@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+declare_args() {
+  alloy_enable_guard_canary = false
+  alloy_enable_guard_log = false
+  alloy_enable_class_marking = false
+}

@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+caption: Allow website icon downloads
+default: null
+desc: |-
+  Controls whether Alloy downloads website icons (favicons).
+
+  When enabled, website icons may be downloaded. When disabled, Alloy does not
+  schedule icon downloads and the network guard rejects stray favicon requests.
+  If unset, the user's alloy.favicons_enabled preference applies (enabled by default).
+example_value: true
+features:
+  can_be_mandatory: true
+  can_be_recommended: false
+  dynamic_refresh: true
+  per_profile: true
+items:
+- caption: Allow website icon downloads
+  value: true
+- caption: Block website icon downloads
+  value: false
+- caption: Let the user choose
+  value: null
+owners:
+- iam@alexindigo.com
+schema:
+  type: boolean
+supported_on:
+- chrome.linux:156-
+tags: []
+type: main

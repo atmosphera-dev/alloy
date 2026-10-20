@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+caption: Allow website search-description downloads
+default: null
+desc: |-
+  Controls whether Alloy downloads a website's OpenSearch search description.
+
+  When enabled, Alloy may download search descriptions offered by visited websites.
+  When disabled, Alloy does not schedule these downloads and the network guard
+  rejects stray OpenSearch requests. If unset, the user's alloy.open_search_enabled
+  preference applies (disabled by default).
+example_value: false
+features:
+  can_be_mandatory: true
+  can_be_recommended: false
+  dynamic_refresh: true
+  per_profile: true
+items:
+- caption: Allow website search-description downloads
+  value: true
+- caption: Block website search-description downloads
+  value: false
+- caption: Let the user choose
+  value: null
+owners:
+- iam@alexindigo.com
+schema:
+  type: boolean
+supported_on:
+- chrome.linux:156-
+tags: []
+type: main

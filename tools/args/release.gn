@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Merged nonofficial Brave Static / CEF configuration used by the spike.
+import("brave_static_args.gni")
+
+blink_heap_inside_shared_library=true
+blink_symbol_level=0
+cc_wrapper=""
+cef_use_gtk=true
+clang_use_chrome_plugins=false
+dcheck_always_on=false
+enable_background_mode=false
+enable_cef=true
+enable_downgrade_processing=false
+enable_linux_installer=false
+enable_precompiled_headers=false
+enable_resource_allowlist_generation=false
+enable_widevine=true
+forbid_non_component_debug_builds=false
+google_api_key=""
+google_default_client_id=""
+google_default_client_secret=""
+is_component_build=false
+is_debug=false
+is_official_build=false
+optimize_webui=true
+symbol_level=0
+use_qt5=false
+use_qt6=false
+use_siso=true
+use_sysroot=true
+v8_symbol_level=0

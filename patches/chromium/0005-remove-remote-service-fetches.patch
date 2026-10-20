@@ -1,0 +1,877 @@
+--- a/components/variations/service/variations_service.cc
++++ b/components/variations/service/variations_service.cc
+@@ -114,12 +114,6 @@
+ // For the HTTP date headers, the resolution of the server time is 1 second.
+ const uint32_t kServerTimeResolutionInSeconds = 1;
+ 
+-// Timeout for fetching the variations seed.
+-const base::TimeDelta kVariationsSeedFetchTimeout = base::Seconds(60);
+-
+-// Whether the VariationsService should fetch the seed for testing.
+-bool g_should_fetch_for_testing = false;
+-
+ // Returns a string that will be used for the value of the 'osname' URL param
+ // to the variations server.
+ std::string GetPlatformString() {
+@@ -273,22 +267,8 @@
+ // Variations seed fetching is only enabled in official Chrome builds, if a URL
+ // is specified on the command line, and for testing.
+ bool IsFetchingEnabled() {
+-#if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          switches::kDisableVariationsSeedFetch)) {
+-    return false;
+-  }
+-#else
+-  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          switches::kVariationsServerURL) &&
+-      !g_should_fetch_for_testing) {
+-    DVLOG(1)
+-        << "Not performing repeated fetching in unofficial build without --"
+-        << switches::kVariationsServerURL << " specified.";
+-    return false;
+-  }
+-#endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)
+-  return true;
++  // Alloy ships no remote experiment seed. There is no runtime override.
++  return false;
+ }
+ 
+ // Returns the already downloaded first run seed, and clear the seed from the
+@@ -702,23 +682,11 @@
+ }
+ 
+ // static
+-void VariationsService::EnableFetchForTesting() {
+-  g_should_fetch_for_testing = true;
+-}
++void VariationsService::EnableFetchForTesting() {}
+ 
+ void VariationsService::DoActualFetch() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  // Normally, there shouldn't be a fetch in progress when this fires.
+-  // However it's not impossible - for example if Chrome was paused (e.g. in a
+-  // debugger or if the machine was suspended) and the previous request hasn't
+-  // completed yet. In this case, don't start a new request and just let the
+-  // previous one finish.
+-  if (is_fetching_seed_) {
+-    return;
+-  }
+-  is_fetching_seed_ = true;
+-  last_request_was_http_retry_ = false;
+-  FetchSeedOverHTTPS();
++  is_fetching_seed_ = false;
+ }
+ 
+ void VariationsService::FetchSeedOverHTTPS() {
+@@ -750,70 +718,7 @@
+ void VariationsService::DoFetchFromURL(const GURL& url,
+                                        std::string header_serial_number) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  DCHECK(IsFetchingEnabled());
+-  DCHECK(!pending_seed_request_);
+-
+-  CHECK(state_manager_);
+-  safe_seed_manager_.RecordFetchStarted(state_manager_->startup_visibility());
+-
+-  net::NetworkTrafficAnnotationTag traffic_annotation =
+-      net::DefineNetworkTrafficAnnotation("chrome_variations_service", R"(
+-        semantics {
+-          sender: "Chrome Variations Service"
+-          description:
+-            "Retrieves the list of Google Chrome's Variations from the server, "
+-            "which will apply to the next Chrome session upon a restart."
+-          trigger:
+-            "Requests are made periodically while Google Chrome is running."
+-          data: "The operating system name."
+-          destination: GOOGLE_OWNED_SERVICE
+-        }
+-        policy {
+-          cookies_allowed: NO
+-          setting: "This feature cannot be disabled by settings."
+-          policy_exception_justification:
+-            "The ChromeVariations policy prevents Variations from applying, "
+-            "but Google Chrome still downloads Variations from the server "
+-            "periodically. This way, the downloaded Variations apply "
+-            "immediately on restart if you unset the ChromeVariations policy."
+-        })");
+-  auto resource_request = std::make_unique<network::ResourceRequest>();
+-  resource_request->url = url;
+-  resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+-
+-  const bool enable_deltas =
+-      !header_serial_number.empty() && !delta_error_since_last_success_;
+-
+-  if (!header_serial_number.empty()) {
+-    resource_request->headers.SetHeader("If-None-Match",
+-                                        std::move(header_serial_number));
+-  }
+-  // Tell the server that delta-compressed and gzipped seeds are supported.
+-  const char* supported_im = enable_deltas ? "x-bm,gzip" : "gzip";
+-  resource_request->headers.SetHeader("A-IM", supported_im);
+-
+-  pending_seed_request_ = network::SimpleURLLoader::Create(
+-      std::move(resource_request), traffic_annotation);
+-  // Ensure our callback is called even with "304 Not Modified" responses.
+-  pending_seed_request_->SetAllowHttpErrorResults(true);
+-  pending_seed_request_->SetTimeoutDuration(kVariationsSeedFetchTimeout);
+-  pending_seed_request_->DownloadToStringOfUnboundedSizeUntilCrashAndDie(
+-      client_->GetURLLoaderFactory().get(),
+-      base::BindOnce(&VariationsService::OnSimpleLoaderComplete,
+-                     weak_ptr_factory_.GetWeakPtr()));
+-
+-  const base::TimeTicks now = base::TimeTicks::Now();
+-  base::TimeDelta time_since_last_fetch;
+-  // Record a time delta of 0 (default value) if there was no previous fetch.
+-  if (!last_request_started_time_.is_null()) {
+-    time_since_last_fetch = now - last_request_started_time_;
+-  }
+-  base::UmaHistogramCustomCounts("Variations.TimeSinceLastFetchAttempt",
+-                                 time_since_last_fetch.InMinutes(), 1,
+-                                 base::Days(7).InMinutes(), 50);
+-  ++request_count_;
+-  last_request_started_time_ = now;
+-  delta_error_since_last_success_ = false;
++  is_fetching_seed_ = false;
+ }
+ 
+ void VariationsService::ContinueRetryOverHTTP(
+@@ -1061,20 +966,8 @@
+ }
+ 
+ void VariationsService::StartRepeatedVariationsSeedFetch() {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  // Initialize Variations server URLs.
+-  variations_server_url_ = GetVariationsServerURL(USE_HTTPS);
+-  insecure_variations_server_url_ = GetVariationsServerURL(USE_HTTP);
+-
+-  DCHECK(!request_scheduler_);
+-  request_scheduler_.reset(VariationsRequestScheduler::Create(
+-      base::BindRepeating(&VariationsService::FetchVariationsSeed,
+-                          weak_ptr_factory_.GetWeakPtr()),
+-      local_state_));
+-  // Note that the act of starting the scheduler will start the fetch, if the
+-  // scheduler deems appropriate.
+-  request_scheduler_->Start();
++  // The remote fetch scheduler is not part of Alloy.
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ }
+ 
+ void VariationsService::FetchVariationsSeed() {
+--- a/components/safe_browsing/core/browser/db/v4_update_protocol_manager.cc
++++ b/components/safe_browsing/core/browser/db/v4_update_protocol_manager.cc
+@@ -116,13 +116,8 @@
+ void V4UpdateProtocolManager::ScheduleNextUpdateAfterInterval(
+     base::TimeDelta interval) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  DCHECK(interval >= base::TimeDelta());
+-
+-  next_update_time_ = Time::Now() + interval;
+-  // Unschedule any current timer.
++  // Local DB inspection remains available; remote update scheduling is removed.
+   update_timer_.Stop();
+-  update_timer_.Start(FROM_HERE, interval, this,
+-                      &V4UpdateProtocolManager::IssueUpdateRequest);
+ }
+ 
+ std::string V4UpdateProtocolManager::GetBase64SerializedUpdateRequestProto() {
+@@ -207,63 +202,7 @@
+ 
+ void V4UpdateProtocolManager::IssueUpdateRequest() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  // If an update request is already pending, record and return silently.
+-  if (request_) {
+-    RecordUpdateResult(V4OperationResult::ALREADY_PENDING_ERROR);
+-    return;
+-  }
+-
+-  net::NetworkTrafficAnnotationTag traffic_annotation =
+-      net::DefineNetworkTrafficAnnotation("safe_browsing_v4_update", R"(
+-        semantics {
+-          sender: "Safe Browsing"
+-          description:
+-            "Safe Browsing issues a request to Google every 30 minutes or so "
+-            "to get the latest database of hashes of bad URLs."
+-          trigger:
+-            "On a timer, approximately every 30 minutes."
+-          data:
+-             "The state of the local DB is sent so the server can send just "
+-             "the changes. This doesn't include any user data."
+-          destination: GOOGLE_OWNED_SERVICE
+-        }
+-        policy {
+-          cookies_allowed: YES
+-          cookies_store: "Safe Browsing cookie store"
+-          setting:
+-            "Users can disable Safe Browsing by unchecking 'Protect you and "
+-            "your device from dangerous sites' in Chromium settings under "
+-            "Privacy. The feature is enabled by default."
+-          chrome_policy {
+-            SafeBrowsingEnabled {
+-              policy_options {mode: MANDATORY}
+-              SafeBrowsingEnabled: false
+-            }
+-          }
+-        })");
+-  auto resource_request = std::make_unique<network::ResourceRequest>();
+-  std::string req_base64 = GetBase64SerializedUpdateRequestProto();
+-  GetUpdateUrlAndHeaders(req_base64, &resource_request->url,
+-                         &resource_request->headers);
+-  resource_request->load_flags = net::LOAD_DISABLE_CACHE;
+-  resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+-  std::unique_ptr<network::SimpleURLLoader> loader =
+-      network::SimpleURLLoader::Create(std::move(resource_request),
+-                                       traffic_annotation);
+-  base::TimeTicks request_start_time = base::TimeTicks::Now();
+-  loader->DownloadToStringOfUnboundedSizeUntilCrashAndDie(
+-      url_loader_factory_.get(),
+-      base::BindOnce(&V4UpdateProtocolManager::OnURLLoaderComplete,
+-                     base::Unretained(this), request_start_time));
+-
+-  request_ = std::move(loader);
+-
+-  // Begin the update request timeout.
+-  timeout_timer_.Start(
+-      FROM_HERE, base::Seconds(kTimerUpdateWaitSecMax),
+-      base::BindOnce(&V4UpdateProtocolManager::HandleTimeout,
+-                     base::Unretained(this), request_start_time));
++  // No remote Safe Browsing transport exists in Alloy.
+ }
+ 
+ void V4UpdateProtocolManager::HandleTimeout(
+--- a/components/update_client/net/network_impl.cc
++++ b/components/update_client/net/network_impl.cc
+@@ -4,117 +4,21 @@
+ 
+ #include "components/update_client/net/network_impl.h"
+ 
+-#include <stddef.h>
+-#include <stdint.h>
+-
+-#include <memory>
++#include <optional>
+ #include <utility>
+ 
+-#include "base/check.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+-#include "base/functional/callback_helpers.h"
+-#include "base/memory/weak_ptr.h"
+-#include "base/numerics/safe_conversions.h"
++#include "base/memory/ref_counted.h"
+ #include "base/task/sequenced_task_runner.h"
+-#include "build/branding_buildflags.h"
+-#include "components/update_client/net/network_chromium.h"
+-#include "net/base/load_flags.h"
+ #include "net/base/net_errors.h"
+-#include "net/http/http_response_headers.h"
+-#include "net/traffic_annotation/network_traffic_annotation.h"
+-#include "services/network/public/cpp/is_potentially_trustworthy.h"
+-#include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+-#include "services/network/public/cpp/simple_url_loader.h"
+-#include "services/network/public/mojom/url_response_head.mojom.h"
+-#include "url/gurl.h"
+-
+-#if BUILDFLAG(CHROME_FOR_TESTING)
+-#include "net/base/request_priority.h"
+-#endif
+-
+-namespace {
+-
+-const net::NetworkTrafficAnnotationTag traffic_annotation =
+-    net::DefineNetworkTrafficAnnotation("update_client", R"(
+-        semantics {
+-          sender: "Component Updater and Extension Updater"
+-          description:
+-            "This network module is used by both the component and the "
+-            "extension updaters in Chrome. "
+-            "The component updater is responsible for updating code and data "
+-            "modules such as Flash, CrlSet, Origin Trials, etc. These modules "
+-            "are updated on cycles independent of the Chrome release tracks. "
+-            "It runs in the browser process and communicates with a set of "
+-            "servers using the Omaha protocol to find the latest versions of "
+-            "components, download them, and register them with the rest of "
+-            "Chrome. "
+-            "The extension updater works similarly, but it updates user "
+-            "extensions instead of Chrome components. "
+-          trigger: "Manual or automatic software updates."
+-          data:
+-            "Various OS and Chrome parameters such as version, bitness, "
+-            "release tracks, etc. The component and the extension ids are also "
+-            "present in both the request and the response from the servers. "
+-            "The URL that refers to a component CRX payload is obfuscated for "
+-            "most components."
+-          destination: GOOGLE_OWNED_SERVICE
+-        }
+-        policy {
+-          cookies_allowed: YES
+-          cookies_store: "user"
+-          setting: "This feature cannot be disabled."
+-          chrome_policy {
+-            ComponentUpdatesEnabled {
+-              policy_options {mode: MANDATORY}
+-              ComponentUpdatesEnabled: false
+-            }
+-          }
+-        })");
+-
+-// Returns the string value of a header of the server response or an empty
+-// string if the header is not available. Only the first header is returned
+-// if multiple instances of the same header are present.
+-std::string GetStringHeader(const network::SimpleURLLoader* simple_url_loader,
+-                            const char* header_name) {
+-  CHECK(simple_url_loader);
+-
+-  const auto* response_info = simple_url_loader->ResponseInfo();
+-  if (!response_info || !response_info->headers) {
+-    return {};
+-  }
+-
+-  std::string header_value;
+-  return response_info->headers->EnumerateHeader(nullptr, header_name,
+-                                                 &header_value)
+-             ? header_value
+-             : std::string{};
+-}
+-
+-// Returns the integral value of a header of the server response or -1 if
+-// if the header is not available or a conversion error has occurred.
+-int64_t GetInt64Header(const network::SimpleURLLoader* simple_url_loader,
+-                       const char* header_name) {
+-  CHECK(simple_url_loader);
+-
+-  const auto* response_info = simple_url_loader->ResponseInfo();
+-  if (!response_info || !response_info->headers) {
+-    return -1;
+-  }
+-
+-  return response_info->headers->GetInt64HeaderValue(header_name).value_or(-1);
+-}
+-
+-}  // namespace
+ 
+ namespace update_client {
+ 
+ NetworkFetcherImpl::NetworkFetcherImpl(
+     scoped_refptr<network::SharedURLLoaderFactory> shared_url_network_factory,
+-    SendCookiesPredicate cookie_predicate)
+-    : shared_url_network_factory_(shared_url_network_factory),
+-      cookie_predicate_(cookie_predicate) {}
++    SendCookiesPredicate cookie_predicate) {}
+ NetworkFetcherImpl::~NetworkFetcherImpl() = default;
+ 
+ void NetworkFetcherImpl::PostRequest(
+@@ -125,48 +29,12 @@
+     ResponseStartedCallback response_started_callback,
+     ProgressCallback progress_callback,
+     PostRequestCompleteCallback post_request_complete_callback) {
+-  auto resource_request = std::make_unique<network::ResourceRequest>();
+-  resource_request->url = url;
+-  resource_request->method = "POST";
+-  resource_request->load_flags = net::LOAD_DISABLE_CACHE;
+-  resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+-  for (const auto& [name, value] : post_additional_headers) {
+-    resource_request->headers.SetHeader(name, value);
+-  }
+-  std::unique_ptr<network::SimpleURLLoader> simple_url_loader =
+-      network::SimpleURLLoader::Create(std::move(resource_request),
+-                                       traffic_annotation);
+-  simple_url_loader->SetRetryOptions(
+-      kMaxRetriesOnNetworkChange,
+-      network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE);
+-  // The `Content-Type` header set by |AttachStringForUpload| overwrites any
+-  // `Content-Type` header present in the |ResourceRequest| above.
+-  simple_url_loader->AttachStringForUpload(post_data, content_type);
+-  simple_url_loader->SetOnResponseStartedCallback(base::BindOnce(
+-      &NetworkFetcherImpl::OnResponseStartedCallback,
+-      weak_ptr_factory_.GetWeakPtr(), std::move(response_started_callback)));
+-  simple_url_loader->SetOnDownloadProgressCallback(base::BindRepeating(
+-      &NetworkFetcherImpl::OnProgressCallback, weak_ptr_factory_.GetWeakPtr(),
+-      std::move(progress_callback)));
+-  static constexpr size_t kMaxResponseSize = 1024 * 1024;
+-  simple_url_loader->DownloadToString(
+-      shared_url_network_factory_.get(),
+-      base::BindOnce(
+-          [](std::unique_ptr<network::SimpleURLLoader> simple_url_loader,
+-             PostRequestCompleteCallback post_request_complete_callback,
+-             std::optional<std::string> response_body) {
+-            std::move(post_request_complete_callback)
+-                .Run(std::move(response_body), simple_url_loader->NetError(),
+-                     GetStringHeader(simple_url_loader.get(), kHeaderEtag),
+-                     GetStringHeader(simple_url_loader.get(),
+-                                     kHeaderXCupServerProof),
+-                     /*header_set_cookie=*/"",
+-                     GetInt64Header(simple_url_loader.get(),
+-                                    kHeaderXRetryAfter));
+-          },
+-          std::move(simple_url_loader),
+-          std::move(post_request_complete_callback)),
+-      kMaxResponseSize);
++  // Covers component and extension Omaha callers, including explicit checks
++  // and reporting pings. No URLLoader or retry path is created.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(post_request_complete_callback),
++                               std::nullopt, net::ERR_NETWORK_ACCESS_DENIED,
++                               std::string(), std::string(), std::string(), -1));
+ }
+ 
+ base::OnceClosure NetworkFetcherImpl::DownloadToFile(
+@@ -175,92 +43,22 @@
+     ResponseStartedCallback response_started_callback,
+     ProgressCallback progress_callback,
+     DownloadToFileCompleteCallback download_to_file_complete_callback) {
+-  auto resource_request = std::make_unique<network::ResourceRequest>();
+-  resource_request->url = url;
+-  resource_request->method = "GET";
+-#if BUILDFLAG(CHROME_FOR_TESTING)
+-  // Chrome for Testing disables component updates by default, but it can
+-  // optionally install required components prior to browser startup. In such
+-  // cases, we must bump the request priority to avoid a deadlock in
+-  // ComponentUpdateService::EnsureRequiredComponentsReady().
+-  // If left at the default net::IDLE priority, download requests are not
+-  // serviced when Chrome creates a new user data directory from scratch (a
+-  // common scenario in test automation) and update progress gets stuck after
+-  // the first OnEvent() call with ComponentState::kDownloading state.
+-  resource_request->priority = net::LOW;
+-#endif
+-  resource_request->load_flags = net::LOAD_DISABLE_CACHE;
+-  if (!cookie_predicate_.Run(url) ||
+-      !network::IsUrlPotentiallyTrustworthy(url)) {
+-    resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+-  } else {
+-    resource_request->site_for_cookies = net::SiteForCookies::FromUrl(url);
+-  }
+-  // The loader is owned by this fetcher so the download can be cancelled by
+-  // destroying it. The completion callback is kept here so that it can be run
+-  // after a cancellation, since a destroyed loader never runs it.
+-  CHECK(!simple_url_loader_);
+-  CHECK(!download_to_file_complete_callback_);
+-  download_to_file_complete_callback_ =
+-      std::move(download_to_file_complete_callback);
+-  simple_url_loader_ = network::SimpleURLLoader::Create(
+-      std::move(resource_request), traffic_annotation);
+-  simple_url_loader_->SetRetryOptions(
+-      kMaxRetriesOnNetworkChange,
+-      network::SimpleURLLoader::RetryMode::RETRY_ON_NETWORK_CHANGE);
+-  simple_url_loader_->SetAllowPartialResults(true);
+-  simple_url_loader_->SetOnResponseStartedCallback(base::BindOnce(
+-      &NetworkFetcherImpl::OnResponseStartedCallback,
+-      weak_ptr_factory_.GetWeakPtr(), std::move(response_started_callback)));
+-  simple_url_loader_->SetOnDownloadProgressCallback(base::BindRepeating(
+-      &NetworkFetcherImpl::OnProgressCallback, weak_ptr_factory_.GetWeakPtr(),
+-      std::move(progress_callback)));
+-  simple_url_loader_->DownloadToFile(
+-      shared_url_network_factory_.get(),
+-      base::BindOnce(&NetworkFetcherImpl::OnDownloadToFileComplete,
+-                     weak_ptr_factory_.GetWeakPtr()),
+-      file_path);
+-  return base::BindOnce(&NetworkFetcherImpl::CancelDownloadToFile,
+-                        weak_ptr_factory_.GetWeakPtr());
+-}
+-
+-void NetworkFetcherImpl::OnDownloadToFileComplete(base::FilePath file_path) {
+-  // The loader runs this callback itself, and cancelling destroys the loader
+-  // before it can, so the loader is always set here.
+-  CHECK(simple_url_loader_);
+-  // Take the loader so it is destroyed after this method returns, once its
+-  // result has been read.
+-  std::unique_ptr<network::SimpleURLLoader> simple_url_loader =
+-      std::move(simple_url_loader_);
+-  std::move(download_to_file_complete_callback_)
+-      .Run(simple_url_loader->NetError(), simple_url_loader->GetContentSize());
+-}
+-
+-void NetworkFetcherImpl::CancelDownloadToFile() {
+-  if (!simple_url_loader_) {
+-    // The download has already completed, or was already cancelled.
+-    return;
+-  }
+-  // Destroying the loader stops the download. The loader then never runs the
+-  // completion callback, so it is run here, once, like any other completion.
+-  simple_url_loader_.reset();
++  auto cancelled = base::MakeRefCounted<base::RefCountedData<bool>>(false);
+   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(std::move(download_to_file_complete_callback_),
+-                                net::ERR_ABORTED, /*content_size=*/0));
+-}
+-
+-void NetworkFetcherImpl::OnResponseStartedCallback(
+-    ResponseStartedCallback response_started_callback,
+-    const GURL& final_url,
+-    const network::mojom::URLResponseHead& response_head) {
+-  std::move(response_started_callback)
+-      .Run(response_head.headers ? response_head.headers->response_code() : -1,
+-           response_head.content_length);
+-}
+-
+-void NetworkFetcherImpl::OnProgressCallback(ProgressCallback progress_callback,
+-                                            uint64_t current) {
+-  progress_callback.Run(base::saturated_cast<int64_t>(current));
++      FROM_HERE,
++      base::BindOnce(
++          [](scoped_refptr<base::RefCountedData<bool>> cancelled,
++             DownloadToFileCompleteCallback callback) {
++            std::move(callback).Run(cancelled->data ? net::ERR_ABORTED
++                                                    : net::ERR_NETWORK_ACCESS_DENIED,
++                                    0);
++          },
++          cancelled, std::move(download_to_file_complete_callback)));
++  return base::BindOnce(
++      [](scoped_refptr<base::RefCountedData<bool>> cancelled) {
++        cancelled->data = true;
++      },
++      cancelled);
+ }
+ 
+ NetworkFetcherChromiumFactory::NetworkFetcherChromiumFactory(
+--- a/components/update_client/net/network_impl.h
++++ b/components/update_client/net/network_impl.h
+@@ -53,27 +53,8 @@
+       DownloadToFileCompleteCallback download_to_file_complete_callback)
+       override;
+ 
+- private:
+-  void OnResponseStartedCallback(
+-      ResponseStartedCallback response_started_callback,
+-      const GURL& final_url,
+-      const network::mojom::URLResponseHead& response_head);
+ 
+-  void OnProgressCallback(ProgressCallback response_started_callback,
+-                          uint64_t current);
+ 
+-  static constexpr int kMaxRetriesOnNetworkChange = 3;
+-
+-  void OnDownloadToFileComplete(base::FilePath file_path);
+-  void CancelDownloadToFile();
+-
+-  scoped_refptr<network::SharedURLLoaderFactory> shared_url_network_factory_;
+-  SendCookiesPredicate cookie_predicate_;
+-  // The loader and the completion callback of the download in progress, if
+-  // any. Both are reset when the download completes or is cancelled.
+-  std::unique_ptr<network::SimpleURLLoader> simple_url_loader_;
+-  DownloadToFileCompleteCallback download_to_file_complete_callback_;
+-  base::WeakPtrFactory<NetworkFetcherImpl> weak_ptr_factory_{this};
+ };
+ 
+ }  // namespace update_client
+--- a/components/component_updater/component_updater_service.cc
++++ b/components/component_updater/component_updater_service.cc
+@@ -176,18 +176,7 @@
+ 
+ void CrxUpdateService::Start() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  VLOG(1) << "CrxUpdateService starting up. "
+-          << "First update attempt will take place in "
+-          << config_->InitialDelay() << " seconds. "
+-          << "Next update attempt will take place in "
+-          << config_->NextCheckDelay() << " seconds. ";
+-
+-  scheduler_->Schedule(
+-      config_->InitialDelay(), config_->NextCheckDelay(),
+-      base::BindRepeating(
+-          base::IgnoreResult(&CrxUpdateService::CheckForUpdates),
+-          weak_ptr_factory_.GetWeakPtr()),
+-      base::DoNothing());
++  // Release resources replace remote component updates; never start a timer.
+ }
+ 
+ // Stops the update loop. In flight operations will be completed.
+--- a/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
++++ b/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
+@@ -15,7 +15,6 @@
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+-#include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/observer_list.h"
+ #include "base/path_service.h"
+@@ -34,12 +33,6 @@
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/render_process_host.h"
+-#include "content/public/browser/storage_partition.h"
+-#include "net/base/load_flags.h"
+-#include "net/traffic_annotation/network_traffic_annotation.h"
+-#include "services/network/public/cpp/resource_request.h"
+-#include "services/network/public/cpp/simple_url_loader.h"
+-#include "services/network/public/mojom/url_response_head.mojom.h"
+ #include "url/gurl.h"
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -51,10 +44,7 @@
+ 
+ namespace {
+ 
+-GURL& GetDownloadUrlForTesting() {
+-  static base::NoDestructor<GURL> download_url_for_testing;
+-  return *download_url_for_testing;
+-}
++
+ 
+ // Close the file.
+ void CloseDictionary(base::File file) {
+@@ -63,32 +53,7 @@
+   file.Close();
+ }
+ 
+-// Saves |data| to file at |path|. Returns true on successful save, otherwise
+-// returns false.
+-bool SaveDictionaryData(std::string data, const base::FilePath& path) {
+-  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+-                                                base::BlockingType::MAY_BLOCK);
+-
+-  if (!base::WriteFile(path, data)) {
+-    bool success = false;
+-#if BUILDFLAG(IS_WIN)
+-    base::FilePath dict_dir;
+-    base::PathService::Get(chrome::DIR_USER_DATA, &dict_dir);
+-    base::FilePath fallback_file_path =
+-        dict_dir.Append(path.BaseName());
+-    if (base::WriteFile(fallback_file_path, data)) {
+-      success = true;
+-    }
+-#endif
+-
+-    if (!success) {
+-      base::DeleteFile(path);
+-      return false;
+-    }
+-  }
+-
+-  return true;
+-}
++
+ 
+ }  // namespace
+ 
+@@ -127,7 +92,6 @@
+       language_(language),
+       platform_spellcheck_language_(platform_spellcheck_language),
+       use_browser_spellchecker_(false),
+-      browser_context_(browser_context),
+       spellcheck_service_(spellcheck_service),
+       download_status_(DOWNLOAD_NONE),
+       dictionary_file_(task_runner_.get()) {}
+@@ -165,12 +129,8 @@
+ 
+ void SpellcheckHunspellDictionary::RetryDownloadDictionary(
+     content::BrowserContext* browser_context) {
+-  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  if (dictionary_file_.file.IsValid()) {
+-    NOTREACHED();
+-  }
+-  browser_context_ = browser_context;
+-  DownloadDictionary(GetDictionaryURL());
++  // Retry only the installed release dictionary, never a remote download.
++  Load();
+ }
+ 
+ bool SpellcheckHunspellDictionary::IsReady() const {
+@@ -222,116 +182,8 @@
+   return download_status_ == DOWNLOAD_FAILED;
+ }
+ 
+-void SpellcheckHunspellDictionary::OnSimpleLoaderComplete(
+-    std::optional<std::string> data) {
+-  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-
+-  bool is_success = simple_loader_->NetError() == net::OK;
+-  int response_code = -1;
+-  if (simple_loader_->ResponseInfo() && simple_loader_->ResponseInfo()->headers)
+-    response_code = simple_loader_->ResponseInfo()->headers->response_code();
+-
+-  if (!is_success || ((response_code / 100) != 2)) {
+-    // Initialize will not try to download the file a second time.
+-    InformListenersOfDownloadFailure();
+-    return;
+-  }
+-
+-  // We don't need the loader anymore.
+-  simple_loader_.reset();
+-
+-  // Basic sanity check on the dictionary. There's a small chance of 200 status
+-  // code for a body that represents some form of failure.
+-  if (!data || data->size() < 4 || data->compare(0, 4, "BDic") != 0) {
+-    InformListenersOfDownloadFailure();
+-    return;
+-  }
+-
+-#if !BUILDFLAG(IS_ANDROID)
+-  // To prevent corrupted dictionary data from causing a renderer crash, scan
+-  // the dictionary data and verify it is sane before save it to a file.
+-  if (!hunspell::BDict::Verify(base::as_byte_span(*data))) {
+-    // Let PostTaskAndReply caller send to InformListenersOfInitialization
+-    // through SaveDictionaryDataComplete().
+-    SaveDictionaryDataComplete(false);
+-    return;
+-  }
+-#endif
+-
+-  task_runner_->PostTaskAndReplyWithResult(
+-      FROM_HERE,
+-      base::BindOnce(&SaveDictionaryData, std::move(data).value(),
+-                     dictionary_file_.path),
+-      base::BindOnce(&SpellcheckHunspellDictionary::SaveDictionaryDataComplete,
+-                     weak_ptr_factory_.GetWeakPtr()));
+-}
+-
+ void SpellcheckHunspellDictionary::SetDownloadURLForTesting(const GURL url) {
+-  GetDownloadUrlForTesting() = url;
+-}
+-
+-GURL SpellcheckHunspellDictionary::GetDictionaryURL() {
+-  if (GetDownloadUrlForTesting() != GURL()) {
+-    return GetDownloadUrlForTesting();
+-  }
+-
+-  std::string bdict_file = dictionary_file_.path.BaseName().MaybeAsASCII();
+-  DCHECK(!bdict_file.empty());
+-
+-  static const char kDownloadServerUrl[] =
+-      "https://dict.brave.com/edgedl/chrome/dict/";
+-
+-  return GURL(std::string(kDownloadServerUrl) +
+-              base::ToLowerASCII(bdict_file));
+-}
+-
+-void SpellcheckHunspellDictionary::DownloadDictionary(GURL url) {
+-  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  DCHECK(browser_context_);
+-
+-  download_status_ = DOWNLOAD_IN_PROGRESS;
+-  for (Observer& observer : observers_)
+-    observer.OnHunspellDictionaryDownloadBegin(language_);
+-
+-  net::NetworkTrafficAnnotationTag traffic_annotation =
+-      net::DefineNetworkTrafficAnnotation("spellcheck_hunspell_dictionary", R"(
+-        semantics {
+-          sender: "Spellcheck Dictionary Downloader"
+-          description:
+-            "When user selects a new language for spell checking in Google "
+-            "Chrome, a new dictionary is downloaded for it."
+-          trigger: "User selects a new language for spell checking."
+-          data:
+-            "The spell checking language identifier. No user identifier is "
+-            "sent."
+-          destination: GOOGLE_OWNED_SERVICE
+-        }
+-        policy {
+-          cookies_allowed: NO
+-          setting:
+-            "You can prevent downloading dictionaries by not selecting 'Use "
+-            "this language for spell checking.' in Chrome's settings under "
+-            "Lanugagues -> 'Language and input settings...'."
+-          policy_exception_justification:
+-            "Not implemented, considered not useful."
+-        })");
+-
+-  auto resource_request = std::make_unique<network::ResourceRequest>();
+-  resource_request->url = url;
+-  resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+-  simple_loader_ = network::SimpleURLLoader::Create(std::move(resource_request),
+-                                                    traffic_annotation);
+-  network::mojom::URLLoaderFactory* loader_factory =
+-      browser_context_->GetDefaultStoragePartition()
+-          ->GetURLLoaderFactoryForBrowserProcess()
+-          .get();
+-  simple_loader_->DownloadToStringOfUnboundedSizeUntilCrashAndDie(
+-      loader_factory,
+-      base::BindOnce(&SpellcheckHunspellDictionary::OnSimpleLoaderComplete,
+-                     base::Unretained(this)));
+-
+-  // Attempt downloading the dictionary only once.
+-  browser_context_ = nullptr;
++  // The removed network transport cannot be restored by a test URL override.
+ }
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -412,40 +264,16 @@
+   dictionary_file_ = std::move(file);
+ 
+   if (!dictionary_file_.file.IsValid()) {
+-    // Notify browser tests that this dictionary is corrupted. Skip downloading
+-    // the dictionary in browser tests.
+-    // TODO(rouslan): Remove this test-only case.
+-    if (spellcheck_service_->SignalStatusEvent(
+-          SpellcheckService::BDICT_CORRUPTED)) {
+-      browser_context_ = nullptr;
+-    }
+-
+-    if (browser_context_) {
+-      // Download from the UI thread to check that |browser_context_| is
+-      // still valid.
+-      DownloadDictionary(GetDictionaryURL());
+-      return;
+-    }
+-  }
++    spellcheck_service_->SignalStatusEvent(SpellcheckService::BDICT_CORRUPTED);
++    InformListenersOfDownloadFailure();
++  }
++
+ 
+   InformListenersOfInitialization();
+ }
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+-void SpellcheckHunspellDictionary::SaveDictionaryDataComplete(
+-    bool dictionary_saved) {
+-  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-
+-  if (dictionary_saved) {
+-    download_status_ = DOWNLOAD_NONE;
+-    for (Observer& observer : observers_)
+-      observer.OnHunspellDictionaryDownloadSuccess(language_);
+-    Load();
+-  } else {
+-    InformListenersOfDownloadFailure();
+-    InformListenersOfInitialization();
+-  }
+-}
++
+ 
+ void SpellcheckHunspellDictionary::InformListenersOfInitialization() {
+   for (Observer& observer : observers_)
+--- a/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.h
++++ b/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.h
+@@ -130,13 +130,7 @@
+     scoped_refptr<base::TaskRunner> task_runner_;
+   };
+ 
+-  void OnSimpleLoaderComplete(std::optional<std::string> response_body);
+ 
+-  // Determine the correct url to download the dictionary.
+-  GURL GetDictionaryURL();
+-
+-  // Attempt to download the dictionary.
+-  void DownloadDictionary(GURL url);
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   // Figures out the location for the dictionary, verifies its contents, and
+@@ -157,9 +151,7 @@
+   void SpellCheckPlatformSetLanguageComplete(bool result);
+ #endif
+ 
+-  // The reply point for PostTaskAndReplyWithResult, called after the dictionary
+-  // file has been saved.
+-  void SaveDictionaryDataComplete(bool dictionary_saved);
++
+ 
+   // Notify listeners that the dictionary has been initialized.
+   void InformListenersOfInitialization();
+@@ -185,12 +177,7 @@
+   // Whether to use the platform spellchecker instead of Hunspell.
+   bool use_browser_spellchecker_;
+ 
+-  // Used for downloading the dictionary file. SpellcheckHunspellDictionary does
+-  // not hold a reference, and it is only valid to use it on the UI thread.
+-  raw_ptr<content::BrowserContext> browser_context_;
+ 
+-  // Used for downloading the dictionary file.
+-  std::unique_ptr<network::SimpleURLLoader> simple_loader_;
+ 
+   const raw_ptr<SpellcheckService> spellcheck_service_;
+ 

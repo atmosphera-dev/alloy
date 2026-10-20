@@ -1,0 +1,39 @@
+diff --git a/third_party/crashpad/crashpad/handler/handler_main.cc b/third_party/crashpad/crashpad/handler/handler_main.cc
+--- a/third_party/crashpad/crashpad/handler/handler_main.cc
++++ b/third_party/crashpad/crashpad/handler/handler_main.cc
+@@ -1051,33 +1051,8 @@
+   }
+ 
+   ScopedStoppable upload_thread;
+-  if (!options.url.empty()) {
+-    // TODO(scottmg): options.rate_limit should be removed when we have a
+-    // configurable database setting to control upload limiting.
+-    // See https://crashpad.chromium.org/bug/23.
+-    CrashReportUploadThread::Options upload_thread_options;
+-    upload_thread_options.identify_client_via_url =
+-        options.identify_client_via_url;
+-    upload_thread_options.rate_limit = options.rate_limit;
+-    upload_thread_options.upload_gzip = options.upload_gzip;
+-    upload_thread_options.watch_pending_reports = options.periodic_tasks;
+-
+-#if BUILDFLAG(ENABLE_CEF)
+-    upload_thread.Reset(new CefCrashReportUploadThread(
+-        database.get(),
+-        options.url,
+-        upload_thread_options,
+-        CrashReportUploadThread::ProcessPendingReportsObservationCallback(),
+-        options.max_uploads));
+-#else
+-    upload_thread.Reset(new CrashReportUploadThread(
+-        database.get(),
+-        options.url,
+-        upload_thread_options,
+-        CrashReportUploadThread::ProcessPendingReportsObservationCallback()));
+-#endif
+-    upload_thread.Get()->Start();
+-  }
++  // Alloy retains local exception handling but has no upload-thread owner,
++  // including when the handler is invoked directly with an upload URL.
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+   std::unique_ptr<ExceptionHandlerServer::Delegate> exception_handler;

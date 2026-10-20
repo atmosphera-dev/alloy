@@ -1,0 +1,19 @@
+diff --git a/libcef/browser/alloy/alloy_browser_host_impl.cc b/libcef/browser/alloy/alloy_browser_host_impl.cc
+--- a/libcef/browser/alloy/alloy_browser_host_impl.cc
++++ b/libcef/browser/alloy/alloy_browser_host_impl.cc
+@@ -34,6 +34,7 @@
+ #include "cef/libcef/common/values_impl.h"
+ #include "chrome/browser/file_select_helper.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
++#include "chrome/browser/ui/search_engines/search_engine_tab_helper.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "components/printing/browser/print_composite_client.h"
+@@ -193,6 +194,7 @@
+       settings, client, web_contents, browser_info, opener, request_context,
+       std::move(platform_delegate));
+   browser->InitializeBrowser();
++  SearchEngineTabHelper::CreateForWebContents(web_contents);
+ 
+   if (!browser->CreateHostWindow()) {
+     return nullptr;

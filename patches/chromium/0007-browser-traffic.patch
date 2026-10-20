@@ -1,0 +1,650 @@
+diff --git a/chrome/browser/favicon/favicon_utils.cc b/chrome/browser/favicon/favicon_utils.cc
+--- a/chrome/browser/favicon/favicon_utils.cc
++++ b/chrome/browser/favicon/favicon_utils.cc
+@@ -7,6 +7,7 @@
+ #include "base/hash/sha1.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/url_constants.h"
+ #include "chrome/common/webui_url_constants.h"
+@@ -75,7 +76,14 @@
+   return ContentFaviconDriver::CreateForWebContents(
+       web_contents,
+       FaviconServiceFactory::GetForProfile(original_profile,
+-                                           ServiceAccessType::IMPLICIT_ACCESS));
++                                           ServiceAccessType::IMPLICIT_ACCESS),
++      base::BindRepeating(
++          [](PrefService* prefs) {
++            return prefs->GetBoolean(alloy::kFaviconsEnabled);
++          },
++          base::Unretained(
++              Profile::FromBrowserContext(web_contents->GetBrowserContext())
++                  ->GetPrefs())));
+ }
+ 
+ SkBitmap GenerateMonogramFavicon(GURL url, int icon_size, int circle_size) {
+diff --git a/chrome/browser/net/BUILD.gn b/chrome/browser/net/BUILD.gn
+--- a/chrome/browser/net/BUILD.gn
++++ b/chrome/browser/net/BUILD.gn
+@@ -2,6 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//testing/test.gni")
+ import("//build/config/features.gni")
+ import("//chrome/common/features.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
+@@ -26,8 +27,24 @@
+   ]
+ }
+ 
++test("alloy_traffic_unittests") {
++  sources = [
++    "//base/test/run_all_unittests.cc",
++    "alloy_traffic_prefs_unittest.cc",
++  ]
++  deps = [
++    "//base/test:test_support",
++    "//components/policy/core/browser:test_support",
++    "//components/prefs:test_support",
++    "//testing/gmock",
++    "//testing/gtest",
++  ]
++}
++
+ source_set("net") {
+   public = [
++    "alloy_traffic_policy.h",
++    "alloy_traffic_prefs.h",
+     "cert_verifier_service_time_updater.h",
+     "chrome_mojo_proxy_resolver_factory.h",
+     "chrome_network_delegate.h",
+diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -37,6 +37,7 @@
+ #include "chrome/browser/content_settings/cookie_settings_factory.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/domain_reliability/service_factory.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/net/system_network_context_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/signin/signin_util.h"
+@@ -555,6 +556,12 @@
+   HostContentSettingsMapFactory::GetForProfile(profile_)->AddObserver(this);
+ 
+   pref_change_registrar_.Init(profile_prefs);
++  for (auto* key : alloy::kTrafficPrefs) {
++    pref_change_registrar_.Add(
++        key, base::BindRepeating(
++                 &ProfileNetworkContextService::UpdateAlloyTrafficOptions,
++                 base::Unretained(this)));
++  }
+ 
+   // When any of the following CT preferences change, we schedule an update
+   // to aggregate the actual update using a |ct_policy_update_timer_|.
+@@ -648,6 +655,8 @@
+ // static
+ void ProfileNetworkContextService::RegisterProfilePrefs(
+     user_prefs::PrefRegistrySyncable* registry) {
++  alloy::RegisterTrafficPrefs(registry);
++
+   registry->RegisterBooleanPref(embedder_support::kAlternateErrorPagesEnabled,
+                                 true);
+   registry->RegisterBooleanPref(prefs::kQuicAllowed, true);
+@@ -680,6 +689,18 @@
+   registry->RegisterIntegerPref(
+       prefs::kAmbientAuthenticationInPrivateModesEnabled,
+       static_cast<int>(net::AmbientAuthAllowedProfileTypes::kRegularOnly));
++}
++
++void ProfileNetworkContextService::UpdateAlloyTrafficOptions() {
++  const PrefService* prefs = profile_->GetPrefs();
++  profile_->ForEachLoadedStoragePartition(
++      [&](content::StoragePartition* partition) {
++        partition->GetNetworkContext()->SetAlloyTrafficOptions(
++            prefs->GetBoolean(alloy::kFaviconsEnabled),
++            prefs->GetBoolean(alloy::kOpenSearchEnabled),
++            prefs->GetBoolean(alloy::kDnsPrefetchEnabled),
++            prefs->GetBoolean(alloy::kPreconnectEnabled));
++      });
+ }
+ 
+ void ProfileNetworkContextService::DisableQuicIfNotAllowed() {
+@@ -1356,6 +1377,15 @@
+   network_context_params->alloy_guard_log_path =
+       root.AppendASCII("alloy-guard.log");
+ 
++  const PrefService* alloy_prefs = profile_->GetPrefs();
++  network_context_params->alloy_favicons_enabled =
++      alloy_prefs->GetBoolean(alloy::kFaviconsEnabled);
++  network_context_params->alloy_open_search_enabled =
++      alloy_prefs->GetBoolean(alloy::kOpenSearchEnabled);
++  network_context_params->alloy_dns_prefetch_enabled =
++      alloy_prefs->GetBoolean(alloy::kDnsPrefetchEnabled);
++  network_context_params->alloy_preconnect_enabled =
++      alloy_prefs->GetBoolean(alloy::kPreconnectEnabled);
+   network_context_params->accept_language = ComputeAcceptLanguage();
+   network_context_params->enable_referrers = enable_referrers_.GetValue();
+ 
+diff --git a/chrome/browser/net/profile_network_context_service.h b/chrome/browser/net/profile_network_context_service.h
+--- a/chrome/browser/net/profile_network_context_service.h
++++ b/chrome/browser/net/profile_network_context_service.h
+@@ -217,6 +217,7 @@
+   // Creates parameters for the NetworkContext. Use |in_memory| instead of
+   // |profile_->IsOffTheRecord()| because sometimes normal profiles want off the
+   // record partitions (e.g. for webview tag).
++  void UpdateAlloyTrafficOptions();
+   void ConfigureNetworkContextParamsInternal(
+       bool in_memory,
+       const base::FilePath& relative_partition_path,
+diff --git a/chrome/browser/policy/configuration_policy_handler_list_factory.cc b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+--- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
++++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/glic/gemini_spark_settings_policy_handler.h"
+ #include "chrome/browser/glic/glic_pref_names.h"
+ #include "chrome/browser/media/webrtc/capture_policy_utils.h"
++#include "chrome/browser/net/alloy_traffic_policy.h"
+ #include "chrome/browser/net/disk_cache_dir_policy_handler.h"
+ #include "chrome/browser/net/explicitly_allowed_network_ports_policy_handler.h"
+ #include "chrome/browser/net/secure_dns_policy_handler.h"
+@@ -2631,6 +2632,7 @@
+           base::BindRepeating(&PopulatePolicyHandlerParameters),
+           base::BindRepeating(&GetChromePolicyDetails),
+           AreFuturePoliciesEnabledByDefault()));
++  alloy::AddTrafficPolicyHandlers(handlers.get());
+   for (const PolicyToPreferenceMapEntry& entry : kSimplePolicyMap) {
+     handlers->AddHandler(std::make_unique<SimplePolicyHandler>(
+         entry.policy_name, entry.preference_path, entry.value_type));
+diff --git a/chrome/browser/predictors/loading_predictor.cc b/chrome/browser/predictors/loading_predictor.cc
+--- a/chrome/browser/predictors/loading_predictor.cc
++++ b/chrome/browser/predictors/loading_predictor.cc
+@@ -11,6 +11,7 @@
+ #include "base/trace_event/trace_event.h"
+ #include "base/unguessable_token.h"
+ #include "build/build_config.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/predictors/lcp_critical_path_predictor/lcp_critical_path_predictor_util.h"
+ #include "chrome/browser/predictors/lcp_critical_path_predictor/prewarm_http_disk_cache_manager.h"
+ #include "chrome/browser/predictors/loading_data_collector.h"
+@@ -18,6 +19,7 @@
+ #include "chrome/browser/predictors/predictors_features.h"
+ #include "chrome/browser/predictors/predictors_traffic_annotations.h"
+ #include "chrome/browser/predictors/resource_prefetch_predictor.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/service_worker_context.h"
+ #include "content/public/browser/storage_partition.h"
+@@ -210,7 +212,7 @@
+ 
+   ++total_hints_activated_;
+   active_hints_.emplace(url, base::TimeTicks::Now());
+-  if (IsPreconnectEnabled()) {
++  if (IsPreconnectEnabled() || IsDnsPrefetchEnabled()) {
+     MaybeAddPreconnect(url, std::move(prediction));
+   }
+   return has_local_preconnect_prediction || preconnect_prediction;
+@@ -376,7 +378,8 @@
+     bool only_allow_https,
+     PreconnectData& preconnect_data,
+     base::UnguessableToken network_restrictions_id) {
+-  if (!url.is_valid() || !url.has_host() || !IsPreconnectEnabled() ||
++  if (!url.is_valid() || !url.has_host() ||
++      !(IsPreconnectEnabled() || IsDnsPrefetchEnabled()) ||
+       (only_allow_https && url.GetScheme() != url::kHttpsScheme)) {
+     return false;
+   }
+@@ -451,7 +454,12 @@
+ }
+ 
+ bool LoadingPredictor::IsPreconnectEnabled() {
+-  return IsPreconnectAllowed(profile_);
++  return profile_->GetPrefs()->GetBoolean(alloy::kPreconnectEnabled) &&
++         IsPreconnectAllowed(profile_);
++}
++bool LoadingPredictor::IsDnsPrefetchEnabled() {
++  return profile_->GetPrefs()->GetBoolean(alloy::kDnsPrefetchEnabled) &&
++         IsPreconnectAllowed(profile_);
+ }
+ 
+ void LoadingPredictor::PrefetchInitiated(const GURL& url,
+@@ -483,7 +491,8 @@
+     const base::UnguessableToken& network_restrictions_id,
+     const net::NetworkTrafficAnnotationTag& traffic_annotation,
+     const content::StoragePartitionConfig* storage_partition_config) {
+-  if (!url.is_valid() || !url.has_host() || !IsPreconnectEnabled()) {
++  if (!url.is_valid() || !url.has_host() ||
++      !(IsPreconnectEnabled() || IsDnsPrefetchEnabled())) {
+     return;
+   }
+ 
+diff --git a/chrome/browser/predictors/loading_predictor.h b/chrome/browser/predictors/loading_predictor.h
+--- a/chrome/browser/predictors/loading_predictor.h
++++ b/chrome/browser/predictors/loading_predictor.h
+@@ -114,6 +114,7 @@
+   void PreconnectFinished(
+       std::unique_ptr<content::PreconnectStats> stats) override;
+   bool IsPreconnectEnabled() override;
++  bool IsDnsPrefetchEnabled() override;
+ 
+   // PrefetchManager::Delegate:
+   void PrefetchInitiated(const GURL& url, const GURL& prefetch_url) override;
+diff --git a/chrome/browser/predictors/loading_predictor_config.cc b/chrome/browser/predictors/loading_predictor_config.cc
+--- a/chrome/browser/predictors/loading_predictor_config.cc
++++ b/chrome/browser/predictors/loading_predictor_config.cc
+@@ -5,6 +5,9 @@
+ #include "chrome/browser/predictors/loading_predictor_config.h"
+ 
+ #include "base/metrics/field_trial_params.h"
++#include "chrome/browser/battery/battery_saver.h"
++#include "chrome/browser/data_saver/data_saver.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/predictors/predictors_features.h"
+ #include "chrome/browser/preloading/preloading_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -13,16 +16,21 @@
+ namespace predictors {
+ 
+ bool IsLoadingPredictorEnabled(Profile* profile) {
+-  if ((true)) return false;
++  // Keep the feature owner available while its runtime permissions are off.
++  // KeyedServiceFactory caches even null services; deciding capability lifetime
++  // from a mutable traffic preference would make later enablement ineffective.
+   // Disabled for off-the-record. Policy choice, not a technical limitation.
+   return profile && !profile->IsOffTheRecord();
+ }
+ 
+ bool IsPreconnectAllowed(Profile* profile) {
+-  // Checks that the preconnect is allowed by user settings.
++  // Alloy's independent preferences own prediction permission. The existing
++  // NetworkPredictionOptions policy maps to these same preferences, while
++  // saver modes continue to suppress speculative work.
+   return profile && profile->GetPrefs() &&
+-         (prefetch::IsSomePreloadingEnabled(*profile->GetPrefs()) ==
+-          content::PreloadingEligibility::kEligible);
++         (profile->GetPrefs()->GetBoolean(alloy::kDnsPrefetchEnabled) ||
++          profile->GetPrefs()->GetBoolean(alloy::kPreconnectEnabled)) &&
++         !data_saver::IsDataSaverEnabled() && !battery::IsBatterySaverEnabled();
+ }
+ 
+ std::string GetStringNameForHintOrigin(HintOrigin hint_origin) {
+diff --git a/chrome/browser/predictors/network_hints_handler_impl.cc b/chrome/browser/predictors/network_hints_handler_impl.cc
+--- a/chrome/browser/predictors/network_hints_handler_impl.cc
++++ b/chrome/browser/predictors/network_hints_handler_impl.cc
+@@ -7,6 +7,7 @@
+ #include <optional>
+ 
+ #include "base/memory/ptr_util.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/predictors/loading_predictor.h"
+ #include "chrome/browser/predictors/loading_predictor_factory.h"
+ #include "chrome/browser/predictors/predictors_traffic_annotations.h"
+@@ -17,6 +18,7 @@
+ #include "content/public/browser/storage_partition.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ #include "net/base/isolation_info.h"
++#include "services/network/public/cpp/alloy_annotations.h"
+ 
+ namespace predictors {
+ 
+@@ -48,6 +50,15 @@
+ 
+ void NetworkHintsHandlerImpl::PrefetchDNS(
+     const std::vector<url::SchemeHostPort>& urls) {
++  auto* alloy_frame = content::RenderFrameHost::FromID(render_frame_host_id_);
++  if (!alloy_frame ||
++      !Profile::FromBrowserContext(alloy_frame->GetBrowserContext())
++           ->GetPrefs()
++           ->GetBoolean(alloy::kDnsPrefetchEnabled)) {
++    return;
++  }
++
++  RefreshPreconnectManager();
+   if (!preconnect_manager_)
+     return;
+ 
+@@ -66,12 +77,21 @@
+       render_frame_host->GetStoragePartition()->GetConfig();
+   preconnect_manager_->StartPreresolveHosts(
+       gurls, GetPendingNetworkAnonymizationKey(render_frame_host),
+-      kNetworkHintsTrafficAnnotation, &storage_partition_config,
++      network::alloy::kDnsPrefetch, &storage_partition_config,
+       network_restrictions_id);
+ }
+ 
+ void NetworkHintsHandlerImpl::Preconnect(const url::SchemeHostPort& url,
+                                          bool allow_credentials) {
++  auto* alloy_frame = content::RenderFrameHost::FromID(render_frame_host_id_);
++  if (!alloy_frame ||
++      !Profile::FromBrowserContext(alloy_frame->GetBrowserContext())
++           ->GetPrefs()
++           ->GetBoolean(alloy::kPreconnectEnabled)) {
++    return;
++  }
++
++  RefreshPreconnectManager();
+   if (!preconnect_manager_)
+     return;
+ 
+@@ -102,7 +122,17 @@
+ NetworkHintsHandlerImpl::NetworkHintsHandlerImpl(
+     content::RenderFrameHost* frame_host)
+     : render_frame_host_id_(frame_host->GetGlobalId()) {
+-  // Get the PreconnectManager for this process.
++  RefreshPreconnectManager();
++}
++
++void NetworkHintsHandlerImpl::RefreshPreconnectManager() {
++  auto* frame_host = content::RenderFrameHost::FromID(render_frame_host_id_);
++  if (!frame_host) {
++    preconnect_manager_.reset();
++    return;
++  }
++  // Resolve the feature owner after permission changes, not just when the
++  // renderer first binds this handler while prediction is disabled.
+   auto* render_process_host = frame_host->GetProcess();
+   auto* profile =
+       Profile::FromBrowserContext(render_process_host->GetBrowserContext());
+diff --git a/chrome/browser/predictors/network_hints_handler_impl.h b/chrome/browser/predictors/network_hints_handler_impl.h
+--- a/chrome/browser/predictors/network_hints_handler_impl.h
++++ b/chrome/browser/predictors/network_hints_handler_impl.h
+@@ -38,6 +38,7 @@
+ 
+  private:
+   explicit NetworkHintsHandlerImpl(content::RenderFrameHost* frame_host);
++  void RefreshPreconnectManager();
+ 
+   const content::GlobalRenderFrameHostId render_frame_host_id_;
+   base::WeakPtr<content::PreconnectManager> preconnect_manager_;
+diff --git a/chrome/browser/predictors/network_hints_handler_impl_unittest.cc b/chrome/browser/predictors/network_hints_handler_impl_unittest.cc
+--- a/chrome/browser/predictors/network_hints_handler_impl_unittest.cc
++++ b/chrome/browser/predictors/network_hints_handler_impl_unittest.cc
+@@ -11,6 +11,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/predictors/loading_predictor.h"
+ #include "chrome/browser/predictors/loading_predictor_factory.h"
+ #include "chrome/test/base/chrome_render_view_host_test_harness.h"
+@@ -96,6 +97,8 @@
+  public:
+   void SetUp() override {
+     ChromeRenderViewHostTestHarness::SetUp();
++    profile()->GetPrefs()->SetBoolean(alloy::kDnsPrefetchEnabled, true);
++    profile()->GetPrefs()->SetBoolean(alloy::kPreconnectEnabled, true);
+     auto* loading_predictor = LoadingPredictorFactory::GetForProfile(profile());
+     ASSERT_TRUE(loading_predictor);
+     auto mock_preconnect_manager =
+diff --git a/chrome/browser/ui/search_engines/search_engine_tab_helper.cc b/chrome/browser/ui/search_engines/search_engine_tab_helper.cc
+--- a/chrome/browser/ui/search_engines/search_engine_tab_helper.cc
++++ b/chrome/browser/ui/search_engines/search_engine_tab_helper.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "chrome/browser/favicon/favicon_utils.h"
++#include "chrome/browser/net/alloy_traffic_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search_engines/template_url_fetcher_factory.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+@@ -135,7 +136,8 @@
+       Profile::FromBrowserContext(web_contents()->GetBrowserContext());
+   if (page_url != web_contents()->GetLastCommittedURL() ||
+       !TemplateURLFetcherFactory::GetForProfile(profile) ||
+-      profile->IsOffTheRecord()) {
++      profile->IsOffTheRecord() ||
++      !profile->GetPrefs()->GetBoolean(alloy::kOpenSearchEnabled)) {
+     return;
+   }
+ 
+diff --git a/components/favicon/content/content_favicon_driver.cc b/components/favicon/content/content_favicon_driver.cc
+--- a/components/favicon/content/content_favicon_driver.cc
++++ b/components/favicon/content/content_favicon_driver.cc
+@@ -56,13 +56,22 @@
+              : GURL();
+ }
+ 
+-ContentFaviconDriver::ContentFaviconDriver(content::WebContents* web_contents,
+-                                           CoreFaviconService* favicon_service)
++ContentFaviconDriver::ContentFaviconDriver(
++    content::WebContents* web_contents,
++    CoreFaviconService* favicon_service,
++    base::RepeatingCallback<bool()> fetch_enabled)
+     : content::WebContentsObserver(web_contents),
+       content::WebContentsUserData<ContentFaviconDriver>(*web_contents),
+-      FaviconDriverImpl(favicon_service) {}
++      FaviconDriverImpl(favicon_service),
++      fetch_enabled_(std::move(fetch_enabled)) {}
+ 
+ ContentFaviconDriver::~ContentFaviconDriver() = default;
++void ContentFaviconDriver::FetchFavicon(const GURL& page_url,
++                                        bool is_same_document) {
++  if (CanFetch()) {
++    FaviconDriverImpl::FetchFavicon(page_url, is_same_document);
++  }
++}
+ 
+ ContentFaviconDriver::DocumentManifestData::DocumentManifestData(
+     content::RenderFrameHost* rfh)
+@@ -167,6 +176,10 @@
+     content::RenderFrameHost* rfh,
+     const std::vector<blink::mojom::FaviconURLPtr>& candidates,
+     blink::mojom::FaviconUpdateReason reason) {
++  if (!CanFetch()) {
++    return;
++  }
++
+   // Ignore the update if there is no last committed navigation entry. This can
+   // occur when loading an initially blank page.
+   content::NavigationEntry* entry =
+@@ -186,6 +199,10 @@
+ void ContentFaviconDriver::DidUpdateWebManifestURL(
+     content::RenderFrameHost* rfh,
+     const GURL& manifest_url) {
++  if (!CanFetch()) {
++    return;
++  }
++
+   // Ignore the update if there is no last committed navigation entry. This can
+   // occur when loading an initially blank page.
+   content::NavigationEntry* entry =
+diff --git a/components/favicon/content/content_favicon_driver.h b/components/favicon/content/content_favicon_driver.h
+--- a/components/favicon/content/content_favicon_driver.h
++++ b/components/favicon/content/content_favicon_driver.h
+@@ -7,6 +7,7 @@
+ 
+ #include <vector>
+ 
++#include "base/functional/callback.h"
+ #include "components/favicon/core/favicon_driver_impl.h"
+ #include "content/public/browser/document_user_data.h"
+ #include "content/public/browser/navigation_handle_user_data.h"
+@@ -38,12 +39,14 @@
+   gfx::Image GetFavicon() const override;
+   bool FaviconIsValid() const override;
+   GURL GetActiveURL() override;
++  void FetchFavicon(const GURL& page_url, bool is_same_document) override;
+ 
+   GURL GetManifestURL(content::RenderFrameHost* rfh);
+ 
+  protected:
+   ContentFaviconDriver(content::WebContents* web_contents,
+-                       CoreFaviconService* favicon_service);
++                       CoreFaviconService* favicon_service,
++                       base::RepeatingCallback<bool()> fetch_enabled = {});
+ 
+  private:
+   friend class content::WebContentsUserData<ContentFaviconDriver>;
+@@ -101,6 +104,8 @@
+   void DidFinishNavigation(
+       content::NavigationHandle* navigation_handle) override;
+ 
++  bool CanFetch() const { return !fetch_enabled_ || fetch_enabled_.Run(); }
++  base::RepeatingCallback<bool()> fetch_enabled_;
+   GURL bypass_cache_page_url_;
+ 
+   base::WeakPtrFactory<ContentFaviconDriver> weak_ptr_factory_{this};
+diff --git a/content/browser/preloading/preconnect/preconnect_manager_impl.cc b/content/browser/preloading/preconnect/preconnect_manager_impl.cc
+--- a/content/browser/preloading/preconnect/preconnect_manager_impl.cc
++++ b/content/browser/preloading/preconnect/preconnect_manager_impl.cc
+@@ -21,6 +21,7 @@
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/common/content_features.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
++#include "services/network/public/cpp/alloy_annotations.h"
+ #include "services/network/public/cpp/constants.h"
+ #include "services/network/public/mojom/connection_change_observer_client.mojom.h"
+ #include "services/network/public/mojom/network_context.mojom.h"
+@@ -135,10 +136,18 @@
+     std::vector<content::PreconnectRequest> requests,
+     net::NetworkTrafficAnnotationTag traffic_annotation) {
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI, base::NotFatalUntil::M159);
+-  if (!delegate_ || !delegate_->IsPreconnectEnabled()) {
++  if (!delegate_ || !(delegate_->IsPreconnectEnabled() ||
++                      delegate_->IsDnsPrefetchEnabled())) {
+     return;
+   }
+   if (!url.SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
++  std::erase_if(requests, [&](const auto& request) {
++    return request.num_sockets > 0 ? !delegate_->IsPreconnectEnabled()
++                                   : !delegate_->IsDnsPrefetchEnabled();
++  });
++  if (requests.empty()) {
+     return;
+   }
+   PreresolveInfo* info;
+@@ -169,7 +178,7 @@
+     const base::UnguessableToken& network_restrictions_id) {
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI, base::NotFatalUntil::M159);
+   CHECK(!network_restrictions_id.is_empty(), base::NotFatalUntil::M165);
+-  if (!delegate_ || !delegate_->IsPreconnectEnabled()) {
++  if (!delegate_ || !delegate_->IsDnsPrefetchEnabled()) {
+     return;
+   }
+   if (!url.SchemeIsHTTPOrHTTPS()) {
+@@ -193,7 +202,7 @@
+     const base::UnguessableToken& network_restrictions_id) {
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI, base::NotFatalUntil::M159);
+   CHECK(!network_restrictions_id.is_empty(), base::NotFatalUntil::M165);
+-  if (!delegate_ || !delegate_->IsPreconnectEnabled()) {
++  if (!delegate_ || !delegate_->IsDnsPrefetchEnabled()) {
+     return;
+   }
+   // Push jobs in front of the queue due to higher priority.
+@@ -275,6 +284,10 @@
+     std::optional<net::ConnectionKeepAliveConfig> keepalive_config,
+     mojo::PendingRemote<network::mojom::ConnectionChangeObserverClient>
+         connection_change_observer_client) const {
++  if (!delegate_ || !delegate_->IsPreconnectEnabled()) {
++    return;
++  }
++
+   CHECK(!network_restrictions_id.is_empty(), base::NotFatalUntil::M165);
+   CHECK(url.DeprecatedGetOriginAsURL() == url, base::NotFatalUntil::M159);
+   CHECK(url.SchemeIsHTTPOrHTTPS(), base::NotFatalUntil::M159);
+@@ -313,7 +326,8 @@
+     const net::NetworkAnonymizationKey& network_anonymization_key,
+     const content::StoragePartitionConfig* storage_partition_config,
+     const base::UnguessableToken& network_restrictions_id,
+-    ResolveHostCallback callback) const {
++    ResolveHostCallback callback,
++    int originating_annotation_hash) const {
+   CHECK(url.DeprecatedGetOriginAsURL() == url, base::NotFatalUntil::M159);
+   CHECK(url.SchemeIsHTTPOrHTTPS(), base::NotFatalUntil::M159);
+ 
+@@ -321,7 +335,7 @@
+ 
+   return std::make_unique<ResolveHostClientImpl>(
+       url, network_anonymization_key, network_restrictions_id,
+-      std::move(callback), network_context);
++      std::move(callback), network_context, originating_annotation_hash);
+ }
+ 
+ void PreconnectManagerImpl::LookupProxyForUrl(
+@@ -355,7 +369,10 @@
+ 
+     PreresolveInfo* info = job->info;
+ 
+-    if (!(info && info->was_canceled)) {
++    const bool enabled =
++        delegate_ && (job->num_sockets > 0 ? delegate_->IsPreconnectEnabled()
++                                           : delegate_->IsDnsPrefetchEnabled());
++    if (!(info && info->was_canceled) && enabled) {
+       // This is used to avoid issuing DNS requests when a fixed proxy
+       // configuration is in place, which improves efficiency, and is also
+       // important if the unproxied DNS may contain incorrect entries.
+@@ -420,7 +437,10 @@
+         base::OptionalToPtr(job->storage_partition_config),
+         job->network_restrictions_id,
+         base::BindOnce(&PreconnectManagerImpl::OnPreresolveFinished,
+-                       weak_factory_.GetWeakPtr(), job_id));
++                       weak_factory_.GetWeakPtr(), job_id),
++        job->num_sockets > 0
++            ? job->traffic_annotation_tag.unique_id_hash_code
++            : network::alloy::kDnsPrefetch.unique_id_hash_code);
+   }
+ }
+ 
+diff --git a/content/browser/preloading/preconnect/preconnect_manager_impl.h b/content/browser/preloading/preconnect/preconnect_manager_impl.h
+--- a/content/browser/preloading/preconnect/preconnect_manager_impl.h
++++ b/content/browser/preloading/preconnect/preconnect_manager_impl.h
+@@ -171,7 +171,8 @@
+       const net::NetworkAnonymizationKey& network_anonymization_key,
+       const content::StoragePartitionConfig* storage_partition_config,
+       const base::UnguessableToken& network_restrictions_id,
+-      ResolveHostCallback callback) const;
++      ResolveHostCallback callback,
++      int originating_annotation_hash = 0) const;
+   void LookupProxyForUrl(
+       const GURL& url,
+       const net::NetworkAnonymizationKey& network_anonymization_key,
+diff --git a/content/browser/preloading/resolve_host_client_impl.cc b/content/browser/preloading/resolve_host_client_impl.cc
+--- a/content/browser/preloading/resolve_host_client_impl.cc
++++ b/content/browser/preloading/resolve_host_client_impl.cc
+@@ -29,7 +29,8 @@
+     const net::NetworkAnonymizationKey& network_anonymization_key,
+     base::optional_ref<const base::UnguessableToken> network_restrictions_id,
+     ResolveHostCallback callback,
+-    network::mojom::NetworkContext* network_context)
++    network::mojom::NetworkContext* network_context,
++    int originating_annotation_hash)
+     : callback_(std::move(callback)) {
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI, base::NotFatalUntil::M159);
+ 
+@@ -37,6 +38,7 @@
+       network::mojom::ResolveHostParameters::New();
+   parameters->initial_priority = net::RequestPriority::IDLE;
+   parameters->is_speculative = true;
++  parameters->alloy_request_annotation = originating_annotation_hash;
+   parameters->purpose =
+       network::mojom::ResolveHostParameters::Purpose::kPreconnect;
+   parameters->network_restrictions_id =
+diff --git a/content/browser/preloading/resolve_host_client_impl.h b/content/browser/preloading/resolve_host_client_impl.h
+--- a/content/browser/preloading/resolve_host_client_impl.h
++++ b/content/browser/preloading/resolve_host_client_impl.h
+@@ -41,7 +41,8 @@
+       const net::NetworkAnonymizationKey& network_anonymization_key,
+       base::optional_ref<const base::UnguessableToken> network_restrictions_id,
+       ResolveHostCallback callback,
+-      network::mojom::NetworkContext* network_context);
++      network::mojom::NetworkContext* network_context,
++      int originating_annotation_hash = 0);
+ 
+   ResolveHostClientImpl(const ResolveHostClientImpl&) = delete;
+   ResolveHostClientImpl& operator=(const ResolveHostClientImpl&) = delete;
+diff --git a/content/public/browser/preconnect_manager.h b/content/public/browser/preconnect_manager.h
+--- a/content/public/browser/preconnect_manager.h
++++ b/content/public/browser/preconnect_manager.h
+@@ -80,6 +80,7 @@
+ 
+     // Returns true if the preconnect functionality is enabled.
+     virtual bool IsPreconnectEnabled() = 0;
++    virtual bool IsDnsPrefetchEnabled() { return IsPreconnectEnabled(); }
+   };
+ 
+   // An observer for testing.

@@ -1,0 +1,6 @@
+.envrc
+token
+*.local.toml
+/out/
+/build/
+/work/

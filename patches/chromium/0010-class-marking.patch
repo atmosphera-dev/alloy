@@ -1,0 +1,1016 @@
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 63c1615..dde925a 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -9,6 +9,7 @@ import("//build/config/cronet/config.gni")
+ import("//build/config/features.gni")
+ import("//crypto/features.gni")
+ import("//net/features.gni")
++import("//services/network/alloy.gni")
+ import("//testing/libfuzzer/fuzzer_test.gni")
+ import("//testing/test.gni")
+ import("//third_party/icu/config.gni")
+@@ -72,6 +73,7 @@ use_external_gssapi = use_kerberos && !is_android && !is_win
+ buildflag_header("buildflags") {
+   header = "net_buildflags.h"
+   flags = [
++    "ALLOY_ENABLE_CLASS_MARKING=$alloy_enable_class_marking",
+     "DISABLE_FILE_SUPPORT=$disable_file_support",
+     "ENABLE_MDNS=$enable_mdns",
+     "ENABLE_REPORTING=$enable_reporting",
+@@ -174,6 +176,8 @@ source_set("chrome_root_store_data") {
+ 
+ component("net") {
+   sources = [
++    "base/alloy_traffic_class.h",
++    "base/alloy_traffic_classes.inc",
+     "base/address_family.cc",
+     "base/address_family.h",
+     "base/address_list.cc",
+diff --git a/net/dns/address_sorter.h b/net/dns/address_sorter.h
+index c892191..ed79ca8 100644
+--- a/net/dns/address_sorter.h
++++ b/net/dns/address_sorter.h
+@@ -12,6 +12,7 @@
+ #include "net/base/ip_endpoint.h"
+ #include "net/base/net_export.h"
+ #include "net/base/network_handle.h"
++#include "net/socket/socket_tag.h"
+ 
+ namespace net {
+ 
+@@ -42,7 +43,8 @@ class NET_EXPORT AddressSorter {
+   virtual void Sort(const std::vector<IPEndPoint>& endpoints,
+                     const NetworkAnonymizationKey& anonymization_key,
+                     handles::NetworkHandle target_network,
+-                    CallbackType callback) const = 0;
++                    CallbackType callback,
++                    const SocketTag& socket_tag = SocketTag()) const = 0;
+ 
+   // Creates platform-dependent AddressSorter.
+   static std::unique_ptr<AddressSorter> CreateAddressSorter();
+diff --git a/net/dns/address_sorter_posix.cc b/net/dns/address_sorter_posix.cc
+index a7a4faf..19bb9f7 100644
+--- a/net/dns/address_sorter_posix.cc
++++ b/net/dns/address_sorter_posix.cc
+@@ -288,14 +288,19 @@ class AddressSorterPosix::SortContext {
+               AddressSorter::CallbackType callback,
+               const AddressSorterPosix* sorter,
+               base::WeakPtr<ConnectPredictor::Partition> partition,
+-              base::TimeTicks start_time)
++              base::TimeTicks start_time,
++              const SocketTag& socket_tag)
+       : num_endpoints_(in_num_endpoints),
+         anonymization_key_(anonymization_key),
+         target_network_(target_network),
+         callback_(std::move(callback)),
+         sorter_(sorter),
+         partition_(std::move(partition)),
+-        start_time_(start_time) {}
++        start_time_(start_time) {
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++    socket_tag_ = socket_tag;
++#endif
++  }
+   SortContext(const SortContext&) = delete;
+   SortContext& operator=(const SortContext&) = delete;
+ 
+@@ -306,6 +311,9 @@ class AddressSorterPosix::SortContext {
+     info.socket = sorter_->socket_factory_->CreateDatagramClientSocket(
+         DatagramSocket::DEFAULT_BIND, target_network_, /*net_log=*/nullptr,
+         NetLogSource());
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++    info.socket->ApplySocketTag(socket_tag_);
++#endif
+     IPEndPoint dest = info.endpoint;
+     // Even though no packets are sent, cannot use port 0 in Connect.
+     if (dest.port() == 0) {
+@@ -442,6 +450,9 @@ class AddressSorterPosix::SortContext {
+   raw_ptr<const AddressSorterPosix> sorter_;
+   base::WeakPtr<ConnectPredictor::Partition> partition_;
+   const base::TimeTicks start_time_;
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  SocketTag socket_tag_;
++#endif
+ };
+ 
+ AddressSorterPosix::AddressSorterPosix(ClientSocketFactory* socket_factory)
+@@ -462,7 +473,8 @@ AddressSorterPosix::~AddressSorterPosix() {
+ void AddressSorterPosix::Sort(const std::vector<IPEndPoint>& endpoints,
+                               const NetworkAnonymizationKey& anonymization_key,
+                               handles::NetworkHandle target_network,
+-                              CallbackType callback) const {
++                              CallbackType callback,
++                              const SocketTag& socket_tag) const {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+ 
+   auto partition =
+@@ -471,7 +483,7 @@ void AddressSorterPosix::Sort(const std::vector<IPEndPoint>& endpoints,
+   // include the memory allocation overhead in the time measurement.
+   auto [it, inserted] = sort_contexts_.insert(std::make_unique<SortContext>(
+       endpoints.size(), anonymization_key, target_network, std::move(callback),
+-      this, partition, base::TimeTicks::Now()));
++      this, partition, base::TimeTicks::Now(), socket_tag));
+   CHECK(inserted);
+   auto* sort_context = it->get();
+   for (const IPEndPoint& endpoint : endpoints) {
+diff --git a/net/dns/address_sorter_posix.h b/net/dns/address_sorter_posix.h
+index 48ce41d..52edf8a 100644
+--- a/net/dns/address_sorter_posix.h
++++ b/net/dns/address_sorter_posix.h
+@@ -75,7 +75,8 @@ class NET_EXPORT_PRIVATE AddressSorterPosix
+   void Sort(const std::vector<IPEndPoint>& endpoints,
+             const NetworkAnonymizationKey& anonymization_key,
+             handles::NetworkHandle target_network,
+-            CallbackType callback) const override;
++            CallbackType callback,
++            const SocketTag& socket_tag = SocketTag()) const override;
+ 
+  private:
+   friend class AddressSorterPosixTest;
+diff --git a/net/dns/address_sorter_win.cc b/net/dns/address_sorter_win.cc
+index 71fc490..356182b 100644
+--- a/net/dns/address_sorter_win.cc
++++ b/net/dns/address_sorter_win.cc
+@@ -44,7 +44,8 @@ class AddressSorterWin : public AddressSorter {
+   void Sort(const std::vector<IPEndPoint>& endpoints,
+             const NetworkAnonymizationKey& anonymization_key,
+             handles::NetworkHandle target_network,
+-            CallbackType callback) const override {
++            CallbackType callback,
++            const SocketTag& socket_tag = SocketTag()) const override {
+     // Multi-network support is available only on Android, we should never
+     // receive a non-default `target_network` argument.
+     CHECK_EQ(target_network, handles::kInvalidNetworkHandle);
+diff --git a/net/dns/dns_test_util.cc b/net/dns/dns_test_util.cc
+index 9d91127..74181eb 100644
+--- a/net/dns/dns_test_util.cc
++++ b/net/dns/dns_test_util.cc
+@@ -92,7 +92,8 @@ class MockAddressSorter : public AddressSorter {
+   void Sort(const std::vector<IPEndPoint>& endpoints,
+             const NetworkAnonymizationKey& anonymization_key,
+             handles::NetworkHandle target_network,
+-            CallbackType callback) const override {
++            CallbackType callback,
++            const SocketTag& socket_tag = SocketTag()) const override {
+     // This is used only for testing in scenarios that do not involve multiple
+     // networks. With that in mind, it's safe to ignore `target_network`.
+     // Do nothing.
+diff --git a/net/dns/dns_transaction.cc b/net/dns/dns_transaction.cc
+index e4b5631..f39cefb 100644
+--- a/net/dns/dns_transaction.cc
++++ b/net/dns/dns_transaction.cc
+@@ -88,6 +88,7 @@
+ #include "net/log/net_log_with_source.h"
+ #include "net/socket/client_socket_factory.h"
+ #include "net/socket/datagram_client_socket.h"
++#include "net/socket/socket_tag.h"
+ #include "net/socket/stream_socket.h"
+ #include "net/third_party/uri_template/uri_template.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+@@ -725,6 +726,8 @@ class DnsTransactionImpl final : public DnsTransaction {
+             ->client_socket_factory->CreateDatagramClientSocket(
+                 DatagramSocket::RANDOM_BIND, target_network_,
+                 net_log_.net_log(), net_log_.source());
++    socket->ApplySocketTag(
++        SocketTag().WithAlloyAnnotation(originating_annotation_hash_));
+ 
+     attempts_.push_back(std::make_unique<DnsUDPAttempt>(
+         server_index, std::move(socket), config.nameservers[server_index],
+@@ -826,6 +829,8 @@ class DnsTransactionImpl final : public DnsTransaction {
+                 AddressList(config.nameservers[server_index]), target_network_,
+                 nullptr, network_quality_estimator, net_log_.net_log(),
+                 net_log_.source());
++    socket->ApplySocketTag(
++        SocketTag().WithAlloyAnnotation(originating_annotation_hash_));
+ 
+     uint32_t attempt_number = attempts_.size();
+ 
+diff --git a/net/dns/host_resolver_dns_task.cc b/net/dns/host_resolver_dns_task.cc
+index 929a03b..67f806c 100644
+--- a/net/dns/host_resolver_dns_task.cc
++++ b/net/dns/host_resolver_dns_task.cc
+@@ -807,7 +807,8 @@ void HostResolverDnsTask::SortTransactionAndHandleResults(
+         base::BindOnce(&HostResolverDnsTask::OnTransactionSorted,
+                        weak_ptr_factory_.GetWeakPtr(),
+                        std::move(transaction_info_ptr),
+-                       std::move(transaction_results)));
++                       std::move(transaction_results)),
++        SocketTag().WithAlloyAnnotation(originating_annotation_hash_));
+   } else {
+     HandleTransactionResults(std::move(transaction_info),
+                              std::move(transaction_results));
+@@ -969,7 +970,8 @@ void HostResolverDnsTask::OnTransactionsFinished(
+           base::BindOnce(&HostResolverDnsTask::OnSortComplete,
+                          weak_ptr_factory_.GetWeakPtr(),
+                          tick_clock_->NowTicks(), std::move(saved_results_),
+-                         secure()));
++                         secure()),
++          SocketTag().WithAlloyAnnotation(originating_annotation_hash_));
+       return;
+     }
+   }
+diff --git a/net/dns/host_resolver_dns_task_unittest.cc b/net/dns/host_resolver_dns_task_unittest.cc
+index af701ed..7989d5f 100644
+--- a/net/dns/host_resolver_dns_task_unittest.cc
++++ b/net/dns/host_resolver_dns_task_unittest.cc
+@@ -519,7 +519,8 @@ class DelayingAddressSorter : public AddressSorter {
+   void Sort(const std::vector<IPEndPoint>& endpoints,
+             const NetworkAnonymizationKey& anonymization_key,
+             handles::NetworkHandle target_network,
+-            CallbackType callback) const override {
++            CallbackType callback,
++            const SocketTag& socket_tag = SocketTag()) const override {
+     // This is used only for testing in scenarios that do not involve multiple
+     // networks. With that in mind, it's safe to ignore `target_network`.
+     in_progress_.emplace_back(endpoints, std::move(callback));
+diff --git a/net/dns/host_resolver_manager.h b/net/dns/host_resolver_manager.h
+index b7cd33d..6c3f66c 100644
+--- a/net/dns/host_resolver_manager.h
++++ b/net/dns/host_resolver_manager.h
+@@ -307,6 +307,7 @@ class NET_EXPORT HostResolverManager
+   void SetHaveOnlyLoopbackAddresses(bool result);
+ 
+  private:
++  friend class AlloyRouteProbeTest;
+   friend class HostResolverManagerTest;
+   friend class HostResolverManagerDnsTest;
+   class LoopbackProbeJob;
+diff --git a/net/dns/host_resolver_service_endpoint_request_unittest.cc b/net/dns/host_resolver_service_endpoint_request_unittest.cc
+index f61ecfa..efec473 100644
+--- a/net/dns/host_resolver_service_endpoint_request_unittest.cc
++++ b/net/dns/host_resolver_service_endpoint_request_unittest.cc
+@@ -76,7 +76,8 @@ class FakeAddressSorter : public AddressSorter {
+   void Sort(const std::vector<IPEndPoint>& endpoints,
+             const NetworkAnonymizationKey& anonymization_key,
+             handles::NetworkHandle target_network,
+-            CallbackType callback) const override {
++            CallbackType callback,
++            const SocketTag& socket_tag = SocketTag()) const override {
+     // This is used only for testing in scenarios that do not involve multiple
+     // networks. With that in mind, it's safe to ignore `target_network`.
+     std::vector<IPEndPoint> sorted = endpoints;
+diff --git a/net/http/http_stream_pool_attempt.cc b/net/http/http_stream_pool_attempt.cc
+index c34cccd..ab3eac1 100644
+--- a/net/http/http_stream_pool_attempt.cc
++++ b/net/http/http_stream_pool_attempt.cc
+@@ -62,6 +62,8 @@ class HttpStreamPool::Attempt::TcpAttempt : public TlsStreamAttempt::Delegate {
+           &owner_->stream_attempt_params_.get(), ip_endpoint_,
+           delegate().GetHttpStreamKey().target_network(), owner_->track_);
+     }
++    attempt_->SetAlloyAnnotation(
++        delegate().GetHttpStreamKey().originating_annotation_hash());
+   }
+ 
+   TcpAttempt(const TcpAttempt&) = delete;
+diff --git a/net/http/http_stream_pool_tcp_based_attempt.cc b/net/http/http_stream_pool_tcp_based_attempt.cc
+index 7851243..3a49b51 100644
+--- a/net/http/http_stream_pool_tcp_based_attempt.cc
++++ b/net/http/http_stream_pool_tcp_based_attempt.cc
+@@ -100,6 +100,8 @@ HttpStreamPool::TcpBasedAttempt::TcpBasedAttempt(AttemptManager* manager,
+         manager_->pool()->stream_attempt_params(), std::move(ip_endpoint),
+         manager_->stream_key().target_network(), track_);
+   }
++  attempt_->SetAlloyAnnotation(
++      manager_->stream_key().originating_annotation_hash());
+ }
+ 
+ HttpStreamPool::TcpBasedAttempt::~TcpBasedAttempt() {
+diff --git a/net/quic/dedicated_web_transport_http3_client.cc b/net/quic/dedicated_web_transport_http3_client.cc
+index 528f2de..fd2f54d 100644
+--- a/net/quic/dedicated_web_transport_http3_client.cc
++++ b/net/quic/dedicated_web_transport_http3_client.cc
+@@ -27,6 +27,7 @@
+ #include "net/quic/crypto/proof_verifier_chromium.h"
+ #include "net/quic/quic_chromium_alarm_factory.h"
+ #include "net/quic/web_transport_send_stats_tracker.h"
++#include "net/socket/socket_tag.h"
+ #include "net/spdy/spdy_http_utils.h"
+ #include "net/third_party/quiche/src/quiche/quic/core/http/web_transport_http3.h"
+ #include "net/third_party/quiche/src/quiche/quic/core/quic_connection.h"
+@@ -747,9 +748,12 @@ int DedicatedWebTransportHttp3Client::DoConnect() {
+                 ->client_socket_factory->CreateDatagramClientSocket(
+                     DatagramSocket::DEFAULT_BIND, target_network_,
+                     net_log_.net_log(), net_log_.source());
+-  if (quic_context_->params()->enable_socket_recv_optimization)
++  if (quic_context_->params()->enable_socket_recv_optimization) {
+     socket_->EnableRecvOptimization();
++  }
+   socket_->UseNonBlockingIO();
++  socket_->ApplySocketTag(
++      SocketTag().WithAlloyAnnotation(originating_annotation_hash_));
+ 
+   IPEndPoint server_address =
+       resolve_host_request_->GetAddressResults().front();
+diff --git a/net/quic/quic_session_key.h b/net/quic/quic_session_key.h
+index 6ce55e4..34dc1b4 100644
+--- a/net/quic/quic_session_key.h
++++ b/net/quic/quic_session_key.h
+@@ -88,7 +88,9 @@ class NET_EXPORT_PRIVATE QuicSessionKey {
+ 
+   SessionUsage session_usage() const { return session_usage_; }
+ 
+-  SocketTag socket_tag() const { return socket_tag_; }
++  SocketTag socket_tag() const {
++    return socket_tag_.WithAlloyAnnotation(originating_annotation_hash_);
++  }
+ 
+   const NetworkAnonymizationKey& network_anonymization_key() const {
+     return network_anonymization_key_;
+diff --git a/net/quic/quic_session_pool.cc b/net/quic/quic_session_pool.cc
+index 10ffcdb..0770e7f 100644
+--- a/net/quic/quic_session_pool.cc
++++ b/net/quic/quic_session_pool.cc
+@@ -1213,6 +1213,9 @@ void QuicSessionPool::ConnectAndConfigureSocket(CompletionOnceCallback callback,
+                                                 handles::NetworkHandle network,
+                                                 const SocketTag& socket_tag) {
+   socket->UseNonBlockingIO();
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  socket->ApplySocketTag(socket_tag);
++#endif
+ 
+   int rv;
+   auto split_callback = base::SplitOnceCallback(std::move(callback));
+@@ -1350,6 +1353,9 @@ int QuicSessionPool::ConfigureSocket(DatagramClientSocket* socket,
+                                      handles::NetworkHandle network,
+                                      const SocketTag& socket_tag) {
+   socket->UseNonBlockingIO();
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  socket->ApplySocketTag(socket_tag);
++#endif
+ 
+   int rv;
+   if (!params_.migrate_sessions_on_network_change_v2) {
+diff --git a/net/socket/datagram_server_socket.h b/net/socket/datagram_server_socket.h
+index 32f7194..1b50584 100644
+--- a/net/socket/datagram_server_socket.h
++++ b/net/socket/datagram_server_socket.h
+@@ -17,6 +17,7 @@ namespace net {
+ class IPAddress;
+ class IPEndPoint;
+ class IOBuffer;
++class SocketTag;
+ 
+ // A UDP Socket.
+ class NET_EXPORT DatagramServerSocket : public DatagramSocket {
+@@ -26,6 +27,8 @@ class NET_EXPORT DatagramServerSocket : public DatagramSocket {
+   // Initialize this socket as a server socket listening at |address|.
+   // Returns a network error code.
+   virtual int Listen(const IPEndPoint& address) = 0;
++  // Retained before Listen(), including when the descriptor is opened lazily.
++  virtual void ApplySocketTag(const SocketTag& tag) {}
+ 
+   // Read from a socket and receive sender address information.
+   // |buf| is the buffer to read data into.
+diff --git a/net/socket/socket_tag.cc b/net/socket/socket_tag.cc
+index 6a2fef1..ee8bab3 100644
+--- a/net/socket/socket_tag.cc
++++ b/net/socket/socket_tag.cc
+@@ -10,12 +10,66 @@
+ #include "base/notreached.h"
+ #include "build/build_config.h"
+ 
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++#include "base/check_op.h"
++#include "net/base/alloy_traffic_class.h"
++#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+ #include "net/android/network_library.h"
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+ namespace net {
+ 
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++int SocketTag::AlloyDscpForAnnotation(int annotation) {
++  if (annotation <= 0) {
++#define ALLOY_TRAFFIC_CLASS(symbol, name, dscp)
++#define ALLOY_NO_CLASS(name, dscp) return dscp;
++#include "net/base/alloy_traffic_classes.inc"
++#undef ALLOY_NO_CLASS
++#undef ALLOY_TRAFFIC_CLASS
++  }
++  switch (ClassifyAlloyAnnotation(annotation)) {
++#define ALLOY_TRAFFIC_CLASS(symbol, name, dscp) \
++  case AlloyTrafficClass::symbol:               \
++    return dscp;
++#define ALLOY_NO_CLASS(name, dscp)
++#include "net/base/alloy_traffic_classes.inc"
++#undef ALLOY_NO_CLASS
++#undef ALLOY_TRAFFIC_CLASS
++  }
++  NOTREACHED();
++}
++
++void SocketTag::ApplyAlloy(SocketDescriptor socket) const {
++  sockaddr_storage address{};
++  socklen_t length = sizeof(address);
++  CHECK_EQ(0,
++           getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length));
++  // Unix-domain sockets have no IP traffic class.
++  if (address.ss_family != AF_INET && address.ss_family != AF_INET6) {
++    return;
++  }
++  auto set = [&](int level, int option) {
++    int value = 0;
++    socklen_t size = sizeof(value);
++    CHECK_EQ(0, getsockopt(socket, level, option, &value, &size));
++    value = (alloy_dscp() << 2) | (value & 3);  // Preserve ECN.
++    CHECK_EQ(0, setsockopt(socket, level, option, &value, sizeof(value)))
++        << "Alloy verification socket class marking failed";
++  };
++  // Set both options for IPv6 sockets: mapped IPv4 destinations use IP_TOS.
++  set(IPPROTO_IP, IP_TOS);
++  if (address.ss_family == AF_INET6) {
++    set(IPPROTO_IPV6, IPV6_TCLASS);
++  }
++}
++#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+ // Expose UNSET_UID to Java.
+ // GENERATED_JAVA_ENUM_PACKAGE: org.chromium.net
+diff --git a/net/socket/socket_tag.h b/net/socket/socket_tag.h
+index 250c782..9427ba4 100644
+--- a/net/socket/socket_tag.h
++++ b/net/socket/socket_tag.h
+@@ -9,6 +9,7 @@
+ 
+ #include "build/build_config.h"
+ #include "net/base/net_export.h"
++#include "net/net_buildflags.h"
+ #include "net/socket/socket_descriptor.h"
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -44,6 +45,28 @@ class NET_EXPORT SocketTag {
+   // Apply this tag to |socket|.
+   void Apply(SocketDescriptor socket) const;
+ 
++  // Retain the actual request owner through the existing socket-tag plumbing.
++  // Product builds have neither this state nor any DSCP implementation.
++  SocketTag WithAlloyAnnotation(int annotation) const {
++    SocketTag result = *this;
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++    result.alloy_annotation_ = annotation;
++#endif
++    return result;
++  }
++  int alloy_annotation() const {
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++    return alloy_annotation_;
++#else
++    return -1;
++#endif
++  }
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  static int AlloyDscpForAnnotation(int annotation);
++  int alloy_dscp() const { return AlloyDscpForAnnotation(alloy_annotation_); }
++  void ApplyAlloy(SocketDescriptor socket) const;
++#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+   // Values to indicate no UID or tag should be set. These values match those in
+   // Android:
+@@ -61,6 +84,10 @@ class NET_EXPORT SocketTag {
+   // TrafficStats tag to tag with.
+   int32_t traffic_stats_tag_;
+ #endif  // BUILDFLAG(IS_ANDROID)
++ private:
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  int alloy_annotation_ = -1;
++#endif
+   // Copying and assignment are allowed.
+ };
+ 
+diff --git a/net/socket/stream_attempt.h b/net/socket/stream_attempt.h
+index 169eb08..727e237 100644
+--- a/net/socket/stream_attempt.h
++++ b/net/socket/stream_attempt.h
+@@ -19,6 +19,7 @@
+ #include "net/base/network_handle.h"
+ #include "net/log/net_log_event_type.h"
+ #include "net/log/net_log_with_source.h"
++#include "net/socket/socket_tag.h"
+ #include "net/socket/stream_socket_close_reason.h"
+ 
+ namespace net {
+@@ -100,6 +101,19 @@ class NET_EXPORT_PRIVATE StreamAttempt {
+ 
+   void SetCancelReason(StreamSocketCloseReason cancel_reason);
+ 
++  void SetAlloyAnnotation(int annotation) {
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++    alloy_socket_tag_ = SocketTag().WithAlloyAnnotation(annotation);
++#endif
++  }
++  SocketTag alloy_socket_tag() const {
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++    return alloy_socket_tag_;
++#else
++    return SocketTag();
++#endif
++  }
++
+  protected:
+   virtual int StartInternal() = 0;
+ 
+@@ -125,6 +139,9 @@ class NET_EXPORT_PRIVATE StreamAttempt {
+   void LogCompletion(int rv);
+ 
+   const raw_ptr<const StreamAttemptParams> params_;
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  SocketTag alloy_socket_tag_;
++#endif
+   const IPEndPoint ip_endpoint_;
+   handles::NetworkHandle target_network_;
+   perfetto::Track track_;
+diff --git a/net/socket/tcp_connect_job_connector.cc b/net/socket/tcp_connect_job_connector.cc
+index 688e88e..867af2c 100644
+--- a/net/socket/tcp_connect_job_connector.cc
++++ b/net/socket/tcp_connect_job_connector.cc
+@@ -196,7 +196,8 @@ int TcpConnectJob::Connector::DoTcpConnect() {
+           parent_->network_quality_estimator(), net_log.net_log(),
+           net_log.source());
+ 
+-  transport_socket_->ApplySocketTag(parent_->socket_tag());
++  transport_socket_->ApplySocketTag(parent_->socket_tag().WithAlloyAnnotation(
++      parent_->params_->originating_annotation_hash()));
+ 
+   // If there's a `websocket_endpoint_lock_manager`, then this is a WebSocket
+   // connection attempt, and a lock must be obtained on the destination endpoint
+diff --git a/net/socket/tcp_server_socket.cc b/net/socket/tcp_server_socket.cc
+index 8c1eb28..dee1308 100644
+--- a/net/socket/tcp_server_socket.cc
++++ b/net/socket/tcp_server_socket.cc
+@@ -17,11 +17,15 @@
+ 
+ namespace net {
+ 
+-TCPServerSocket::TCPServerSocket(NetLog* net_log, const NetLogSource& source)
++TCPServerSocket::TCPServerSocket(NetLog* net_log,
++                                 const NetLogSource& source,
++                                 const SocketTag& tag)
+     : TCPServerSocket(
+           TCPSocket::Create(nullptr /* socket_performance_watcher */,
+                             net_log,
+-                            source)) {}
++                            source)) {
++  socket_->ApplySocketTag(tag);
++}
+ 
+ TCPServerSocket::TCPServerSocket(std::unique_ptr<TCPSocket> socket)
+     : socket_(std::move(socket)) {}
+diff --git a/net/socket/tcp_server_socket.h b/net/socket/tcp_server_socket.h
+index 528248e..cbf041f 100644
+--- a/net/socket/tcp_server_socket.h
++++ b/net/socket/tcp_server_socket.h
+@@ -12,6 +12,7 @@
+ #include "net/base/net_export.h"
+ #include "net/socket/server_socket.h"
+ #include "net/socket/socket_descriptor.h"
++#include "net/socket/socket_tag.h"
+ #include "net/socket/tcp_socket.h"
+ 
+ namespace net {
+@@ -22,7 +23,9 @@ struct NetLogSource;
+ // A server socket that uses TCP as the transport layer.
+ class NET_EXPORT TCPServerSocket : public ServerSocket {
+  public:
+-  TCPServerSocket(NetLog* net_log, const NetLogSource& source);
++  TCPServerSocket(NetLog* net_log,
++                  const NetLogSource& source,
++                  const SocketTag& tag = SocketTag());
+ 
+   // Adopts the provided socket, which must not be a connected socket.
+   explicit TCPServerSocket(std::unique_ptr<TCPSocket> socket);
+diff --git a/net/socket/tcp_socket_posix.cc b/net/socket/tcp_socket_posix.cc
+index e8837a9..0128d3a 100644
+--- a/net/socket/tcp_socket_posix.cc
++++ b/net/socket/tcp_socket_posix.cc
+@@ -192,10 +192,17 @@ int TCPSocketPosix::Open(AddressFamily family) {
+   DCHECK(!socket_);
+   socket_ = std::make_unique<SocketPosix>();
+   int rv = socket_->Open(ConvertAddressFamily(family));
+-  if (rv != OK)
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  if (rv == OK) {
++    tag_.ApplyAlloy(socket_->socket_fd());
++  }
++#endif
++  if (rv != OK) {
+     socket_.reset();
+-  if (rv == OK && tag_ != SocketTag())
++  }
++  if (rv == OK && tag_ != SocketTag()) {
+     tag_.Apply(socket_->socket_fd());
++  }
+   return rv;
+ }
+ 
+@@ -227,10 +234,17 @@ int TCPSocketPosix::AdoptConnectedSocket(SocketDescriptor socket,
+ 
+   socket_ = std::make_unique<SocketPosix>();
+   int rv = socket_->AdoptConnectedSocket(socket, storage);
+-  if (rv != OK)
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  if (rv == OK) {
++    tag_.ApplyAlloy(socket_->socket_fd());
++  }
++#endif
++  if (rv != OK) {
+     socket_.reset();
+-  if (rv == OK && tag_ != SocketTag())
++  }
++  if (rv == OK && tag_ != SocketTag()) {
+     tag_.Apply(socket_->socket_fd());
++  }
+   return rv;
+ }
+ 
+@@ -239,10 +253,17 @@ int TCPSocketPosix::AdoptUnconnectedSocket(SocketDescriptor socket) {
+ 
+   socket_ = std::make_unique<SocketPosix>();
+   int rv = socket_->AdoptUnconnectedSocket(socket);
+-  if (rv != OK)
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  if (rv == OK) {
++    tag_.ApplyAlloy(socket_->socket_fd());
++  }
++#endif
++  if (rv != OK) {
+     socket_.reset();
+-  if (rv == OK && tag_ != SocketTag())
++  }
++  if (rv == OK && tag_ != SocketTag()) {
+     tag_.Apply(socket_->socket_fd());
++  }
+   return rv;
+ }
+ 
+@@ -570,7 +591,7 @@ void TCPSocketPosix::Close() {
+   }
+ #endif  // BUILDFLAG(IS_MAC)
+   socket_.reset();
+-  tag_ = SocketTag();
++  tag_ = SocketTag().WithAlloyAnnotation(tag_.alloy_annotation());
+ }
+ 
+ bool TCPSocketPosix::IsValid() const {
+@@ -614,7 +635,16 @@ void TCPSocketPosix::ApplySocketTag(const SocketTag& tag) {
+   if (IsValid() && tag != tag_) {
+     tag.Apply(socket_->socket_fd());
+   }
+-  tag_ = tag;
++  // Accounting tags may be reapplied after connection/pool reuse; an absent
++  // owner never erases the creating request's class.
++  tag_ = tag.WithAlloyAnnotation(tag.alloy_annotation() > 0
++                                     ? tag.alloy_annotation()
++                                     : tag_.alloy_annotation());
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  if (IsValid()) {
++    tag_.ApplyAlloy(socket_->socket_fd());
++  }
++#endif
+ }
+ 
+ void TCPSocketPosix::AcceptCompleted(
+@@ -658,6 +688,7 @@ int TCPSocketPosix::BuildTcpSocketPosix(
+   *tcp_socket =
+       TCPSocketPosix::Create(nullptr, net_log_.net_log(), net_log_.source());
+   (*tcp_socket)->socket_ = std::move(accept_socket_);
++  (*tcp_socket)->ApplySocketTag(tag_);
+   return OK;
+ }
+ 
+@@ -671,7 +702,7 @@ int TCPSocketPosix::HandleConnectCompleted(int rv) {
+   if (rv != OK) {
+     net_log_.EndEventWithIntParams(NetLogEventType::TCP_CONNECT_ATTEMPT,
+                                    "os_error", errno);
+-    tag_ = SocketTag();
++    tag_ = SocketTag().WithAlloyAnnotation(tag_.alloy_annotation());
+   } else {
+     net_log_.EndEvent(NetLogEventType::TCP_CONNECT_ATTEMPT);
+     NotifySocketPerformanceWatcher();
+diff --git a/net/socket/tcp_stream_attempt.cc b/net/socket/tcp_stream_attempt.cc
+index 02a8357..1078fc2 100644
+--- a/net/socket/tcp_stream_attempt.cc
++++ b/net/socket/tcp_stream_attempt.cc
+@@ -82,6 +82,9 @@ int TcpStreamAttempt::StartInternal() {
+           net_log().source());
+ 
+   TransportClientSocket* socket_ptr = stream_socket.get();
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  socket_ptr->ApplySocketTag(alloy_socket_tag());
++#endif
+   SetStreamSocket(std::move(stream_socket));
+ 
+   mutable_connect_timing().connect_start = base::TimeTicks::Now();
+diff --git a/net/socket/tls_stream_attempt.cc b/net/socket/tls_stream_attempt.cc
+index 5641bd7..7c13544 100644
+--- a/net/socket/tls_stream_attempt.cc
++++ b/net/socket/tls_stream_attempt.cc
+@@ -155,6 +155,7 @@ int TlsStreamAttempt::DoTcpAttempt() {
+   next_state_ = State::kTcpAttemptComplete;
+   nested_attempt_ = std::make_unique<TcpStreamAttempt>(
+       &params(), ip_endpoint(), target_network(), track(), &net_log());
++  nested_attempt_->SetAlloyAnnotation(alloy_socket_tag().alloy_annotation());
+   return nested_attempt_->Start(
+       base::BindOnce(&TlsStreamAttempt::OnIOComplete, base::Unretained(this)));
+ }
+diff --git a/net/socket/transport_connect_sub_job.cc b/net/socket/transport_connect_sub_job.cc
+index 0785a76..1a737a8 100644
+--- a/net/socket/transport_connect_sub_job.cc
++++ b/net/socket/transport_connect_sub_job.cc
+@@ -112,7 +112,9 @@ int TransportConnectSubJob::DoTransportConnect() {
+     return dict;
+   });
+ 
+-  transport_socket_->ApplySocketTag(parent_job_->socket_tag());
++  transport_socket_->ApplySocketTag(
++      parent_job_->socket_tag().WithAlloyAnnotation(
++          parent_job_->params_->originating_annotation_hash()));
+ 
+   // If there's a `websocket_endpoint_lock_manager`, then this is a WebSocket
+   // connection attempt, and a lock must be obtained on the destination endpoint
+diff --git a/net/socket/udp_server_socket.cc b/net/socket/udp_server_socket.cc
+index 0f1968b..e20b769 100644
+--- a/net/socket/udp_server_socket.cc
++++ b/net/socket/udp_server_socket.cc
+@@ -17,10 +17,15 @@ UDPServerSocket::UDPServerSocket(net::NetLog* net_log,
+ 
+ UDPServerSocket::~UDPServerSocket() = default;
+ 
++void UDPServerSocket::ApplySocketTag(const SocketTag& tag) {
++  socket_.ApplySocketTag(tag);
++}
++
+ int UDPServerSocket::Listen(const IPEndPoint& address) {
+   int rv = socket_.Open(address.GetFamily());
+-  if (rv != OK)
++  if (rv != OK) {
+     return rv;
++  }
+ 
+   if (allow_address_reuse_) {
+     rv = socket_.AllowAddressReuse();
+diff --git a/net/socket/udp_server_socket.h b/net/socket/udp_server_socket.h
+index 19f223e..a456857 100644
+--- a/net/socket/udp_server_socket.h
++++ b/net/socket/udp_server_socket.h
+@@ -31,6 +31,7 @@ class NET_EXPORT UDPServerSocket : public DatagramServerSocket {
+ 
+   // Implement DatagramServerSocket:
+   int Listen(const IPEndPoint& address) override;
++  void ApplySocketTag(const SocketTag& tag) override;
+   int RecvFrom(IOBuffer* buf,
+                int buf_len,
+                IPEndPoint* address,
+diff --git a/net/socket/udp_socket_posix.cc b/net/socket/udp_socket_posix.cc
+index b1f48b0..a613a8b 100644
+--- a/net/socket/udp_socket_posix.cc
++++ b/net/socket/udp_socket_posix.cc
+@@ -350,8 +350,13 @@ int UDPSocketPosix::ConfigureOpenedSocket() {
+     Close();
+     return err;
+   }
+-  if (tag_ != SocketTag())
++  if (tag_ != SocketTag()) {
+     tag_.Apply(socket_);
++  }
++
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  tag_.ApplyAlloy(socket_);
++#endif
+ 
+   return OK;
+ }
+@@ -443,7 +448,7 @@ void UDPSocketPosix::Close() {
+   socket_ = kInvalidSocket;
+   addr_family_ = 0;
+   is_connected_ = false;
+-  tag_ = SocketTag();
++  tag_ = SocketTag().WithAlloyAnnotation(tag_.alloy_annotation());
+ }
+ 
+ int UDPSocketPosix::GetPeerAddress(IPEndPoint* address) const {
+@@ -671,8 +676,9 @@ int UDPSocketPosix::Connect(const IPEndPoint& address) {
+   rv = InternalConnect(address);
+   net_log_.EndEventWithNetErrorCode(NetLogEventType::UDP_CONNECT, rv);
+   is_connected_ = (rv == OK);
+-  if (rv != OK)
+-    tag_ = SocketTag();
++  if (rv != OK) {
++    tag_ = SocketTag().WithAlloyAnnotation(tag_.alloy_annotation());
++  }
+   return rv;
+ }
+ 
+@@ -1751,6 +1757,11 @@ int UDPSocketPosix::SetTos(DiffServCodePoint dscp, EcnCodePoint ecn) {
+   if (dscp == DSCP_NO_CHANGE && ecn == ECN_NO_CHANGE) {
+     return OK;
+   }
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  // WebRTC/QUIC may change QoS and ECN after creation. Verification owns only
++  // the DSCP bits; never allow a later QoS request to erase the guard class.
++  dscp = static_cast<DiffServCodePoint>(tag_.alloy_dscp());
++#endif
+   int dscp_and_ecn = (dscp << 2) | ecn;
+   socklen_t size = sizeof(dscp_and_ecn);
+   if (dscp == DSCP_NO_CHANGE || ecn == ECN_NO_CHANGE) {
+@@ -1802,7 +1813,14 @@ void UDPSocketPosix::ApplySocketTag(const SocketTag& tag) {
+   if (socket_ != kInvalidSocket && tag != tag_) {
+     tag.Apply(socket_);
+   }
+-  tag_ = tag;
++  tag_ = tag.WithAlloyAnnotation(tag.alloy_annotation() > 0
++                                     ? tag.alloy_annotation()
++                                     : tag_.alloy_annotation());
++#if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
++  if (socket_ != kInvalidSocket) {
++    tag_.ApplyAlloy(socket_);
++  }
++#endif
+ }
+ 
+ int UDPSocketPosix::SetIOSNetworkServiceType(int ios_network_service_type) {
+diff --git a/services/network/BUILD.gn b/services/network/BUILD.gn
+index d92709a..39454f0 100644
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -24,12 +24,15 @@ buildflag_header("alloy_buildflags") {
+ 
+ source_set("alloy_guard") {
+   sources = [ "alloy_guard.cc", "alloy_guard.h", "alloy_capability.h", "alloy_annotation_catalog.inc" ]
+-  public_deps = [ "//base", ":alloy_buildflags" ]
++  public_deps = [ "//base", "//net", ":alloy_buildflags" ]
+ }
+ 
+ test("alloy_guard_unittests") {
+   sources = [ "alloy_guard_test_main.cc", "alloy_guard_unittest.cc", "alloy_guard_network_unittest.cc", "alloy_guard_dns_unittest.cc", "alloy_test_dns_server.h" ]
+-  deps = [ ":alloy_guard", ":network_service", ":test_support", "//base/test:test_support", "//net:test_support", "//mojo/core/embedder", "//services/network/public/cpp:cpp_p2p", "//third_party/webrtc_overrides:webrtc_component", "//testing/gtest" ]
++  sources += [ "alloy_class_marking_unittest.cc" ]
++  sources += [ "alloy_route_probe_unittest.cc" ]
++  deps = [ "//services/proxy_resolver/public/mojom" ]
++  deps += [ ":alloy_guard", ":network_service", ":test_support", "//base/test:test_support", "//net:test_support", "//mojo/core/embedder", "//services/network/public/cpp:cpp_p2p", "//third_party/webrtc_overrides:webrtc_component", "//testing/gtest" ]
+ }
+ 
+ component("network_service") {
+diff --git a/services/network/p2p/socket_manager.cc b/services/network/p2p/socket_manager.cc
+index cc132d6..d607595 100644
+--- a/services/network/p2p/socket_manager.cc
++++ b/services/network/p2p/socket_manager.cc
+@@ -337,6 +337,8 @@ void P2PSocketManager::GetDefaultLocalAddress(int family,
+                         // network. Revisit this decision if a need arises.
+                         net::handles::kInvalidNetworkHandle,
+                         nullptr /* net_log */, net::NetLogSource());
++  socket->ApplySocketTag(net::SocketTag().WithAlloyAnnotation(
++      alloy_.originating_annotation_hash()));
+ 
+   net::IPAddress ip_address;
+   if (family == AF_INET) {
+diff --git a/services/network/p2p/socket_udp.cc b/services/network/p2p/socket_udp.cc
+index 8d22432..94c5474 100644
+--- a/services/network/p2p/socket_udp.cc
++++ b/services/network/p2p/socket_udp.cc
+@@ -254,6 +254,8 @@ void P2PSocketUdp::Init(
+   DCHECK_LE(min_port, max_port);
+ 
+   socket_ = socket_factory_.Run(net_log());
++  socket_->ApplySocketTag(net::SocketTag().WithAlloyAnnotation(
++      alloy_.originating_annotation_hash()));
+ 
+   int result = -1;
+   if (min_port == 0) {
+@@ -263,6 +265,8 @@ void P2PSocketUdp::Init(
+       result = socket_->Listen(net::IPEndPoint(local_address.address(), port));
+       if (result < 0 && port != max_port) {
+         socket_ = socket_factory_.Run(net_log());
++        socket_->ApplySocketTag(net::SocketTag().WithAlloyAnnotation(
++            alloy_.originating_annotation_hash()));
+       }
+     }
+   } else if (local_address.port() >= min_port &&
+diff --git a/services/network/socket_factory.cc b/services/network/socket_factory.cc
+index f846314..9461c31 100644
+--- a/services/network/socket_factory.cc
++++ b/services/network/socket_factory.cc
+@@ -151,8 +151,10 @@ void SocketFactory::DidCompleteCreate(
+     std::move(callback).Run(result, std::nullopt);
+     return;
+   }
+-  auto tcp_socket =
+-      std::make_unique<net::TCPServerSocket>(net_log_, net::NetLogSource());
++  auto tcp_socket = std::make_unique<net::TCPServerSocket>(
++      net_log_, net::NetLogSource(),
++      net::SocketTag().WithAlloyAnnotation(
++          traffic_annotation.unique_id_hash_code));
+   tcp_socket->AdoptSocket(socket.TakeSocket());
+ 
+   auto tcp_server_socket = std::make_unique<TCPServerSocket>(
+diff --git a/services/network/tcp_bound_socket.cc b/services/network/tcp_bound_socket.cc
+index 3399f01..18b1505 100644
+--- a/services/network/tcp_bound_socket.cc
++++ b/services/network/tcp_bound_socket.cc
+@@ -41,10 +41,13 @@ int TCPBoundSocket::Bind(const net::IPEndPoint& local_addr,
+   }
+ 
+   bind_address_ = local_addr;
++  socket_->ApplySocketTag(net::SocketTag().WithAlloyAnnotation(
++      alloy_.originating_annotation_hash()));
+ 
+   int result = socket_->Open(local_addr.GetFamily());
+-  if (result != net::OK)
++  if (result != net::OK) {
+     return result;
++  }
+ 
+   // This is primarily intended for use with server sockets.
+   result = socket_->SetDefaultOptionsForServer();
+diff --git a/services/network/tcp_connected_socket.cc b/services/network/tcp_connected_socket.cc
+index 612875e..6489a3b 100644
+--- a/services/network/tcp_connected_socket.cc
++++ b/services/network/tcp_connected_socket.cc
+@@ -146,6 +146,8 @@ void TCPConnectedSocket::Connect(
+           net::handles::kInvalidNetworkHandle,
+           nullptr /*socket_performance_watcher*/, network_quality_estimator,
+           net_log_, net::NetLogSource());
++  socket->ApplySocketTag(net::SocketTag().WithAlloyAnnotation(
++      alloy_.originating_annotation_hash()));
+ 
+   if (local_addr) {
+     int result = socket->Bind(local_addr.value());
+@@ -171,6 +173,8 @@ void TCPConnectedSocket::ConnectWithSocket(
+   }
+ 
+   socket_ = std::move(socket);
++  socket_->ApplySocketTag(net::SocketTag().WithAlloyAnnotation(
++      alloy_.originating_annotation_hash()));
+   connect_callback_ = std::move(callback);
+ 
+   if (tcp_connected_socket_options) {
+diff --git a/services/network/tcp_server_socket.cc b/services/network/tcp_server_socket.cc
+index 57d3c23..d3470a0 100644
+--- a/services/network/tcp_server_socket.cc
++++ b/services/network/tcp_server_socket.cc
+@@ -24,11 +24,14 @@ TCPServerSocket::TCPServerSocket(
+     Delegate* delegate,
+     net::NetLog* net_log,
+     const net::NetworkTrafficAnnotationTag& traffic_annotation)
+-    : TCPServerSocket(
+-          std::make_unique<net::TCPServerSocket>(net_log, net::NetLogSource()),
+-          0 /*backlog*/,
+-          delegate,
+-          traffic_annotation) {}
++    : TCPServerSocket(std::make_unique<net::TCPServerSocket>(
++                          net_log,
++                          net::NetLogSource(),
++                          net::SocketTag().WithAlloyAnnotation(
++                              traffic_annotation.unique_id_hash_code)),
++                      0 /*backlog*/,
++                      delegate,
++                      traffic_annotation) {}
+ 
+ TCPServerSocket::TCPServerSocket(
+     std::unique_ptr<net::ServerSocket> server_socket,
+diff --git a/services/network/udp_socket.cc b/services/network/udp_socket.cc
+index e79e87e..0d2ca66 100644
+--- a/services/network/udp_socket.cc
++++ b/services/network/udp_socket.cc
+@@ -15,6 +15,7 @@
+ #include "net/base/io_buffer.h"
+ #include "net/base/net_errors.h"
+ #include "net/log/net_log.h"
++#include "net/socket/socket_tag.h"
+ #include "net/socket/udp_socket.h"
+ 
+ namespace network {
+@@ -36,8 +37,12 @@ class SocketWrapperImpl : public UDPSocket::SocketWrapper {
+  public:
+   SocketWrapperImpl(net::DatagramSocket::BindType bind_type,
+                     net::NetLog* net_log,
+-                    const net::NetLogSource& source)
+-      : socket_(bind_type, net_log, source) {}
++                    const net::NetLogSource& source,
++                    int originating_annotation_hash)
++      : socket_(bind_type, net_log, source) {
++    socket_.ApplySocketTag(
++        net::SocketTag().WithAlloyAnnotation(originating_annotation_hash));
++  }
+ 
+   SocketWrapperImpl(const SocketWrapperImpl&) = delete;
+   SocketWrapperImpl& operator=(const SocketWrapperImpl&) = delete;
+@@ -392,8 +397,9 @@ void UDPSocket::Close() {
+ 
+ std::unique_ptr<UDPSocket::SocketWrapper> UDPSocket::CreateSocketWrapper()
+     const {
+-  return std::make_unique<SocketWrapperImpl>(net::DatagramSocket::RANDOM_BIND,
+-                                             nullptr, net::NetLogSource());
++  return std::make_unique<SocketWrapperImpl>(
++      net::DatagramSocket::RANDOM_BIND, nullptr, net::NetLogSource(),
++      alloy_.originating_annotation_hash());
+ }
+ 
+ bool UDPSocket::IsConnectedOrBound() const {

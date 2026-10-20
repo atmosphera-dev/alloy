@@ -1,0 +1,4520 @@
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index c6dfce7..3821271 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -40,6 +40,7 @@
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/common/buildflags.h"
+ #include "chrome/common/channel_info.h"
+ #include "chrome/common/chrome_constants.h"
+@@ -640,6 +641,7 @@ struct MainFunction {
+ };
+ 
+ #if !defined(BUILDING_CHROME_RENDERER)
++#if !BUILDFLAG(ENABLE_CEF)
+ // Initializes the user data dir. Must be called before InitializeLocalState().
+ void InitializeUserDataDir(base::CommandLine* command_line) {
+ #if BUILDFLAG(IS_WIN)
+@@ -785,6 +787,7 @@ void RecordMainStartupMetrics(const StartupTimestamps& timestamps) {
+ 
+   startup_metric_utils::GetCommon().RecordChromeMainEntryTime(now);
+ }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+ #if BUILDFLAG(IS_WIN) && !defined(BUILDING_CHROME_RENDERER)
+ constexpr wchar_t kOnResourceExhaustedMessage[] =
+@@ -861,6 +864,10 @@ ChromeMainDelegate::~ChromeMainDelegate() {
+ ChromeMainDelegate::~ChromeMainDelegate() = default;
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
++void ChromeMainDelegate::CleanupOnUIThread() {
++  memory_system_.reset();
++}
++
+ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+     InvokedIn invoked_in) {
+   DUMP_WILL_BE_CHECK(base::ThreadPoolInstance::Get());
+@@ -887,7 +894,7 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+     // future session's metrics.
+     DeferBrowserMetrics(user_data_dir);
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !BUILDFLAG(ENABLE_CEF)
+     // In the case the process is not the singleton process, the uninstall tasks
+     // need to be executed here. A window will be displayed asking to close all
+     // running instances.
+@@ -965,8 +972,9 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+   CommonEarlyInitialization();
+ 
+   // Initializes the resource bundle and determines the locale.
+-  std::string actual_locale = LoadLocalState(
+-      chrome_feature_list_creator, invoked_in_browser->is_running_test);
++  std::string actual_locale =
++      LoadLocalState(chrome_feature_list_creator, GetResourceBundleDelegate(),
++                     invoked_in_browser->is_running_test);
+   chrome_feature_list_creator->SetApplicationLocale(actual_locale);
+ 
+ #if BUILDFLAG(CHROME_FOR_TESTING)
+@@ -989,6 +997,8 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+       new net::NetworkChangeNotifierFactoryAndroid());
+ #endif
+ 
++#if !BUILDFLAG(ENABLE_CEF)
++  // Avoid CEF crash with multi-threaded-message-loop.
+   bool record = true;
+ #if BUILDFLAG(IS_ANDROID)
+   record =
+@@ -997,6 +1007,7 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+   if (record) {
+     chrome_content_browser_client_->startup_data()->RecordCoreSystemProfile();
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   UmaSessionStats::OnStartup();
+@@ -1067,8 +1078,8 @@ void ChromeMainDelegate::CreateThreadPool(std::string_view name) {
+       std::make_unique<ChromeThreadProfilerClient>());
+ 
+ // `ChromeMainDelegateAndroid::PreSandboxStartup` creates the profiler a little
+-// later.
+-#if !BUILDFLAG(IS_ANDROID)
++// later. Same with CEF.
++#if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(ENABLE_CEF)
+   // Start the sampling profiler as early as possible - namely, once the thread
+   // pool has been created.
+   sampling_profiler_ = std::make_unique<MainThreadStackSamplingProfiler>();
+@@ -1546,6 +1557,7 @@ void ChromeMainDelegate::PreSandboxStartup() {
+   }
+ #endif
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+   crash_reporter::InitializeCrashKeys();
+ 
+ #if BUILDFLAG(IS_POSIX)
+@@ -1556,20 +1568,25 @@ void ChromeMainDelegate::PreSandboxStartup() {
+   InitMacCrashReporter(command_line, process_type);
+   SetUpInstallerPreferences(command_line);
+ #endif
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+ #if !defined(BUILDING_CHROME_RENDERER)
++#if !BUILDFLAG(ENABLE_CEF)
+   // Initialize the user data dir for any process type that needs it.
+   if (chrome::ProcessNeedsProfileDir(process_type)) {
+     InitializeUserDataDir(base::CommandLine::ForCurrentProcess());
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+   // Register component_updater PathProvider after DIR_USER_DATA overridden by
+   // command line flags. Maybe move the chrome PathProvider down here also?
+   component_updater::RegisterPathProvider(chrome::DIR_COMPONENTS,
+                                           chrome::DIR_USER_DATA);
+ #else   // !defined(BUILDING_CHROME_RENDERER)
++#if !BUILDFLAG(ENABLE_CEF)
+   // Renderers on Windows never require a profile directory.
+   CHECK(!chrome::ProcessNeedsProfileDir(process_type));
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ #endif  // !defined(BUILDING_CHROME_RENDERER)
+ 
+ #if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_WIN)
+@@ -1667,7 +1684,8 @@ void ChromeMainDelegate::PreSandboxStartup() {
+ #else
+     const std::string loaded_locale =
+         ui::ResourceBundle::InitSharedInstanceWithLocale(
+-            locale, nullptr, ui::ResourceBundle::LOAD_COMMON_RESOURCES);
++            locale, GetResourceBundleDelegate(),
++            ui::ResourceBundle::LOAD_COMMON_RESOURCES);
+ 
+     base::FilePath resources_pack_path;
+     base::PathService::Get(chrome::FILE_RESOURCES_PACK, &resources_pack_path);
+@@ -1677,6 +1695,7 @@ void ChromeMainDelegate::PreSandboxStartup() {
+     CHECK(!loaded_locale.empty()) << "Locale could not be found for " << locale;
+   }
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+ #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
+   // Zygote needs to call InitCrashReporter() in RunZygote().
+   if (process_type != switches::kZygoteProcess &&
+@@ -1713,6 +1732,7 @@ void ChromeMainDelegate::PreSandboxStartup() {
+   // After all the platform Breakpads have been initialized, store the command
+   // line for crash reporting.
+   crash_keys::SetCrashKeysFromCommandLine(command_line);
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+ #if BUILDFLAG(ENABLE_PDF) && !defined(BUILDING_CHROME_RENDERER)
+   MaybePatchGdiGetFontData();
+@@ -1845,6 +1865,7 @@ void ChromeMainDelegate::ZygoteForked() {
+   }
+ #endif  // !defined(BUILDING_CHROME_RENDERER)
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+   // Needs to be called after we have chrome::DIR_USER_DATA.  BrowserMain sets
+   // this up for the browser process in a different manner.
+   const base::CommandLine* command_line =
+@@ -1857,6 +1878,7 @@ void ChromeMainDelegate::ZygoteForked() {
+ 
+   // Reset the command line for the newly spawned process.
+   crash_keys::SetCrashKeysFromCommandLine(*command_line);
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ }
+ 
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+@@ -1983,6 +2005,7 @@ void ChromeMainDelegate::InitializeMemorySystem() {
+                              : memory_system::DispatcherParameters::
+                                    AllocationTraceRecorderInclusion::kIgnore;
+ 
++  memory_system_ = std::make_unique<memory_system::MemorySystem>();
+   memory_system::Initializer()
+       .SetGwpAsanParameters(gwp_asan_boost_sampling, process_type)
+       .SetProfilingClientParameters(chrome::GetChannel(),
+@@ -1990,7 +2013,7 @@ void ChromeMainDelegate::InitializeMemorySystem() {
+       .SetDispatcherParameters(memory_system::DispatcherParameters::
+                                    PoissonAllocationSamplerInclusion::kEnforce,
+                                allocation_recorder_inclusion, process_type)
+-      .Initialize(memory_system_);
++      .Initialize(*memory_system_);
+ }
+ 
+ bool ChromeMainDelegate::IsInitFeatureListEarly() {
+diff --git a/chrome/app/chrome_main_delegate.h b/chrome/app/chrome_main_delegate.h
+index 3b706fd..90f73c9 100644
+--- a/chrome/app/chrome_main_delegate.h
++++ b/chrome/app/chrome_main_delegate.h
+@@ -17,6 +17,7 @@
+ #include "chrome/common/chrome_content_client.h"
+ #include "components/memory_system/memory_system.h"
+ #include "content/public/app/content_main_delegate.h"
++#include "ui/base/resource/resource_bundle.h"
+ 
+ namespace base {
+ class CommandLine;
+@@ -54,6 +55,8 @@ class ChromeMainDelegate : public content::ContentMainDelegate {
+ 
+   ~ChromeMainDelegate() override;
+ 
++  virtual void CleanupOnUIThread();
++
+  protected:
+   // content::ContentMainDelegate:
+   std::optional<int> BasicStartupComplete() override;
+@@ -101,6 +104,10 @@ class ChromeMainDelegate : public content::ContentMainDelegate {
+ 
+   bool IsInitFeatureListEarly() override;
+ 
++  virtual ui::ResourceBundle::Delegate* GetResourceBundleDelegate() {
++    return nullptr;
++  }
++
+ #if !defined(BUILDING_CHROME_RENDERER)
+   std::unique_ptr<ChromeContentBrowserClient> chrome_content_browser_client_;
+   std::unique_ptr<ChromeContentUtilityClient> chrome_content_utility_client_;
+@@ -109,7 +116,7 @@ class ChromeMainDelegate : public content::ContentMainDelegate {
+ 
+   BraveContentClient chrome_content_client_;
+ 
+-  memory_system::MemorySystem memory_system_;
++  std::unique_ptr<memory_system::MemorySystem> memory_system_;
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   // The sampling profiler exists until the `ChromeContentBrowserClient` is
+diff --git a/chrome/app_shim/BUILD.gn b/chrome/app_shim/BUILD.gn
+index c5629cd..44a3206 100644
+--- a/chrome/app_shim/BUILD.gn
++++ b/chrome/app_shim/BUILD.gn
+@@ -28,6 +28,7 @@ source_set("app_shim") {
+   deps = [
+     "//base/allocator:early_zone_registration_apple",
+     "//build:chromeos_buildflags",
++    "//cef/libcef/features:buildflags",
+     "//chrome:strings",
+     "//chrome/app:command_ids",
+     "//chrome/browser/renderer_host:history_swiper",
+diff --git a/chrome/app_shim/app_shim_main_delegate.mm b/chrome/app_shim/app_shim_main_delegate.mm
+index 2b3ed5c..059ffb2 100644
+--- a/chrome/app_shim/app_shim_main_delegate.mm
++++ b/chrome/app_shim/app_shim_main_delegate.mm
+@@ -19,6 +19,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_executor.h"
+ #include "base/threading/thread.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/app/chrome_crash_reporter_client.h"
+ #include "chrome/app_shim/app_shim_application.h"
+ #include "chrome/app_shim/app_shim_controller.h"
+@@ -77,7 +78,9 @@ std::optional<int> AppShimMainDelegate::BasicStartupComplete() {
+ }
+ 
+ void AppShimMainDelegate::PreSandboxStartup() {
++#if !BUILDFLAG(ENABLE_CEF)
+   ChromeCrashReporterClient::Create();
++#endif
+   crash_reporter::InitializeCrashpad(true, "app_shim");
+ 
+   // Initialize features and field trials, either from command line or from
+diff --git a/chrome/browser/browser_about_handler.cc b/chrome/browser/browser_about_handler.cc
+index 08949a6..e417f50 100644
+--- a/chrome/browser/browser_about_handler.cc
++++ b/chrome/browser/browser_about_handler.cc
+@@ -25,6 +25,10 @@
+ 
+ namespace {
+ 
++bool IsChromeIgnoreUrl(const std::string& spec) {
++  return base::EqualsCaseInsensitiveASCII(spec, "chrome://ignore/");
++}
++
+ bool IsNonNavigationAboutUrl(const GURL& url) {
+   if (!url.is_valid()) {
+     return false;
+@@ -32,8 +36,8 @@ bool IsNonNavigationAboutUrl(const GURL& url) {
+ 
+   const std::string spec(url.spec());
+   return base::EqualsCaseInsensitiveASCII(spec, chrome::kChromeUIRestartURL) ||
+-         base::EqualsCaseInsensitiveASCII(spec, chrome::kChromeUIQuitURL);
+-  ;
++         base::EqualsCaseInsensitiveASCII(spec, chrome::kChromeUIQuitURL) ||
++         IsChromeIgnoreUrl(spec);
+ }
+ 
+ }  // namespace
+@@ -102,5 +106,8 @@ bool HandleNonNavigationAboutURL(const GURL& url,
+         FROM_HERE, base::BindOnce(&chrome::AttemptExit));
+     return true;
+   }
++  if (IsChromeIgnoreUrl(spec)) {
++    return true;
++  }
+   NOTREACHED();
+ }
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 3f89705..6d45636 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -29,6 +29,7 @@
+ #include "base/values.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/active_use_util.h"
+ #include "chrome/browser/after_startup_task_utils.h"
+ #include "chrome/browser/browser_features.h"
+@@ -546,7 +547,7 @@ void ProcessSingletonNotificationCallbackImpl(
+     return;
+   }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !BUILDFLAG(ENABLE_CEF)
+   // The uninstall command-line switch is handled by the origin process; see
+   // ChromeMainDelegate::PostEarlyInitialization(...). The other process won't
+   // be able to become the singleton process and will display a window asking
+@@ -1178,7 +1179,7 @@ int ChromeBrowserMainParts::OnLocalStateLoaded(
+       browser_process_->local_state());
+   platform_management_service->RefreshCache(base::NullCallback());
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !BUILDFLAG(ENABLE_CEF)
+   if (first_run::IsChromeFirstRun()) {
+     bool stats_default;
+     if (GoogleUpdateSettings::GetCollectStatsConsentDefault(&stats_default)) {
+@@ -1222,6 +1223,7 @@ int ChromeBrowserMainParts::ApplyFirstRunPrefs() {
+ #if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_CHROMEOS)
+   master_prefs_ = std::make_unique<first_run::MasterPrefs>();
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+   std::unique_ptr<installer::InitialPreferences> installer_initial_prefs =
+       startup_data_->chrome_feature_list_creator()->TakeInitialPrefs();
+   if (!installer_initial_prefs) {
+@@ -1257,6 +1259,7 @@ int ChromeBrowserMainParts::ApplyFirstRunPrefs() {
+                             master_prefs_->confirm_to_quit);
+   }
+ #endif
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ #endif  // !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_CHROMEOS)
+   return content::RESULT_CODE_NORMAL_EXIT;
+ }
+@@ -1326,6 +1329,7 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+ 
+   browser_process_->browser_policy_connector()->OnResourceBundleCreated();
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+ // Android does first run in Java instead of native.
+ // Chrome OS has its own out-of-box-experience code.
+ #if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_CHROMEOS)
+@@ -1336,6 +1340,7 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+     }
+   }
+ #endif  // !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_CHROMEOS)
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE) &&                                   \
+     (BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || \
+@@ -1781,7 +1786,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+ #endif
+ 
+   // Should be done before starting metrics recording.
+-#if BUILDFLAG(IS_LINUX)
++#if BUILDFLAG(IS_LINUX) && !BUILDFLAG(ENABLE_CEF)
+   // On Linux, the EULA dialog requires Views, so it is shown here rather than
+   // when applying the first-run prefs.
+   if (first_run::IsChromeFirstRun() && master_prefs_->eula_required &&
+@@ -1798,6 +1803,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   browser_process_->PreMainMessageLoopRun();
+ 
+ #if BUILDFLAG(IS_WIN)
++#if !BUILDFLAG(ENABLE_CEF)
+   // If the command line specifies 'uninstall' then we need to work here
+   // unless we detect another chrome browser running.
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kUninstall)) {
+@@ -1809,6 +1815,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+     return ChromeBrowserMainPartsWin::HandleIconsCommands(
+         *base::CommandLine::ForCurrentProcess());
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+   ui::SelectFileDialog::SetFactory(
+       std::make_unique<ChromeSelectFileDialogFactory>());
+@@ -1831,6 +1838,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   }
+ #endif
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           switches::kMakeDefaultBrowser)) {
+     bool is_managed = g_browser_process->local_state()->IsManagedPreference(
+@@ -1844,6 +1852,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+                ? static_cast<int>(content::RESULT_CODE_NORMAL_EXIT)
+                : static_cast<int>(CHROME_RESULT_CODE_SHELL_INTEGRATION_FAILED);
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+ #if defined(USE_AURA)
+   // Make sure aura::Env has been initialized.
+@@ -1890,7 +1899,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   }
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !BUILDFLAG(ENABLE_CEF)
+   // Check if there is any machine level Chrome installed on the current
+   // machine. If yes and the current Chrome process is user level, we do not
+   // allow the user level Chrome to run. So we notify the user and uninstall
+@@ -1967,7 +1976,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   // Call `PostProfileInit()`and set it up for profiles created later.
+   profile_init_manager_ = std::make_unique<ProfileInitManager>(this, profile);
+ 
+-#if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_CHROMEOS)
++#if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(ENABLE_CEF)
+   // Execute first run specific code after the PrefService has been initialized
+   // and preferences have been registered since some of the import code depends
+   // on preferences.
+@@ -2008,7 +2017,7 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   }
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !BUILDFLAG(ENABLE_CEF)
+   // Registers Chrome with the Windows Restart Manager, which will restore the
+   // Chrome session when the computer is restarted after a system update.
+   // This could be run as late as WM_QUERYENDSESSION for system update reboots,
+@@ -2121,6 +2130,10 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   }
+ #endif
+ 
++  // Bypass StartupBrowserCreator and RunLoop creation with CEF.
++  // CEF with the Chrome runtime will create and manage its own RunLoop.
++#if !BUILDFLAG(ENABLE_CEF)
++
+   // This step is costly.
+   if (browser_creator_->Start(*base::CommandLine::ForCurrentProcess(),
+                               base::FilePath(), profile_info,
+@@ -2148,11 +2161,14 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+ 
+     // Create the RunLoop for MainMessageLoopRun() to use and transfer
+     // ownership of the browser's lifetime to the BrowserProcess.
++    // CEF with the Chrome runtime will create and manage its own RunLoop.
+     DCHECK(!GetMainRunLoopInstance());
+     GetMainRunLoopInstance() = std::make_unique<base::RunLoop>();
+     browser_process_->SetQuitClosure(
+         GetMainRunLoopInstance()->QuitWhenIdleClosure());
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
++
+   browser_creator_.reset();
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+diff --git a/chrome/browser/chrome_browser_main_mac.mm b/chrome/browser/chrome_browser_main_mac.mm
+index 0f634bf..a2eb198 100644
+--- a/chrome/browser/chrome_browser_main_mac.mm
++++ b/chrome/browser/chrome_browser_main_mac.mm
+@@ -21,6 +21,7 @@
+ #include "base/path_service.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "build/branding_buildflags.h"
++#include "cef/libcef/features/features.h"
+ #import "chrome/browser/app_controller_mac.h"
+ #include "chrome/browser/apps/app_shim/app_shim_listener.h"
+ #include "chrome/browser/browser_process.h"
+@@ -155,6 +156,7 @@ int ChromeBrowserMainPartsMac::PreCreateThreads() {
+     return ret;
+   }
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+   // Create the app delegate by requesting the shared AppController.
+   CHECK_EQ(nil, NSApp.delegate);
+   AppController* app_controller = AppController.sharedController;
+@@ -165,6 +167,7 @@ int ChromeBrowserMainPartsMac::PreCreateThreads() {
+                         /*is_pwa=*/false,
+                         /*is_rtl=*/base::i18n::IsRTL());
+   [app_controller mainMenuCreated];
++#endif  // BUILDFLAG(ENABLE_CEF)
+ 
+   return content::RESULT_CODE_NORMAL_EXIT;
+ }
+@@ -183,5 +186,7 @@ void ChromeBrowserMainPartsMac::PostProfileInit(Profile* profile,
+ }
+ 
+ void ChromeBrowserMainPartsMac::DidEndMainMessageLoop() {
++#if !BUILDFLAG(ENABLE_CEF)
+   [AppController.sharedController didEndMainMessageLoop];
++#endif
+ }
+diff --git a/chrome/browser/chrome_browser_main_win.cc b/chrome/browser/chrome_browser_main_win.cc
+index 691b61d..0753aa2 100644
+--- a/chrome/browser/chrome_browser_main_win.cc
++++ b/chrome/browser/chrome_browser_main_win.cc
+@@ -52,6 +52,7 @@
+ #include "base/win/wrapped_window_proc.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/about_flags.h"
+ #include "chrome/browser/active_use_util.h"
+ #include "chrome/browser/browser_features.h"
+@@ -372,6 +373,7 @@ void UpdatePwaLaunchersForProfile(const base::FilePath& profile_dir) {
+ }
+ 
+ void MigratePinnedTaskBarShortcutsIfNeeded() {
++#if !BUILDFLAG(ENABLE_CEF)
+   // Update this number when users should go through a taskbar shortcut
+   // migration again. The last reason to do this was crrev.com/798174. @
+   // 86.0.4231.0.
+@@ -392,6 +394,7 @@ void MigratePinnedTaskBarShortcutsIfNeeded() {
+           prefs::kShortcutMigrationVersion, version_info::GetVersionNumber()));
+     }
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ }
+ 
+ void MaybeBlockDynamicCodeForBrowserProcess() {
+@@ -632,6 +635,7 @@ int ChromeBrowserMainPartsWin::PreCreateThreads() {
+ }
+ 
+ int ChromeBrowserMainPartsWin::PostCreateThreads() {
++#if !BUILDFLAG(ENABLE_CEF)
+   const base::CommandLine& command_line =
+       *base::CommandLine::ForCurrentProcess();
+ 
+@@ -646,6 +650,7 @@ int ChromeBrowserMainPartsWin::PostCreateThreads() {
+   if (upgrade_util::DoUpgradeTasks(command_line)) {
+     return CHROME_RESULT_CODE_NORMAL_EXIT_UPGRADE_RELAUNCHED;
+   }
++#endif  // !BUILDFLAG(ENABLE_CEF)
+ 
+   performance_manager::InitializeDllPrereadPolicy();
+ 
+@@ -1012,4 +1017,3 @@ void ChromeBrowserMainPartsWin::SetupModuleDatabase(
+   *module_watcher = ModuleWatcher::Create(base::BindRepeating(
+       &ChromeBrowserMainPartsWin::OnModuleEvent, base::Unretained(this)));
+ }
+-
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 080b459..93705a8 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -56,6 +56,7 @@
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "build/config/chromebox_for_meetings/buildflags.h"  // PLATFORM_CFM
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/accessibility/caption_settings_dialog.h"
+ #include "chrome/browser/actor/actor_commit_deferring_condition.h"
+ #include "chrome/browser/after_startup_task_utils.h"
+@@ -1561,6 +1562,8 @@ ChromeContentBrowserClient::GetPopupNavigationDelegateFactoryForTesting() {
+ }
+ 
+ ChromeContentBrowserClient::ChromeContentBrowserClient() {
++  keepalive_timer_.reset(new base::OneShotTimer());
++
+ #if BUILDFLAG(ENABLE_PLUGINS)
+   extra_parts_.push_back(
+       std::make_unique<ChromeContentBrowserClientPluginsPart>());
+@@ -1601,6 +1604,11 @@ ChromeContentBrowserClient::~ChromeContentBrowserClient() {
+   }
+ }
+ 
++void ChromeContentBrowserClient::CleanupOnUIThread() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  keepalive_timer_.reset();
++}
++
+ // static
+ void ChromeContentBrowserClient::RegisterLocalStatePrefs(
+     PrefRegistrySimple* registry) {
+@@ -5150,9 +5158,11 @@ void ChromeContentBrowserClient::BrowserURLHandlerCreated(
+                           &search::HandleNewTabURLReverseRewrite);
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++#if !BUILDFLAG(ENABLE_CEF)
+   // chrome: & friends.
+   handler->AddHandlerPair(&ChromeContentBrowserClient::HandleWebUI,
+                           &ChromeContentBrowserClient::HandleWebUIReverse);
++#endif
+ }
+ 
+ base::FilePath ChromeContentBrowserClient::GetDefaultDownloadDirectory() {
+@@ -7086,7 +7096,7 @@ void ChromeContentBrowserClient::OnNetworkServiceCreated(
+                                                        local_state);
+ }
+ 
+-void ChromeContentBrowserClient::ConfigureNetworkContextParams(
++bool ChromeContentBrowserClient::ConfigureNetworkContextParams(
+     content::BrowserContext* context,
+     bool in_memory,
+     const base::FilePath& relative_partition_path,
+@@ -7104,6 +7114,8 @@ void ChromeContentBrowserClient::ConfigureNetworkContextParams(
+     network_context_params->user_agent = GetUserAgent();
+     network_context_params->accept_language = GetApplicationLocale();
+   }
++
++  return true;
+ }
+ 
+ std::vector<base::FilePath>
+@@ -8437,11 +8449,11 @@ void ChromeContentBrowserClient::OnKeepaliveRequestStarted(
+   const auto now = base::TimeTicks::Now();
+   const auto timeout = GetKeepaliveTimerTimeout(context);
+   keepalive_deadline_ = std::max(keepalive_deadline_, now + timeout);
+-  if (keepalive_deadline_ > now && !keepalive_timer_.IsRunning()) {
++  if (keepalive_deadline_ > now && !keepalive_timer_->IsRunning()) {
+     if (!KeepAliveRegistry::GetInstance()->IsShuttingDown()) {
+       DVLOG(1) << "Starting a keepalive timer(" << timeout.InSecondsF()
+                << " seconds)";
+-      keepalive_timer_.Start(
++      keepalive_timer_->Start(
+           FROM_HERE, keepalive_deadline_ - now,
+           base::BindOnce(
+               &ChromeContentBrowserClient::OnKeepaliveTimerFired,
+@@ -8463,7 +8475,9 @@ void ChromeContentBrowserClient::OnKeepaliveRequestFinished() {
+   --num_keepalive_requests_;
+   if (num_keepalive_requests_ == 0) {
+     DVLOG(1) << "Stopping the keepalive timer";
+-    keepalive_timer_.Stop();
++    if (keepalive_timer_) {
++      keepalive_timer_->Stop();
++    }
+     // This deletes the keep alive handle attached to the timer function and
+     // unblock the shutdown sequence.
+   }
+@@ -8685,7 +8699,7 @@ void ChromeContentBrowserClient::OnKeepaliveTimerFired(
+   const auto now = base::TimeTicks::Now();
+   const auto then = keepalive_deadline_;
+   if (now < then) {
+-    keepalive_timer_.Start(
++    keepalive_timer_->Start(
+         FROM_HERE, then - now,
+         base::BindOnce(&ChromeContentBrowserClient::OnKeepaliveTimerFired,
+                        weak_factory_.GetWeakPtr(),
+diff --git a/chrome/browser/chrome_content_browser_client.h b/chrome/browser/chrome_content_browser_client.h
+index 1c972e4..887f4f3 100644
+--- a/chrome/browser/chrome_content_browser_client.h
++++ b/chrome/browser/chrome_content_browser_client.h
+@@ -170,6 +170,8 @@ class ChromeContentBrowserClient : public content::ContentBrowserClient {
+ 
+   ~ChromeContentBrowserClient() override;
+ 
++  virtual void CleanupOnUIThread();
++
+   // TODO(crbug.com/41356866): This file is about calls from content/ out
+   // to chrome/ to get values or notify about events, but both of these
+   // functions are from chrome/ to chrome/ and don't involve content/ at all.
+@@ -756,7 +758,7 @@ class ChromeContentBrowserClient : public content::ContentBrowserClient {
+       override;
+   void OnNetworkServiceCreated(
+       network::mojom::NetworkService* network_service) override;
+-  void ConfigureNetworkContextParams(
++  bool ConfigureNetworkContextParams(
+       content::BrowserContext* context,
+       bool in_memory,
+       const base::FilePath& relative_partition_path,
+@@ -1418,7 +1420,7 @@ class ChromeContentBrowserClient : public content::ContentBrowserClient {
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   uint64_t num_keepalive_requests_ = 0;
+-  base::OneShotTimer keepalive_timer_;
++  std::unique_ptr<base::OneShotTimer> keepalive_timer_;
+   base::TimeTicks keepalive_deadline_;
+ 
+   // Keeps the browser process and relevant profiles alive while browser-side
+diff --git a/chrome/browser/devtools/devtools_window.cc b/chrome/browser/devtools/devtools_window.cc
+index 7613579..4c4d286 100644
+--- a/chrome/browser/devtools/devtools_window.cc
++++ b/chrome/browser/devtools/devtools_window.cc
+@@ -131,6 +131,10 @@
+ #include "components/keep_alive_registry/scoped_keep_alive.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "chrome/browser/ui/browser.h"
++#endif
++
+ using blink::WebInputEvent;
+ using content::BrowserThread;
+ using content::DevToolsAgentHost;
+@@ -862,6 +866,12 @@ Profile* DevToolsWindow::GetProfileForDevToolsWindow(
+   if (profile->IsPrimaryOTRProfile() || profile->IsDevToolsOTRProfile()) {
+     return profile;
+   }
++#if BUILDFLAG(ENABLE_CEF)
++  if (profile->IsOffTheRecord() &&
++      profile->GetOTRProfileID().IsUniqueForCEF()) {
++    return profile;
++  }
++#endif
+   return profile->GetOriginalProfile();
+ }
+ 
+@@ -1405,6 +1415,13 @@ DevToolsWindow* DevToolsWindow::Create(
+     if (!devtools_ui_controller || !devtools_ui_controller->CanDockDevtools()) {
+       can_dock = false;
+     }
++
++#if BUILDFLAG(ENABLE_CEF)
++    if (can_dock && browser && browser->cef_delegate()) {
++      // Don't dock DevTools for CEF-managed browsers.
++      can_dock = false;
++    }
++#endif
+   }
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+@@ -1885,7 +1902,9 @@ void DevToolsWindow::OpenInNewTab(const GURL& url) {
+                                        /*navigation_handle_callback=*/{})) {
+ #if BUILDFLAG(IS_ANDROID)
+     NOTIMPLEMENTED();
+-#else
++#elif !BUILDFLAG(ENABLE_CEF)
++    // Remove default behavior when CEF handles the open via OnOpenURLFromTab.
++    // See CEF issue #3735.
+     chrome::ScopedTabbedBrowserDisplayer displayer(profile_);
+     chrome::AddSelectedTabWithURL(displayer.browser_window_interface(),
+                                   fixed_url, ui::PAGE_TRANSITION_LINK);
+@@ -2091,12 +2110,30 @@ void DevToolsWindow::CreateDevToolsBrowser() {
+       BrowserWindowInterface::CreationStatus::kOk) {
+     return;
+   }
+-  browser_ = CreateBrowserWindow(
+-      BrowserWindowCreateParams::CreateForDevTools(profile_));
+-  browser_->GetTabStripModel()->AddWebContents(
+-      OwnedMainWebContents::TakeWebContents(
+-          std::move(owned_main_web_contents_)),
+-      -1, ui::PAGE_TRANSITION_AUTO_TOPLEVEL, AddTabTypes::ADD_ACTIVE);
++  auto* inspected_web_contents = GetInspectedWebContents();
++  BrowserWindowInterface* opener = nullptr;
++  if (inspected_web_contents) {
++    opener = GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
++        inspected_web_contents);
++  }
++  auto devtools_contents = OwnedMainWebContents::TakeWebContents(
++      std::move(owned_main_web_contents_));
++
++#if BUILDFLAG(ENABLE_CEF)
++  // If a Browser is created, it will take ownership of |devtools_contents|.
++  browser_ = cef::BrowserDelegate::CreateDevToolsBrowser(
++      profile_, opener, inspected_web_contents, devtools_contents);
++#endif
++
++  if (!browser_) {
++    auto create_params = BrowserWindowCreateParams::CreateForDevTools(profile_);
++    create_params.opener = opener;
++
++    browser_ = CreateBrowserWindow(std::move(create_params));
++    browser_->GetTabStripModel()->AddWebContents(
++        std::move(devtools_contents), -1, ui::PAGE_TRANSITION_AUTO_TOPLEVEL,
++        AddTabTypes::ADD_ACTIVE);
++  }
+ #endif
+   OverrideAndSyncDevToolsRendererPrefs();
+ }
+diff --git a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+index b02065e..b7928ba 100644
+--- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
++++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+@@ -446,7 +446,8 @@ gfx::Rect PictureInPictureWindowManager::CalculateOuterWindowBounds(
+     // Ignore the result if we're asked to do so.  Note that we still have to
+     // ask the cache, so that it's set up to accept position updates later for
+     // this request.
+-    if (cached_window_bounds && !pip_options.prefer_initial_window_placement) {
++    if (cached_window_bounds && !pip_options.prefer_initial_window_placement &&
++        !pip_options.initial_position.has_value()) {
+       // Cache hit!  Just return it as the window bounds.
+       return *cached_window_bounds;
+     }
+@@ -500,6 +501,11 @@ gfx::Rect PictureInPictureWindowManager::CalculateOuterWindowBounds(
+   }
+ #endif
+   // Position the window.
++  if (pip_options.initial_position.has_value()) {
++    window_bounds.set_origin(pip_options.initial_position.value());
++    return window_bounds;
++  }
++
+   int window_diff_width = work_area.right() - window_bounds.width();
+   int window_diff_height = work_area.bottom() - window_bounds.height();
+ 
+diff --git a/chrome/browser/prefs/browser_prefs.cc b/chrome/browser/prefs/browser_prefs.cc
+index d48aa0c..1b83274 100644
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -18,6 +18,7 @@
+ #include "build/android_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/about_flags.h"
+ #include "chrome/browser/accessibility/accessibility_labels_service.h"
+ #include "chrome/browser/accessibility/invert_bubble_prefs.h"
+@@ -263,6 +264,10 @@
+ #include "extensions/browser/pref_names.h"
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/prefs/browser_prefs.h"
++#endif
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ #include "chrome/browser/accessibility/animation_policy_prefs.h"
+ #include "extensions/browser/api/audio/audio_api.h"
+@@ -1849,6 +1854,11 @@ void RegisterLocalState(PrefRegistrySimple* registry) {
+ 
+   // This is intentionally last.
+   RegisterLocalStatePrefsForMigration(registry);
++
++#if BUILDFLAG(ENABLE_CEF)
++  // Always call this last.
++  browser_prefs::RegisterLocalStatePrefs(registry);
++#endif
+ }
+ 
+ // Register prefs applicable to all profiles.
+diff --git a/chrome/browser/profiles/off_the_record_profile_impl.cc b/chrome/browser/profiles/off_the_record_profile_impl.cc
+index 21cb081..aa825be 100644
+--- a/chrome/browser/profiles/off_the_record_profile_impl.cc
++++ b/chrome/browser/profiles/off_the_record_profile_impl.cc
+@@ -639,7 +639,9 @@ std::unique_ptr<Profile> Profile::CreateOffTheRecordProfile(
+ #endif
+   if (!profile)
+     profile = std::make_unique<OffTheRecordProfileImpl>(parent, otr_profile_id);
+-  profile->Init();
++  // With CEF we want to delay initialization.
++  if (!otr_profile_id.IsUniqueForCEF())
++    profile->Init();
+   return std::move(profile);
+ }
+ 
+diff --git a/chrome/browser/profiles/pref_service_builder_utils.cc b/chrome/browser/profiles/pref_service_builder_utils.cc
+index 8986f4d..941b1e1 100644
+--- a/chrome/browser/profiles/pref_service_builder_utils.cc
++++ b/chrome/browser/profiles/pref_service_builder_utils.cc
+@@ -16,6 +16,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/threading/scoped_blocking_call.h"
+ #include "build/chromeos_buildflags.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/policy/chrome_browser_policy_connector.h"
+ #include "chrome/browser/prefs/browser_prefs.h"
+@@ -39,6 +40,13 @@
+ #include "services/preferences/public/mojom/tracked_preference_validation_delegate.mojom.h"
+ #include "ui/base/l10n/l10n_util.h"
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#pragma push_macro("RegisterProfilePrefs")
++#undef RegisterProfilePrefs
++#include "cef/libcef/browser/prefs/browser_prefs.h"
++#pragma pop_macro("RegisterProfilePrefs")
++#endif
++
+ namespace {
+ 
+ // Text content of README file created in each profile directory. Both %s
+@@ -77,6 +85,12 @@ void RegisterProfilePrefs(bool is_signin_profile,
+       pref_registry);
+   BrowserContextDependencyManager::GetInstance()
+       ->RegisterProfilePrefsForServices(pref_registry);
++#if BUILDFLAG(ENABLE_CEF)
++#pragma push_macro("RegisterProfilePrefs")
++#undef RegisterProfilePrefs
++  browser_prefs::RegisterProfilePrefs(pref_registry);
++#pragma pop_macro("RegisterProfilePrefs")
++#endif
+ }
+ 
+ std::unique_ptr<sync_preferences::PrefServiceSyncable> CreateProfilePrefService(
+diff --git a/chrome/browser/profiles/profile.cc b/chrome/browser/profiles/profile.cc
+index f9e53f3..ab407d8 100644
+--- a/chrome/browser/profiles/profile.cc
++++ b/chrome/browser/profiles/profile.cc
+@@ -105,6 +105,7 @@ constexpr char kPrimaryOTRProfileID[] = "profile::primary_otr";
+ // differentiated by such prefixes. Consult with the profile owners before
+ // proceeding if you believe a new prefix is strictly necessary.
+ // See `chrome/browser/PRESUBMIT.py` which enforces this via a warning.
++constexpr char kCEFOTRProfileIDPrefix[] = "CEF::BrowserContext";
+ constexpr char kDevToolsOTRProfileIDPrefix[] = "Devtools::BrowserContext";
+ constexpr char kMediaRouterOTRProfileIDPrefix[] = "MediaRouter::Presentation";
+ constexpr char kTestOTRProfileIDPrefix[] = "Test::OTR";
+@@ -125,6 +126,8 @@ bool Profile::OTRProfileID::AllowsBrowserWindows() const {
+   // DevTools::BrowserContext, MediaRouter::Presentation, and
+   // CaptivePortal::Signin are exceptions to this ban.
+   if (*this == PrimaryID() || IsDevTools() || *this == TorID() ||
++      base::StartsWith(profile_id_, kCEFOTRProfileIDPrefix,
++                       base::CompareCase::SENSITIVE) ||
+       base::StartsWith(profile_id_, kMediaRouterOTRProfileIDPrefix,
+                        base::CompareCase::SENSITIVE)) {
+     return true;
+@@ -165,6 +168,16 @@ Profile::OTRProfileID Profile::OTRProfileID::CreateUnique(
+       base::Uuid::GenerateRandomV4().AsLowercaseString().c_str()));
+ }
+ 
++// static
++Profile::OTRProfileID Profile::OTRProfileID::CreateUniqueForCEF() {
++  return CreateUnique(kCEFOTRProfileIDPrefix);
++}
++
++bool Profile::OTRProfileID::IsUniqueForCEF() const {
++  return base::StartsWith(profile_id_, kCEFOTRProfileIDPrefix,
++                          base::CompareCase::SENSITIVE);
++}
++
+ // static
+ Profile::OTRProfileID Profile::OTRProfileID::CreateUniqueForDevTools() {
+   return CreateUnique(kDevToolsOTRProfileIDPrefix);
+diff --git a/chrome/browser/profiles/profile.h b/chrome/browser/profiles/profile.h
+index 4fea4c5..8fb21fe 100644
+--- a/chrome/browser/profiles/profile.h
++++ b/chrome/browser/profiles/profile.h
+@@ -94,6 +94,10 @@ class Profile : public content::BrowserContext {
+     // details.
+     static OTRProfileID CreateUnique(const std::string& profile_id_prefix);
+ 
++    // Creates a unique OTR profile id to be used for CEF browser contexts.
++    static OTRProfileID CreateUniqueForCEF();
++    bool IsUniqueForCEF() const;
++
+     // Creates a unique OTR profile id to be used for DevTools browser contexts.
+     static OTRProfileID CreateUniqueForDevTools();
+ 
+@@ -523,6 +527,8 @@ class Profile : public content::BrowserContext {
+   virtual void AckCrashForTracking() = 0;
+ #endif
+ 
++  void NotifyOffTheRecordProfileCreated(Profile* off_the_record);
++
+   LifecycleState lifecycle_state() const { return lifecycle_state_; }
+   void set_lifecycle_state(LifecycleState lifecycle_state) {
+     lifecycle_state_ = lifecycle_state;
+@@ -543,7 +549,6 @@ class Profile : public content::BrowserContext {
+       Profile*,
+       bool incognito_pref_store);
+ 
+-  void NotifyOffTheRecordProfileCreated(Profile* off_the_record);
+   void NotifyProfileInitializationComplete();
+ 
+   // Returns whether the user has signed in this profile to an account.
+diff --git a/chrome/browser/profiles/profile_impl.cc b/chrome/browser/profiles/profile_impl.cc
+index 2aded56..cc2524f 100644
+--- a/chrome/browser/profiles/profile_impl.cc
++++ b/chrome/browser/profiles/profile_impl.cc
+@@ -40,6 +40,7 @@
+ #include "base/version.h"
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/background/background_contents_service_factory.h"
+ #include "chrome/browser/background_fetch/background_fetch_delegate_factory.h"
+ #include "chrome/browser/background_fetch/background_fetch_delegate_impl.h"
+@@ -238,6 +239,10 @@
+ #include "chrome/browser/background/extensions/background_mode_manager.h"  // nogncheck crbug.com/40147906
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/prefs/pref_names.h"
++#endif
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ #include "chrome/browser/extensions/chrome_content_browser_client_extensions_part.h"  // nogncheck crbug.com/40147906
+ #include "chrome/browser/extensions/extension_special_storage_policy.h"  // nogncheck crbug.com/40147906
+@@ -290,6 +295,12 @@ class ScopedAllowBlockingForProfile : public base::ScopedAllowBlocking {};
+ 
+ namespace {
+ 
++#if BUILDFLAG(ENABLE_CEF)
++BASE_FEATURE(kStorageNotificationService,
++             "StorageNotificationService",
++             base::FEATURE_ENABLED_BY_DEFAULT);
++#endif
++
+ #if BUILDFLAG(ENABLE_SESSION_SERVICE)
+ // Delay before we explicitly create the SessionService.
+ static constexpr base::TimeDelta kCreateSessionServiceDelay =
+@@ -1080,7 +1091,9 @@ Profile* ProfileImpl::GetOffTheRecordProfile(const OTRProfileID& otr_profile_id,
+ 
+   otr_profiles_[otr_profile_id] = std::move(otr_profile);
+ 
+-  NotifyOffTheRecordProfileCreated(raw_otr_profile);
++  // With CEF we want to delay initialization.
++  if (!otr_profile_id.IsUniqueForCEF())
++    NotifyOffTheRecordProfileCreated(raw_otr_profile);
+ 
+   return raw_otr_profile;
+ }
+@@ -1426,6 +1439,12 @@ ProfileImpl::GetStorageNotificationService() {
+ #if BUILDFLAG(IS_ANDROID)
+   return nullptr;
+ #else
++#if BUILDFLAG(ENABLE_CEF)
++  if (!base::FeatureList::IsEnabled(kStorageNotificationService) ||
++      !GetPrefs()->GetBoolean(cef::prefs::kEnableStorageNotificationService)) {
++    return nullptr;
++  }
++#endif
+   return StorageNotificationServiceFactory::GetForBrowserContext(this);
+ #endif
+ }
+diff --git a/chrome/browser/renderer_context_menu/render_view_context_menu.cc b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+index e5cc151..30c2599 100644
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -482,6 +482,18 @@ ui::ImageModel GetLensContextMenuIcon() {
+   );
+ }
+ 
++RenderViewContextMenu_Chromium::MenuCreatedCallback* GetMenuCreatedCallback() {
++  static base::NoDestructor<RenderViewContextMenu_Chromium::MenuCreatedCallback>
++      callback;
++  return callback.get();
++}
++
++RenderViewContextMenu_Chromium::MenuShowHandlerCallback* GetMenuShowHandlerCallback() {
++  static base::NoDestructor<RenderViewContextMenu_Chromium::MenuShowHandlerCallback>
++      callback;
++  return callback.get();
++}
++
+ enum class UmaEnumIdLookupType {
+   GeneralEnumId,
+   ContextSpecificEnumId,
+@@ -498,7 +510,7 @@ int UmaEnumForCommand(int key, UmaEnumIdLookupType type) {
+   // the RenderViewContextMenu.Shown and RenderViewContextMenu.Used histograms.
+   static constexpr auto kGeneralMap = base::MakeFixedFlatMap<int, int>(
+       {// NB: UMA values for 0 and 1 are detected using
+-       // RenderViewContextMenu::IsContentCustomCommandId() and
++       // RenderViewContextMenu_Chromium::IsContentCustomCommandId() and
+        // ContextMenuMatcher::IsExtensionsCustomCommandId()
+        {IDC_CONTENT_CONTEXT_PROTOCOL_HANDLER_FIRST, 2},
+        {IDC_CONTENT_CONTEXT_OPENLINKNEWTAB, 3},
+@@ -771,6 +783,10 @@ int FindUMAEnumValueForCommand(int id, UmaEnumIdLookupType type) {
+     return 1;
+   }
+ 
++  // Match the MENU_ID_USER_FIRST to MENU_ID_USER_LAST range from cef_types.h.
++  if (id >= 26500 && id <= 28500)
++    return 1;
++
+   id = CollapseCommandsForUMA(id);
+   return UmaEnumForCommand(id, type);
+ }
+@@ -1108,6 +1124,14 @@ RenderViewContextMenu_Chromium::RenderViewContextMenu_Chromium(
+   system_app_ = app_controller ? app_controller->system_app() : nullptr;
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
++  auto* cb = GetMenuCreatedCallback();
++  if (!cb->is_null()) {
++    first_observer_ = cb->Run(this);
++    if (first_observer_) {
++      observers_.AddObserver(first_observer_.get());
++    }
++  }
++
+   observers_.AddObserver(&autofill_context_menu_manager_);
+ }
+ 
+@@ -1573,6 +1597,14 @@ void RenderViewContextMenu_Chromium::InitMenu() {
+       AppendReadAnythingItem();
+     }
+   }
++
++  AppendEmbedderMenuItems();
++
++  if (first_observer_) {
++    // This runs after all upstream and embedder additions, so the CEF client
++    // can modify or clear the complete menu before toolkit initialization.
++    first_observer_->InitMenu(params_);
++  }
+ }
+ 
+ Profile* RenderViewContextMenu_Chromium::GetProfile() const {
+@@ -4325,6 +4357,26 @@ void RenderViewContextMenu_Chromium::RemoveObserverForTesting(
+   observers_.RemoveObserver(observer);
+ }
+ 
++// static
++void RenderViewContextMenu_Chromium::RegisterMenuCreatedCallback(
++    MenuCreatedCallback cb) {
++  *GetMenuCreatedCallback() = cb;
++}
++
++// static
++void RenderViewContextMenu_Chromium::RegisterMenuShowHandlerCallback(
++    MenuShowHandlerCallback cb) {
++  *GetMenuShowHandlerCallback() = cb;
++}
++
++bool RenderViewContextMenu_Chromium::UseShowHandler() {
++  auto* cb = GetMenuShowHandlerCallback();
++  if (!cb->is_null() && cb->Run(this)) {
++    return true;
++  }
++  return false;
++}
++
+ custom_handlers::ProtocolHandlerRegistry::ProtocolHandlerList
+ RenderViewContextMenu_Chromium::GetHandlersForLinkUrl() {
+   custom_handlers::ProtocolHandlerRegistry::ProtocolHandlerList handlers =
+diff --git a/chrome/browser/renderer_context_menu/render_view_context_menu.h b/chrome/browser/renderer_context_menu/render_view_context_menu.h
+index a3b9fe2..a4ed322 100644
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.h
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.h
+@@ -184,7 +184,24 @@ class RenderViewContextMenu_Chromium
+   void AddObserverForTesting(RenderViewContextMenuObserver* observer);
+   void RemoveObserverForTesting(RenderViewContextMenuObserver* observer);
+ 
++  // Registers a callback that will be called each time a context menu is
++  // created.
++  using MenuCreatedCallback = base::RepeatingCallback<
++      std::unique_ptr<RenderViewContextMenuObserver>(RenderViewContextMenu_Chromium*)>;
++  static void RegisterMenuCreatedCallback(MenuCreatedCallback cb);
++
++  // Registers a callback that will be called each time before context menu is
++  // shown. The callback should return true if the show has handled.
++  using MenuShowHandlerCallback = base::RepeatingCallback<
++      bool(RenderViewContextMenu_Chromium*)>;
++  static void RegisterMenuShowHandlerCallback(MenuShowHandlerCallback cb);
++
+  protected:
++  bool UseShowHandler();
++
++  // InitMenu owns the complete ordering: upstream, embedder, then CEF.
++  virtual void AppendEmbedderMenuItems() {}
++
+   Profile* GetProfile() const;
+ 
+   // This may return nullptr (e.g. for WebUI dialogs). Virtual to allow tests to
+@@ -301,7 +318,7 @@ class RenderViewContextMenu_Chromium
+                                const std::string& preconnect_url);
+ 
+   // RenderViewContextMenuBase:
+-  void InitMenu() override;
++  void InitMenu() final;
+   void RecordShownItem(int id, bool is_submenu) override;
+ #if BUILDFLAG(ENABLE_PLUGINS)
+   void HandleAuthorizeAllPlugins() override;
+@@ -577,6 +594,9 @@ class RenderViewContextMenu_Chromium
+   // Video frame sub-menu handling.
+   ui::SimpleMenuModel video_frame_submenu_model_;
+ 
++  // An observer returned via MenuCreatedCallback that will be called first.
++  std::unique_ptr<RenderViewContextMenuObserver> first_observer_;
++
+   // An observer that handles spelling suggestions, "Add to dictionary", and
+   // "Use enhanced spell check" items.
+   std::unique_ptr<SpellingMenuObserver> spelling_suggestions_menu_observer_;
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index d1564eb..87137f4 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -9,6 +9,7 @@ import("//build/config/compiler/compiler.gni")
+ import("//build/config/features.gni")
+ import("//build/config/ozone.gni")
+ import("//build/config/ui.gni")
++import("//cef/libcef/features/features.gni")
+ import("//chrome/browser/buildflags.gni")
+ import("//chrome/common/features.gni")
+ import("//components/captive_portal/core/features.gni")
+@@ -1555,6 +1556,10 @@ static_library("ui") {
+     "//build/config/compiler:wexit_time_destructors",
+   ]
+ 
++  if (enable_cef) {
++    configs += [ "//cef/libcef/features:config" ]
++  }
++
+   public_deps = [
+     # WARNING WARNING WARNING
+     # New dependencies outside of //chrome/browser should be added to
+@@ -1606,6 +1611,7 @@ static_library("ui") {
+     ":ui_features",
+     ":url_identity",
+     "//base",
++    "//cef/libcef/features:buildflags",
+     "//chrome/app:chrome_dll_resources",
+     "//chrome/app/resources:platform_locale_settings",
+     "//chrome/app/theme:chrome_unscaled_resources",
+@@ -1912,6 +1918,13 @@ static_library("ui") {
+     ]
+   }
+ 
++  if (enable_cef) {
++    deps += [
++      "//cef:cef_resources",
++      "//cef/libcef/features:deps",
++    ]
++  }
++
+   if (!is_android) {
+     deps += [
+       ":ui_controller_factory",
+@@ -4655,6 +4668,7 @@ static_library("ui") {
+     deps += [
+       "//chrome/browser/printing",
+       "//chrome/browser/printing:impl",
++      "//components/printing/common:mojo_interfaces",
+     ]
+     allow_circular_includes_from += [ "//chrome/browser/printing:impl" ]
+   }
+diff --git a/chrome/browser/ui/browser.cc b/chrome/browser/ui/browser.cc
+index f7385bd..fa7dcd9 100644
+--- a/chrome/browser/ui/browser.cc
++++ b/chrome/browser/ui/browser.cc
+@@ -268,6 +268,10 @@ Browser::Browser(BrowserWindowCreateParams params)
+     : type_(params.type),
+       profile_(&*params.profile),
+       window_(nullptr),
++#if BUILDFLAG(ENABLE_CEF)
++      cef_browser_delegate_(
++          cef::BrowserDelegate::Create(this, params.cef_params, params.opener)),
++#endif
+       tab_strip_model_delegate_(
+           std::make_unique<chrome::BraveTabStripModelDelegate>(this)),
+       tab_strip_model_(std::make_unique<BraveTabStripModel>(
+@@ -306,9 +310,6 @@ Browser::Browser(BrowserWindowCreateParams params)
+   features_ = std::make_unique<BrowserWindowFeatures>();
+   features_->Init(this);
+ 
+-  if (custom_window) {
+-    CHECK_IS_TEST() << "BrowserWindowCreateParams::window is a test-only param";
+-  }
+   window_ =
+       custom_window
+           ? std::unique_ptr<BrowserWindow, BrowserWindowDeleter>(custom_window)
+@@ -326,9 +327,19 @@ Browser::Browser(BrowserWindowCreateParams params)
+     session_service->WindowOpened(this);
+   }
+ 
+-  // Initialize the browser features that rely on the browser window now that it
+-  // is initialized.
+-  features_->InitPostWindowConstruction(this);
++  const bool views_hosted =
++#if BUILDFLAG(ENABLE_CEF)
++      cef_delegate() && cef_delegate()->IsViewsHosted();
++#else
++      false;
++#endif
++
++  if (!views_hosted) {
++    // Initialize the browser features that rely on the browser window now that
++    // it is initialized. This will instead be called from
++    // BrowserView::AddedToWidget() for CEF Views-hosted windows.
++    features_->InitPostWindowConstruction(this);
++  }
+ 
+   // All initialization is complete; after this point, the browser should be on
+   // the browser list until it is marked for destruction.
+@@ -504,6 +515,10 @@ BrowserWindowInterface::Type Browser::GetType() const {
+   return type_;
+ }
+ 
++bool Browser::IsNormalBrowser() const {
++  return BrowserWindowFeatures::IsNormalBrowser(this);
++}
++
+ std::vector<tabs::TabInterface*> Browser::GetAllTabInterfaces() {
+   std::vector<tabs::TabInterface*> results;
+   results.reserve(tab_strip_model_->count());
+@@ -880,6 +895,12 @@ void Browser::OnTabReplacedAt(WebContents* old_contents,
+ // Browser, Assorted utility functions (private):
+ 
+ void Browser::SetAsDelegate(WebContents* web_contents, bool set_delegate) {
++#if BUILDFLAG(ENABLE_CEF)
++  if (cef_browser_delegate_) {
++    cef_browser_delegate_->SetAsDelegate(web_contents, set_delegate);
++  }
++#endif
++
+   content::WebContentsDelegate* delegate =
+       set_delegate ? BrowserWebContentsDelegate::From(this) : nullptr;
+ 
+diff --git a/chrome/browser/ui/browser.h b/chrome/browser/ui/browser.h
+index fd7a450..0ebab62 100644
+--- a/chrome/browser/ui/browser.h
++++ b/chrome/browser/ui/browser.h
+@@ -24,6 +24,7 @@
+ #include "base/timer/elapsed_timer.h"
+ #include "base/types/expected.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/tab_contents/web_contents_collection.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar_controller.h"
+@@ -77,6 +78,10 @@ namespace content {
+ class NavigationHandle;
+ }  // namespace content
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#endif
++
+ namespace web_app {
+ class AppBrowserController;
+ }
+@@ -158,6 +163,7 @@ class Browser : public TabStripModelObserver,
+       DidBecomeInactiveCallback callback) override;
+   Type GetType() const override;
+   std::vector<tabs::TabInterface*> GetAllTabInterfaces() override;
++  bool IsNormalBrowser() const override;
+   bool IsTabModalPopup() const override;
+   void SetIsTabModalPopup(
+       bool is_tab_modal_popup,
+@@ -168,6 +174,22 @@ class Browser : public TabStripModelObserver,
+   DesktopBrowserWindowCapabilities* capabilities() override;
+   const DesktopBrowserWindowCapabilities* capabilities() const override;
+ 
++  // Return true if CEF will expose the toolbar to the client. This value is
++  // used to selectively enable toolbar behaviors such as command processing
++  // and omnibox focus without also including the toolbar in BrowserView layout
++  // calculations.
++  void set_toolbar_overridden(bool val) { toolbar_overridden_ = val; }
++  bool toolbar_overridden() const { return toolbar_overridden_; }
++
++  // Used when the BrowserWindow will outlive this Browser.
++  void ReleaseBrowserWindow() { window_.release(); }
++
++#if BUILDFLAG(ENABLE_CEF)
++  cef::BrowserDelegate* cef_delegate() const override {
++    return cef_browser_delegate_.get();
++  }
++#endif
++
+  private:
+   friend class BookmarkPrefsService;
+   friend class BraveBrowser;
+@@ -266,6 +288,10 @@ class Browser : public TabStripModelObserver,
+   // This Browser's window.
+   std::unique_ptr<BrowserWindow, BrowserWindowDeleter> window_;
+ 
++#if BUILDFLAG(ENABLE_CEF)
++  std::unique_ptr<cef::BrowserDelegate> cef_browser_delegate_;
++#endif
++
+   std::unique_ptr<TabStripModelDelegate> const tab_strip_model_delegate_;
+   std::unique_ptr<TabStripModel> const tab_strip_model_;
+ 
+@@ -278,6 +304,8 @@ class Browser : public TabStripModelObserver,
+ 
+   WebContentsCollection web_contents_collection_{this};
+ 
++  bool toolbar_overridden_ = false;
++
+   // If true, the browser window was created as a tab modal pop-up.
+   bool is_tab_modal_popup_ = false;
+ 
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index 921461b..06c7fb4 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -198,6 +198,10 @@
+ #include "chrome/browser/ui/shortcuts/desktop_shortcuts_utils.h"
+ #endif  // BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_util.h"
++#endif
++
+ static_assert(BUILDFLAG(ENABLE_EXTENSIONS));
+ 
+ using Extension = extensions::Extension;
+@@ -554,6 +558,12 @@ void BrowserCommandController::ContentRestrictionsChanged() {
+ 
+ void BrowserCommandController::FullscreenStateChanged() {
+   UpdateCommandsForFullscreenMode();
++
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_->cef_delegate()) {
++    browser_->cef_delegate()->WindowFullscreenStateChanged();
++  }
++#endif
+ }
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -641,6 +651,7 @@ bool BrowserCommandController::ExecuteCommandWithDispositionAndContext(
+     std::optional<actions::ActionInvocationContext> context,
+     base::TimeTicks time_stamp) {
+   if (!SupportsCommand(id) || !IsCommandEnabled(id)) {
++    LOG(WARNING) << "Invalid/disabled command " << id;
+     return false;
+   }
+ 
+@@ -667,6 +678,13 @@ void BrowserCommandController::HandleCommandWithDisposition(
+     base::TimeTicks time_stamp) {
+   DCHECK(IsCommandEnabled(id)) << "Invalid/disabled command " << id;
+ 
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_->cef_delegate() &&
++      browser_->cef_delegate()->HandleCommand(id, disposition)) {
++    return;
++  }
++#endif
++
+   // The order of commands in this switch statement must match the function
+   // declaration order in browser.h!
+   switch (id) {
+@@ -1712,12 +1730,14 @@ void BrowserCommandController::TabRestoreServiceLoaded(
+ 
+ bool BrowserCommandController::IsShowingMainUI() {
+   return WindowFeatureController::From(browser_)->SupportsWindowFeature(
+-      WindowFeatureController::WindowFeature::kFeatureTabStrip);
++             WindowFeatureController::WindowFeature::kFeatureTabStrip) ||
++         cef::BrowserForBWI(browser_)->toolbar_overridden();
+ }
+ 
+ bool BrowserCommandController::IsShowingLocationBar() {
+   return WindowFeatureController::From(browser_)->SupportsWindowFeature(
+-      WindowFeatureController::WindowFeature::kFeatureLocationBar);
++             WindowFeatureController::WindowFeature::kFeatureLocationBar) ||
++         cef::BrowserForBWI(browser_)->toolbar_overridden();
+ }
+ 
+ void BrowserCommandController::InitCommandState() {
+diff --git a/chrome/browser/ui/browser_manager_service.cc b/chrome/browser/ui/browser_manager_service.cc
+index c9ca880..390c116 100644
+--- a/chrome/browser/ui/browser_manager_service.cc
++++ b/chrome/browser/ui/browser_manager_service.cc
+@@ -142,10 +142,17 @@ void BrowserManagerService::DeleteBrowser(
+   //
+   // TODO(crbug.com/40159237): Use ScopedProfileKeepAlive for Incognito too,
+   // instead of separate logic for Incognito and regular profiles.
+-  target_browser_and_subscriptions->browser.reset();
+-  if (browsers_and_subscriptions_.empty() &&
+-      profile_->IsPrimaryOTRProfileWithRegularParent() &&
+-      !profile_->IsSystemProfile()) {
++  // Capture state from `this` before destroying the Browser. The destruction
++  // chain may release the last reference keeping the Profile alive (e.g. via
++  // CEF's CefRequestContext release for OTR profiles), which triggers keyed
++  // service shutdown and destroys `this`. Do not access members after the
++  // reset below.
++  const bool is_last_browser = browsers_and_subscriptions_.empty();
++  base::WeakPtr<Profile> weak_profile = profile_->GetWeakPtr();
++  target_browser_and_subscriptions.reset();
++  if (is_last_browser && weak_profile &&
++      weak_profile->IsPrimaryOTRProfileWithRegularParent() &&
++      !weak_profile->IsSystemProfile()) {
+ #if BUILDFLAG(ENABLE_PRINT_PREVIEW)
+     // The Printing Background Manager holds onto preview dialog WebContents
+     // whose corresponding print jobs have not yet fully spooled. Make sure
+@@ -153,12 +160,12 @@ void BrowserManagerService::DeleteBrowser(
+     // profile so that their RenderFrameHosts can exit in time - see
+     // crbug.com/41235373
+     g_browser_process->background_printing_manager()
+-        ->DeletePreviewContentsForBrowserContext(&profile_.get());
++        ->DeletePreviewContentsForBrowserContext(weak_profile.get());
+ #endif
+     // The incognito or isolated mode profile is no longer needed, this
+     // indirectly frees its cache and cookies once it gets destroyed at the
+     // appropriate time.
+-    ProfileDestroyer::DestroyOTRProfileWhenAppropriate(&profile_.get());
++    ProfileDestroyer::DestroyOTRProfileWhenAppropriate(weak_profile.get());
+   }
+ 
+   // If we're exiting, send out the APP_TERMINATING notification to allow other
+diff --git a/chrome/browser/ui/browser_tabstrip.cc b/chrome/browser/ui/browser_tabstrip.cc
+index 039a885..1500401 100644
+--- a/chrome/browser/ui/browser_tabstrip.cc
++++ b/chrome/browser/ui/browser_tabstrip.cc
+@@ -29,6 +29,10 @@
+ #include "ui/base/window_open_disposition.h"
+ #include "url/gurl.h"
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#endif
++
+ namespace chrome {
+ 
+ GURL GetNewTabURL(const BrowserWindowInterface* browser) {
+@@ -50,7 +54,12 @@ content::WebContents* AddAndReturnTabAt(
+     bool pinned,
+     std::optional<NavigateParams::WindowAction> window_action) {
+   const GURL resolved_url = url.is_empty() ? GetNewTabURL(browser) : url;
+-  NavigateParams params(browser, resolved_url, ui::PAGE_TRANSITION_TYPED);
++  // For CEF use a PageTransition that matches
++  // CefFrameHostImpl::kPageTransitionExplicit.
++  NavigateParams params(
++      browser, resolved_url,
++      static_cast<ui::PageTransition>(ui::PAGE_TRANSITION_TYPED |
++                                      ui::PAGE_TRANSITION_FROM_ADDRESS_BAR));
+   params.disposition = foreground ? WindowOpenDisposition::NEW_FOREGROUND_TAB
+                                   : WindowOpenDisposition::NEW_BACKGROUND_TAB;
+   if (window_action) {
+@@ -109,6 +118,17 @@ content::WebContents* AddWebContents(
+   // Can't create a new contents for the current tab - invalid case.
+   DCHECK(disposition != WindowOpenDisposition::CURRENT_TAB);
+ 
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser && new_contents) {
++    if (auto* cef_delegate = browser->cef_delegate()) {
++      new_contents = cef_delegate->AddWebContents(std::move(new_contents));
++      if (!new_contents) {
++        return nullptr;
++      }
++    }
++  }
++#endif
++
+   NavigateParams params(browser, std::move(new_contents));
+   params.source_contents = source_contents;
+   params.url = target_url;
+@@ -132,8 +152,6 @@ void CloseWebContents(BrowserWindowInterface* browser,
+                       bool add_to_history) {
+   int index = browser->GetTabStripModel()->GetIndexOfWebContents(contents);
+   if (index == TabStripModel::kNoTab) {
+-    DUMP_WILL_BE_NOTREACHED()
+-        << "CloseWebContents called for tab not in our strip";
+     return;
+   }
+ 
+diff --git a/chrome/browser/ui/browser_ui_controller/browser_ui_controller.cc b/chrome/browser/ui/browser_ui_controller/browser_ui_controller.cc
+index 76ae80e..dc644b5 100644
+--- a/chrome/browser/ui/browser_ui_controller/browser_ui_controller.cc
++++ b/chrome/browser/ui/browser_ui_controller/browser_ui_controller.cc
+@@ -11,8 +11,10 @@
+ #include "base/check_op.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_event.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/app_mode/app_mode_utils.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar_controller.h"
++#include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -145,7 +147,11 @@ void BrowserUiController::ScheduleUIUpdate(content::WebContents* source,
+     // Update the loading state synchronously. This is so the throbber will
+     // immediately start/stop, which gives a more snappy feel. We want to do
+     // this for any tab so they start & stop quickly.
+-    NotifyTabUIChanged(tab, TabChangeType::kLoadingOnly);
++    // Guard against notifications during tab insertion when the tab strip model
++    // state is not yet fully consistent.
++    if (tab_strip_model_->GetIndexOfTab(tab) != TabStripModel::kNoTab) {
++      NotifyTabUIChanged(tab, TabChangeType::kLoadingOnly);
++    }
+     // The status bubble needs to be updated during INVALIDATE_TYPE_LOAD too,
+     // but we do that asynchronously by not stripping INVALIDATE_TYPE_LOAD from
+     // changed_flags.
+@@ -261,9 +267,11 @@ void BrowserUiController::NotifyTabUIChanged(tabs::TabInterface* tab,
+ }
+ 
+ std::vector<StatusBubble*> BrowserUiController::GetStatusBubbles() {
++  bool show_by_default = true;
++
+   // For kiosk and exclusive app mode we want to always hide the status bubble.
+   if (IsRunningInAppMode()) {
+-    return {};
++    show_by_default = false;
+   }
+ 
+   // We hide the status bar for web apps windows as this matches native
+@@ -273,6 +281,16 @@ std::vector<StatusBubble*> BrowserUiController::GetStatusBubbles() {
+       web_app::AppBrowserController::From(&*browser_);
+   if (app_browser_controller &&
+       !app_browser_controller->HasMinimalUiButtons()) {
++    show_by_default = false;
++  }
++
++  bool show = show_by_default;
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_->cef_delegate()) {
++    show = browser_->cef_delegate()->ShowStatusBubble(show_by_default);
++  }
++#endif
++  if (!show) {
+     return {};
+   }
+ 
+diff --git a/chrome/browser/ui/browser_window/internal/browser_window_features.cc b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+index 4123c22..623598b 100644
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -12,6 +12,7 @@
+ #include "base/memory/ptr_util.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/no_destructor.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/actor/ui/actor_border_view_controller.h"
+ #include "chrome/browser/actor/ui/actor_ui_window_controller.h"
+ #include "chrome/browser/autocomplete/aim_eligibility_service_factory.h"
+@@ -246,6 +247,17 @@
+ BrowserWindowFeatures_ChromiumImpl::BrowserWindowFeatures_ChromiumImpl() = default;
+ BrowserWindowFeatures_ChromiumImpl::~BrowserWindowFeatures_ChromiumImpl() = default;
+ 
++// static
++bool BrowserWindowFeatures_ChromiumImpl::IsNormalBrowser(
++    const BrowserWindowInterface* browser) {
++  // CEF normal browsers have TYPE_POPUP.
++  if (browser->GetType() == BrowserWindowInterface::Type::TYPE_POPUP &&
++      browser->cef_delegate()) {
++    return true;
++  }
++  return browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL;
++}
++
+ void BrowserWindowFeatures_ChromiumImpl::Init(BrowserWindowInterface* browser) {
+   // This is used only for the controllers which will be created on demand
+   // later.
+@@ -318,8 +330,8 @@ void BrowserWindowFeatures_ChromiumImpl::Init(BrowserWindowInterface* browser) {
+           *browser, *browser, *browser->GetTabStripModel());
+   window_feature_controller_ =
+       GetUserDataFactory().CreateInstance<WindowFeatureController>(
+-          *browser, fullscreen_controller_.get(), app_browser_controller_.get(),
+-          browser->GetType(),
++          *browser, browser, fullscreen_controller_.get(),
++          app_browser_controller_.get(), browser->GetType(),
+           BrowserInitState::From(browser)
+               ->browser_window_create_params()
+               .is_trusted_source,
+@@ -688,6 +700,9 @@ void BrowserWindowFeatures_ChromiumImpl::InitPostWindowConstruction(
+   // Foundational state used throughout this function. Computed/assigned early
+   // so the alphabetical sections below can rely on them.
+   Profile* const profile = browser_->GetProfile();
++
++  const bool supports_toolbar = IsNormalBrowser(browser);
++
+   BrowserView* const browser_view =
+       BrowserView::GetBrowserViewForBrowser(browser);
+   WebUIBrowserWindow* const webui_browser_window =
+@@ -750,18 +765,6 @@ void BrowserWindowFeatures_ChromiumImpl::InitPostWindowConstruction(
+         std::make_unique<ContentsBorderController>(browser_view);
+   }
+ 
+-  if (browser_view) {
+-    if (browser_->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL ||
+-        browser_->GetType() == BrowserWindowInterface::Type::TYPE_POPUP ||
+-        browser_view->GetIsWebAppType()) {
+-      data_protection_ui_controller_ =
+-          GetUserDataFactory()
+-              .CreateInstance<
+-                  enterprise_data_protection::DataProtectionUIController>(
+-                  *browser_view->browser(), browser_view);
+-    }
+-  }
+-
+ #if BUILDFLAG(ENABLE_EXTENSIONS) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC))
+   if (browser_view) {
+     if (!browser_->GetProfile()->IsOffTheRecord()) {
+@@ -812,7 +815,12 @@ void BrowserWindowFeatures_ChromiumImpl::InitPostWindowConstruction(
+ 
+   // Must be after exclusive_access_manager_,
+   // desktop_browser_window_capabilities_, and browser_ui_controller_.
++#if BUILDFLAG(ENABLE_CEF)
++  browser_web_contents_delegate_ =
++      cef::BrowserDelegate::CreateWebContentsDelegate(
++#else
+   browser_web_contents_delegate_ = std::make_unique<BraveBrowserWebContentsDelegate>(
++#endif
+       browser, *exclusive_access_manager_, *browser_command_controller_,
+       *unload_controller_, app_browser_controller_.get(),
+       *BrowserWindow::FromBrowser(browser),
+@@ -925,7 +933,7 @@ void BrowserWindowFeatures_ChromiumImpl::InitPostWindowConstruction(
+           *browser, browser, browser->GetTabStripModel(),
+           browser->GetSessionID(), browser->GetType());
+ 
+-  if (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL ||
++  if (supports_toolbar ||
+       browser->GetType() == BrowserWindowInterface::Type::TYPE_APP) {
+     toast_service_ =
+         GetUserDataFactory().CreateInstance<ToastService>(*browser, browser);
+@@ -969,7 +977,7 @@ void BrowserWindowFeatures_ChromiumImpl::InitPostWindowConstruction(
+   // omnibox and a tab strip). By default most new features should be
+   // instantiated in this block (please keep this list ordered without taking
+   // into consideration buildflags, repeating buildflags is ok):
+-  if (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL) {
++  if (supports_toolbar) {
+     if (browser_view) {
+       if (base::FeatureList::IsEnabled(features::kGlicActorUi)) {
+         std::vector<std::pair<views::WebView*, ActorOverlayWebView*>>
+@@ -1134,6 +1142,38 @@ void BrowserWindowFeatures_ChromiumImpl::InitPostBrowserViewConstruction(
+       browser_view);
+ }
+ 
++void BrowserWindowFeatures_ChromiumImpl::InitPostTabModelConstruction(
++    BrowserWindowInterface* interface) {
++  auto* browser_view = BrowserView::GetBrowserViewForBrowser(interface);
++  CHECK(browser_view);
++
++  auto* browser = browser_view->browser();
++  const bool supports_toolbar = IsNormalBrowser(browser);
++
++  if (supports_toolbar) {
++    if (!data_protection_ui_controller_) {
++      data_protection_ui_controller_ =
++          GetUserDataFactory()
++              .CreateInstance<
++                  enterprise_data_protection::DataProtectionUIController>(
++                  *browser, browser_view);
++    }
++  }
++}
++
++void BrowserWindowFeatures_ChromiumImpl::OnWebContentsCreated(
++    BrowserWindowInterface* interface,
++    content::WebContents* target_contents) {
++#if BUILDFLAG(ENABLE_CEF)
++  auto* browser_view = BrowserView::GetBrowserViewForBrowser(interface);
++  CHECK(browser_view);
++
++  if (auto cef_delegate = browser_view->browser()->cef_delegate()) {
++    cef_delegate->OnWebContentsCreated(target_contents);
++  }
++#endif
++}
++
+ void BrowserWindowFeatures_ChromiumImpl::TearDownPreBrowserWindowDestruction() {
+   // Tear down in reverse order of construction: embedder first, then
+   // InitPostWindowConstruction, then Init. Within each section, members are
+diff --git a/chrome/browser/ui/browser_window/public/browser_window_features.h b/chrome/browser/ui/browser_window/public/browser_window_features.h
+index c12037d..3cf5e5b 100644
+--- a/chrome/browser/ui/browser_window/public/browser_window_features.h
++++ b/chrome/browser/ui/browser_window/public/browser_window_features.h
+@@ -161,6 +161,9 @@ namespace content_settings {
+ class CookieControlsController;
+ }  // namespace content_settings
+ 
++namespace content {
++class WebContents;
++}
+ namespace contextual_tasks {
+ class ContextualTasksBrowserController;
+ }  // namespace contextual_tasks
+@@ -282,6 +285,8 @@ class BrowserWindowFeatures_ChromiumImpl {
+   BrowserWindowFeatures_ChromiumImpl();
+   virtual ~BrowserWindowFeatures_ChromiumImpl();
+ 
++  static bool IsNormalBrowser(const BrowserWindowInterface* browser);
++
+   BrowserWindowFeatures_ChromiumImpl(const BrowserWindowFeatures_ChromiumImpl&) = delete;
+   BrowserWindowFeatures_ChromiumImpl& operator=(const BrowserWindowFeatures_ChromiumImpl&) = delete;
+ 
+@@ -298,6 +303,16 @@ class BrowserWindowFeatures_ChromiumImpl {
+   // hierarchy in BrowserView.
+   virtual void InitPostBrowserViewConstruction(BrowserView* browser_view);
+ 
++  // Initialize features that depend on the tab model object being created. May
++  // be called multiple times (on TabModel ceation via Navigate). With CEF this
++  // will be called after BrowserView construction.
++  void InitPostTabModelConstruction(BrowserWindowInterface* browser);
++
++  // Called when a WebContents is created as part of TabModel ceation via
++  // Navigate.
++  void OnWebContentsCreated(BrowserWindowInterface* browser,
++                            content::WebContents* target_contents);
++
+   // Called exactly once to tear down state that depends on the window object.
+   virtual void TearDownPreBrowserWindowDestruction();
+ 
+diff --git a/chrome/browser/ui/browser_window/public/browser_window_interface.h b/chrome/browser/ui/browser_window/public/browser_window_interface.h
+index 8a2e9f1..9154d1a 100644
+--- a/chrome/browser/ui/browser_window/public/browser_window_interface.h
++++ b/chrome/browser/ui/browser_window/public/browser_window_interface.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "content/public/browser/page_navigator.h"
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -54,6 +55,12 @@ class UnownedUserDataHost;
+ class Profile;
+ class SessionID;
+ 
++#if BUILDFLAG(ENABLE_CEF)
++namespace cef {
++class BrowserDelegate;
++}
++#endif
++
+ namespace internal {
+ class ScopedBrowserShower;
+ }
+@@ -315,6 +322,14 @@ class BrowserWindowInterface : public content::PageNavigator {
+   virtual base::CallbackListSubscription RegisterDidBecomeInactive(
+       DidBecomeInactiveCallback callback) = 0;
+ 
++  // Returns true if this is a normal browser as determined by
++  // BrowserWindowFeatures::IsNormalBrowser.
++  virtual bool IsNormalBrowser() const = 0;
++
++#if BUILDFLAG(ENABLE_CEF)
++  virtual cef::BrowserDelegate* cef_delegate() const { return nullptr; }
++#endif
++
+   // This is used by features that need to operate on most or all tabs in the
+   // browser window. Do not use this method to find a specific tab.
+   virtual std::vector<tabs::TabInterface*> GetAllTabInterfaces() = 0;
+diff --git a/chrome/browser/ui/browser_window/public/create_browser_window.h b/chrome/browser/ui/browser_window/public/create_browser_window.h
+index 6ecba96..5418512 100644
+--- a/chrome/browser/ui/browser_window/public/create_browser_window.h
++++ b/chrome/browser/ui/browser_window/public/create_browser_window.h
+@@ -13,10 +13,15 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "ui/base/mojom/window_show_state.mojom.h"
+ #include "ui/gfx/geometry/rect.h"
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#endif
++
+ #if !BUILDFLAG(IS_ANDROID)
+ #include "components/tab_groups/tab_group_id.h"
+ #include "third_party/blink/public/mojom/picture_in_picture_window_options/picture_in_picture_window_options.mojom.h"
+@@ -170,6 +175,15 @@ struct BrowserWindowCreateParams {
+   // Specifies the width for the uncollapsed Vertical Tab Strip.
+   std::optional<int> vertical_tab_strip_uncollapsed_width;
+ 
++#if BUILDFLAG(ENABLE_CEF)
++  // Opaque CEF-specific configuration. Will be propagated to new Browsers.
++  scoped_refptr<cef::BrowserDelegate::CreateParams> cef_params;
++
++  // Specify the Browser that is opening this popup.
++  // Currently only used with TYPE_PICTURE_IN_PICTURE and TYPE_DEVTOOLS.
++  raw_ptr<BrowserWindowInterface, DanglingUntriaged> opener = nullptr;
++#endif
++
+   // Specifies the focused tab group ID, if the window should be created in a
+   // focused state.
+   std::optional<tab_groups::TabGroupId> focused_tab_group_id;
+diff --git a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.h b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.h
+index 3506a97..a3600ff 100644
+--- a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.h
++++ b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.h
+@@ -31,6 +31,7 @@ class RenderViewContextMenuMacCocoa : public RenderViewContextMenuMac {
+ 
+   // RenderViewContextMenu:
+   void Show() override;
++  bool IsRunning() override;
+ 
+  private:
+   // RenderViewContextMenuViewsMac:
+diff --git a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.mm b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.mm
+index 10829d1..e6462ce 100644
+--- a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.mm
++++ b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_cocoa.mm
+@@ -75,6 +75,10 @@ RenderViewContextMenuMacCocoa::~RenderViewContextMenuMacCocoa() {
+ }
+ 
+ void RenderViewContextMenuMacCocoa::Show() {
++  if (UseShowHandler()) {
++    return;
++  }
++
+   views::Widget* widget = views::Widget::GetTopLevelWidgetForNativeView(
+       source_web_contents_->GetNativeView());
+ 
+@@ -100,6 +104,10 @@ void RenderViewContextMenuMacCocoa::Show() {
+                       views::ElementTrackerViews::GetContextForWidget(widget));
+ }
+ 
++bool RenderViewContextMenuMacCocoa::IsRunning() {
++  return menu_controller_ && [menu_controller_ isMenuOpen];
++}
++
+ void RenderViewContextMenuMacCocoa::CancelToolkitMenu() {
+   [menu_controller_ cancel];
+ }
+diff --git a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.h b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.h
+index 7838ec2..1b1bae4 100644
+--- a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.h
++++ b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.h
+@@ -35,6 +35,7 @@ class RenderViewContextMenuMacRemoteCocoa : public RenderViewContextMenuMac {
+ 
+   // RenderViewContextMenu:
+   void Show() override;
++  bool IsRunning() override;
+ 
+  private:
+   // RenderViewContextMenuViewsMac:
+diff --git a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.mm b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.mm
+index ec7a5fd..ba77275 100644
+--- a/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.mm
++++ b/chrome/browser/ui/cocoa/renderer_context_menu/render_view_context_menu_mac_remote_cocoa.mm
+@@ -48,6 +48,10 @@ void RenderViewContextMenuMacRemoteCocoa::Show() {
+       target_view_id_);
+ }
+ 
++bool RenderViewContextMenuMacRemoteCocoa::IsRunning() {
++  return runner_ && runner_->IsRunning();
++}
++
+ void RenderViewContextMenuMacRemoteCocoa::CancelToolkitMenu() {
+   runner_->Cancel();
+ }
+diff --git a/chrome/browser/ui/navigator/browser_navigator.cc b/chrome/browser/ui/navigator/browser_navigator.cc
+index f2b1d02..e20448b 100644
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/browser_init_state.h"
+ #include "chrome/browser/ui/browser_ui_controller/browser_ui_controller.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+@@ -334,6 +335,12 @@ std::tuple<BrowserWindowInterface*, int> GetBrowserAndTabForDisposition(
+ 
+       browser_params.pip_options = pip_options;
+ 
++      browser_params.can_resize = pip_options->resizable;
++
++#if BUILDFLAG(ENABLE_CEF)
++      browser_params.opener = params.browser;
++#endif
++
+       const ui::BaseWindow* const browser_window = params.browser->GetWindow();
+       const gfx::NativeWindow native_window =
+           browser_window ? browser_window->GetNativeWindow()
+@@ -533,7 +540,13 @@ std::unique_ptr<content::WebContents> CreateTargetContents(
+   }
+ #endif
+ 
+-  return WebContents::Create(create_params);
++  std::unique_ptr<WebContents> target_contents =
++      WebContents::Create(create_params);
++
++  params.browser->GetFeatures().OnWebContentsCreated(params.browser,
++                                                     target_contents.get());
++
++  return target_contents;
+ }
+ 
+ }  // namespace
+@@ -974,6 +987,11 @@ base::WeakPtr<content::NavigationHandle> NavigateImpl(
+     // navigation happens in a different tab to the link click.
+     apps::SetLinkCapturingSourceDisposition(tab_to_insert->GetContents(),
+                                             params->disposition);
++
++    // With CEF the BrowserView is created before the TabModel, so we need a
++    // separate initialization of objects that depend on TabModel.
++    params->browser->GetFeatures().InitPostTabModelConstruction(
++        params->browser);
+   }
+ 
+   if (params->source_contents == contents_to_navigate_or_insert) {
+diff --git a/chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl/tab_strip_model_adapter_impl.cc b/chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl/tab_strip_model_adapter_impl.cc
+index 1ab7299..c9ae31f 100644
+--- a/chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl/tab_strip_model_adapter_impl.cc
++++ b/chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl/tab_strip_model_adapter_impl.cc
+@@ -15,6 +15,8 @@
+ #include "components/tab_groups/tab_group_visual_data.h"
+ #include "components/tabs/public/split_tab_collection.h"
+ #include "components/tabs/public/tab_collection.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/native_theme/native_theme.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -70,7 +72,11 @@ types::TabStates TabStripModelAdapterImpl::GetTabStates(
+ const ui::ColorProvider& TabStripModelAdapterImpl::GetColorProvider() const {
+   content::WebContents* active_contents =
+       tab_strip_model_->GetActiveWebContents();
+-  CHECK(active_contents);
++  if (!active_contents) {
++    return *ui::ColorProviderManager::Get().GetColorProviderFor(
++        ui::NativeTheme::GetInstanceForNativeUi()->GetColorProviderKey(
++            /*custom_theme=*/nullptr));
++  }
+   return active_contents->GetColorProvider();
+ }
+ 
+diff --git a/chrome/browser/ui/toolbar/app_menu_model.cc b/chrome/browser/ui/toolbar/app_menu_model.cc
+index faaded8..292beca 100644
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -190,6 +190,10 @@
+ #include "content/public/browser/gpu_data_manager.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#endif
++
+ using base::UserMetricsAction;
+ using content::WebContents;
+ 
+@@ -778,18 +782,20 @@ FindAndEditSubMenuModel::FindAndEditSubMenuModel(
+   AddItemWithStringIdAndVectorIcon(
+       this, IDC_FIND, IDS_FIND,
+       features::IsRoundedIconsEnabled() ? kFindInPageIcon : kSearchMenuOldIcon);
+-  AddSeparator(ui::NORMAL_SEPARATOR);
+-  AddItemWithStringIdAndVectorIcon(
+-      this, IDC_CUT, IDS_CUT,
+-      features::IsRoundedIconsEnabled() ? kContentCutIcon : kCutMenuOldIcon);
+-  AddItemWithStringIdAndVectorIcon(this, IDC_COPY, IDS_COPY,
+-                                   features::IsRoundedIconsEnabled()
+-                                       ? vector_icons::kContentCopyIcon
+-                                       : kCopyMenuOldIcon);
+-  AddItemWithStringIdAndVectorIcon(this, IDC_PASTE, IDS_PASTE,
+-                                   features::IsRoundedIconsEnabled()
+-                                       ? kContentPasteIcon
+-                                       : kPasteMenuOldIcon);
++  if (delegate->IsCommandIdVisible(AppMenuModel::kEditMenuPlaceholder)) {
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    AddItemWithStringIdAndVectorIcon(
++        this, IDC_CUT, IDS_CUT,
++        features::IsRoundedIconsEnabled() ? kContentCutIcon : kCutMenuOldIcon);
++    AddItemWithStringIdAndVectorIcon(this, IDC_COPY, IDS_COPY,
++                                     features::IsRoundedIconsEnabled()
++                                         ? vector_icons::kContentCopyIcon
++                                         : kCopyMenuOldIcon);
++    AddItemWithStringIdAndVectorIcon(this, IDC_PASTE, IDS_PASTE,
++                                     features::IsRoundedIconsEnabled()
++                                         ? kContentPasteIcon
++                                         : kPasteMenuOldIcon);
++  }
+ }
+ 
+ class SaveAndShareSubMenuModel : public ui::SimpleMenuModel {
+@@ -932,6 +938,57 @@ bool ArePromotionsEnabled() {
+   return local_state && local_state->GetBoolean(prefs::kPromotionsEnabled);
+ }
+ 
++#if BUILDFLAG(ENABLE_CEF)
++using IsVisibleCallback = base::RepeatingCallback<bool(int)>;
++
++void FilterMenuModel(ui::SimpleMenuModel* model,
++                     const IsVisibleCallback& is_visible) {
++  std::optional<size_t> last_separator;
++  size_t visible_ct = 0;
++  for (size_t i = 0; i < model->GetItemCount(); ++i) {
++    const auto type = model->GetTypeAt(i);
++    if (type == ui::MenuModel::TYPE_SEPARATOR) {
++      if (last_separator) {
++        // Remove multiple separators in a row. Prefer to remove a NORMAL
++        // separator if possible (as compared to zoom/edit controls which use
++        // UPPER/LOWER separators).
++        if (model->GetSeparatorTypeAt(*last_separator) ==
++            ui::NORMAL_SEPARATOR) {
++          model->RemoveItemAt(*last_separator);
++          i--;
++          last_separator = i;
++        } else {
++          model->RemoveItemAt(i);
++          i--;
++        }
++      } else if (visible_ct == 0) {
++        // Remove leading separator.
++        model->RemoveItemAt(i);
++        i--;
++      } else {
++        last_separator = i;
++      }
++      visible_ct = 0;
++    } else if (is_visible.Run(model->GetCommandIdAt(i))) {
++      last_separator = std::nullopt;
++      visible_ct++;
++
++      if (type == ui::MenuModel::TYPE_SUBMENU) {
++        // Filter sub-menu.
++        auto sub_model =
++            static_cast<ui::SimpleMenuModel*>(model->GetSubmenuModelAt(i));
++        FilterMenuModel(sub_model, is_visible);
++      }
++    }
++  }
++
++  if (last_separator) {
++    // Remove trailing separator.
++    model->RemoveItemAt(*last_separator);
++  }
++}
++#endif  // BUILDFLAG(ENABLE_CEF)
++
+ }  // namespace
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -2019,7 +2076,7 @@ bool AppMenuModel::IsCommandIdChecked(int command_id) const {
+   return false;
+ }
+ 
+-bool AppMenuModel::IsCommandIdEnabled(int command_id) const {
++bool AppMenuModel::IsCommandIdEnabledInternal(int command_id) const {
+   GlobalError* error =
+       GlobalErrorServiceFactory::GetForProfile(browser_->GetProfile())
+           ->GetGlobalErrorByMenuItemCommandID(command_id);
+@@ -2037,6 +2094,30 @@ bool AppMenuModel::IsCommandIdEnabled(int command_id) const {
+   }
+ }
+ 
++bool AppMenuModel::IsCommandIdEnabled(int command_id) const {
++  if (!IsCommandIdEnabledInternal(command_id)) {
++    return false;
++  }
++
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_->cef_delegate()) {
++    return browser_->cef_delegate()->IsAppMenuItemEnabled(command_id);
++  }
++#endif
++
++  return true;
++}
++
++bool AppMenuModel::IsCommandIdVisible(int command_id) const {
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_->cef_delegate()) {
++    return browser_->cef_delegate()->IsAppMenuItemVisible(command_id);
++  }
++#endif
++
++  return true;
++}
++
+ bool AppMenuModel::IsCommandIdAlerted(int command_id) const {
+   if (command_id == IDC_VIEW_PASSWORDS ||
+       command_id == IDC_SHOW_PASSWORD_MANAGER) {
+@@ -2277,8 +2358,10 @@ void AppMenuModel::Build() {
+   SetElementIdentifierAt(GetIndexOfCommandId(IDC_CLEAR_BROWSING_DATA).value(),
+                          kClearBrowsingDataMenuItem);
+ 
+-  AddSeparator(ui::NORMAL_SEPARATOR);
+-  CreateZoomMenu();
++  if (IsCommandIdVisible(AppMenuModel::kZoomMenuPlaceholder)) {
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    CreateZoomMenu();
++  }
+   AddSeparator(ui::NORMAL_SEPARATOR);
+ 
+   AddItemWithStringIdAndVectorIcon(
+@@ -2431,6 +2514,11 @@ void AppMenuModel::Build() {
+   }
+ #endif  // !BUILDFLAG(IS_CHROMEOS)
+ 
++#if BUILDFLAG(ENABLE_CEF)
++  FilterMenuModel(this, base::BindRepeating(&AppMenuModel::IsCommandIdVisible,
++                                            base::Unretained(this)));
++#endif
++
+   uma_action_recorded_ = false;
+ }
+ 
+diff --git a/chrome/browser/ui/toolbar/app_menu_model.h b/chrome/browser/ui/toolbar/app_menu_model.h
+index 7fd1446..59ee3ac 100644
+--- a/chrome/browser/ui/toolbar/app_menu_model.h
++++ b/chrome/browser/ui/toolbar/app_menu_model.h
+@@ -310,6 +310,7 @@ class AppMenuModel : public ui::SimpleMenuModel,
+   void ExecuteCommand(int command_id, int event_flags) override;
+   bool IsCommandIdChecked(int command_id) const override;
+   bool IsCommandIdEnabled(int command_id) const override;
++  bool IsCommandIdVisible(int command_id) const override;
+   bool IsCommandIdAlerted(int command_id) const override;
+   bool GetAcceleratorForCommandId(int command_id,
+                                   ui::Accelerator* accelerator) const override;
+@@ -349,6 +350,8 @@ class AppMenuModel : public ui::SimpleMenuModel,
+   void LogSafetyHubInteractionMetrics(safety_hub::SafetyHubModuleType sh_module,
+                                       int event_flags);
+ 
++  bool IsCommandIdEnabledInternal(int command_id) const;
++
+  private:
+   // Adds actionable global error menu items to the menu.
+   // Examples: Extension permissions and sign in errors.
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index 8eee77f..db8608f 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -419,6 +419,10 @@
+ #undef LoadAccelerators
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_util.h"
++#endif
++
+ using base::UserMetricsAction;
+ using content::WebContents;
+ using input::NativeWebKeyboardEvent;
+@@ -891,11 +895,21 @@ class BrowserView::PipExclusionObserverImpl
+ ///////////////////////////////////////////////////////////////////////////////
+ // BrowserView, public:
+ 
++BrowserView::BrowserView() : BrowserView(nullptr) {}
++
+ BrowserView::BrowserView(BrowserWindowInterface* browser)
+     : views::ClientView(nullptr, nullptr),
+       exclusive_access_context_(
+-          std::make_unique<ExclusiveAccessContextImpl>(*this)),
+-      browser_(browser) {
++          std::make_unique<ExclusiveAccessContextImpl>(*this)) {
++  if (browser) {
++    InitBrowser(browser);
++  }
++}
++
++void BrowserView::InitBrowser(BrowserWindowInterface* browser) {
++  DCHECK(!browser_);
++  browser_ = browser;
++
+   if (auto* manager = InitialWebUIWindowMetricsManager::From(browser_.get())) {
+     manager->OnBrowserWindowCreated();
+   }
+@@ -922,7 +936,8 @@ BrowserView::BrowserView(BrowserWindowInterface* browser)
+     SetCanMinimize(false);
+     SetCanMaximize(false);
+     SetCanFullscreen(false);
+-    SetCanResize(true);
++    SetCanResize(
++        BrowserInitState::From(&*browser_)->create_params().can_resize);
+   } else {
+     SetCanResize(
+         BrowserInitState::From(&*browser_)->create_params().can_resize);
+@@ -946,8 +961,16 @@ BrowserView::BrowserView(BrowserWindowInterface* browser)
+   top_container_ = AddChildView(std::make_unique<TopContainerView>(this));
+   top_container_insertion_index_ = GetIndexOf(top_container_.get());
+ 
+-  toolbar_ = top_container_->AddChildView(
+-      std::make_unique<ToolbarView>(browser_.get(), this));
++  toolbar_ = OverrideCreateToolbar();
++  if (!toolbar_) {
++    toolbar_ = new ToolbarView(browser_.get(), this, std::nullopt);
++  } else {
++    cef::BrowserForBWI(browser_.get())->set_toolbar_overridden(true);
++    // Update state that depends on the above flag.
++    chrome::BrowserCommandController::From(browser_.get())
++        ->FullscreenStateChanged();
++  }
++  top_container_->AddChildView(base::WrapUnique(toolbar_.get()));
+ 
+   top_container_separator_ = top_container_->AddChildView(
+       ContentsSeparator::CreateContentsSeparator());
+@@ -1109,6 +1132,10 @@ BrowserView::BrowserView(BrowserWindowInterface* browser)
+ }
+ 
+ BrowserView::~BrowserView() {
++  // If the Toolbar is not overloaded it will be destroyed via
++  // RemoveAllChildViews().
++  WillDestroyToolbar();
++
+   // Remove the layout manager to avoid dangling. This needs to be earlier than
+   // other cleanups that destroy views referenced in the layout manager.
+   SetLayoutManager(nullptr);
+@@ -1123,7 +1150,9 @@ BrowserView::~BrowserView() {
+ 
+   // All the tabs should have been destroyed already. If we were closed by the
+   // OS with some tabs than the BrowserNativeWidget should have destroyed them.
+-  DCHECK_EQ(0, browser_->GetTabStripModel()->count());
++  if (browser_) {
++    DCHECK_EQ(0, browser_->GetTabStripModel()->count());
++  }
+ 
+   // Stop the animation timer explicitly here to avoid running it in a nested
+   // message loop, which may run by Browser destructor.
+@@ -1222,7 +1251,7 @@ void BrowserView::SetDisableRevealerDelayForTesting(bool disable) {
+   g_disable_revealer_delay_for_testing = disable;
+ }
+ 
+-gfx::Rect BrowserView::GetFindBarBoundingBox() const {
++gfx::Rect BrowserView::GetFindBarBoundingBoxImpl() const {
+   gfx::Rect contents_bounds = multi_contents_view_->ConvertRectToWidget(
+       multi_contents_view_->GetLocalBounds());
+ 
+@@ -1244,6 +1273,16 @@ gfx::Rect BrowserView::GetFindBarBoundingBox() const {
+   return multi_contents_view_->GetMirroredRect(contents_bounds);
+ }
+ 
++gfx::Rect BrowserView::GetFindBarBoundingBox() const {
++  auto bounds = GetFindBarBoundingBoxImpl();
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser() && browser()->cef_delegate()) {
++    browser()->cef_delegate()->UpdateFindBarBoundingBox(&bounds);
++  }
++#endif
++  return bounds;
++}
++
+ ClientFrameElementInfo BrowserView::GetFrameElementInfo() const {
+   // We want to return tabstrip_->height(), but we might be called in the midst
+   // of layout, when that hasn't yet been updated to reflect the current state.
+@@ -1968,6 +2007,27 @@ gfx::Point BrowserView::GetThemeOffsetFromBrowserView() const {
+       ThemeProperties::kFrameHeightAboveTabs - browser_view_origin.y());
+ }
+ 
++void BrowserView::WillDestroyToolbar() {
++  // Reset autofill bubble handler to make sure it does not out-live toolbar,
++  // since it is responsible for showing autofill related bubbles from toolbar's
++  // child views and it is an observer for avatar toolbar button if any.
++  autofill_bubble_handler_.reset();
++
++  if (GetBrowserViewLayout()) {
++    GetBrowserViewLayout()->reset_toolbar();
++  }
++
++  if (toolbar_ && toolbar_->parent()) {
++    // Remove now instead of waiting for RemoveAllChildViews(), as there is
++    // otherwise no guarantee that the Toolbar will be removed before the
++    // BrowserView is removed (and destroyed).
++    toolbar_->parent()->RemoveChildView(toolbar_);
++    toolbar_.ClearAndDelete();
++  } else {
++    toolbar_ = nullptr;
++  }
++}
++
+ bool BrowserView::IsLoadingAnimationRunning() const {
+   return !loading_animation_start_.is_null();
+ }
+@@ -3176,6 +3236,9 @@ ShowTranslateBubbleResult BrowserView::ShowTranslateBubble(
+ 
+ DownloadBubbleUIController* BrowserView::GetDownloadBubbleUIController() {
+ #if !BUILDFLAG(IS_CHROMEOS)
++  if (!browser_) {
++    return nullptr;
++  }
+   if (auto* download_controller =
+           DownloadToolbarUIController::From(browser_.get())) {
+     return download_controller->bubble_controller();
+@@ -4097,7 +4160,10 @@ bool BrowserView::GetSavedWindowPlacement(
+ }
+ 
+ views::View* BrowserView::GetContentsView() {
+-  return multi_contents_view_->GetActiveContentsView();
++  if (multi_contents_view_) {
++    return multi_contents_view_->GetActiveContentsView();
++  }
++  return nullptr;
+ }
+ 
+ views::ClientView* BrowserView::CreateClientView(views::Widget* widget) {
+@@ -4274,9 +4340,22 @@ void BrowserView::DeleteBrowserWindow() {
+   // before the frame is destroyed to mitigate UAF risk.
+   browser_widget_->SaveWindowPlacementIfNeeded();
+ 
+-  browser_widget_.reset();
+-  // BrowserWidget owns BrowserView in its views::View hierarchy and `this` will
+-  // not be valid after this returns.
++  const bool views_hosted =
++#if BUILDFLAG(ENABLE_CEF)
++      browser() && browser()->cef_delegate() &&
++      browser()->cef_delegate()->IsViewsHosted();
++#else
++      false;
++#endif
++
++  if (views_hosted) {
++    // The BrowserWidget is owned by CefWindowWidgetDelegate.
++    browser_widget_.release();
++  } else {
++    browser_widget_.reset();
++    // BrowserWidget owns BrowserView in its views::View hierarchy and `this`
++    // will not be valid after this returns.
++  }
+ }
+ 
+ void BrowserView::SetForceShowBookmarkBarFlag(
+@@ -4534,12 +4613,39 @@ void BrowserView::GetAccessiblePanes(std::vector<views::View*>* panes) {
+ bool BrowserView::ShouldDescendIntoChildForEventHandling(
+     gfx::NativeView child,
+     const gfx::Point& location) {
++#if BUILDFLAG(ENABLE_CEF)
++  const bool frameless_pip =
++      GetIsPictureInPictureType() &&
++      !WindowFeatureController::From(browser_.get())
++           ->SupportsWindowFeature(
++               WindowFeatureController::WindowFeature::kFeatureTitleBar);
++  if (frameless_pip) {
++    int result = GetFrameView()->NonClientHitTest(location);
++    if (result == HTTOP || result == HTTOPLEFT || result == HTTOPRIGHT) {
++      // Allow resize from the top of a frameless window.
++      return false;
++    }
++  }
++#endif
++
++  std::optional<SkRegion> draggable_region;
++
+   // Window for PWAs with window-controls-overlay display override should claim
+   // mouse events that fall within the draggable region.
+   web_app::AppBrowserController* controller =
+       web_app::AppBrowserController::From(browser());
+-  if (AreDraggableRegionsEnabled() && controller &&
+-      controller->draggable_region().has_value()) {
++  if (AreDraggableRegionsEnabled() && controller) {
++    draggable_region = controller->draggable_region();
++  }
++
++#if BUILDFLAG(ENABLE_CEF)
++  // Match logic in PictureInPictureBrowserFrameView::NonClientHitTest.
++  if (!draggable_region.has_value() && frameless_pip) {
++    draggable_region = browser_->cef_delegate()->GetDraggableRegion();
++  }
++#endif
++
++  if (draggable_region.has_value()) {
+     gfx::Point point_in_browser_view_coords(location);
+     views::View::ConvertPointToTarget(GetWidget()->GetRootView(), this,
+                                       &point_in_browser_view_coords);
+@@ -4552,9 +4658,8 @@ bool BrowserView::ShouldDescendIntoChildForEventHandling(
+ 
+     // Draggable regions should be ignored for clicks into any browser view's
+     // owned widgets, for example alerts, permission prompts or find bar.
+-    return !controller->draggable_region()->contains(
+-               point_in_contents_web_view_coords.x(),
+-               point_in_contents_web_view_coords.y()) ||
++    return !draggable_region->contains(point_in_contents_web_view_coords.x(),
++                                       point_in_contents_web_view_coords.y()) ||
+            WidgetOwnedByAnchorContainsPoint(point_in_browser_view_coords);
+   }
+ 
+@@ -4890,7 +4995,9 @@ void BrowserView::Layout(PassKey) {
+   LayoutSuperclass<views::View>(this);
+ 
+   // TODO(jamescook): Why was this in the middle of layout code?
+-  toolbar_->location_bar()->UpdateFocusBehavior(IsToolbarVisible());
++  toolbar_->location_bar()->UpdateFocusBehavior(
++      IsToolbarVisible() ||
++      cef::BrowserForBWI(browser_.get())->toolbar_overridden());
+   GetFrameView()->UpdateMinimumSize();
+ 
+   if (omnibox::IsWebUIOmniboxInBrowserViewEnabled()) {
+@@ -5178,6 +5285,16 @@ void BrowserView::AddedToWidget() {
+   fallback_popup_anchor_ = std::make_unique<views::ViewSubregionAnchor>(
+       kFallbackPopupAnchorElementId, *this);
+ 
++  if (browser_->GetWindow()) {
++    // Initialize the browser features that rely on the browser window now that
++    // it is initialized. This will instead be called from the Browser
++    // constructor for default Chrome UI windows.
++    // TODO(cef): Remove BrowserForBWI cast once InitPostWindowConstruction
++    // takes BrowserWindowInterface* (upstream change pending).
++    browser_->GetFeatures().InitPostWindowConstruction(
++        cef::BrowserForBWI(browser_.get()));
++  }
++
+   initialized_ = true;
+ }
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_view.h b/chrome/browser/ui/views/frame/browser_view.h
+index 77689a1..5586acb 100644
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -151,7 +151,9 @@ class BrowserView : public BrowserWindow,
+   // locate this object using just the handle.
+   static constexpr char kBrowserViewKey[] = "__BROWSER_VIEW__";
+ 
++  BrowserView();
+   explicit BrowserView(BrowserWindowInterface* browser);
++  void InitBrowser(BrowserWindowInterface* browser);
+   BrowserView(const BrowserView&) = delete;
+   BrowserView& operator=(const BrowserView&) = delete;
+   ~BrowserView() override;
+@@ -823,10 +825,16 @@ class BrowserView : public BrowserWindow,
+   bool IsLockedFullscreen() const;
+ #endif
+ 
+- protected:
++  // Called during Toolbar destruction to remove dependent objects that have
++  // dangling references.
++  virtual void WillDestroyToolbar();
++
+   // BrowserWindow:
+   void DeleteBrowserWindow() final;
+ 
++ protected:
++  virtual ToolbarView* OverrideCreateToolbar() { return nullptr; }
++
+  private:
+   // Do not friend BrowserViewLayout. Use the BrowserViewLayoutDelegate
+   // interface to keep these two classes decoupled and testable.
+@@ -1093,11 +1101,13 @@ class BrowserView : public BrowserWindow,
+   class ExclusiveAccessContextImpl;
+   std::unique_ptr<ExclusiveAccessContextImpl> exclusive_access_context_;
+ 
++  gfx::Rect GetFindBarBoundingBoxImpl() const;
++
+   // The BrowserWidget that owns this view.
+   std::unique_ptr<BrowserWidget> browser_widget_;
+ 
+   // The owning BrowserWindowInterface object. `browser_` will outlive this.
+-  const raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<BrowserWindowInterface> browser_;
+ 
+   base::CallbackListSubscription chip_visibility_subscription_;
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_widget.cc b/chrome/browser/ui/views/frame/browser_widget.cc
+index 6a22159..e103756 100644
+--- a/chrome/browser/ui/views/frame/browser_widget.cc
++++ b/chrome/browser/ui/views/frame/browser_widget.cc
+@@ -100,16 +100,29 @@ bool IsUsingLinuxSystemTheme(Profile* profile) {
+ ////////////////////////////////////////////////////////////////////////////////
+ // BrowserWidget, public:
+ 
++BrowserWidget::BrowserWidget() : BrowserWidget(nullptr) {}
++
+ BrowserWidget::BrowserWidget(BrowserView* browser_view)
+     : browser_native_widget_(nullptr),
+       root_view_(nullptr),
+       browser_frame_view_(nullptr),
+-      browser_view_(browser_view) {
++      browser_view_(nullptr) {
+   // Don't focus anything on creation, selecting a tab will set the focus.
+   set_focus_on_creation(false);
++  if (browser_view) {
++    SetBrowserView(browser_view);
++  }
+   views::WidgetStationarityMonitor::GetInstance().TrackWidget(*this);
+ }
+ 
++void BrowserWidget::SetBrowserFrameView(BrowserFrameView* browser_frame_view) {
++  browser_frame_view_ = browser_frame_view;
++}
++
++void BrowserWidget::SetBrowserView(BrowserView* browser_view) {
++  browser_view_ = browser_view;
++}
++
+ BrowserWidget::~BrowserWidget() {
+   set_widget_closed();
+ 
+@@ -128,7 +141,11 @@ BrowserWidget::~BrowserWidget() {
+   // Do this here and not in ~BrowserView() as BrowserWindowFeatures may attempt
+   // to read state on the BrowserWidget as they undergo destruction, and
+   // BrowserWidget state is destroyed at the end of this scope.
+-  browser_view_->browser()->GetFeatures().TearDownPreBrowserWindowDestruction();
++  if (browser_view_ && browser_view_->browser()) {
++    browser_view_->browser()
++        ->GetFeatures()
++        .TearDownPreBrowserWindowDestruction();
++  }
+ }
+ 
+ void BrowserWidget::InitBrowserWidget() {
+@@ -253,6 +270,8 @@ void BrowserWidget::GetWindowPlacement(
+     ui::mojom::WindowShowState* show_state) const {
+   if (browser_native_widget_) {
+     browser_native_widget_->GetWindowPlacement(bounds, show_state);
++  } else {
++    *show_state = ui::mojom::WindowShowState::kDefault;
+   }
+ }
+ 
+@@ -385,6 +404,9 @@ ui::ColorProviderKey::ThemeInitializerSupplier* BrowserWidget::GetCustomTheme()
+ }
+ 
+ void BrowserWidget::OnNativeWidgetWorkspaceChanged() {
++  if (!browser_view_) {
++    return;
++  }
+   chrome::SaveWindowWorkspace(browser_view_->browser(), GetWorkspace());
+   chrome::SaveWindowVisibleOnAllWorkspaces(browser_view_->browser(),
+                                            IsVisibleOnAllWorkspaces());
+@@ -553,6 +575,13 @@ void BrowserWidget::SelectNativeTheme() {
+     return;
+   }
+ 
++  // Always use the NativeTheme for forced color modes.
++  if (ui::NativeTheme::IsForcedDarkMode() ||
++      ui::NativeTheme::IsForcedLightMode()) {
++    SetNativeTheme(native_theme);
++    return;
++  }
++
+   // Ignore the system theme for web apps with window-controls-overlay as the
+   // display_override so the web contents can blend with the overlay by using
+   // the developer-provided theme color for a better experience. Context:
+@@ -567,17 +596,23 @@ void BrowserWidget::SelectNativeTheme() {
+ }
+ 
+ void BrowserWidget::OnTouchUiChanged() {
+-  client_view()->InvalidateLayout();
+-
+-  // For standard browser frame, if we do not invalidate the FrameView
+-  // the client window bounds will not be properly updated which could cause
+-  // visual artifacts. See crbug.com/40112464 for details.
+-  if (non_client_view()->frame_view()) {
+-    // Note that invalidating a view invalidates all of its ancestors, so it is
+-    // not necessary to also invalidate the NonClientView or RootView here.
+-    non_client_view()->frame_view()->InvalidateLayout();
+-  } else {
+-    non_client_view()->InvalidateLayout();
++  // client_view() is null when there is no NonClientView (e.g. CEF Chrome-style
++  // browsers with a native parent use TYPE_CONTROL). See CEF issue #3941.
++  if (client_view()) {
++    client_view()->InvalidateLayout();
++  }
++
++  if (non_client_view()) {
++    // For standard browser frame, if we do not invalidate the FrameView
++    // the client window bounds will not be properly updated which could cause
++    // visual artifacts. See crbug.com/40112464 for details.
++    if (non_client_view()->frame_view()) {
++      // Note that invalidating a view invalidates all of its ancestors, so it
++      // is not necessary to also invalidate the NonClientView or RootView here.
++      non_client_view()->frame_view()->InvalidateLayout();
++    } else {
++      non_client_view()->InvalidateLayout();
++    }
+   }
+   GetRootView()->InvalidateLayout();
+ }
+@@ -616,6 +651,9 @@ bool BrowserWidget::RegenerateFrameOnThemeChange(
+ }
+ 
+ bool BrowserWidget::IsIncognitoBrowser() const {
++  if (!browser_view_) {
++    return true;
++  }
+   return browser_view_->browser()->GetProfile()->IsIncognitoProfile();
+ }
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_widget.h b/chrome/browser/ui/views/frame/browser_widget.h
+index f2adb10..f292bb4 100644
+--- a/chrome/browser/ui/views/frame/browser_widget.h
++++ b/chrome/browser/ui/views/frame/browser_widget.h
+@@ -58,6 +58,7 @@ enum class TabDragKind {
+ class BrowserWidget : public views::Widget,
+                       public views::ContextMenuController {
+  public:
++  BrowserWidget();
+   explicit BrowserWidget(BrowserView* browser_view);
+ 
+   BrowserWidget(const BrowserWidget&) = delete;
+@@ -98,7 +99,7 @@ class BrowserWidget : public views::Widget,
+ 
+   // ThemeService calls this when a user has changed their theme, indicating
+   // that it's time to redraw everything.
+-  void UserChangedTheme(BrowserThemeChangeType theme_change_type);
++  virtual void UserChangedTheme(BrowserThemeChangeType theme_change_type);
+ 
+   // views::Widget:
+   views::internal::RootView* CreateRootView() override;
+@@ -132,11 +133,21 @@ class BrowserWidget : public views::Widget,
+   virtual void SetTabDragKind(TabDragKind tab_drag_kind);
+   TabDragKind tab_drag_kind() const { return tab_drag_kind_; }
+ 
++  BrowserView* browser_view() const { return browser_view_.get(); }
++
+  protected:
++  void SetBrowserFrameView(BrowserFrameView* browser_frame_view);
++  void SetBrowserView(BrowserView* browser_view);
++
+   // views::Widget:
+   void OnNativeThemeUpdated(ui::NativeTheme* observed_theme) override;
+   ui::ColorProviderKey GetColorProviderKey() const override;
+ 
++  // Select a native theme that is appropriate for the current context. This is
++  // currently only needed for Linux to switch between the regular NativeTheme
++  // and the GTK NativeTheme instance.
++  void SelectNativeTheme();
++
+  private:
+   friend class BraveBrowserWidget;
+   const ui::ThemeProvider* GetBaseThemeProvider() const;
+@@ -147,11 +158,6 @@ class BrowserWidget : public views::Widget,
+   // Callback for MenuRunner.
+   void OnMenuClosed();
+ 
+-  // Select a native theme that is appropriate for the current context. This is
+-  // currently only needed for Linux to switch between the regular NativeTheme
+-  // and the GTK NativeTheme instance.
+-  void SelectNativeTheme();
+-
+   // Regenerate the frame on theme change if necessary. Returns true if
+   // regenerated.
+   bool RegenerateFrameOnThemeChange(BrowserThemeChangeType theme_change_type);
+diff --git a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+index 4c9d195..1c12801 100644
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -203,8 +203,7 @@ HorizontalTabStripRegionViewOld::HorizontalTabStripRegionViewOld(
+ 
+   // Add and configure the TabStripComboButton.
+   std::unique_ptr<TabStripActionContainer> tab_strip_action_container;
+-  if (browser &&
+-      (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL)) {
++  if (browser && browser->IsNormalBrowser()) {
+     // The Glic button visibility is dynamic and depends on profile state
+     // (e.g., sign-in status, enterprise policies, recoverable errors).
+     // We instantiate the action container if the profile is eligible (even if
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout.cc b/chrome/browser/ui/views/frame/layout/browser_view_layout.cc
+index 778997a..9f7f996 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout.cc
+@@ -24,6 +24,10 @@
+ #include "ui/views/widget/widget.h"
+ #include "ui/views/widget/widget_observer.h"
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/views/chrome_views_util.h"
++#endif
++
+ using web_modal::ModalDialogHostObserver;
+ using web_modal::WebContentsModalDialogHost;
+ 
+@@ -66,6 +70,8 @@ class BrowserViewLayout::BrowserModalDialogHostViews
+     observer_list_.Notify(&ModalDialogHostObserver::OnHostDestroying);
+   }
+ 
++  bool HasObservers() const { return !observer_list_.empty(); }
++
+   void NotifyPositionRequiresUpdate() override {
+     observer_list_.Notify(&ModalDialogHostObserver::OnPositionRequiresUpdate);
+   }
+@@ -221,18 +227,21 @@ void BrowserViewLayout::UpdateBubbles() {
+     exclusive_access_bubble->RepositionIfVisible();
+   }
+ 
+-  // Adjust any hosted dialogs if the browser's dialog hosting bounds changed.
+-  const gfx::Rect dialog_bounds(dialog_host_->GetDialogPosition(gfx::Size()),
+-                                dialog_host_->GetMaximumDialogSize());
+-  const gfx::Rect host_widget_bounds =
+-      dialog_host_->GetHostWidget()
+-          ? dialog_host_->GetHostWidget()->GetClientAreaBoundsInScreen()
+-          : gfx::Rect();
+-  const gfx::Rect dialog_bounds_in_screen =
+-      dialog_bounds + host_widget_bounds.OffsetFromOrigin();
+-  if (latest_dialog_bounds_in_screen_ != dialog_bounds_in_screen) {
+-    latest_dialog_bounds_in_screen_ = dialog_bounds_in_screen;
+-    dialog_host_->NotifyPositionRequiresUpdate();
++  // Avoid unnecessary calls to UpdateDialogTopInsetInBrowserView().
++  if (dialog_host_->HasObservers()) {
++    // Adjust any hosted dialogs if the browser's dialog hosting bounds changed.
++    const gfx::Rect dialog_bounds(dialog_host_->GetDialogPosition(gfx::Size()),
++                                  dialog_host_->GetMaximumDialogSize());
++    const gfx::Rect host_widget_bounds =
++        dialog_host_->GetHostWidget()
++            ? dialog_host_->GetHostWidget()->GetClientAreaBoundsInScreen()
++            : gfx::Rect();
++    const gfx::Rect dialog_bounds_in_screen =
++        dialog_bounds + host_widget_bounds.OffsetFromOrigin();
++    if (latest_dialog_bounds_in_screen_ != dialog_bounds_in_screen) {
++      latest_dialog_bounds_in_screen_ = dialog_bounds_in_screen;
++      dialog_host_->NotifyPositionRequiresUpdate();
++    }
+   }
+ }
+ 
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout.h b/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+index c84c47a..a2bb1d2 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+@@ -136,6 +136,8 @@ class BrowserViewLayout : public views::LayoutManager {
+     return views_.side_panel_animation_content;
+   }
+ 
++  void reset_toolbar() { views_.toolbar = nullptr; }
++
+   // views::LayoutManager overrides:
+   gfx::Size GetPreferredSize(
+       const views::View* host,
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
+index ac03bc0..b695949 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
+@@ -46,6 +46,7 @@ class BrowserViewLayoutDelegate {
+       bool use_browser_bounds) const = 0;
+   virtual WindowState GetBrowserWindowState() const = 0;
+   virtual views::LayoutAlignment GetWindowTitleAlignment() const = 0;
++  virtual void UpdateDialogTopInsetInBrowserView(int* dialog_top_y) const = 0;
+   virtual bool IsToolbarVisible() const = 0;
+   virtual bool IsBookmarkBarVisible() const = 0;
+   virtual bool IsInfobarVisible() const = 0;
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+index 162cb04..fdf3895 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -35,19 +35,23 @@
+ #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#endif
++
+ BrowserViewLayoutDelegateImpl::BrowserViewLayoutDelegateImpl(
+     BrowserView& browser_view)
+     : browser_view_(browser_view) {
+-    PrefService* prefs = browser_view_->GetProfile()->GetPrefs();
+-    tab_search_pinned_to_tab_strip_ =
+-        prefs->GetBoolean(prefs::kTabSearchPinnedToTabstrip);
+-
+-    pref_registrar_.Init(prefs);
+-    pref_registrar_.Add(
+-        prefs::kTabSearchPinnedToTabstrip,
+-        base::BindRepeating(
+-            &BrowserViewLayoutDelegateImpl::OnTabSearchPinnedStateChanged,
+-            base::Unretained(this)));
++  PrefService* prefs = browser_view_->GetProfile()->GetPrefs();
++  tab_search_pinned_to_tab_strip_ =
++      prefs->GetBoolean(prefs::kTabSearchPinnedToTabstrip);
++
++  pref_registrar_.Init(prefs);
++  pref_registrar_.Add(
++      prefs::kTabSearchPinnedToTabstrip,
++      base::BindRepeating(
++          &BrowserViewLayoutDelegateImpl::OnTabSearchPinnedStateChanged,
++          base::Unretained(this)));
+ }
+ BrowserViewLayoutDelegateImpl::~BrowserViewLayoutDelegateImpl() = default;
+ 
+@@ -144,6 +148,15 @@ views::LayoutAlignment BrowserViewLayoutDelegateImpl::GetWindowTitleAlignment()
+   return GetFrameView()->GetWindowTitleAlignment();
+ }
+ 
++void BrowserViewLayoutDelegateImpl::UpdateDialogTopInsetInBrowserView(
++    int* dialog_top_y) const {
++#if BUILDFLAG(ENABLE_CEF)
++  if (auto cef_delegate = browser_view_->browser()->cef_delegate()) {
++    cef_delegate->UpdateDialogTopInset(dialog_top_y);
++  }
++#endif
++}
++
+ bool BrowserViewLayoutDelegateImpl::IsToolbarVisible() const {
+   return browser_view_->IsToolbarVisible();
+ }
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
+index df5a04f..b726f84 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
+@@ -30,6 +30,7 @@ class BrowserViewLayoutDelegateImpl : public BrowserViewLayoutDelegate {
+       bool use_browser_bounds) const override;
+   WindowState GetBrowserWindowState() const override;
+   views::LayoutAlignment GetWindowTitleAlignment() const override;
++  void UpdateDialogTopInsetInBrowserView(int* dialog_top_y) const override;
+   bool IsToolbarVisible() const override;
+   bool IsBookmarkBarVisible() const override;
+   bool IsInfobarVisible() const override;
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc b/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
+index 32dc273..b0a5644 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
+@@ -221,7 +221,16 @@ void BrowserViewLayoutImpl::Layout(views::View* host) {
+ 
+   auto params = delegate().GetBrowserLayoutParams(/*use_browser_bounds=*/true);
+   if (params.IsEmpty()) {
+-    return;
++    // Layout params are empty during early initialization (before the frame
++    // view has been laid out). Fall back to using the host's local bounds
++    // as the visual client area to allow layout to proceed with valid bounds.
++    // This prevents View::Layout's for-loop from triggering child layouts
++    // with 0x0 bounds.
++    params.visual_client_area = host->GetLocalBounds();
++    if (params.IsEmpty()) {
++      // Host also has no bounds yet, can't perform layout.
++      return;
++    }
+   }
+ 
+   DoPreLayoutComputations(params);
+@@ -353,11 +362,13 @@ void BrowserViewLayoutImpl::OnGlassModeChanged() {}
+ int BrowserViewLayoutImpl::GetDialogTop(const ProposedLayout& layout) const {
+   const int kConstrainedWindowOverlap = 3;
+   const auto* const browser_view = views().browser_view.get();
++  int dialog_top_y = kConstrainedWindowOverlap;
+   if (const auto toolbar_rect =
+           layout.GetBoundsFor(views().toolbar, browser_view)) {
+-    return toolbar_rect->bottom() - kConstrainedWindowOverlap;
++    dialog_top_y = toolbar_rect->bottom() - kConstrainedWindowOverlap;
+   }
+-  return kConstrainedWindowOverlap;
++  delegate().UpdateDialogTopInsetInBrowserView(&dialog_top_y);
++  return dialog_top_y;
+ }
+ 
+ int BrowserViewLayoutImpl::GetDialogBottom(const ProposedLayout& layout) const {
+diff --git a/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc b/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc
+index 59bdfa1..69a4e32 100644
+--- a/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc
++++ b/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/views/picture_in_picture/picture_in_picture_bounds_change_animation.h"
+ #include "chrome/browser/ui/views/picture_in_picture/picture_in_picture_tucker.h"
+ #include "chrome/browser/ui/views/picture_in_picture/pip_top_bar_animation_controller.h"
++#include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/omnibox/browser/location_bar_model_impl.h"
+ #include "components/vector_icons/vector_icons.h"
+@@ -75,6 +76,11 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ #include "extensions/common/constants.h"
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++
++#if BUILDFLAG(ENABLE_CEF)
++#include "ui/views/controls/webview/webview.h"
++#endif
++
+ namespace {
+ 
+ constexpr int kWindowIconImageSize = 16;
+@@ -346,6 +352,12 @@ PictureInPictureBrowserFrameView::PictureInPictureBrowserFrameView(
+       IsOverlayViewVisible()) {
+     PictureInPictureWindowManager::GetInstance()->ClearCachedBounds();
+   }
++
++  if (!WindowFeatureController::From(browser_view->browser())
++           ->SupportsWindowFeature(
++               WindowFeatureController::WindowFeature::kFeatureTitleBar)) {
++    top_bar_container_view_->SetVisible(false);
++  }
+ }
+ 
+ PictureInPictureBrowserFrameView::~PictureInPictureBrowserFrameView() {
+@@ -452,18 +464,42 @@ gfx::Rect PictureInPictureBrowserFrameView::GetWindowBoundsForClientBounds(
+ 
+ int PictureInPictureBrowserFrameView::NonClientHitTest(
+     const gfx::Point& point) {
+-  // Allow interacting with the buttons.
+-  if (GetLocationIconViewBounds().Contains(point) ||
+-      GetBackToTabControlsBounds().Contains(point) ||
+-      GetCloseControlsBounds().Contains(point)) {
+-    return HTCLIENT;
++  const bool frameless = !top_bar_container_view_->GetVisible();
++  if (!frameless) {
++    // Allow interacting with the buttons.
++    if (GetLocationIconViewBounds().Contains(point) ||
++        GetBackToTabControlsBounds().Contains(point) ||
++        GetCloseControlsBounds().Contains(point)) {
++      return HTCLIENT;
++    }
++
++    for (size_t i = 0; i < content_setting_views_.size(); i++) {
++      if (GetContentSettingViewBounds(i).Contains(point)) {
++        return HTCLIENT;
++      }
++    }
+   }
+ 
+-  for (size_t i = 0; i < content_setting_views_.size(); i++) {
+-    if (GetContentSettingViewBounds(i).Contains(point)) {
+-      return HTCLIENT;
++#if BUILDFLAG(ENABLE_CEF)
++  if (frameless) {
++    // Match logic in BrowserView::ShouldDescendIntoChildForEventHandling.
++    const auto draggable_region =
++        GetBrowserView()->browser()->cef_delegate()->GetDraggableRegion();
++    if (draggable_region.has_value()) {
++      // Draggable regions are defined relative to the web contents.
++      gfx::Point point_in_contents_web_view_coords(point);
++      views::View::ConvertPointToTarget(
++          GetWidget()->GetRootView(),
++          GetBrowserView()->GetActiveContentsWebView(),
++          &point_in_contents_web_view_coords);
++
++      if (draggable_region->contains(point_in_contents_web_view_coords.x(),
++                                     point_in_contents_web_view_coords.y())) {
++        return HTCAPTION;
++      }
+     }
+   }
++#endif  // BUILDFLAG(ENABLE_CEF)
+ 
+   // Allow dragging and resizing the window.
+   int window_component = GetHTComponentForFrame(
+@@ -528,7 +564,8 @@ void PictureInPictureBrowserFrameView::Layout(PassKey) {
+   gfx::Rect content_area = GetLocalBounds();
+   content_area.Inset(FrameBorderInsets());
+   gfx::Rect top_bar = content_area;
+-  top_bar.set_height(kTopControlsHeight);
++  top_bar.set_height(top_bar_container_view_->GetVisible() ? kTopControlsHeight
++                                                           : 0);
+   top_bar_container_view_->SetBoundsRect(top_bar);
+ #if !BUILDFLAG(IS_ANDROID)
+   if (auto_pip_setting_overlay_) {
+@@ -1004,7 +1041,8 @@ gfx::Insets PictureInPictureBrowserFrameView::FrameBorderInsets() const {
+ }
+ 
+ int PictureInPictureBrowserFrameView::GetTopAreaHeight() const {
+-  return FrameBorderInsets().top() + kTopControlsHeight;
++  return FrameBorderInsets().top() +
++         (top_bar_container_view_->GetVisible() ? kTopControlsHeight : 0);
+ }
+ 
+ gfx::Size PictureInPictureBrowserFrameView::GetNonClientViewAreaSize() const {
+diff --git a/chrome/browser/ui/views/location_bar/location_bar_view.cc b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+index 2b6f75e..c5c5361 100644
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -171,6 +171,10 @@
+ #include "chrome/browser/web_applications/web_app_tab_helper.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_util.h"
++#endif
++
+ namespace {
+ 
+ int IncrementalMinimumWidth(const views::View* view) {
+@@ -197,6 +201,14 @@ bool CanHostWebUIOmnibox(BrowserWindowInterface* browser, bool is_popup_mode) {
+   if (!browser) {
+     return true;
+   }
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser->cef_delegate() && browser->cef_delegate()->IsViewsHosted() &&
++      !cef::BrowserForBWI(browser)->toolbar_overridden()) {
++    // CEF initializes a fallback toolbar even when none is configured.
++    // Only create WebUI popups for a configured Chrome toolbar.
++    return false;
++  }
++#endif
+   return !web_app::AppBrowserController::IsWebApp(browser) &&
+          browser->GetType() != BrowserWindowInterface::Type::TYPE_DEVTOOLS;
+ }
+@@ -396,7 +408,7 @@ void LocationBarView::Init() {
+     }
+   }
+ 
+-  // Default to the legacy popup view for web apps, devtools, and popup windows.
++  // Default to the legacy popup view when WebUI popups are not supported.
+   // When the legacy `OmniboxPopupViewViews` is deprecated we will need to
+   // ensure that a null `omnibox_popup_view_` doesn't cause any issues (or aim
+   // for a cleaner solution).
+@@ -479,6 +491,18 @@ void LocationBarView::Init() {
+     page_action_items = page_actions::GetActivePageActionItems(*browser_);
+   }
+ 
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_ && browser_->cef_delegate()) {
++    const auto& properties_provider =
++        page_actions::PageActionPropertiesProvider();
++    std::erase_if(page_action_items, [&](actions::ActionItem* item) {
++      const auto& props =
++          properties_provider.GetProperties(item->GetActionId().value());
++      return !browser_->cef_delegate()->IsPageActionIconVisible(props.type);
++    });
++  }
++#endif
++
+   static constexpr int kBetweenIconSpacing = 8;
+   const page_actions::PageActionViewParams page_action_params{
+       .icon_size =
+diff --git a/chrome/browser/ui/views/omnibox/omnibox_popup_closer.cc b/chrome/browser/ui/views/omnibox/omnibox_popup_closer.cc
+index f3468b8..44c5970 100644
+--- a/chrome/browser/ui/views/omnibox/omnibox_popup_closer.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_popup_closer.cc
+@@ -59,7 +59,8 @@ OmniboxPopupCloser::~OmniboxPopupCloser() = default;
+ 
+ void OmniboxPopupCloser::OnMouseEvent(ui::MouseEvent* event) {
+   // Close the omnibox popup if the click is outside the omnibox view.
+-  if (!browser_view_->browser()->IsDeleteScheduled()) {
++  if (browser_view_->browser() &&
++      !browser_view_->browser()->IsDeleteScheduled()) {
+     LocationBar* location_bar = browser_view_->GetLocationBar();
+     CHECK(location_bar);
+     if (location_bar->ShouldCloseOmniboxPopup(event)) {
+diff --git a/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.cc b/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.cc
+index 2a5168e..dfc75cf 100644
+--- a/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.cc
++++ b/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.cc
+@@ -158,6 +158,9 @@ void RenderViewContextMenuViews::RunMenuAt(views::Widget* parent,
+ bool RenderViewContextMenuViews::GetAcceleratorForCommandId(
+     int command_id,
+     ui::Accelerator* accel) const {
++  if (RenderViewContextMenu::GetAcceleratorForCommandId(command_id, accel))
++    return true;
++
+   // There are no formally defined accelerators we can query so we assume
+   // that Ctrl+C, Ctrl+V, Ctrl+X, Ctrl-A, etc do what they normally do.
+   switch (command_id) {
+@@ -403,6 +406,10 @@ void RenderViewContextMenuViews::AppendPlatformEditableItems() {
+ }
+ 
+ void RenderViewContextMenuViews::Show() {
++  if (UseShowHandler()) {
++    return;
++  }
++
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kKioskMode)) {
+     return;
+   }
+@@ -449,6 +456,11 @@ void RenderViewContextMenuViews::Show() {
+   }
+ }
+ 
++bool RenderViewContextMenuViews::IsRunning() {
++  return static_cast<ToolkitDelegateViews*>(toolkit_delegate())
++             ->IsMenuRunning();
++}
++
+ views::Widget* RenderViewContextMenuViews::GetTopLevelWidget() {
+   return views::Widget::GetTopLevelWidgetForNativeView(GetActiveNativeView());
+ }
+diff --git a/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.h b/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.h
+index 8a9a765..09779da 100644
+--- a/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.h
++++ b/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.h
+@@ -49,6 +49,7 @@ class RenderViewContextMenuViews : public RenderViewContextMenu {
+ 
+   // RenderViewContextMenuBase implementation.
+   void Show() override;
++  bool IsRunning() override;
+ 
+  protected:
+   RenderViewContextMenuViews(content::RenderFrameHost& render_frame_host,
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
+index fdefbf5..aef9b5c 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
+@@ -101,6 +101,10 @@ void ChromeWebContentsViewDelegateViews::ShowMenu(
+   context_menu_->Show();
+ }
+ 
++bool ChromeWebContentsViewDelegateViews::IsMenuRunning() {
++  return context_menu_ && context_menu_->IsRunning();
++}
++
+ void ChromeWebContentsViewDelegateViews::ShowContextMenu(
+     content::RenderFrameHost& render_frame_host,
+     const content::ContextMenuParams& params) {
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.h b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.h
+index 11b494e..091e23b 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.h
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.h
+@@ -70,6 +70,7 @@ class ChromeWebContentsViewDelegateViews
+       base::OnceCallback<void(std::unique_ptr<RenderViewContextMenuBase>)>
+           callback) override;
+   void ShowMenu(std::unique_ptr<RenderViewContextMenuBase> menu) override;
++  bool IsMenuRunning() override;
+ 
+  private:
+   void OnReadAvailableTypes(
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.h b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.h
+index e5c0a40..5367e9c 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.h
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.h
+@@ -69,6 +69,7 @@ class ChromeWebContentsViewDelegateViewsMac
+       base::OnceCallback<void(std::unique_ptr<RenderViewContextMenuBase>)>
+           callback) override;
+   void ShowMenu(std::unique_ptr<RenderViewContextMenuBase> menu) override;
++  bool IsMenuRunning() override;
+ 
+  private:
+   void OnReadAvailableTypes(
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
+index 564c8c0..fce6219 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
+@@ -213,6 +213,10 @@ void ChromeWebContentsViewDelegateViewsMac::ShowMenu(
+   context_menu_->Show();
+ }
+ 
++bool ChromeWebContentsViewDelegateViewsMac::IsMenuRunning() {
++  return context_menu_ && context_menu_->IsRunning();
++}
++
+ content::RenderWidgetHostView*
+ ChromeWebContentsViewDelegateViewsMac::GetActiveRenderWidgetHostView() const {
+   return web_contents_->GetTopLevelRenderWidgetHostView();
+diff --git a/chrome/browser/ui/views/tab_search_bubble_host.cc b/chrome/browser/ui/views/tab_search_bubble_host.cc
+index faa251b..176aa8b 100644
+--- a/chrome/browser/ui/views/tab_search_bubble_host.cc
++++ b/chrome/browser/ui/views/tab_search_bubble_host.cc
+@@ -66,7 +66,7 @@ TabSearchOpenAction GetActionForEvent(const ui::Event& event) {
+ TabSearchBubbleHost::TabSearchBubbleHost(
+     views::Button* button,
+     BrowserWindowInterface* browser_window_interface)
+-    : button_(button),
++    : button_tracker_(button),
+       profile_(browser_window_interface->GetProfile()),
+       browser_window_interface_(browser_window_interface),
+       webui_bubble_manager_(WebUIBubbleManager::Create<TabSearchUI>(
+@@ -204,8 +204,9 @@ bool TabSearchBubbleHost::ShowTabSearchBubble(
+   const tabs::TabSearchPosition position =
+       tabs::GetTabSearchPosition(browser_window_interface_);
+   webui_bubble_manager_->ShowBubble(
+-      button_,
++      button(),
+       (use_brave_vertical_tab_ ||
++       position == tabs::TabSearchPosition::kLeadingHorizontalTabstrip ||
+        position == tabs::TabSearchPosition::kVerticalTabstrip)
+           ? views::BubbleBorder::TOP_LEFT
+           : views::BubbleBorder::TOP_RIGHT,
+@@ -224,9 +225,11 @@ bool TabSearchBubbleHost::ShowTabSearchBubble(
+ 
+   // Hold the pressed lock while the |bubble_| is active.
+   // LINT.IfChange(pressed_lock_)
+-  pressed_lock_ =
+-      static_cast<views::MenuButtonController*>(button_->button_controller())
+-          ->TakeLock();
++  if (auto* button = static_cast<views::Button*>(button_tracker_.view())) {
++    pressed_lock_ =
++        static_cast<views::MenuButtonController*>(button->button_controller())
++            ->TakeLock();
++  }
+   // LINT.ThenChange(:menu_button_controller)
+   return true;
+ }
+diff --git a/chrome/browser/ui/views/tab_search_bubble_host.h b/chrome/browser/ui/views/tab_search_bubble_host.h
+index 3340182..1806699 100644
+--- a/chrome/browser/ui/views/tab_search_bubble_host.h
++++ b/chrome/browser/ui/views/tab_search_bubble_host.h
+@@ -9,6 +9,7 @@
+ #include "base/observer_list.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/views/bubble/webui_bubble_manager.h"
++#include "ui/views/view_tracker.h"
+ #include "chrome/browser/ui/views/bubble/webui_bubble_manager_observer.h"
+ #include "chrome/browser/ui/views/tabs/tab_slot_controller.h"
+ #include "chrome/browser/ui/webui/tab_search/tab_search.mojom.h"
+@@ -55,7 +56,7 @@ class TabSearchBubbleHost : public views::WidgetObserver,
+ 
+   BrowserWindowInterface* GetBrowser();
+ 
+-  views::View* button() { return button_; }
++  views::View* button() { return button_tracker_.view(); }
+ 
+   WebUIBubbleManager* webui_bubble_manager_for_testing() {
+     return webui_bubble_manager_.get();
+@@ -72,7 +73,7 @@ class TabSearchBubbleHost : public views::WidgetObserver,
+   TabSearchUI* GetTabSearchUI();
+ 
+   // The anchor button for the tab search bubble.
+-  const raw_ptr<views::Button> button_;
++  views::ViewTracker button_tracker_;
+ 
+   const raw_ptr<Profile> profile_;
+ 
+@@ -87,7 +88,7 @@ class TabSearchBubbleHost : public views::WidgetObserver,
+ 
+   base::ObserverList<TabSearchBubbleHostObserver> observers_;
+ 
+-  // A lock to keep its `button_` pressed while |bubble_| is showing or in the
++  // A lock to keep the button pressed while |bubble_| is showing or in the
+   // process of being shown.
+   std::unique_ptr<views::MenuButtonController::PressedLock> pressed_lock_;
+ 
+diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.cc b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+index 0890005..3031d74 100644
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -43,6 +43,7 @@
+ #include "chrome/browser/themes/theme_properties.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/ai_overlay_dialog/ai_overlay_dialog_controller.h"
++#include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_commands.h"
+@@ -182,6 +183,10 @@
+ #include "ui/aura/window_occlusion_tracker.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_util.h"
++#endif
++
+ using base::UserMetricsAction;
+ using content::WebContents;
+ 
+@@ -269,12 +274,13 @@ void SetRefreshMargins(views::View* button, bool expanded) {
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(ToolbarView, kToolbarElementId);
+ 
+ ToolbarView::ToolbarView(BrowserWindowInterface* browser,
+-                         BrowserView* browser_view)
++                         BrowserView* browser_view,
++                         std::optional<DisplayMode> display_mode)
+     : AnimationDelegateViews(this),
+       browser_(browser),
+       browser_view_(browser_view),
+       app_menu_icon_controller_(browser->GetProfile(), this),
+-      display_mode_(GetDisplayMode(browser)) {
++      display_mode_(display_mode ? *display_mode : GetDisplayMode(browser)) {
+   // WebApp type-browsers set their own ToolbarButtonProvider.
+   if (!web_app::AppBrowserController::IsWebApp(browser)) {
+     scoped_unowned_user_data_.emplace(browser_->GetUnownedUserDataHost(),
+@@ -314,6 +320,8 @@ ToolbarView::~ToolbarView() {
+   for (const auto& view_and_command : GetViewCommandMap()) {
+     chrome::RemoveCommandObserver(browser_, view_and_command.second, this);
+   }
++
++  browser_view_->WillDestroyToolbar();
+ }
+ 
+ // Forwards the early teardown request to both the embedded and detached WebUI
+@@ -328,6 +336,19 @@ void ToolbarView::DestroyWebUIToolbarWebContents() {
+ }
+ 
+ void ToolbarView::Init() {
++#if BUILDFLAG(ENABLE_CEF)
++  using ToolbarButtonType = cef::BrowserDelegate::ToolbarButtonType;
++  auto button_visible = [this](ToolbarButtonType type) {
++    if (this->browser_->cef_delegate()) {
++      return this->browser_->cef_delegate()->IsToolbarButtonVisible(type);
++    }
++    return true;
++  };
++#define BUTTON_VISIBLE(type) button_visible(ToolbarButtonType::type)
++#else
++#define BUTTON_VISIBLE(type) true
++#endif
++
+ #if defined(USE_AURA)
+   // Avoid generating too many occlusion tracking calculation events before this
+   // function returns. The occlusion status will be computed only once once this
+@@ -348,7 +369,8 @@ void ToolbarView::Init() {
+     location_bar_view = std::make_unique<LocationBarViewAlias>(
+         browser_, browser_->GetProfile(),
+         chrome::BrowserCommandController::From(browser_), this,
+-        display_mode_ != DisplayMode::kNormal);
++        display_mode_ != DisplayMode::kNormal &&
++            !cef::BrowserForBWI(browser_)->toolbar_overridden());
+   }
+ 
+   // Make sure the toolbar shows by default.
+@@ -421,7 +443,7 @@ void ToolbarView::Init() {
+ 
+   std::unique_ptr<MediaToolbarButtonView> media_button;
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+-  if (!features::IsWebUIMediaButtonEnabled()) {
++  if (!features::IsWebUIMediaButtonEnabled() && BUTTON_VISIBLE(kMedia)) {
+     media_button = std::make_unique<MediaToolbarButtonView>(
+         browser_view_, std::make_unique<MediaToolbarButtonContextualMenu>(
+                            browser_->GetProfile()));
+@@ -556,7 +578,8 @@ void ToolbarView::Init() {
+   // Only show the Battery Saver button when it is not controlled by the OS. On
+   // ChromeOS the battery icon in the shelf shows the same information.
+   if (!performance_manager::user_tuning::IsBatterySaverModeManagedByOS() &&
+-      !features::IsWebUIBatterySaverButtonEnabled()) {
++      !features::IsWebUIBatterySaverButtonEnabled() &&
++      BUTTON_VISIBLE(kBatterySaver)) {
+     battery_saver_button_ =
+         AddChildView(std::make_unique<BatterySaverButton>(browser_));
+   }
+@@ -613,7 +636,7 @@ void ToolbarView::Init() {
+     avatar_ = AddChildView(std::make_unique<BraveAvatarToolbarButton>(browser_));
+     bool show_avatar_toolbar_button =
+         AvatarToolbarButtonInterface::CanShowForProfile(browser_->GetProfile());
+-    avatar_->SetVisible(show_avatar_toolbar_button);
++    avatar_->SetVisible(show_avatar_toolbar_button && BUTTON_VISIBLE(kAvatar));
+   }
+ 
+   // Only manage the overflow button when there are at least some views
+diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.h b/chrome/browser/ui/views/toolbar/toolbar_view.h
+index 160c31d..a8973c2 100644
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -113,7 +113,9 @@ class ToolbarView : public views::AccessiblePaneView,
+ 
+   DECLARE_CLASS_ELEMENT_IDENTIFIER_VALUE(kToolbarElementId);
+ 
+-  ToolbarView(BrowserWindowInterface* browser, BrowserView* browser_view);
++  ToolbarView(BrowserWindowInterface* browser,
++              BrowserView* browser_view,
++              std::optional<DisplayMode> display_mode = std::nullopt);
+   ToolbarView(const ToolbarView&) = delete;
+   ToolbarView& operator=(const ToolbarView&) = delete;
+   ~ToolbarView() override;
+diff --git a/chrome/browser/ui/webui/version/version_handler.cc b/chrome/browser/ui/webui/version/version_handler.cc
+index 410556c..68613ed 100644
+--- a/chrome/browser/ui/webui/version/version_handler.cc
++++ b/chrome/browser/ui/webui/version/version_handler.cc
+@@ -28,12 +28,23 @@
+ #include "ui/base/l10n/l10n_util.h"
+ #include "url/gurl.h"
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "base/base_paths.h"
++#include "base/path_service.h"
++#include "chrome/common/chrome_paths.h"
++#endif
++
+ namespace {
+ 
+ // Retrieves the executable and profile paths on the FILE thread.
+ void GetFilePaths(const base::FilePath& profile_path,
+                   std::u16string* exec_path_out,
+-                  std::u16string* profile_path_out) {
++                  std::u16string* profile_path_out
++#if BUILDFLAG(ENABLE_CEF)
++                  , std::u16string* module_path_out,
++                  std::u16string* user_data_path_out
++#endif
++                  ) {
+   base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+                                                 base::BlockingType::MAY_BLOCK);
+ 
+@@ -51,6 +62,19 @@ void GetFilePaths(const base::FilePath& profile_path,
+   } else {
+     *profile_path_out = l10n_util::GetStringUTF16(IDS_VERSION_UI_PATH_NOTFOUND);
+   }
++
++#if BUILDFLAG(ENABLE_CEF)
++  base::FilePath module_path;
++  if (base::PathService::Get(base::FILE_MODULE, &module_path)) {
++    *module_path_out = module_path.LossyDisplayName();
++  } else {
++    *module_path_out = l10n_util::GetStringUTF16(IDS_VERSION_UI_PATH_NOTFOUND);
++  }
++
++  base::FilePath user_data_dir =
++      base::PathService::CheckedGet(chrome::DIR_USER_DATA);
++  *user_data_path_out = user_data_dir.LossyDisplayName();
++#endif
+ }
+ 
+ }  // namespace
+@@ -122,23 +146,46 @@ void VersionHandler::HandleRequestPathInfo(const base::ListValue& args) {
+   // OnGotFilePaths.
+   std::u16string* exec_path_buffer = new std::u16string;
+   std::u16string* profile_path_buffer = new std::u16string;
++#if BUILDFLAG(ENABLE_CEF)
++  std::u16string* module_path_buffer = new std::u16string;
++  std::u16string* user_data_path_buffer = new std::u16string;
++#endif
+   base::ThreadPool::PostTaskAndReply(
+       FROM_HERE, {base::TaskPriority::USER_VISIBLE, base::MayBlock()},
+       base::BindOnce(&GetFilePaths, Profile::FromWebUI(web_ui())->GetPath(),
+                      base::Unretained(exec_path_buffer),
+-                     base::Unretained(profile_path_buffer)),
++                     base::Unretained(profile_path_buffer)
++#if BUILDFLAG(ENABLE_CEF)
++                     , base::Unretained(module_path_buffer),
++                     base::Unretained(user_data_path_buffer)
++#endif
++                     ),
+       base::BindOnce(&VersionHandler::OnGotFilePaths,
+                      weak_ptr_factory_.GetWeakPtr(), callback_id,
+                      base::Owned(exec_path_buffer),
+-                     base::Owned(profile_path_buffer)));
++                     base::Owned(profile_path_buffer)
++#if BUILDFLAG(ENABLE_CEF)
++                     , base::Owned(module_path_buffer),
++                     base::Owned(user_data_path_buffer)
++#endif
++                     ));
+ }
+ 
+ void VersionHandler::OnGotFilePaths(std::string callback_id,
+                                     std::u16string* executable_path_data,
+-                                    std::u16string* profile_path_data) {
++                                    std::u16string* profile_path_data
++#if BUILDFLAG(ENABLE_CEF)
++                                    , std::u16string* module_path_data,
++                                    std::u16string* user_data_path_data
++#endif
++                                    ) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   base::DictValue response;
+   response.Set(version_ui::kKeyExecPath, *executable_path_data);
+   response.Set(version_ui::kKeyProfilePath, *profile_path_data);
++#if BUILDFLAG(ENABLE_CEF)
++  response.Set(version_ui::kKeyModulePath, *module_path_data);
++  response.Set(version_ui::kKeyUserDataPath, *user_data_path_data);
++#endif
+   ResolveJavascriptCallback(base::Value(callback_id), response);
+ }
+diff --git a/chrome/browser/ui/webui/version/version_handler.h b/chrome/browser/ui/webui/version/version_handler.h
+index 7d1beed..d4c79e2 100644
+--- a/chrome/browser/ui/webui/version/version_handler.h
++++ b/chrome/browser/ui/webui/version/version_handler.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "base/values.h"
++#include "cef/libcef/features/features.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ 
+ // Handler class for Version page operations.
+@@ -44,7 +45,12 @@ class VersionHandler : public content::WebUIMessageHandler {
+   // front end.
+   void OnGotFilePaths(std::string callback_id,
+                       std::u16string* executable_path_data,
+-                      std::u16string* profile_path_data);
++                      std::u16string* profile_path_data
++#if BUILDFLAG(ENABLE_CEF)
++                      , std::u16string* module_path_data,
++                      std::u16string* user_data_path_data
++#endif
++                      );
+ 
+   // Factory for the creating refs in callbacks.
+   base::WeakPtrFactory<VersionHandler> weak_ptr_factory_{this};
+diff --git a/chrome/browser/ui/webui/version/version_ui.cc b/chrome/browser/ui/webui/version/version_ui.cc
+index 4c523d4..35a8e8d 100644
+--- a/chrome/browser/ui/webui/version/version_ui.cc
++++ b/chrome/browser/ui/webui/version/version_ui.cc
+@@ -19,6 +19,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/browser_process_impl.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/webui/version/version_handler.h"
+@@ -69,6 +70,10 @@
+ #include "chrome/browser/ui/webui/version/version_util_win.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/include/cef_version.h"
++#endif
++
+ using content::WebUIDataSource;
+ 
+ namespace {
+@@ -89,6 +94,10 @@ void CreateAndAddVersionUIDataSource(Profile* profile) {
+       {version_ui::kCommandLineName, IDS_VERSION_UI_COMMAND_LINE},
+       {version_ui::kExecutablePathName, IDS_VERSION_UI_EXECUTABLE_PATH},
+       {version_ui::kProfilePathName, IDS_VERSION_UI_PROFILE_PATH},
++#if BUILDFLAG(ENABLE_CEF)
++      {version_ui::kModulePathName, IDS_VERSION_UI_MODULE_PATH},
++      {version_ui::kUserDataPathName, IDS_VERSION_UI_USER_DATA_PATH},
++#endif
+       {version_ui::kVariationsName, IDS_VERSION_UI_VARIATIONS},
+       {version_ui::kVariationsCmdName, IDS_VERSION_UI_VARIATIONS_CMD},
+       {version_ui::kCopyVariationsLabel, IDS_VERSION_UI_COPY_VARIATIONS_LABEL},
+@@ -122,6 +131,10 @@ void CreateAndAddVersionUIDataSource(Profile* profile) {
+   html_source->AddResourcePath("images/product_logo_white.png",
+                                IDR_PRODUCT_LOGO_WHITE);
+ #endif  // BUILDFLAG(IS_ANDROID)
++
++#if BUILDFLAG(ENABLE_CEF)
++  html_source->AddString(version_ui::kCefVersion, CEF_VERSION);
++#endif
+ }
+ 
+ std::string GetProductModifier() {
+@@ -269,6 +282,10 @@ void VersionUI::AddVersionDetailStrings(content::WebUIDataSource* html_source) {
+   // blank.
+   html_source->AddString(version_ui::kExecutablePath, std::string_view());
+   html_source->AddString(version_ui::kProfilePath, std::string_view());
++#if BUILDFLAG(ENABLE_CEF)
++  html_source->AddString(version_ui::kModulePath, std::string_view());
++  html_source->AddString(version_ui::kUserDataPath, std::string_view());
++#endif
+ 
+ #if BUILDFLAG(IS_MAC)
+   html_source->AddString(version_ui::kOSType, base::mac::GetOSDisplayName());
+diff --git a/chrome/browser/ui/window_feature_controller/window_feature_controller.cc b/chrome/browser/ui/window_feature_controller/window_feature_controller.cc
+index cdb2d82..2ac6c33 100644
+--- a/chrome/browser/ui/window_feature_controller/window_feature_controller.cc
++++ b/chrome/browser/ui/window_feature_controller/window_feature_controller.cc
+@@ -7,18 +7,25 @@
+ #include "base/check.h"
+ #include "base/check_deref.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ #include "chrome/browser/ui/fullscreen/browser_window_fullscreen_controller.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ 
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#endif
++
+ DEFINE_USER_DATA(WindowFeatureController);
+ 
+ WindowFeatureController::WindowFeatureController(
++    BrowserWindowInterface* browser,
+     BrowserWindowFullscreenController* fullscreen_controller,
+     web_app::AppBrowserController* app_controller,
+     BrowserWindowInterface::Type browser_type,
+     bool is_trusted_source,
+     ui::UnownedUserDataHost& host)
+-    : fullscreen_controller_(CHECK_DEREF(fullscreen_controller)),
++    : browser_(browser),
++      fullscreen_controller_(CHECK_DEREF(fullscreen_controller)),
+       app_controller_(app_controller),
+       browser_type_(browser_type),
+       is_trusted_source_(is_trusted_source),
+@@ -43,6 +50,14 @@ const WindowFeatureController* WindowFeatureController::From(
+ 
+ bool WindowFeatureController::SupportsWindowFeature(
+     WindowFeature feature) const {
++#if BUILDFLAG(ENABLE_CEF)
++  if (browser_->cef_delegate()) {
++    if (auto value = browser_->cef_delegate()->SupportsWindowFeature(
++            static_cast<int>(feature))) {
++      return *value;
++    }
++  }
++#endif
+   bool supports =
+       SupportsWindowFeatureImpl(feature, /*check_can_support=*/false);
+   // Supported features imply CanSupportWindowFeature.
+diff --git a/chrome/browser/ui/window_feature_controller/window_feature_controller.h b/chrome/browser/ui/window_feature_controller/window_feature_controller.h
+index 744490e..2a36e8c 100644
+--- a/chrome/browser/ui/window_feature_controller/window_feature_controller.h
++++ b/chrome/browser/ui/window_feature_controller/window_feature_controller.h
+@@ -34,6 +34,7 @@ class WindowFeatureController {
+   };
+ 
+   WindowFeatureController(
++      BrowserWindowInterface* browser,
+       BrowserWindowFullscreenController* fullscreen_controller,
+       web_app::AppBrowserController* app_controller,
+       BrowserWindowInterface::Type browser_type,
+@@ -88,6 +89,7 @@ class WindowFeatureController {
+                                  bool check_can_support) const;
+   bool IsFullscreen() const;
+ 
++  const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ref<BrowserWindowFullscreenController> fullscreen_controller_;
+ 
+   // Can be null.
+diff --git a/chrome/browser/ui/window_metadata/window_metadata_controller.cc b/chrome/browser/ui/window_metadata/window_metadata_controller.cc
+index 2e7435b..b04afdf 100644
+--- a/chrome/browser/ui/window_metadata/window_metadata_controller.cc
++++ b/chrome/browser/ui/window_metadata/window_metadata_controller.cc
+@@ -64,8 +64,13 @@ WindowMetadataController::WindowMetadataController(
+ WindowMetadataController::~WindowMetadataController() = default;
+ 
+ gfx::Image WindowMetadataController::GetCurrentPageIcon() const {
++  // For document picture-in-picture windows, we use the favicon from the opener
++  // WebContents instead of the picture-in-picture WebContents itself.
+   content::WebContents* web_contents =
+-      browser_->tab_strip_model()->GetActiveWebContents();
++      (browser_->GetType() ==
++       BrowserWindowInterface::Type::TYPE_PICTURE_IN_PICTURE)
++          ? PictureInPictureWindowManager::GetInstance()->GetWebContents()
++          : browser_->tab_strip_model()->GetActiveWebContents();
+   // |web_contents| can be NULL since GetCurrentPageIcon() is called by the
+   // window during the window's creation (before tabs have been added).
+   favicon::FaviconDriver* favicon_driver =
+diff --git a/chrome/renderer/BUILD.gn b/chrome/renderer/BUILD.gn
+index 2b4f322..f34645d 100644
+--- a/chrome/renderer/BUILD.gn
++++ b/chrome/renderer/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ import("//brave/renderer/sources.gni")
+ import("//build/config/buildflags_paint_preview.gni")
++import("//cef/libcef/features/features.gni")
+ import("//chrome/common/features.gni")
+ import("//chrome/common/request_header_integrity/buildflags.gni")
+ import("//components/guest_view/buildflags/buildflags.gni")
+@@ -132,6 +133,7 @@ static_library("renderer") {
+     ":process_state",
+     "//base/allocator:buildflags",
+     "//build:chromeos_buildflags",
++    "//cef/libcef/features:buildflags",
+     "//chrome:resources",
+     "//chrome:strings",
+     "//chrome/common",
+@@ -260,6 +262,10 @@ static_library("renderer") {
+     ]
+   }
+ 
++  if (enable_cef) {
++    configs += [ "//cef/libcef/features:config" ]
++  }
++
+   if (enable_plugins) {
+     sources += [
+       "plugins/chrome_plugin_placeholder.cc",
+diff --git a/components/renderer_context_menu/context_menu_delegate.h b/components/renderer_context_menu/context_menu_delegate.h
+index 993cac5..3d2847b 100644
+--- a/components/renderer_context_menu/context_menu_delegate.h
++++ b/components/renderer_context_menu/context_menu_delegate.h
+@@ -55,6 +55,8 @@ class ContextMenuDelegate {
+   // Displays the context menu.
+   virtual void ShowMenu(std::unique_ptr<RenderViewContextMenuBase> menu) = 0;
+ 
++  virtual bool IsMenuRunning() = 0;
++
+  private:
+   raw_ptr<content::WebContents> web_contents_ = nullptr;
+ };
+diff --git a/components/renderer_context_menu/render_view_context_menu_base.cc b/components/renderer_context_menu/render_view_context_menu_base.cc
+index 2b2fe5f..23c768a 100644
+--- a/components/renderer_context_menu/render_view_context_menu_base.cc
++++ b/components/renderer_context_menu/render_view_context_menu_base.cc
+@@ -416,6 +416,17 @@ bool RenderViewContextMenuBase::IsCommandIdChecked(int id) const {
+   return false;
+ }
+ 
++bool RenderViewContextMenuBase::GetAcceleratorForCommandId(
++    int id,
++    ui::Accelerator* accelerator) const {
++  for (auto& observer : observers_) {
++    if (observer.IsCommandIdSupported(id))
++      return observer.GetAccelerator(id, accelerator);
++  }
++
++  return false;
++}
++
+ void RenderViewContextMenuBase::ExecuteCommand(int id, int event_flags) {
+   command_executed_ = true;
+   RecordUsedItem(id);
+diff --git a/components/renderer_context_menu/render_view_context_menu_base.h b/components/renderer_context_menu/render_view_context_menu_base.h
+index 39771ca..43a698c 100644
+--- a/components/renderer_context_menu/render_view_context_menu_base.h
++++ b/components/renderer_context_menu/render_view_context_menu_base.h
+@@ -86,8 +86,13 @@ class RenderViewContextMenuBase : public ui::SimpleMenuModel::Delegate,
+   // Programmatically closes the context menu.
+   void Cancel();
+ 
++  virtual bool IsRunning() = 0;
++
+   const ui::SimpleMenuModel& menu_model() const { return menu_model_; }
+   const content::ContextMenuParams& params() const { return params_; }
++  content::WebContents* source_web_contents() const {
++    return source_web_contents_;
++  }
+ 
+   // Returns true if the specified command id is known and valid for
+   // this menu. If the command is known |enabled| is set to indicate
+@@ -96,6 +101,9 @@ class RenderViewContextMenuBase : public ui::SimpleMenuModel::Delegate,
+ 
+   // SimpleMenuModel::Delegate implementation.
+   bool IsCommandIdChecked(int command_id) const override;
++  bool GetAcceleratorForCommandId(
++      int command_id,
++      ui::Accelerator* accelerator) const override;
+   void ExecuteCommand(int command_id, int event_flags) override;
+   void OnMenuWillShow(ui::SimpleMenuModel* source) override;
+   void MenuClosed(ui::SimpleMenuModel* source) override;
+diff --git a/components/renderer_context_menu/render_view_context_menu_observer.cc b/components/renderer_context_menu/render_view_context_menu_observer.cc
+index 9fdda16..538bd05 100644
+--- a/components/renderer_context_menu/render_view_context_menu_observer.cc
++++ b/components/renderer_context_menu/render_view_context_menu_observer.cc
+@@ -15,3 +15,8 @@ bool RenderViewContextMenuObserver::IsCommandIdChecked(int command_id) {
+ bool RenderViewContextMenuObserver::IsCommandIdEnabled(int command_id) {
+   return false;
+ }
++
++bool RenderViewContextMenuObserver::GetAccelerator(int command_id,
++                                                   ui::Accelerator* accel) {
++  return false;
++}
+diff --git a/components/renderer_context_menu/render_view_context_menu_observer.h b/components/renderer_context_menu/render_view_context_menu_observer.h
+index b2aa338..233c340 100644
+--- a/components/renderer_context_menu/render_view_context_menu_observer.h
++++ b/components/renderer_context_menu/render_view_context_menu_observer.h
+@@ -11,6 +11,10 @@ namespace content {
+ struct ContextMenuParams;
+ }
+ 
++namespace ui {
++class Accelerator;
++}
++
+ // The interface used for implementing context-menu items. The following
+ // instruction describe how to implement a context-menu item with this
+ // interface.
+@@ -100,6 +104,8 @@ class RenderViewContextMenuObserver {
+   virtual bool IsCommandIdChecked(int command_id);
+   virtual bool IsCommandIdEnabled(int command_id);
+ 
++  virtual bool GetAccelerator(int command_id, ui::Accelerator* accel);
++
+   // Called when a user selects the specified context-menu item. This is
+   // only called when the observer returns true for IsCommandIdSupported()
+   // for that |command_id|.
+diff --git a/components/renderer_context_menu/views/toolkit_delegate_views.cc b/components/renderer_context_menu/views/toolkit_delegate_views.cc
+index 0be2640..8bfdc61 100644
+--- a/components/renderer_context_menu/views/toolkit_delegate_views.cc
++++ b/components/renderer_context_menu/views/toolkit_delegate_views.cc
+@@ -31,6 +31,10 @@ void ToolkitDelegateViews::RunMenuAt(views::Widget* parent,
+                           anchor_position, type);
+ }
+ 
++bool ToolkitDelegateViews::IsMenuRunning() const {
++  return menu_runner_ && menu_runner_->IsRunning();
++}
++
+ void ToolkitDelegateViews::Init(ui::SimpleMenuModel* menu_model) {
+   menu_adapter_ = std::make_unique<views::MenuModelAdapter>(menu_model);
+   std::unique_ptr<views::MenuItemView> menu_view = menu_adapter_->CreateMenu();
+diff --git a/components/renderer_context_menu/views/toolkit_delegate_views.h b/components/renderer_context_menu/views/toolkit_delegate_views.h
+index 7762b3e..5bd1544 100644
+--- a/components/renderer_context_menu/views/toolkit_delegate_views.h
++++ b/components/renderer_context_menu/views/toolkit_delegate_views.h
+@@ -39,6 +39,7 @@ class ToolkitDelegateViews : public RenderViewContextMenuBase::ToolkitDelegate {
+                  const gfx::Point& point,
+                  ui::mojom::MenuSourceType type);
+   views::MenuItemView* menu_view() { return menu_view_; }
++  bool IsMenuRunning() const;
+ 
+  protected:
+   // ToolkitDelegate:
+diff --git a/components/version_ui_strings.grdp b/components/version_ui_strings.grdp
+index 0b736b0..5af3d4f 100644
+--- a/components/version_ui_strings.grdp
++++ b/components/version_ui_strings.grdp
+@@ -79,6 +79,14 @@
+   <message name="IDS_VERSION_UI_PROFILE_PATH" desc="label for the profile path on the about:version page">
+     Profile Path
+   </message>
++  <if expr="enable_cef">
++    <message name="IDS_VERSION_UI_MODULE_PATH" desc="label for the module path on the about:version page">
++      Module Path
++    </message>
++    <message name="IDS_VERSION_UI_USER_DATA_PATH" desc="label for the user data path on the about:version page">
++      User Data Path
++    </message>
++  </if>
+   <message name="IDS_VERSION_UI_PATH_NOTFOUND" desc="label for the non-existent path on the about:version page">
+     No such file or directory
+   </message>
+diff --git a/components/webui/version/BUILD.gn b/components/webui/version/BUILD.gn
+index 2193019..42ec99b 100644
+--- a/components/webui/version/BUILD.gn
++++ b/components/webui/version/BUILD.gn
+@@ -2,6 +2,8 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//cef/libcef/features/features.gni")
++
+ static_library("version") {
+   sources = [
+     "version_handler_helper.cc",
+@@ -16,4 +18,8 @@ static_library("version") {
+     "//components/variations/net",
+     "//components/variations/service",
+   ]
++
++  if (enable_cef) {
++    configs += [ "//cef/libcef/features:config" ]
++  }
+ }
+diff --git a/components/webui/version/resources/about_version.css b/components/webui/version/resources/about_version.css
+index 6c17f3b..4987ced 100644
+--- a/components/webui/version/resources/about_version.css
++++ b/components/webui/version/resources/about_version.css
+@@ -139,3 +139,7 @@ html[webui-rounded-icons] #copy-to-clipboard-icon {
+ 
+ .label,
+ .version { vertical-align: baseline; }
++
++#footnote {
++  font-size: 0.8em;
++}
+diff --git a/components/webui/version/resources/about_version.html b/components/webui/version/resources/about_version.html
+index 950b0a5..840c4ba 100644
+--- a/components/webui/version/resources/about_version.html
++++ b/components/webui/version/resources/about_version.html
+@@ -49,9 +49,21 @@ about:version template page
+         </picture>
+ </if>
+         <div id="company">$i18n{company}</div>
+-        <div id="copyright">$i18n{copyright}</div>
++        <div id="copyright">$i18n{copyright}
++<if expr="enable_cef">
++        <br/><a href="chrome://license">license</a> | <a href="chrome://credits">credits</a>
++</if>
++        </div>
+       </div>
+       <table id="inner" cellpadding="0" cellspacing="0" border="0">
++<if expr="enable_cef">
++        <tr>
++          <td class="label">CEF</td>
++          <td class="version">
++            <span>$i18n{cef_version}</span>
++          </td>
++        </tr>
++</if>
+         <tr><td class="label">$i18n{application_label}</td>
+           <td class="version" id="version">
+             <span id="copy-content">
+@@ -155,7 +167,15 @@ about:version template page
+         <tr><td class="label">$i18n{executable_path_name}</td>
+           <td class="version" id="executable_path">$i18n{executable_path}</td>
+         </tr>
+-        <tr><td class="label">$i18n{profile_path_name}</td>
++<if expr="enable_cef">
++        <tr><td class="label">$i18n{module_path_name}</td>
++          <td class="version" id="module_path">$i18n{module_path}</td>
++        </tr>
++        <tr><td class="label">$i18n{user_data_path_name} <sup><a href="#footnote">[*]</a></sup></td>
++          <td class="version" id="user_data_path">$i18n{user_data_path}</td>
++        </tr>
++</if>
++        <tr><td class="label">$i18n{profile_path_name} <sup><a href="#footnote">[*]</a></sup></td>
+           <td class="version" id="profile_path">$i18n{profile_path}</td>
+         </tr>
+ </if>
+@@ -198,6 +218,17 @@ about:version template page
+           <td class="version" id="sanitizer">$i18n{sanitizer}</td>
+         </tr>
+       </table>
++<if expr="enable_cef">
++      <div id="footnote">
++        <br/><a name="footnote">[*] In <a href="https://chromium.googlesource.com/chromium/src/+/master/docs/user_data_dir.md" target="_new">Chromium terminology</a>,
++        <a href="https://cef-builds.spotifycdn.com/docs/stable.html?structcef__settings__t.html#a2e2be03f34ddd93de90e1cf196757a19" target="_new">CefSettings.root_cache_path</a>
++        is the "$i18n{user_data_path_name}" and <a href="https://cef-builds.spotifycdn.com/docs/stable.html?structcef__settings__t.html#ad1644a7eb23cad969181db010f007710" target="_new">CefSettings.cache_path</a>
++        is the "$i18n{profile_path_name}". Chromium's <a href="https://chromium.googlesource.com/chromium/src/+/master/chrome/browser/process_singleton.h#35" target="_new">process singleton lock</a>
++        protects against multiple app instances writing to the same "$i18n{user_data_path_name}" directory.
++        Implement <a href="https://cef-builds.spotifycdn.com/docs/stable.html?classCefBrowserProcessHandler.html#a052a91639483467c0b546d57a05c2f06" target="_new">CefBrowserProcessHandler:: OnAlreadyRunningAppRelaunch</a>
++        to handle the case of app relaunch with the same directory.
++      </div>
++</if>
+     </div>
+ 
+     <div id="messages" role="alert" aria-live="polite" aria-relevant="additions">
+diff --git a/components/webui/version/resources/about_version.ts b/components/webui/version/resources/about_version.ts
+index 105c2e2..e478b8c 100644
+--- a/components/webui/version/resources/about_version.ts
++++ b/components/webui/version/resources/about_version.ts
+@@ -76,9 +76,21 @@ function handleVariationInfo(
+  * @param profilePath The profile path to display.
+  */
+ function handlePathInfo(
+-    {execPath, profilePath}: {execPath: string, profilePath: string}) {
++    {execPath, profilePath
++// <if expr="enable_cef">
++     , modulePath, userDataPath
++// </if>
++    }: {execPath: string, profilePath: string
++// <if expr="enable_cef">
++        , modulePath: string, userDataPath: string
++// </if>
++    }) {
+   getRequiredElement('executable_path').textContent = execPath;
+   getRequiredElement('profile_path').textContent = profilePath;
++// <if expr="enable_cef">
++  getRequiredElement('module_path').textContent = modulePath;
++  getRequiredElement('user_data_path').textContent = userDataPath;
++// </if>
+ }
+ 
+ // <if expr="is_win">
+@@ -196,7 +208,11 @@ function initialize() {
+   sendWithPromise<{variationsList: string[], variationsCmd: string}>(
+       'requestVariationInfo', includeVariationsCmd)
+       .then(handleVariationInfo);
+-  sendWithPromise<{execPath: string, profilePath: string}>('requestPathInfo')
++  sendWithPromise<{execPath: string, profilePath: string
++// <if expr="enable_cef">
++      , modulePath: string, userDataPath: string
++// </if>
++      }>('requestPathInfo')
+       .then(handlePathInfo);
+ 
+   if (getRequiredElement('variations-source').textContent !== '') {
+diff --git a/components/webui/version/version_ui_constants.cc b/components/webui/version/version_ui_constants.cc
+index 7b7be3e..af7a2b2 100644
+--- a/components/webui/version/version_ui_constants.cc
++++ b/components/webui/version/version_ui_constants.cc
+@@ -5,6 +5,7 @@
+ #include "components/webui/version/version_ui_constants.h"
+ 
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ 
+ namespace version_ui {
+ 
+@@ -92,4 +93,15 @@ const char kVersionSuffix[] = "version_suffix";
+ const char kVersionModifier[] = "version_modifier";
+ const char kVersionProcessorVariation[] = "version_processor_variation";
+ 
++#if BUILDFLAG(ENABLE_CEF)
++const char kKeyModulePath[] = "modulePath";
++const char kKeyUserDataPath[] = "userDataPath";
++
++const char kCefVersion[] = "cef_version";
++const char kModulePath[] = "module_path";
++const char kModulePathName[] = "module_path_name";
++const char kUserDataPath[] = "user_data_path";
++const char kUserDataPathName[] = "user_data_path_name";
++#endif
++
+ }  // namespace version_ui
+diff --git a/components/webui/version/version_ui_constants.h b/components/webui/version/version_ui_constants.h
+index 775826e..7131738 100644
+--- a/components/webui/version/version_ui_constants.h
++++ b/components/webui/version/version_ui_constants.h
+@@ -6,6 +6,7 @@
+ #define COMPONENTS_WEBUI_VERSION_VERSION_UI_CONSTANTS_H_
+ 
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
+ 
+ namespace version_ui {
+ 
+@@ -96,6 +97,17 @@ extern const char kVersionSuffix[];
+ extern const char kVersionModifier[];
+ extern const char kVersionProcessorVariation[];
+ 
++#if BUILDFLAG(ENABLE_CEF)
++extern const char kKeyModulePath[];
++extern const char kKeyUserDataPath[];
++
++extern const char kCefVersion[];
++extern const char kModulePath[];
++extern const char kModulePathName[];
++extern const char kUserDataPath[];
++extern const char kUserDataPathName[];
++#endif
++
+ }  // namespace version_ui
+ 
+ #endif  // COMPONENTS_WEBUI_VERSION_VERSION_UI_CONSTANTS_H_
+diff --git a/content/renderer/render_frame_impl.cc b/content/renderer/render_frame_impl.cc
+index 4323fba..9f5af6a 100644
+--- a/content/renderer/render_frame_impl.cc
++++ b/content/renderer/render_frame_impl.cc
+@@ -7135,6 +7135,8 @@ WebView* RenderFrameImpl::CreateNewWindow(
+         pip_options->disallow_return_to_opener;
+     pip_mojom_opts->prefer_initial_window_placement =
+         pip_options->prefer_initial_window_placement;
++    pip_mojom_opts->initial_position = pip_options->initial_position;
++    pip_mojom_opts->resizable = pip_options->resizable;
+     params->pip_options = std::move(pip_mojom_opts);
+   }
+ 
+diff --git a/net/cookies/cookie_monster.cc b/net/cookies/cookie_monster.cc
+index 4b909c2..97eaef9 100644
+--- a/net/cookies/cookie_monster.cc
++++ b/net/cookies/cookie_monster.cc
+@@ -55,6 +55,7 @@
+ #include <set>
+ #include <string_view>
+ #include <tuple>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -683,7 +684,7 @@ void CookieMonster_ChromiumImpl::SetCookieableSchemes(
+ 
+   // Calls to this method will have no effect if made after a WebView or
+   // CookieManager instance has been created.
+-  if (initialized_) {
++  if (!CanChangeCookieableSchemes()) {
+     MaybeRunCookieCallback(std::move(callback), false);
+     return;
+   }
+@@ -692,6 +693,50 @@ void CookieMonster_ChromiumImpl::SetCookieableSchemes(
+   MaybeRunCookieCallback(std::move(callback), true);
+ }
+ 
++void CookieMonster_ChromiumImpl::AddCookieableSchemes(
++    const std::vector<std::string>& schemes,
++    SetCookieableSchemesCallback callback) {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++
++  // Calls to this method will have no effect if made after a WebView or
++  // CookieManager instance has been created.
++  if (!CanChangeCookieableSchemes()) {
++    MaybeRunCookieCallback(std::move(callback), false);
++    return;
++  }
++
++  for (const auto& element : schemes) {
++    if (std::find(cookieable_schemes_.begin(), cookieable_schemes_.end(),
++                  element) == cookieable_schemes_.end()) {
++      cookieable_schemes_.push_back(element);
++    }
++  }
++  MaybeRunCookieCallback(std::move(callback), true);
++}
++
++void CookieMonster_ChromiumImpl::RemoveCookieableSchemes(
++    const std::vector<std::string>& schemes,
++    SetCookieableSchemesCallback callback) {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++
++  // Calls to this method will have no effect if made after a WebView or
++  // CookieManager instance has been created.
++  if (!CanChangeCookieableSchemes()) {
++    MaybeRunCookieCallback(std::move(callback), false);
++    return;
++  }
++
++  if (!schemes.empty()) {
++    std::unordered_set<std::string> set(schemes.begin(), schemes.end());
++    auto it = std::remove_if(
++        cookieable_schemes_.begin(),
++        cookieable_schemes_.end(),
++        [&](const auto& s) { return set.count(s); });
++    cookieable_schemes_.erase(it, cookieable_schemes_.end());
++  }
++  MaybeRunCookieCallback(std::move(callback), true);
++}
++
+ // This function must be called before the CookieMonster is used.
+ void CookieMonster_ChromiumImpl::SetPersistSessionCookies(bool persist_session_cookies) {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+diff --git a/net/cookies/cookie_monster.h b/net/cookies/cookie_monster.h
+index d3122d1..dd50f09 100644
+--- a/net/cookies/cookie_monster.h
++++ b/net/cookies/cookie_monster.h
+@@ -246,6 +246,10 @@ class NET_EXPORT CookieMonster_ChromiumImpl : public CookieStore {
+   CookieChangeDispatcher& GetChangeDispatcher() override;
+   void SetCookieableSchemes(std::vector<std::string> schemes,
+                             SetCookieableSchemesCallback callback) override;
++  void AddCookieableSchemes(const std::vector<std::string>& schemes,
++                            SetCookieableSchemesCallback callback) override;
++  void RemoveCookieableSchemes(const std::vector<std::string>& schemes,
++                               SetCookieableSchemesCallback callback) override;
+   std::optional<bool> SiteHasCookieInOtherPartition(
+       const net::SchemefulSite& site,
+       const CookiePartitionKey& partition_key) const override;
+@@ -276,6 +280,14 @@ class NET_EXPORT CookieMonster_ChromiumImpl : public CookieStore {
+   // periodically.
+   bool DoRecordPeriodicStatsForTesting() { return DoRecordPeriodicStats(); }
+ 
++ protected:
++  // Derived cookie stores may route first use to child stores without invoking
++  // this owner's initialization. Share that first-use gate for all mutations.
++  virtual bool CanChangeCookieableSchemes() const { return !initialized_; }
++  const std::vector<std::string>& GetCookieableSchemesForChildStore() const {
++    return cookieable_schemes_;
++  }
++
+  private:
+   // For garbage collection constants.
+   FRIEND_TEST_ALL_PREFIXES(CookieMonsterTest, TestHostGarbageCollection);
+diff --git a/net/cookies/cookie_store.h b/net/cookies/cookie_store.h
+index 97ef592..43697f0 100644
+--- a/net/cookies/cookie_store.h
++++ b/net/cookies/cookie_store.h
+@@ -170,6 +170,17 @@ class NET_EXPORT CookieStore {
+   // Transfer ownership of a CookieAccessDelegate.
+   void SetCookieAccessDelegate(std::unique_ptr<CookieAccessDelegate> delegate);
+ 
++  // Adds to the list of cookieable schemes. Does nothing if called after first
++  // use of the instance (i.e. after the instance initialization process).
++  virtual void AddCookieableSchemes(const std::vector<std::string>& schemes,
++                                    SetCookieableSchemesCallback callback) = 0;
++
++  // Removes from the list of cookieable schemes. Does nothing if called after
++  // first use of the instance (i.e. after the instance initialization process).
++  virtual void RemoveCookieableSchemes(
++      const std::vector<std::string>& schemes,
++      SetCookieableSchemesCallback callback) = 0;
++
+   // This may be null if no delegate has been set yet, or the delegate has been
+   // reset to null.
+   const CookieAccessDelegate* cookie_access_delegate() const {
+diff --git a/services/network/cookie_manager.cc b/services/network/cookie_manager.cc
+index ee56a1c..04e949e 100644
+--- a/services/network/cookie_manager.cc
++++ b/services/network/cookie_manager.cc
+@@ -344,13 +344,13 @@ void CookieManager::AllowFileSchemeCookies(
+     AllowFileSchemeCookiesCallback callback) {
+   OnSettingsWillChange();
+ 
+-  std::vector<std::string> cookieable_schemes =
+-      net::CookieMonster::GetDefaultCookieableSchemes();
+   if (allow) {
+-    cookieable_schemes.emplace_back(url::kFileScheme);
++    cookie_store_->AddCookieableSchemes({url::kFileScheme},
++                                        std::move(callback));
++  } else {
++    cookie_store_->RemoveCookieableSchemes({url::kFileScheme},
++                                           std::move(callback));
+   }
+-  cookie_store_->SetCookieableSchemes(std::move(cookieable_schemes),
+-                                      std::move(callback));
+ }
+ 
+ void CookieManager::SetForceKeepSessionState() {
+diff --git a/services/network/network_context.cc b/services/network/network_context.cc
+index 66e2d04..a43cc4b 100644
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -3117,22 +3117,26 @@ URLRequestContextOwner NetworkContext::MakeURLRequestContext(
+             pref_service.get(), network_service_->network_quality_estimator());
+   }
+ 
+-  if (session_cleanup_cookie_store) {
+-    // If the pref service was registered and initialized use it.
+-    // If not, use nullptr to indicate prefs aren't available.
+-    std::unique_ptr<net::CookieMonster> cookie_store =
+-        std::make_unique<net::CookieMonster>(
+-            session_cleanup_cookie_store.get(), net_log,
+-            pref_service
+-                ? std::make_unique<KnownLegacyScopeDomainsPrefDelegate>(
+-                      pref_service.get())
+-                : nullptr);
+-    if (params_->persist_session_cookies) {
+-      cookie_store->SetPersistSessionCookies(true);
+-    }
+-
+-    builder.SetCookieStore(std::move(cookie_store));
+-  }
++  // If the pref service was registered and initialized use it.
++  // If not, use nullptr to indicate prefs aren't available.
++  std::unique_ptr<net::CookieMonster> cookie_store =
++      std::make_unique<net::CookieMonster>(
++          session_cleanup_cookie_store.get(), net_log,
++          pref_service
++              ? std::make_unique<KnownLegacyScopeDomainsPrefDelegate>(
++                    pref_service.get())
++              : nullptr);
++  if (session_cleanup_cookie_store && params_->persist_session_cookies) {
++    cookie_store->SetPersistSessionCookies(true);
++  }
++
++  if (params_->cookieable_schemes.has_value()) {
++    cookie_store->SetCookieableSchemes(
++        *params_->cookieable_schemes,
++        net::CookieStore::SetCookieableSchemesCallback());
++  }
++
++  builder.SetCookieStore(std::move(cookie_store));
+ 
+   base::FilePath transport_security_persister_file_name;
+   if (GetFullDataFilePath(params_->file_paths,
+diff --git a/services/network/public/mojom/network_context.mojom b/services/network/public/mojom/network_context.mojom
+index 5eb7be8..261d842 100644
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -402,6 +402,9 @@ struct NetworkContextParams {
+   // cookies. Otherwise it should be false.
+   bool persist_session_cookies = false;
+ 
++  // Schemes that will be passed to CookieMonster::SetCookieableSchemes.
++  array<string>? cookieable_schemes;
++
+   // True if an HTTP cache should be used.
+   bool http_cache_enabled = true;
+   // Maximum size of the HTTP cache. 0 means to use the default size.
+diff --git a/third_party/blink/public/mojom/picture_in_picture_window_options/picture_in_picture_window_options.mojom b/third_party/blink/public/mojom/picture_in_picture_window_options/picture_in_picture_window_options.mojom
+index 0a10dd9..7249532 100644
+--- a/third_party/blink/public/mojom/picture_in_picture_window_options/picture_in_picture_window_options.mojom
++++ b/third_party/blink/public/mojom/picture_in_picture_window_options/picture_in_picture_window_options.mojom
+@@ -4,6 +4,8 @@
+ 
+ module blink.mojom;
+ 
++import "ui/gfx/geometry/mojom/geometry.mojom";
++
+ struct PictureInPictureWindowOptions {
+   // The requested width for the picture-in-picture window to be initially sized
+   // to.
+@@ -21,4 +23,8 @@ struct PictureInPictureWindowOptions {
+   // When true, don't try to re-use the previous window bounds from the
+   // bounds cache.  Instead, just use the default position and size.
+   bool prefer_initial_window_placement;
++
++  // CEF extension
++  gfx.mojom.Point? initial_position;
++  bool resizable = true;
+ };
+diff --git a/third_party/blink/public/web/web_picture_in_picture_window_options.h b/third_party/blink/public/web/web_picture_in_picture_window_options.h
+index f3a5b90..53c5c69 100644
+--- a/third_party/blink/public/web/web_picture_in_picture_window_options.h
++++ b/third_party/blink/public/web/web_picture_in_picture_window_options.h
+@@ -6,6 +6,9 @@
+ #define THIRD_PARTY_BLINK_PUBLIC_WEB_WEB_PICTURE_IN_PICTURE_WINDOW_OPTIONS_H_
+ 
+ #include <cstdint>
++#include <optional>
++
++#include "ui/gfx/geometry/point.h"
+ 
+ namespace blink {
+ 
+@@ -14,6 +17,9 @@ struct WebPictureInPictureWindowOptions {
+   uint64_t height = 0;
+   bool disallow_return_to_opener = false;
+   bool prefer_initial_window_placement = false;
++  // CEF extension
++  std::optional<gfx::Point> initial_position;
++  bool resizable = true;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/public/web/web_view.h b/third_party/blink/public/web/web_view.h
+index 8bd6b07..a311893 100644
+--- a/third_party/blink/public/web/web_view.h
++++ b/third_party/blink/public/web/web_view.h
+@@ -471,6 +471,16 @@ class BLINK_EXPORT WebView {
+   // Returns the number of live WebView instances in this process.
+   static size_t GetWebViewCount();
+ 
++  // Sets whether to allow the use of JavaScript moveTo/By() and resizeTo/By()
++  // (without user activation) with Document picture-in-picture popups.
++  virtual void SetMovePictureInPictureEnabled(bool enabled) = 0;
++  virtual bool MovePictureInPictureEnabled() const = 0;
++
++  // Sets whether to allow opening Document picture-in-picture windows without
++  // user activation. Defaults to false (user activation required).
++  virtual void SetAllowPictureInPictureWithoutUserActivation(bool allow) = 0;
++  virtual bool AllowPictureInPictureWithoutUserActivation() const = 0;
++
+  protected:
+   ~WebView() = default;
+ };
+diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
+index 36d7b01..87d1e9d 100644
+--- a/third_party/blink/renderer/bindings/generated_in_modules.gni
++++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
+@@ -392,6 +392,10 @@ generated_dictionary_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_directory_picker_options.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_display_media_stream_options.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_display_media_stream_options.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_cef_options.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_cef_options.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_position.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_position.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_event_init.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_event_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_options.cc",
+diff --git a/third_party/blink/renderer/core/exported/web_view_impl.h b/third_party/blink/renderer/core/exported/web_view_impl.h
+index 1c4e22e..865f727 100644
+--- a/third_party/blink/renderer/core/exported/web_view_impl.h
++++ b/third_party/blink/renderer/core/exported/web_view_impl.h
+@@ -323,6 +323,20 @@ class CORE_EXPORT WebViewImpl final : public WebView,
+       const ColorProviderColorMaps& color_provider_colors) override;
+   void SetSupportsDraggableRegions(bool supports_draggable_regions) override;
+ 
++  void SetMovePictureInPictureEnabled(bool enabled) override {
++    move_pip_enabled_ = enabled;
++  }
++  bool MovePictureInPictureEnabled() const override {
++    return move_pip_enabled_;
++  }
++
++  void SetAllowPictureInPictureWithoutUserActivation(bool allow) override {
++    allow_pip_without_user_activation_ = allow;
++  }
++  bool AllowPictureInPictureWithoutUserActivation() const override {
++    return allow_pip_without_user_activation_;
++  }
++
+   void DispatchPersistedPageshow(base::TimeTicks navigation_start);
+   void DispatchPagehide(mojom::blink::PagehideDispatch pagehide_dispatch);
+   void HookBackForwardCacheEviction(bool hook);
+@@ -1029,6 +1043,9 @@ class CORE_EXPORT WebViewImpl final : public WebView,
+   // native restoration. Reset on each lifecycle update.
+   bool last_page_lifecycle_state_update_restored_from_bfcache_ = false;
+ 
++  bool move_pip_enabled_ = false;
++  bool allow_pip_without_user_activation_ = false;
++
+   // All the registered observers.
+   base::ObserverList<WebViewObserver> observers_;
+ };
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index 55722cb..9dd0f45 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -50,6 +50,7 @@
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/public/platform/web_string.h"
+ #include "third_party/blink/public/web/web_picture_in_picture_window_options.h"
++#include "third_party/blink/public/web/web_view.h"
+ #include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
+ #include "third_party/blink/renderer/bindings/core/v8/capture_source_location.h"
+ #include "third_party/blink/renderer/bindings/core/v8/isolated_world_csp.h"
+@@ -106,6 +107,7 @@
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/frame/viewport_data.h"
+ #include "third_party/blink/renderer/core/frame/visual_viewport.h"
++#include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
+ #include "third_party/blink/renderer/core/html/custom/custom_element_registry.h"
+ #include "third_party/blink/renderer/core/html/custom/custom_element_registry_assignment.h"
+ #include "third_party/blink/renderer/core/html/forms/form_controller.h"
+@@ -2106,7 +2108,7 @@ void LocalDOMWindow::moveBy(int x, int y) const {
+     return;
+   }
+ 
+-  if (IsPictureInPictureWindow()) {
++  if (IsPictureInPictureWindow() && !MovePictureInPictureEnabled()) {
+     return;
+   }
+ 
+@@ -2131,7 +2133,7 @@ void LocalDOMWindow::moveTo(int x, int y) const {
+     return;
+   }
+ 
+-  if (IsPictureInPictureWindow()) {
++  if (IsPictureInPictureWindow() && !MovePictureInPictureEnabled()) {
+     return;
+   }
+ 
+@@ -2159,7 +2161,8 @@ void LocalDOMWindow::resizeBy(int x,
+   }
+ 
+   if (IsPictureInPictureWindow()) {
+-    if (!LocalFrame::ConsumeTransientUserActivation(GetFrame())) {
++    if (!MovePictureInPictureEnabled() &&
++        !LocalFrame::ConsumeTransientUserActivation(GetFrame())) {
+       exception_state.ThrowDOMException(
+           DOMExceptionCode::kNotAllowedError,
+           "resizeBy() requires user activation in document picture-in-picture");
+@@ -2191,7 +2194,8 @@ void LocalDOMWindow::resizeTo(int width,
+   }
+ 
+   if (IsPictureInPictureWindow()) {
+-    if (!LocalFrame::ConsumeTransientUserActivation(GetFrame())) {
++    if (!MovePictureInPictureEnabled() &&
++        !LocalFrame::ConsumeTransientUserActivation(GetFrame())) {
+       exception_state.ThrowDOMException(
+           DOMExceptionCode::kNotAllowedError,
+           "resizeTo() requires user activation in document picture-in-picture");
+@@ -2641,6 +2645,12 @@ DOMWindow* LocalDOMWindow::openPictureInPictureWindow(
+       To<LocalDOMWindow>(result.frame->DomWindow());
+   pip_dom_window->SetIsPictureInPictureWindow();
+ 
++  if (WebLocalFrameImpl::FromFrame(entered_window->GetFrame())
++          ->View()
++          ->MovePictureInPictureEnabled()) {
++    pip_dom_window->SetMovePictureInPictureEnabled(true);
++  }
++
+   // Ensure that we're using the same compatibility mode as the opener document.
+   pip_dom_window->document()->SetCompatibilityMode(
+       entered_window->document()->GetCompatibilityMode());
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.h b/third_party/blink/renderer/core/frame/local_dom_window.h
+index ee2c080..759d768 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.h
++++ b/third_party/blink/renderer/core/frame/local_dom_window.h
+@@ -646,6 +646,11 @@ class CORE_EXPORT LocalDOMWindow final : public DOMWindow,
+ 
+   void SetIsPictureInPictureWindow();
+ 
++  void SetMovePictureInPictureEnabled(bool enabled) {
++    move_pip_enabled_ = enabled;
++  }
++  bool MovePictureInPictureEnabled() const { return move_pip_enabled_; }
++
+   // Return the viewport size including scrollbars.
+   gfx::Size GetViewportSize() const;
+ 
+@@ -756,6 +761,8 @@ class CORE_EXPORT LocalDOMWindow final : public DOMWindow,
+   // https://wicg.github.io/document-picture-in-picture/
+   bool is_picture_in_picture_window_ = false;
+ 
++  bool move_pip_enabled_ = false;
++
+   // Records this window's Storage Access API status. It cannot be downgraded.
+   net::StorageAccessApiStatus storage_access_api_status_ =
+       net::StorageAccessApiStatus::kNone;
+diff --git a/third_party/blink/renderer/modules/document_picture_in_picture/document_picture_in_picture_options.idl b/third_party/blink/renderer/modules/document_picture_in_picture/document_picture_in_picture_options.idl
+index de4f029..8fa3bef 100644
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/document_picture_in_picture_options.idl
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/document_picture_in_picture_options.idl
+@@ -4,9 +4,20 @@
+ 
+ // https://wicg.github.io/document-picture-in-picture/#dictdef-documentpictureinpictureoptions
+ 
++dictionary DocumentPictureInPicturePosition {
++  required long x;
++  required long y;
++};
++
++dictionary DocumentPictureInPictureCefOptions {
++  DocumentPictureInPicturePosition position;
++  boolean resizable = true;
++};
++
+ dictionary DocumentPictureInPictureOptions {
+   [EnforceRange] unsigned long long width = 0;
+   [EnforceRange] unsigned long long height = 0;
+   boolean disallowReturnToOpener = false;
+   [RuntimeEnabled=DocumentPictureInPicturePreferInitialPlacement] boolean preferInitialWindowPlacement = false;
++  [RuntimeEnabled=DocumentPictureInPictureCefOptions] DocumentPictureInPictureCefOptions cefOptions;
+ };
+diff --git a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+index 235575b..b980804 100644
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+@@ -15,16 +15,20 @@
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/web_media_player.h"
+ #include "third_party/blink/public/web/web_picture_in_picture_window_options.h"
++#include "third_party/blink/public/web/web_view.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_throw_dom_exception.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_cef_options.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_options.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_document_picture_in_picture_position.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
+ #include "third_party/blink/renderer/core/fullscreen/fullscreen.h"
+ #include "third_party/blink/renderer/core/html/media/html_media_element.h"
+ #include "third_party/blink/renderer/core/html/media/html_video_element.h"
+@@ -37,6 +41,7 @@
+ #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
+ #include "third_party/blink/renderer/platform/widget/frame_widget.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
++#include "ui/gfx/geometry/point.h"
+ 
+ namespace blink {
+ 
+@@ -429,7 +434,12 @@ void PictureInPictureControllerImpl::CreateDocumentPictureInPictureWindow(
+   const bool consumed_pip_request_token = ConsumePictureInPictureRequestToken();
+   const bool has_user_activation =
+       LocalFrame::HasTransientUserActivation(opener.GetFrame());
+-  if (!consumed_pip_request_token && !has_user_activation) {
++  auto* opener_frame_view =
++      WebLocalFrameImpl::FromFrame(opener.GetFrame())->View();
++  const bool allow_without_activation =
++      opener_frame_view->AllowPictureInPictureWithoutUserActivation();
++  if (!allow_without_activation && !consumed_pip_request_token &&
++      !has_user_activation) {
+     resolver->RejectWithDOMException(DOMExceptionCode::kNotAllowedError,
+                                      "Document PiP requires user activation");
+     return;
+@@ -442,6 +452,17 @@ void PictureInPictureControllerImpl::CreateDocumentPictureInPictureWindow(
+   web_options.prefer_initial_window_placement =
+       options->preferInitialWindowPlacement();
+ 
++  if (options->hasCefOptions()) {
++    const auto* cef_options = options->cefOptions();
++    if (cef_options->hasPosition()) {
++      const auto* position = cef_options->position();
++      web_options.initial_position = gfx::Point(position->x(), position->y());
++    }
++    if (cef_options->hasResizable()) {
++      web_options.resizable = cef_options->resizable();
++    }
++  }
++
+   // If either width or height is specified, then both must be specified.
+   if (web_options.width > 0 && web_options.height == 0) {
+     resolver->RejectWithRangeError(
+diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.override.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.override.json5
+index 2a8e6be..6d873dc 100644
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.override.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.override.json5
+@@ -51,5 +51,13 @@
+       public: true,
+       base_feature: "none",
+     },
++    // Enables cefOptions for Document PiP to specify initial window position
++    {
++      name: "DocumentPictureInPictureCefOptions",
++      status: {
++        "Android": "",
++        "default": "",
++      },
++    },
+   ]
+ }
+\ No newline at end of file

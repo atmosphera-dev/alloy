@@ -1,0 +1,861 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index dd0a558..00db117 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1724,6 +1724,8 @@ action("make_colorids_header") {
+   script = "tools/make_colorids_header.py"
+ 
+   inputs = [
++    # Compose Brave's macro extension before the native color enum inputs.
++    "//brave/chromium_src/ui/color/color_id.h",
+     "//ui/color/color_id.h",
+     "//components/color/color_id.h",
+     "//chrome/browser/ui/color/chrome_color_id.h",
+diff --git a/libcef/browser/chrome/chrome_browser_web_contents_delegate.cc b/libcef/browser/chrome/chrome_browser_web_contents_delegate.cc
+index 6b92ce3..badf5ba 100644
+--- a/libcef/browser/chrome/chrome_browser_web_contents_delegate.cc
++++ b/libcef/browser/chrome/chrome_browser_web_contents_delegate.cc
+@@ -80,7 +80,7 @@ ChromeBrowserWebContentsDelegate::ChromeBrowserWebContentsDelegate(
+     BrowserWindow& window,
+     DesktopBrowserWindowCapabilities& capabilities,
+     BrowserUiController& browser_ui_controller)
+-    : BrowserWebContentsDelegate(browser,
++    : BraveBrowserWebContentsDelegate(browser,
+                                  exclusive_access_manager,
+                                  command_controller,
+                                  unload_controller,
+@@ -103,7 +103,7 @@ ChromeBrowserWebContentsDelegate::PreHandleKeyboardEvent(
+       return result;
+     }
+   }
+-  return BrowserWebContentsDelegate::PreHandleKeyboardEvent(source, event);
++  return BraveBrowserWebContentsDelegate::PreHandleKeyboardEvent(source, event);
+ }
+ 
+ bool ChromeBrowserWebContentsDelegate::HandleKeyboardEvent(
+@@ -114,7 +114,7 @@ bool ChromeBrowserWebContentsDelegate::HandleKeyboardEvent(
+       return true;
+     }
+   }
+-  return BrowserWebContentsDelegate::HandleKeyboardEvent(source, event);
++  return BraveBrowserWebContentsDelegate::HandleKeyboardEvent(source, event);
+ }
+ 
+ content::PreloadingEligibility
+@@ -139,7 +139,7 @@ content::WebContents* ChromeBrowserWebContentsDelegate::OpenURLFromTab(
+   // conditions in sync with the early returns in the base implementation, and
+   // let Chrome perform the navigation and manage the callback in those cases.
+   if (browser_->GetType() == BrowserWindowInterface::Type::TYPE_DEVTOOLS) {
+-    return BrowserWebContentsDelegate::OpenURLFromTab(
++    return BraveBrowserWebContentsDelegate::OpenURLFromTab(
+         source, params, std::move(navigation_handle_callback));
+   }
+   if (params.disposition == WindowOpenDisposition::NEW_SPLIT_VIEW && source) {
+@@ -150,7 +150,7 @@ content::WebContents* ChromeBrowserWebContentsDelegate::OpenURLFromTab(
+       for (tabs::TabInterface* tab :
+            browser_->GetTabStripModel()->GetSplitData(split_id)->ListTabs()) {
+         if (tab != source_tab) {
+-          return BrowserWebContentsDelegate::OpenURLFromTab(
++          return BraveBrowserWebContentsDelegate::OpenURLFromTab(
+               source, params, std::move(navigation_handle_callback));
+         }
+       }
+@@ -176,14 +176,14 @@ content::WebContents* ChromeBrowserWebContentsDelegate::OpenURLFromTab(
+       }
+     }
+   }
+-  return BrowserWebContentsDelegate::OpenURLFromTab(
++  return BraveBrowserWebContentsDelegate::OpenURLFromTab(
+       source, params, std::move(navigation_handle_callback));
+ }
+ 
+ void ChromeBrowserWebContentsDelegate::LoadingStateChanged(
+     content::WebContents* source,
+     bool should_show_loading_ui) {
+-  BrowserWebContentsDelegate::LoadingStateChanged(source,
++  BraveBrowserWebContentsDelegate::LoadingStateChanged(source,
+                                                   should_show_loading_ui);
+   if (auto delegate = GetContentsDelegate(browser_.get(), source)) {
+     delegate->LoadingStateChanged(source, should_show_loading_ui);
+@@ -198,7 +198,7 @@ void ChromeBrowserWebContentsDelegate::SetContentsBounds(
+       return;
+     }
+   }
+-  BrowserWebContentsDelegate::SetContentsBounds(source, bounds);
++  BraveBrowserWebContentsDelegate::SetContentsBounds(source, bounds);
+ }
+ 
+ void ChromeBrowserWebContentsDelegate::UpdateTargetURL(
+@@ -207,7 +207,7 @@ void ChromeBrowserWebContentsDelegate::UpdateTargetURL(
+   if (auto delegate = GetContentsDelegate(browser_.get(), source)) {
+     delegate->UpdateTargetURL(source, url);
+   }
+-  BrowserWebContentsDelegate::UpdateTargetURL(source, url);
++  BraveBrowserWebContentsDelegate::UpdateTargetURL(source, url);
+ }
+ 
+ bool ChromeBrowserWebContentsDelegate::TakeFocus(content::WebContents* source,
+@@ -218,7 +218,7 @@ bool ChromeBrowserWebContentsDelegate::TakeFocus(content::WebContents* source,
+     }
+     return false;
+   }
+-  return BrowserWebContentsDelegate::TakeFocus(source, reverse);
++  return BraveBrowserWebContentsDelegate::TakeFocus(source, reverse);
+ }
+ 
+ bool ChromeBrowserWebContentsDelegate::DidAddMessageToConsole(
+@@ -235,7 +235,7 @@ bool ChromeBrowserWebContentsDelegate::DidAddMessageToConsole(
+     // CEF bypasses Chrome's headless console logging even without a host.
+     return false;
+   }
+-  return BrowserWebContentsDelegate::DidAddMessageToConsole(
++  return BraveBrowserWebContentsDelegate::DidAddMessageToConsole(
+       source, log_level, message, line_no, source_id);
+ }
+ 
+@@ -243,7 +243,7 @@ void ChromeBrowserWebContentsDelegate::DraggableRegionsChanged(
+     const std::vector<blink::mojom::DraggableRegionPtr>& regions,
+     content::WebContents* contents) {
+   if (has_app_browser_controller_) {
+-    BrowserWebContentsDelegate::DraggableRegionsChanged(regions, contents);
++    BraveBrowserWebContentsDelegate::DraggableRegionsChanged(regions, contents);
+   } else if (browser_->cef_delegate()) {
+     browser_->cef_delegate()->UpdateDraggableRegions(regions, contents);
+   }
+@@ -256,7 +256,7 @@ void ChromeBrowserWebContentsDelegate::WebContentsCreated(
+     const GURL& target_url,
+     content::WebContents* new_contents) {
+   // SessionTabHelper must exist before CEF initializes the popup browser host.
+-  BrowserWebContentsDelegate::WebContentsCreated(
++  BraveBrowserWebContentsDelegate::WebContentsCreated(
+       source_contents, opener_id, frame_name, target_url, new_contents);
+   if (browser_->cef_delegate()) {
+     browser_->cef_delegate()->OnPopupWebContentsCreated(
+@@ -274,7 +274,7 @@ void ChromeBrowserWebContentsDelegate::RendererUnresponsive(
+       return;
+     }
+   }
+-  BrowserWebContentsDelegate::RendererUnresponsive(
++  BraveBrowserWebContentsDelegate::RendererUnresponsive(
+       source, render_widget_host, std::move(hang_monitor_restarter));
+ }
+ 
+@@ -286,7 +286,7 @@ void ChromeBrowserWebContentsDelegate::RendererResponsive(
+       return;
+     }
+   }
+-  BrowserWebContentsDelegate::RendererResponsive(source, render_widget_host);
++  BraveBrowserWebContentsDelegate::RendererResponsive(source, render_widget_host);
+ }
+ 
+ content::JavaScriptDialogManager*
+@@ -300,13 +300,13 @@ ChromeBrowserWebContentsDelegate::GetJavaScriptDialogManager(
+       }
+     }
+   }
+-  return BrowserWebContentsDelegate::GetJavaScriptDialogManager(source);
++  return BraveBrowserWebContentsDelegate::GetJavaScriptDialogManager(source);
+ }
+ 
+ void ChromeBrowserWebContentsDelegate::EnterFullscreenModeForTab(
+     content::RenderFrameHost* requesting_frame,
+     const blink::mojom::FullscreenOptions& options) {
+-  BrowserWebContentsDelegate::EnterFullscreenModeForTab(requesting_frame,
++  BraveBrowserWebContentsDelegate::EnterFullscreenModeForTab(requesting_frame,
+                                                         options);
+   if (browser_->cef_delegate()) {
+     auto* web_contents =
+@@ -321,7 +321,7 @@ void ChromeBrowserWebContentsDelegate::EnterFullscreenModeForTab(
+ 
+ void ChromeBrowserWebContentsDelegate::ExitFullscreenModeForTab(
+     content::WebContents* web_contents) {
+-  BrowserWebContentsDelegate::ExitFullscreenModeForTab(web_contents);
++  BraveBrowserWebContentsDelegate::ExitFullscreenModeForTab(web_contents);
+   if (browser_->cef_delegate()) {
+     if (auto delegate = GetContentsDelegate(browser_.get(), web_contents)) {
+       delegate->ExitFullscreenModeForTab(web_contents);
+@@ -349,7 +349,7 @@ void ChromeBrowserWebContentsDelegate::FindReply(
+   if (!find_in_page::FindTabHelper::FromWebContents(web_contents)) {
+     return;
+   }
+-  BrowserWebContentsDelegate::FindReply(web_contents, request_id,
++  BraveBrowserWebContentsDelegate::FindReply(web_contents, request_id,
+                                         number_of_matches, selection_rect,
+                                         active_match_ordinal, final_update);
+   if (auto delegate = GetContentsDelegate(browser_.get(), web_contents)) {
+@@ -386,7 +386,7 @@ void ChromeBrowserWebContentsDelegate::CanDownload(
+       return;
+     }
+   }
+-  BrowserWebContentsDelegate::CanDownload(url, request_method,
++  BraveBrowserWebContentsDelegate::CanDownload(url, request_method,
+                                           std::move(callback));
+ }
+ 
+@@ -402,6 +402,6 @@ void ChromeBrowserWebContentsDelegate::RequestMediaAccessPermission(
+       return;
+     }
+   }
+-  BrowserWebContentsDelegate::RequestMediaAccessPermission(
++  BraveBrowserWebContentsDelegate::RequestMediaAccessPermission(
+       web_contents, request, std::move(callback));
+ }
+diff --git a/libcef/browser/chrome/chrome_browser_web_contents_delegate.h b/libcef/browser/chrome/chrome_browser_web_contents_delegate.h
+index 808ebf6..923a30b 100644
+--- a/libcef/browser/chrome/chrome_browser_web_contents_delegate.h
++++ b/libcef/browser/chrome/chrome_browser_web_contents_delegate.h
+@@ -7,13 +7,13 @@
+ #pragma once
+ 
+ #include "base/memory/raw_ref.h"
+-#include "chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.h"
++#include "brave/browser/ui/brave_browser_web_contents_delegate.h"
+ 
+ // Adds CEF callbacks to Chrome's WebContentsDelegate implementation. Owned by
+ // BrowserWindowFeatures, with the same lifetime as BrowserWebContentsDelegate.
+ // Handles WebContents callbacks directly, with ChromeBrowserDelegate providing
+ // popup-host creation and shared browser/window state.
+-class ChromeBrowserWebContentsDelegate : public BrowserWebContentsDelegate {
++class ChromeBrowserWebContentsDelegate : public BraveBrowserWebContentsDelegate {
+  public:
+   ChromeBrowserWebContentsDelegate(
+       BrowserWindowInterface* browser,
+diff --git a/libcef/browser/chrome/chrome_content_browser_client_cef.cc b/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+index 4c4ac81..ea67be7 100644
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.cc
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+@@ -193,7 +193,7 @@ ChromeContentBrowserClientCef::~ChromeContentBrowserClientCef() = default;
+ base::FilePath ChromeContentBrowserClientCef::GetChildProcessPath(int flags) {
+   if (flags !=
+       std::to_underlying(ChildProcessHostFlags::kChildProcessHelperAlerts)) {
+-    return ChromeContentBrowserClient::GetChildProcessPath(flags);
++    return BraveContentBrowserClient::GetChildProcessPath(flags);
+   }
+ 
+   if (!base::apple::AmIBundled()) {
+@@ -206,14 +206,14 @@ base::FilePath ChromeContentBrowserClientCef::GetChildProcessPath(int flags) {
+ 
+ void ChromeContentBrowserClientCef::CleanupOnUIThread() {
+   browser_main_parts_ = nullptr;
+-  ChromeContentBrowserClient::CleanupOnUIThread();
++  BraveContentBrowserClient::CleanupOnUIThread();
+ }
+ 
+ std::unique_ptr<content::BrowserMainParts>
+ ChromeContentBrowserClientCef::CreateBrowserMainParts(
+     bool is_integration_test) {
+   auto main_parts =
+-      ChromeContentBrowserClient::CreateBrowserMainParts(is_integration_test);
++      BraveContentBrowserClient::CreateBrowserMainParts(is_integration_test);
+   auto browser_main_parts = std::make_unique<ChromeBrowserMainExtraPartsCef>();
+   browser_main_parts_ = browser_main_parts.get();
+   static_cast<ChromeBrowserMainParts*>(main_parts.get())
+@@ -224,7 +224,7 @@ ChromeContentBrowserClientCef::CreateBrowserMainParts(
+ void ChromeContentBrowserClientCef::AppendExtraCommandLineSwitches(
+     base::CommandLine* command_line,
+     int child_process_id) {
+-  ChromeContentBrowserClient::AppendExtraCommandLineSwitches(command_line,
++  BraveContentBrowserClient::AppendExtraCommandLineSwitches(command_line,
+                                                              child_process_id);
+ 
+   // Necessary to populate DIR_USER_DATA in sub-processes.
+@@ -309,7 +309,7 @@ void ChromeContentBrowserClientCef::AppendExtraCommandLineSwitches(
+ 
+ void ChromeContentBrowserClientCef::RenderProcessWillLaunch(
+     content::RenderProcessHost* host) {
+-  ChromeContentBrowserClient::RenderProcessWillLaunch(host);
++  BraveContentBrowserClient::RenderProcessWillLaunch(host);
+ 
+   // If the renderer process crashes then the host may already have
+   // CefBrowserInfoManager as an observer. Try to remove it first before adding
+@@ -335,7 +335,7 @@ void ChromeContentBrowserClientCef::AllowCertificateError(
+   }
+ 
+   // Proceed with default handling.
+-  ChromeContentBrowserClient::AllowCertificateError(
++  BraveContentBrowserClient::AllowCertificateError(
+       web_contents, cert_error, ssl_info, request_url, is_main_frame_request,
+       strict_enforcement, std::move(returned_callback));
+ }
+@@ -362,7 +362,7 @@ base::OnceClosure ChromeContentBrowserClientCef::SelectClientCertificate(
+   }
+ 
+   if (!handler) {
+-    return ChromeContentBrowserClient::SelectClientCertificate(
++    return BraveContentBrowserClient::SelectClientCertificate(
+         browser_context, process_id, web_contents, cert_request_info,
+         std::move(client_certs), std::move(delegate));
+   }
+@@ -389,7 +389,7 @@ base::OnceClosure ChromeContentBrowserClientCef::SelectClientCertificate(
+             static_cast<CefX509CertificateImpl*>(cert.get());
+         client_certs.push_back(certImpl->DisconnectIdentity());
+       }
+-      return ChromeContentBrowserClient::SelectClientCertificate(
++      return BraveContentBrowserClient::SelectClientCertificate(
+           browser_context, process_id, web_contents, cert_request_info,
+           std::move(client_certs), std::move(delegate));
+     } else {
+@@ -416,7 +416,7 @@ bool ChromeContentBrowserClientCef::CanCreateWindow(
+     bool opener_suppressed,
+     bool* no_javascript_access) {
+   // The chrome layer has popup blocker, extensions, etc.
+-  if (!ChromeContentBrowserClient::CanCreateWindow(
++  if (!BraveContentBrowserClient::CanCreateWindow(
+           opener, opener_url, opener_top_level_frame_url, source_origin,
+           container_type, target_url, referrer, frame_name, disposition,
+           features, user_gesture, opener_suppressed, no_javascript_access)) {
+@@ -440,7 +440,7 @@ void ChromeContentBrowserClientCef::OverrideWebPreferences(
+     blink::web_pref::WebPreferences* prefs) {
+   renderer_prefs::SetDefaultPrefs(*prefs);
+ 
+-  ChromeContentBrowserClient::OverrideWebPreferences(web_contents,
++  BraveContentBrowserClient::OverrideWebPreferences(web_contents,
+                                                      main_frame_site, prefs);
+ 
+   SkColor base_background_color;
+@@ -496,7 +496,7 @@ void ChromeContentBrowserClientCef::WillCreateURLLoaderFactory(
+   // profiles::CreateSystemProfileForUserManager.
+   auto profile = Profile::FromBrowserContext(browser_context);
+   if (!CefBrowserContext::FromProfile(profile)) {
+-    ChromeContentBrowserClient::WillCreateURLLoaderFactory(
++    BraveContentBrowserClient::WillCreateURLLoaderFactory(
+         browser_context, frame, render_process_id, type, request_initiator,
+         isolation_info, navigation_id, ukm_source_id, factory_builder,
+         header_client, bypass_redirect_checks, disable_secure_dns,
+@@ -528,7 +528,7 @@ void ChromeContentBrowserClientCef::WillCreateURLLoaderFactory(
+   }
+ 
+   // TODO(chrome): Is it necessary to proxy |header_client| callbacks?
+-  ChromeContentBrowserClient::WillCreateURLLoaderFactory(
++  BraveContentBrowserClient::WillCreateURLLoaderFactory(
+       browser_context, frame, render_process_id, type, request_initiator,
+       isolation_info, navigation_id, ukm_source_id, factory_builder,
+       /*header_client=*/nullptr, bypass_redirect_checks, disable_secure_dns,
+@@ -589,7 +589,7 @@ bool ChromeContentBrowserClientCef::HandleExternalProtocol(
+   // The request was unhandled and we've received a callback from
+   // HandleExternalProtocolHelper. Forward to the chrome layer for default
+   // handling.
+-  return ChromeContentBrowserClient::HandleExternalProtocol(
++  return BraveContentBrowserClient::HandleExternalProtocol(
+       url, web_contents_getter, frame_tree_node_id, navigation_data,
+       is_primary_main_frame, is_in_fenced_frame_tree, sandbox_flags,
+       page_transition, has_user_gesture, initiating_origin, initiator_document,
+@@ -632,7 +632,7 @@ bool ChromeContentBrowserClientCef::HandleExternalProtocol(
+ 
+ void ChromeContentBrowserClientCef::CreateThrottlesForNavigation(
+     content::NavigationThrottleRegistry& registry) {
+-  ChromeContentBrowserClient::CreateThrottlesForNavigation(registry);
++  BraveContentBrowserClient::CreateThrottlesForNavigation(registry);
+   throttle::CreateThrottlesForNavigation(registry);
+ }
+ 
+@@ -651,7 +651,7 @@ bool ChromeContentBrowserClientCef::ConfigureNetworkContextParams(
+     return false;
+   }
+ 
+-  ChromeContentBrowserClient::ConfigureNetworkContextParams(
++  BraveContentBrowserClient::ConfigureNetworkContextParams(
+       context, in_memory, relative_partition_path, network_context_params,
+       cert_verifier_creation_params);
+ 
+@@ -696,7 +696,7 @@ ChromeContentBrowserClientCef::CreateLoginDelegate(
+         std::move(auth_required_callback));
+   }
+ 
+-  return ChromeContentBrowserClient::CreateLoginDelegate(
++  return BraveContentBrowserClient::CreateLoginDelegate(
+       auth_info, web_contents, browser_context, request_id,
+       is_request_for_primary_main_frame_navigation, is_request_for_navigation,
+       url, response_headers, first_auth_attempt, guest,
+@@ -707,7 +707,7 @@ void ChromeContentBrowserClientCef::ExposeInterfacesToRenderer(
+     service_manager::BinderRegistry* registry,
+     blink::AssociatedInterfaceRegistry* associated_registry,
+     content::RenderProcessHost* host) {
+-  ChromeContentBrowserClient::ExposeInterfacesToRenderer(
++  BraveContentBrowserClient::ExposeInterfacesToRenderer(
+       registry, associated_registry, host);
+ 
+   CefBrowserManager::ExposeInterfacesToRenderer(registry, associated_registry,
+@@ -717,7 +717,7 @@ void ChromeContentBrowserClientCef::ExposeInterfacesToRenderer(
+ void ChromeContentBrowserClientCef::RegisterBrowserInterfaceBindersForFrame(
+     content::RenderFrameHost* render_frame_host,
+     mojo::BinderMapWithContext<content::RenderFrameHost*>* map) {
+-  ChromeContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
++  BraveContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
+       render_frame_host, map);
+ 
+   CefBrowserFrame::RegisterBrowserInterfaceBindersForFrame(render_frame_host,
+@@ -727,7 +727,7 @@ void ChromeContentBrowserClientCef::RegisterBrowserInterfaceBindersForFrame(
+ std::unique_ptr<content::WebContentsViewDelegate>
+ ChromeContentBrowserClientCef::GetWebContentsViewDelegate(
+     content::WebContents* web_contents) {
+-  // From ChromeContentBrowserClient::GetWebContentsViewDelegate. Windowless
++  // From BraveContentBrowserClient::GetWebContentsViewDelegate. Windowless
+   // browsers don't call this method and use
+   // CefBrowserPlatformDelegateAlloy::AttachHelpers instead.
+   if (auto* registry =
+diff --git a/libcef/browser/chrome/chrome_content_browser_client_cef.h b/libcef/browser/chrome/chrome_content_browser_client_cef.h
+index c7dc803..150574d 100644
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.h
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.h
+@@ -10,13 +10,13 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "cef/libcef/browser/request_context_impl.h"
+-#include "chrome/browser/chrome_content_browser_client.h"
++#include "brave/browser/brave_content_browser_client.h"
+ #include "content/public/browser/web_contents_view_delegate.h"
+ 
+ class ChromeBrowserMainExtraPartsCef;
+ 
+ // CEF override of ChromeContentBrowserClient.
+-class ChromeContentBrowserClientCef : public ChromeContentBrowserClient {
++class ChromeContentBrowserClientCef : public BraveContentBrowserClient {
+  public:
+   ChromeContentBrowserClientCef();
+ 
+diff --git a/libcef/browser/chrome/chrome_context_menu_handler.cc b/libcef/browser/chrome/chrome_context_menu_handler.cc
+index 32b59e9..005d739 100644
+--- a/libcef/browser/chrome/chrome_context_menu_handler.cc
++++ b/libcef/browser/chrome/chrome_context_menu_handler.cc
+@@ -74,11 +74,11 @@ class CefRunContextMenuCallbackImpl : public CefRunContextMenuCallback {
+   IMPLEMENT_REFCOUNTING(CefRunContextMenuCallbackImpl);
+ };
+ 
+-// Lifespan is controlled by RenderViewContextMenu.
++// Lifespan is controlled by RenderViewContextMenu_Chromium.
+ class CefContextMenuObserver : public RenderViewContextMenuObserver,
+                                public CefSimpleMenuModelImpl::StateDelegate {
+  public:
+-  CefContextMenuObserver(RenderViewContextMenu* context_menu,
++  CefContextMenuObserver(RenderViewContextMenu_Chromium* context_menu,
+                          CefRefPtr<CefBrowserHostBase> browser,
+                          CefRefPtr<CefContextMenuHandler> handler)
+       : context_menu_(context_menu), browser_(browser), handler_(handler) {
+@@ -297,7 +297,7 @@ class CefContextMenuObserver : public RenderViewContextMenuObserver,
+     OnMenuClosed();
+   }
+ 
+-  const raw_ptr<RenderViewContextMenu> context_menu_;
++  const raw_ptr<RenderViewContextMenu_Chromium> context_menu_;
+   CefRefPtr<CefBrowserHostBase> browser_;
+   CefRefPtr<CefContextMenuHandler> handler_;
+   CefRefPtr<CefContextMenuParams> params_;
+@@ -313,7 +313,7 @@ class CefContextMenuObserver : public RenderViewContextMenuObserver,
+ };
+ 
+ std::unique_ptr<RenderViewContextMenuObserver> MenuCreatedCallback(
+-    RenderViewContextMenu* context_menu) {
++    RenderViewContextMenu_Chromium* context_menu) {
+   auto browser = CefBrowserHostBase::GetBrowserForContents(
+       context_menu->source_web_contents());
+   if (browser) {
+@@ -331,7 +331,7 @@ std::unique_ptr<RenderViewContextMenuObserver> MenuCreatedCallback(
+   return nullptr;
+ }
+ 
+-bool MenuShowHandlerCallback(RenderViewContextMenu* context_menu) {
++bool MenuShowHandlerCallback(RenderViewContextMenu_Chromium* context_menu) {
+   auto browser = CefBrowserHostBase::GetBrowserForContents(
+       context_menu->source_web_contents());
+   if (browser && browser->context_menu_observer()) {
+@@ -345,9 +345,9 @@ bool MenuShowHandlerCallback(RenderViewContextMenu* context_menu) {
+ }  // namespace
+ 
+ void RegisterCallbacks() {
+-  RenderViewContextMenu::RegisterMenuCreatedCallback(
++  RenderViewContextMenu_Chromium::RegisterMenuCreatedCallback(
+       base::BindRepeating(&MenuCreatedCallback));
+-  RenderViewContextMenu::RegisterMenuShowHandlerCallback(
++  RenderViewContextMenu_Chromium::RegisterMenuShowHandlerCallback(
+       base::BindRepeating(&MenuShowHandlerCallback));
+ }
+ 
+@@ -359,7 +359,7 @@ bool HandleContextMenu(content::WebContents* opener,
+     return true;
+   }
+ 
+-  // Continue with creating the RenderViewContextMenu.
++  // Continue with creating the RenderViewContextMenu_Chromium.
+   return false;
+ }
+ 
+diff --git a/libcef/browser/chrome/views/chrome_browser_view.cc b/libcef/browser/chrome/views/chrome_browser_view.cc
+index 2969d0e..df0dc7b 100644
+--- a/libcef/browser/chrome/views/chrome_browser_view.cc
++++ b/libcef/browser/chrome/views/chrome_browser_view.cc
+@@ -24,7 +24,7 @@ void ChromeBrowserView::InitBrowser(Browser* browser) {
+ 
+   // Initialize the BrowserWidget and BrowserView.
+   auto chrome_widget = static_cast<ChromeBrowserWidget*>(GetWidget());
+-  chrome_widget->Init(this, browser);
++  chrome_widget->InitBrowser(this, browser);
+ 
+   // Retrieve the views::WebView that was created by the above initializations.
+   web_view_ = cef_browser_view_->web_view();
+diff --git a/libcef/browser/chrome/views/chrome_browser_widget.cc b/libcef/browser/chrome/views/chrome_browser_widget.cc
+index 52676a4..d945998 100644
+--- a/libcef/browser/chrome/views/chrome_browser_widget.cc
++++ b/libcef/browser/chrome/views/chrome_browser_widget.cc
+@@ -31,7 +31,8 @@ ChromeBrowserWidget::~ChromeBrowserWidget() {
+   DCHECK(associated_profiles_.empty());
+ }
+ 
+-void ChromeBrowserWidget::Init(BrowserView* browser_view, Browser* browser) {
++void ChromeBrowserWidget::InitBrowser(BrowserView* browser_view,
++                                      Browser* browser) {
+   DCHECK(browser_view);
+   DCHECK(browser);
+ 
+diff --git a/libcef/browser/chrome/views/chrome_browser_widget.h b/libcef/browser/chrome/views/chrome_browser_widget.h
+index cb0c5d0..3342137 100644
+--- a/libcef/browser/chrome/views/chrome_browser_widget.h
++++ b/libcef/browser/chrome/views/chrome_browser_widget.h
+@@ -125,7 +125,7 @@ class ChromeBrowserWidget : public BrowserWidget,
+   ChromeBrowserWidget& operator=(const ChromeBrowserWidget&) = delete;
+ 
+   // Called from ChromeBrowserView::InitBrowser after |browser| creation.
+-  void Init(BrowserView* browser_view, Browser* browser);
++  void InitBrowser(BrowserView* browser_view, Browser* browser);
+ 
+   // CefWidget methods:
+   bool IsAlloyStyle() const override { return false; }
+diff --git a/libcef/browser/chrome/views/toolbar_view_view.h b/libcef/browser/chrome/views/toolbar_view_view.h
+index dda6b5a..a5424d9 100644
+--- a/libcef/browser/chrome/views/toolbar_view_view.h
++++ b/libcef/browser/chrome/views/toolbar_view_view.h
+@@ -7,13 +7,13 @@
+ #pragma once
+ 
+ #include "cef/libcef/browser/views/view_view.h"
+-#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "brave/browser/ui/views/toolbar/brave_toolbar_view.h"
+ 
+-class CefToolbarViewView : public CefViewView<ToolbarView, CefViewDelegate> {
+-  METADATA_HEADER(CefToolbarViewView, ToolbarView)
++class CefToolbarViewView : public CefViewView<BraveToolbarView, CefViewDelegate> {
++  METADATA_HEADER(CefToolbarViewView, BraveToolbarView)
+ 
+  public:
+-  using ParentClass = CefViewView<ToolbarView, CefViewDelegate>;
++  using ParentClass = CefViewView<BraveToolbarView, CefViewDelegate>;
+ 
+   // |cef_delegate| may be nullptr.
+   explicit CefToolbarViewView(CefViewDelegate* cef_delegate,
+diff --git a/libcef/browser/permission_prompt.cc b/libcef/browser/permission_prompt.cc
+index d829857..1f798f1 100644
+--- a/libcef/browser/permission_prompt.cc
++++ b/libcef/browser/permission_prompt.cc
+@@ -255,6 +255,9 @@ cef_permission_request_types_t GetCefRequestType(
+       return CEF_PERMISSION_TYPE_LOCAL_NETWORK;
+     case permissions::RequestType::kLoopbackNetwork:
+       return CEF_PERMISSION_TYPE_LOOPBACK_NETWORK;
++    default:
++      // Embedder-private request types have no representation in the CEF API.
++      break;
+   }
+ 
+   DCHECK(false);
+diff --git a/libcef/browser/setting_helper.cc b/libcef/browser/setting_helper.cc
+index 2be4704..32386f5 100644
+--- a/libcef/browser/setting_helper.cc
++++ b/libcef/browser/setting_helper.cc
+@@ -245,6 +245,9 @@ cef_content_setting_types_t ToCefType(ContentSettingsType type) {
+     TO_CEF_TYPE(INLINE_CUE_MENU);
+     TO_CEF_TYPE(SUSPICIOUS_SITE_WARNING_DATA);
+     case ContentSettingsType::DEFAULT:
++    default:
++      // Embedder-specific types (including Brave settings) are not exposed by
++      // CEF's public content-settings API. Preserve the unsupported path below.
+       break;
+   }
+ 
+diff --git a/libcef/common/chrome/chrome_content_client_cef.cc b/libcef/common/chrome/chrome_content_client_cef.cc
+index 2b0b561..aaed53e 100644
+--- a/libcef/common/chrome/chrome_content_client_cef.cc
++++ b/libcef/common/chrome/chrome_content_client_cef.cc
+@@ -6,7 +6,7 @@
+ #include "cef/libcef/common/chrome/chrome_content_client_cef.h"
+ 
+ #include "cef/libcef/common/app_manager.h"
+-#include "chrome/common/media/cdm_registration.h"
++#include "media/media_buildflags.h"
+ 
+ #if BUILDFLAG(ENABLE_CDM_HOST_VERIFICATION)
+ #include "cef/libcef/common/cdm_host_file_path.h"
+@@ -18,9 +18,9 @@ ChromeContentClientCef::~ChromeContentClientCef() = default;
+ void ChromeContentClientCef::AddContentDecryptionModules(
+     std::vector<content::CdmInfo>* cdms,
+     std::vector<media::CdmHostFilePath>* cdm_host_file_paths) {
+-  if (cdms) {
+-    RegisterCdmInfo(cdms);
+-  }
++  // Preserve Brave CDM registration/hint initialization without adding
++  // Chrome executable host paths; CEF supplies its module paths below.
++  BraveContentClient::AddContentDecryptionModules(cdms, nullptr);
+ 
+ #if BUILDFLAG(ENABLE_CDM_HOST_VERIFICATION)
+   if (cdm_host_file_paths) {
+@@ -30,6 +30,6 @@ void ChromeContentClientCef::AddContentDecryptionModules(
+ }
+ 
+ void ChromeContentClientCef::AddAdditionalSchemes(Schemes* schemes) {
+-  ChromeContentClient::AddAdditionalSchemes(schemes);
++  BraveContentClient::AddAdditionalSchemes(schemes);
+   CefAppManager::Get()->AddAdditionalSchemes(schemes);
+ }
+diff --git a/libcef/common/chrome/chrome_content_client_cef.h b/libcef/common/chrome/chrome_content_client_cef.h
+index e5ec877..e7a0b38 100644
+--- a/libcef/common/chrome/chrome_content_client_cef.h
++++ b/libcef/common/chrome/chrome_content_client_cef.h
+@@ -6,9 +6,9 @@
+ #ifndef CEF_LIBCEF_COMMON_CHROME_CHROME_CONTENT_CLIENT_CEF_H_
+ #define CEF_LIBCEF_COMMON_CHROME_CHROME_CONTENT_CLIENT_CEF_H_
+ 
+-#include "chrome/common/chrome_content_client.h"
++#include "brave/common/brave_content_client.h"
+ 
+-class ChromeContentClientCef : public ChromeContentClient {
++class ChromeContentClientCef : public BraveContentClient {
+  public:
+   ChromeContentClientCef();
+   ~ChromeContentClientCef() override;
+diff --git a/libcef/common/chrome/chrome_main_delegate_cef.cc b/libcef/common/chrome/chrome_main_delegate_cef.cc
+index cb60e83..cb9ee86 100644
+--- a/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -147,7 +147,7 @@ void InitLogging(const base::CommandLine* command_line) {
+ ChromeMainDelegateCef::ChromeMainDelegateCef(CefMainRunner* runner,
+                                              CefSettings* settings,
+                                              CefRefPtr<CefApp> application)
+-    : ChromeMainDelegate({.exe_entry_point_ticks = base::TimeTicks::Now()}),
++    : BraveMainDelegate({.exe_entry_point_ticks = base::TimeTicks::Now()}),
+       runner_(runner),
+       settings_(settings),
+       application_(application) {
+@@ -160,7 +160,7 @@ ChromeMainDelegateCef::~ChromeMainDelegateCef() = default;
+ 
+ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
+   // Returns no value if startup should proceed.
+-  auto result = ChromeMainDelegate::BasicStartupComplete();
++  auto result = BraveMainDelegate::BasicStartupComplete();
+   if (result.has_value()) {
+     return result;
+   }
+@@ -185,6 +185,9 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
+ 
+       const base::CommandLine::SwitchMap& map = command_line->GetSwitches();
+       const_cast<base::CommandLine::SwitchMap*>(&map)->clear();
++
++      // CEF strips application arguments, not Brave embedder defaults.
++      BraveMainDelegate::AppendCommandLineOptions();
+     }
+ 
+     bool no_sandbox = settings_->no_sandbox ? true : false;
+@@ -476,7 +479,7 @@ void ChromeMainDelegateCef::PreSandboxStartup() {
+     }
+   }
+ 
+-  ChromeMainDelegate::PreSandboxStartup();
++  BraveMainDelegate::PreSandboxStartup();
+ 
+   // Initialize crash reporting state for this process/module.
+   // chrome::DIR_CRASH_DUMPS must be configured before calling this function.
+@@ -491,7 +494,7 @@ void ChromeMainDelegateCef::PreSandboxStartup() {
+ 
+ void ChromeMainDelegateCef::SandboxInitialized(
+     const std::string& process_type) {
+-  ChromeMainDelegate::SandboxInitialized(process_type);
++  BraveMainDelegate::SandboxInitialized(process_type);
+ 
+ #if BUILDFLAG(IS_WIN)
+   // Call after InitLogging() potentially changes values in
+@@ -510,14 +513,14 @@ std::optional<int> ChromeMainDelegateCef::PreBrowserMain() {
+ 
+ std::optional<int> ChromeMainDelegateCef::PostEarlyInitialization(
+     InvokedIn invoked_in) {
+-  // Configure this before ChromeMainDelegate::PostEarlyInitialization
++  // Configure this before BraveMainDelegate::PostEarlyInitialization
+   // triggers ChromeBrowserPolicyConnector creation.
+   if (settings_ && settings_->chrome_policy_id.length > 0) {
+     policy::ChromeBrowserPolicyConnector::EnablePlatformPolicySupport(
+         CefString(&settings_->chrome_policy_id).ToString());
+   }
+ 
+-  const auto result = ChromeMainDelegate::PostEarlyInitialization(invoked_in);
++  const auto result = BraveMainDelegate::PostEarlyInitialization(invoked_in);
+   if (!result) {
+     const auto* invoked_in_browser =
+         std::get_if<InvokedInBrowserProcess>(&invoked_in);
+@@ -544,13 +547,13 @@ ChromeMainDelegateCef::RunProcess(
+     return runner_->RunMainProcess(std::move(main_function_params));
+   }
+ 
+-  return ChromeMainDelegate::RunProcess(process_type,
++  return BraveMainDelegate::RunProcess(process_type,
+                                         std::move(main_function_params));
+ }
+ 
+ #if BUILDFLAG(IS_LINUX)
+ void ChromeMainDelegateCef::ZygoteForked() {
+-  ChromeMainDelegate::ZygoteForked();
++  BraveMainDelegate::ZygoteForked();
+ 
+   base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+   const std::string& process_type =
+diff --git a/libcef/common/chrome/chrome_main_delegate_cef.h b/libcef/common/chrome/chrome_main_delegate_cef.h
+index f067895..b44cc7c 100644
+--- a/libcef/common/chrome/chrome_main_delegate_cef.h
++++ b/libcef/common/chrome/chrome_main_delegate_cef.h
+@@ -14,14 +14,14 @@
+ #include "cef/libcef/common/chrome/chrome_content_client_cef.h"
+ #include "cef/libcef/common/resource_bundle_delegate.h"
+ #include "cef/libcef/common/task_runner_manager.h"
+-#include "chrome/app/chrome_main_delegate.h"
++#include "brave/app/brave_main_delegate.h"
+ 
+ class CefMainRunner;
+ class ChromeContentBrowserClientCef;
+ class ChromeContentRendererClientCef;
+ 
+ // CEF override of ChromeMainDelegate
+-class ChromeMainDelegateCef : public ChromeMainDelegate,
++class ChromeMainDelegateCef : public BraveMainDelegate,
+                               public CefAppManager,
+                               public CefTaskRunnerManager {
+  public:
+diff --git a/libcef/renderer/chrome/chrome_content_renderer_client_cef.cc b/libcef/renderer/chrome/chrome_content_renderer_client_cef.cc
+index 1cb197c..00dcddf 100644
+--- a/libcef/renderer/chrome/chrome_content_renderer_client_cef.cc
++++ b/libcef/renderer/chrome/chrome_content_renderer_client_cef.cc
+@@ -28,13 +28,13 @@ ChromeContentRendererClientCef::GetCurrentTaskRunner() {
+ }
+ 
+ void ChromeContentRendererClientCef::RenderThreadStarted() {
+-  ChromeContentRendererClient::RenderThreadStarted();
++  BraveContentRendererClient::RenderThreadStarted();
+ 
+   render_task_runner_ = base::SingleThreadTaskRunner::GetCurrentDefault();
+ }
+ 
+ void ChromeContentRendererClientCef::RenderThreadConnected() {
+-  ChromeContentRendererClient::RenderThreadConnected();
++  BraveContentRendererClient::RenderThreadConnected();
+ 
+   render_manager_->RenderThreadConnected();
+ }
+@@ -61,14 +61,14 @@ void ChromeContentRendererClientCef::RenderFrameCreated(
+         (*config).print_preview_enabled);
+   }
+ 
+-  ChromeContentRendererClient::RenderFrameCreated(render_frame);
++  BraveContentRendererClient::RenderFrameCreated(render_frame);
+ }
+ 
+ void ChromeContentRendererClientCef::WebViewCreated(
+     blink::WebView* web_view,
+     bool was_created_by_renderer,
+     const url::Origin* outermost_origin) {
+-  ChromeContentRendererClient::WebViewCreated(web_view, was_created_by_renderer,
++  BraveContentRendererClient::WebViewCreated(web_view, was_created_by_renderer,
+                                               outermost_origin);
+ 
+   bool browser_created;
+@@ -108,7 +108,7 @@ void ChromeContentRendererClientCef::DevToolsAgentDetached() {
+ 
+ void ChromeContentRendererClientCef::ExposeInterfacesToBrowser(
+     mojo::BinderMap* binders) {
+-  ChromeContentRendererClient::ExposeInterfacesToBrowser(binders);
++  BraveContentRendererClient::ExposeInterfacesToBrowser(binders);
+ 
+   render_manager_->ExposeInterfacesToBrowser(binders);
+ }
+diff --git a/libcef/renderer/chrome/chrome_content_renderer_client_cef.h b/libcef/renderer/chrome/chrome_content_renderer_client_cef.h
+index 7275eae..b21c59b 100644
+--- a/libcef/renderer/chrome/chrome_content_renderer_client_cef.h
++++ b/libcef/renderer/chrome/chrome_content_renderer_client_cef.h
+@@ -10,7 +10,7 @@
+ 
+ #include "base/memory/scoped_refptr.h"
+ #include "base/task/single_thread_task_runner.h"
+-#include "chrome/renderer/chrome_content_renderer_client.h"
++#include "brave/renderer/brave_content_renderer_client.h"
+ 
+ namespace cef {
+ struct BrowserConfig;
+@@ -19,7 +19,7 @@ struct BrowserConfig;
+ class CefRenderManager;
+ 
+ // CEF override of ChromeContentRendererClient.
+-class ChromeContentRendererClientCef : public ChromeContentRendererClient {
++class ChromeContentRendererClientCef : public BraveContentRendererClient {
+  public:
+   ChromeContentRendererClientCef();
+ 
+diff --git a/libcef/resources/cef_strings.grd b/libcef/resources/cef_strings.grd
+index a3d59a2..79e78ea 100644
+--- a/libcef/resources/cef_strings.grd
++++ b/libcef/resources/cef_strings.grd
+@@ -18,11 +18,10 @@ need to be translated for each locale.-->
+     <if expr="pp_ifdef('use_third_party_translations')">
+       <output filename="cef_strings_ast.pak" type="data_package" lang="ast" />
+     </if>
++    <output filename="cef_strings_az.pak" type="data_package" lang="az" />
+     <output filename="cef_strings_bg.pak" type="data_package" lang="bg" />
+     <output filename="cef_strings_bn.pak" type="data_package" lang="bn" />
+-    <if expr="pp_ifdef('use_third_party_translations')">
+-      <output filename="cef_strings_bs.pak" type="data_package" lang="bs" />
+-    </if>
++    <output filename="cef_strings_bs.pak" type="data_package" lang="bs" />
+     <output filename="cef_strings_ca.pak" type="data_package" lang="ca" />
+     <if expr="pp_ifdef('use_third_party_translations')">
+       <output filename="cef_strings_ca@valencia.pak" type="data_package" lang="ca@valencia" />
+@@ -65,20 +64,24 @@ need to be translated for each locale.-->
+     <output filename="cef_strings_id.pak" type="data_package" lang="id" />
+     <output filename="cef_strings_it.pak" type="data_package" lang="it" />
+     <output filename="cef_strings_ja.pak" type="data_package" lang="ja" />
+-    <if expr="pp_ifdef('use_third_party_translations')">
+-      <output filename="cef_strings_ka.pak" type="data_package" lang="ka" />
+-    </if>
++    <output filename="cef_strings_ka.pak" type="data_package" lang="ka" />
++    <output filename="cef_strings_kk.pak" type="data_package" lang="kk" />
++    <output filename="cef_strings_km.pak" type="data_package" lang="km" />
+     <output filename="cef_strings_kn.pak" type="data_package" lang="kn" />
+     <output filename="cef_strings_ko.pak" type="data_package" lang="ko" />
+     <if expr="pp_ifdef('use_third_party_translations')">
+       <output filename="cef_strings_ku.pak" type="data_package" lang="ku" />
+       <output filename="cef_strings_kw.pak" type="data_package" lang="kw" />
+     </if>
++    <output filename="cef_strings_lo.pak" type="data_package" lang="lo" />
+     <output filename="cef_strings_lt.pak" type="data_package" lang="lt" />
+     <output filename="cef_strings_lv.pak" type="data_package" lang="lv" />
++    <output filename="cef_strings_mk.pak" type="data_package" lang="mk" />
+     <output filename="cef_strings_ml.pak" type="data_package" lang="ml" />
++    <output filename="cef_strings_mn.pak" type="data_package" lang="mn" />
+     <output filename="cef_strings_mr.pak" type="data_package" lang="mr" />
+     <output filename="cef_strings_ms.pak" type="data_package" lang="ms" />
++    <output filename="cef_strings_my.pak" type="data_package" lang="my" />
+     <output filename="cef_strings_nl.pak" type="data_package" lang="nl" />
+     <!-- The translation console uses 'no' for Norwegian Bokmål. It should
+          be 'nb'. -->
+@@ -88,9 +91,12 @@ need to be translated for each locale.-->
+     <output filename="cef_strings_pt-PT.pak" type="data_package" lang="pt-PT" />
+     <output filename="cef_strings_ro.pak" type="data_package" lang="ro" />
+     <output filename="cef_strings_ru.pak" type="data_package" lang="ru" />
++    <output filename="cef_strings_si.pak" type="data_package" lang="si" />
+     <output filename="cef_strings_sk.pak" type="data_package" lang="sk" />
+     <output filename="cef_strings_sl.pak" type="data_package" lang="sl" />
++    <output filename="cef_strings_sq.pak" type="data_package" lang="sq" />
+     <output filename="cef_strings_sr.pak" type="data_package" lang="sr" />
++    <output filename="cef_strings_sr-Latn.pak" type="data_package" lang="sr-Latn" />
+     <output filename="cef_strings_sv.pak" type="data_package" lang="sv" />
+     <output filename="cef_strings_sw.pak" type="data_package" lang="sw" />
+     <output filename="cef_strings_ta.pak" type="data_package" lang="ta" />
+@@ -102,6 +108,7 @@ need to be translated for each locale.-->
+     </if>
+     <output filename="cef_strings_uk.pak" type="data_package" lang="uk" />
+     <output filename="cef_strings_ur.pak" type="data_package" lang="ur" />
++    <output filename="cef_strings_uz.pak" type="data_package" lang="uz" />
+     <output filename="cef_strings_vi.pak" type="data_package" lang="vi" />
+     <output filename="cef_strings_zh-CN.pak" type="data_package" lang="zh-CN" />
+     <output filename="cef_strings_zh-TW.pak" type="data_package" lang="zh-TW" />

@@ -1,0 +1,42 @@
+version = 1
+
+[[annotations]]
+path = "**"
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+Copyright = "Alex Indigo"
+
+[[annotations]]
+path = ["pins.json", "tools/**", "harness/**"]
+precedence = "override"
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+SPDX-FileCopyrightText = "Alex Indigo"
+
+[[annotations]]
+path = "patches/brave-core/**"
+precedence = "override"
+SPDX-License-Identifier = "MPL-2.0"
+SPDX-FileCopyrightText = ["The Brave Authors", "Alex Indigo"]
+
+[[annotations]]
+path = "patches/chromium/**"
+precedence = "override"
+SPDX-License-Identifier = "BSD-3-Clause"
+SPDX-FileCopyrightText = ["The Chromium Authors", "Alex Indigo"]
+
+[[annotations]]
+path = "patches/chromium/0008-crashpad-no-uploads.patch"
+precedence = "override"
+SPDX-License-Identifier = "Apache-2.0"
+SPDX-FileCopyrightText = ["The Crashpad Authors", "Alex Indigo"]
+
+[[annotations]]
+path = "patches/cef/**"
+precedence = "override"
+SPDX-License-Identifier = "BSD-3-Clause"
+SPDX-FileCopyrightText = ["Marshall A. Greenblatt", "Alex Indigo"]
+
+[[annotations]]
+path = "patches/series.json"
+precedence = "override"
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+SPDX-FileCopyrightText = "Alex Indigo"

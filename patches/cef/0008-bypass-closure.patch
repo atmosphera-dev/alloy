@@ -1,0 +1,400 @@
+diff --git a/libcef/browser/media_router/media_router_manager.cc b/libcef/browser/media_router/media_router_manager.cc
+--- a/libcef/browser/media_router/media_router_manager.cc
++++ b/libcef/browser/media_router/media_router_manager.cc
+@@ -4,150 +4,10 @@
+ 
+ #include "cef/libcef/browser/media_router/media_router_manager.h"
+ 
+-#include "base/memory/raw_ptr.h"
+-#include "cef/libcef/browser/browser_context.h"
+ #include "cef/libcef/browser/thread_util.h"
+-#include "components/media_router/browser/media_router_factory.h"
+-#include "components/media_router/browser/media_routes_observer.h"
+-#include "components/media_router/browser/presentation_connection_message_observer.h"
+-#include "components/media_router/browser/route_message_util.h"
++#include "components/media_router/common/route_request_result.h"
+ 
+-namespace {
+-
+-const int kTimeoutMs = 5 * 1000;
+-const char kDefaultPresentationUrl[] = "https://google.com";
+-
+-}  // namespace
+-
+-class CefMediaRoutesObserver : public media_router::MediaRoutesObserver {
+- public:
+-  explicit CefMediaRoutesObserver(CefMediaRouterManager* manager)
+-      : media_router::MediaRoutesObserver(manager->GetMediaRouter()),
+-        manager_(manager) {}
+-
+-  CefMediaRoutesObserver(const CefMediaRoutesObserver&) = delete;
+-  CefMediaRoutesObserver& operator=(const CefMediaRoutesObserver&) = delete;
+-
+-  void OnRoutesUpdated(
+-      const std::vector<media_router::MediaRoute>& routes) override {
+-    manager_->routes_ = routes;
+-    manager_->NotifyCurrentRoutes();
+-  }
+-
+- private:
+-  const raw_ptr<CefMediaRouterManager> manager_;
+-};
+-
+-// Used to receive messages if PresentationConnection is not supported.
+-class CefPresentationConnectionMessageObserver
+-    : public media_router::PresentationConnectionMessageObserver {
+- public:
+-  CefPresentationConnectionMessageObserver(
+-      CefMediaRouterManager* manager,
+-      const media_router::MediaRoute& route)
+-      : media_router::PresentationConnectionMessageObserver(
+-            manager->GetMediaRouter(),
+-            route.media_route_id()),
+-        manager_(manager),
+-        route_(route) {}
+-
+-  CefPresentationConnectionMessageObserver(
+-      const CefPresentationConnectionMessageObserver&) = delete;
+-  CefPresentationConnectionMessageObserver& operator=(
+-      const CefPresentationConnectionMessageObserver&) = delete;
+-
+-  void OnMessagesReceived(
+-      CefMediaRouterManager::MediaMessageVector messages) override {
+-    manager_->OnMessagesReceived(route_, messages);
+-  }
+-
+- private:
+-  const raw_ptr<CefMediaRouterManager> manager_;
+-  const media_router::MediaRoute route_;
+-};
+-
+-// Used for messaging and route status notifications with Cast.
+-class CefPresentationConnection : public blink::mojom::PresentationConnection {
+- public:
+-  explicit CefPresentationConnection(
+-      CefMediaRouterManager* manager,
+-      const media_router::MediaRoute& route,
+-      media_router::mojom::RoutePresentationConnectionPtr connections)
+-      : manager_(manager),
+-        route_(route),
+-        connection_receiver_(this, std::move(connections->connection_receiver)),
+-        connection_remote_(std::move(connections->connection_remote)) {}
+-
+-  CefPresentationConnection(const CefPresentationConnection&) = delete;
+-  CefPresentationConnection& operator=(const CefPresentationConnection&) =
+-      delete;
+-
+-  void OnMessage(
+-      blink::mojom::PresentationConnectionMessagePtr message) override {
+-    CefMediaRouterManager::MediaMessageVector messages;
+-    if (message->is_message()) {
+-      messages.push_back(media_router::message_util::RouteMessageFromString(
+-          message->get_message()));
+-    } else if (message->is_data()) {
+-      messages.push_back(media_router::message_util::RouteMessageFromData(
+-          message->get_data()));
+-    }
+-    if (!messages.empty()) {
+-      manager_->OnMessagesReceived(route_, messages);
+-    }
+-  }
+-
+-  void DidChangeState(
+-      blink::mojom::PresentationConnectionState state) override {
+-    // May result in |this| being deleted, so post async and allow the call
+-    // stack to unwind.
+-    CEF_POST_TASK(
+-        CEF_UIT,
+-        base::BindOnce(&CefMediaRouterManager::OnRouteStateChange,
+-                       manager_->weak_ptr_factory_.GetWeakPtr(), route_,
+-                       content::PresentationConnectionStateChangeInfo(state)));
+-  }
+-
+-  void DidClose(
+-      blink::mojom::PresentationConnectionCloseReason reason) override {
+-    DidChangeState(blink::mojom::PresentationConnectionState::CLOSED);
+-  }
+-
+-  void SendRouteMessage(const std::string& message) {
+-    connection_remote_->OnMessage(
+-        blink::mojom::PresentationConnectionMessage::NewMessage(message));
+-  }
+-
+- private:
+-  const raw_ptr<CefMediaRouterManager> manager_;
+-  const media_router::MediaRoute route_;
+-
+-  // Used to receive messages from the MRP.
+-  mojo::Receiver<blink::mojom::PresentationConnection> connection_receiver_;
+-
+-  // Used to send messages to the MRP.
+-  mojo::Remote<blink::mojom::PresentationConnection> connection_remote_;
+-};
+-
+-CefMediaRouterManager::CefMediaRouterManager(
+-    content::BrowserContext* browser_context)
+-    : browser_context_(browser_context),
+-      query_result_manager_(GetMediaRouter()),
+-      weak_ptr_factory_(this) {
+-  // Perform initialization.
+-  GetMediaRouter()->OnUserGesture();
+-
+-  query_result_manager_.AddObserver(this);
+-
+-  // A non-empty presentation URL to required for discovery of Cast devices.
+-  query_result_manager_.SetSourcesForCastMode(
+-      media_router::MediaCastMode::PRESENTATION,
+-      {media_router::MediaSource::ForPresentationUrl(
+-          GURL(kDefaultPresentationUrl))},
+-      url::Origin());
+-
+-  routes_observer_ = std::make_unique<CefMediaRoutesObserver>(this);
+-}
++CefMediaRouterManager::CefMediaRouterManager(content::BrowserContext*) {}
+ 
+ CefMediaRouterManager::~CefMediaRouterManager() {
+   CEF_REQUIRE_UIT();
+@@ -155,8 +15,6 @@
+     observers_.RemoveObserver(&observer);
+     observer.OnMediaRouterDestroyed();
+   }
+-
+-  query_result_manager_.RemoveObserver(this);
+ }
+ 
+ void CefMediaRouterManager::AddObserver(Observer* observer) {
+@@ -172,132 +30,39 @@
+ void CefMediaRouterManager::NotifyCurrentSinks() {
+   CEF_REQUIRE_UIT();
+   for (auto& observer : observers_) {
+-    observer.OnMediaSinks(sinks_);
++    observer.OnMediaSinks({});
+   }
+ }
+ 
+ void CefMediaRouterManager::NotifyCurrentRoutes() {
+   CEF_REQUIRE_UIT();
+   for (auto& observer : observers_) {
+-    observer.OnMediaRoutes(routes_);
++    observer.OnMediaRoutes({});
+   }
+ }
+ 
+-void CefMediaRouterManager::CreateRoute(
+-    const media_router::MediaSource::Id& source_id,
+-    const media_router::MediaSink::Id& sink_id,
+-    const url::Origin& origin,
+-    CreateRouteResultCallback callback) {
+-  GetMediaRouter()->CreateRoute(
+-      source_id, sink_id, origin, /*web_contents=*/nullptr,
+-      base::BindOnce(&CefMediaRouterManager::OnCreateRoute,
+-                     weak_ptr_factory_.GetWeakPtr(), std::move(callback)),
+-      base::Milliseconds(kTimeoutMs));
++void CefMediaRouterManager::CreateRoute(const media_router::MediaSource::Id&,
++                                        const media_router::MediaSink::Id&,
++                                        const url::Origin&,
++                                        CreateRouteResultCallback callback) {
++  CEF_REQUIRE_UIT();
++  auto result = media_router::RouteRequestResult::FromError(
++      "Local-network discovery and casting are disabled in Alloy",
++      media_router::mojom::RouteRequestResultCode::NO_SUPPORTED_PROVIDER);
++  std::move(callback).Run(*result);
+ }
+ 
+ void CefMediaRouterManager::SendRouteMessage(
+-    const media_router::MediaRoute::Id& route_id,
+-    const std::string& message) {
+-  // Must use PresentationConnection to send messages if it exists.
+-  auto state = GetRouteState(route_id);
+-  if (state && state->presentation_connection_) {
+-    state->presentation_connection_->SendRouteMessage(message);
+-    return;
+-  }
+-
+-  GetMediaRouter()->SendRouteMessage(route_id, message);
++    const media_router::MediaRoute::Id&,
++    const std::string&) {
++  CEF_REQUIRE_UIT();
+ }
+ 
+ void CefMediaRouterManager::TerminateRoute(
+-    const media_router::MediaRoute::Id& route_id) {
+-  GetMediaRouter()->TerminateRoute(route_id);
++    const media_router::MediaRoute::Id&) {
++  CEF_REQUIRE_UIT();
+ }
+ 
+-void CefMediaRouterManager::OnSinksUpdated(const MediaSinkVector& sinks) {
+-  sinks_ = sinks;
+-  NotifyCurrentSinks();
++void CefMediaRouterManager::OnSinksUpdated(const MediaSinkVector&) {
++  CEF_REQUIRE_UIT();
+ }
+-
+-media_router::MediaRouter* CefMediaRouterManager::GetMediaRouter() const {
+-  CEF_REQUIRE_UIT();
+-  return media_router::MediaRouterFactory::GetApiForBrowserContext(
+-      browser_context_);
+-}
+-
+-void CefMediaRouterManager::OnCreateRoute(
+-    CreateRouteResultCallback callback,
+-    media_router::mojom::RoutePresentationConnectionPtr connection,
+-    const media_router::RouteRequestResult& result) {
+-  CEF_REQUIRE_UIT();
+-  if (result.route()) {
+-    CreateRouteState(*result.route(), std::move(connection));
+-  }
+-
+-  std::move(callback).Run(result);
+-}
+-
+-void CefMediaRouterManager::OnRouteStateChange(
+-    const media_router::MediaRoute& route,
+-    const content::PresentationConnectionStateChangeInfo& info) {
+-  CEF_REQUIRE_UIT();
+-  if (info.state == blink::mojom::PresentationConnectionState::CLOSED ||
+-      info.state == blink::mojom::PresentationConnectionState::TERMINATED) {
+-    RemoveRouteState(route.media_route_id());
+-  }
+-
+-  for (auto& observer : observers_) {
+-    observer.OnMediaRouteStateChange(route, info);
+-  }
+-}
+-
+-void CefMediaRouterManager::OnMessagesReceived(
+-    const media_router::MediaRoute& route,
+-    const MediaMessageVector& messages) {
+-  CEF_REQUIRE_UIT();
+-  for (auto& observer : observers_) {
+-    observer.OnMediaRouteMessages(route, messages);
+-  }
+-}
+-
+-void CefMediaRouterManager::CreateRouteState(
+-    const media_router::MediaRoute& route,
+-    media_router::mojom::RoutePresentationConnectionPtr connection) {
+-  const auto route_id = route.media_route_id();
+-  auto state = std::make_unique<RouteState>();
+-
+-  if (!connection.is_null()) {
+-    // PresentationConnection must be used for messaging and status
+-    // notifications if it exists.
+-    state->presentation_connection_ =
+-        std::make_unique<CefPresentationConnection>(this, route,
+-                                                    std::move(connection));
+-  } else {
+-    // Fallback if PresentationConnection is not supported.
+-    state->message_observer_ =
+-        std::make_unique<CefPresentationConnectionMessageObserver>(this, route);
+-    state->state_subscription_ =
+-        GetMediaRouter()->AddPresentationConnectionStateChangedCallback(
+-            route_id,
+-            base::BindRepeating(&CefMediaRouterManager::OnRouteStateChange,
+-                                weak_ptr_factory_.GetWeakPtr(), route));
+-  }
+-
+-  route_state_map_.insert(std::make_pair(route_id, std::move(state)));
+-}
+-
+-CefMediaRouterManager::RouteState* CefMediaRouterManager::GetRouteState(
+-    const media_router::MediaRoute::Id& route_id) {
+-  const auto it = route_state_map_.find(route_id);
+-  if (it != route_state_map_.end()) {
+-    return it->second.get();
+-  }
+-  return nullptr;
+-}
+-
+-void CefMediaRouterManager::RemoveRouteState(
+-    const media_router::MediaRoute::Id& route_id) {
+-  auto it = route_state_map_.find(route_id);
+-  if (it != route_state_map_.end()) {
+-    route_state_map_.erase(it);
+-  }
+-}
+diff --git a/libcef/browser/media_router/media_router_manager.h b/libcef/browser/media_router/media_router_manager.h
+--- a/libcef/browser/media_router/media_router_manager.h
++++ b/libcef/browser/media_router/media_router_manager.h
+@@ -78,51 +78,7 @@
+   void OnSinksUpdated(const MediaSinkVector& sinks) override;
+ 
+  private:
+-  friend class CefMediaRoutesObserver;
+-  friend class CefPresentationConnection;
+-  friend class CefPresentationConnectionMessageObserver;
+-
+-  // Do not keep a reference to the object returned by this method.
+-  media_router::MediaRouter* GetMediaRouter() const;
+-
+-  void OnCreateRoute(
+-      CreateRouteResultCallback callback,
+-      media_router::mojom::RoutePresentationConnectionPtr connection,
+-      const media_router::RouteRequestResult& result);
+-  void OnRouteStateChange(
+-      const media_router::MediaRoute& route,
+-      const content::PresentationConnectionStateChangeInfo& info);
+-  void OnMessagesReceived(const media_router::MediaRoute& route,
+-                          const MediaMessageVector& messages);
+-
+-  struct RouteState {
+-    std::unique_ptr<CefPresentationConnection> presentation_connection_;
+-
+-    // Used if there is no RoutePresentationConnectionPtr.
+-    std::unique_ptr<CefPresentationConnectionMessageObserver> message_observer_;
+-    base::CallbackListSubscription state_subscription_;
+-  };
+-  void CreateRouteState(
+-      const media_router::MediaRoute& route,
+-      media_router::mojom::RoutePresentationConnectionPtr connection);
+-  RouteState* GetRouteState(const media_router::MediaRoute::Id& route_id);
+-  void RemoveRouteState(const media_router::MediaRoute::Id& route_id);
+-
+-  const raw_ptr<content::BrowserContext> browser_context_;
+-
+   base::ObserverList<Observer> observers_;
+-
+-  media_router::QueryResultManager query_result_manager_;
+-  std::unique_ptr<CefMediaRoutesObserver> routes_observer_;
+-
+-  MediaRouteVector routes_;
+-  MediaSinkVector sinks_;
+-
+-  using RouteStateMap =
+-      std::map<media_router::MediaRoute::Id, std::unique_ptr<RouteState>>;
+-  RouteStateMap route_state_map_;
+-
+-  base::WeakPtrFactory<CefMediaRouterManager> weak_ptr_factory_;
+ };
+ 
+ #endif  // CEF_LIBCEF_BROWSER_MEDIA_ROUTER_MEDIA_ROUTER_MANAGER_H_
+diff --git a/libcef/common/crash_reporter_client.cc b/libcef/common/crash_reporter_client.cc
+--- a/libcef/common/crash_reporter_client.cc
++++ b/libcef/common/crash_reporter_client.cc
+@@ -649,21 +649,21 @@
+ #endif  // !BUILDFLAG(IS_POSIX)
+ 
+ bool CefCrashReporterClient::GetCollectStatsConsent() {
+-  return true;
++  return false;
+ }
+ 
+ bool CefCrashReporterClient::GetCollectStatsInSample() {
+-  return true;
++  return false;
+ }
+ 
+ bool CefCrashReporterClient::ReportingIsEnforcedByPolicy(
+     bool* crashpad_enabled) {
+-  *crashpad_enabled = true;
++  *crashpad_enabled = false;
+   return true;
+ }
+ 
+ std::string CefCrashReporterClient::GetUploadUrl() {
+-  return server_url_;
++  return {};
+ }
+ 
+ // See HandlerMain() in third_party/crashpad/crashpad/handler/handler_main.cc

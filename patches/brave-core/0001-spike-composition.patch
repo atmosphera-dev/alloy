@@ -1,0 +1,231 @@
+diff --git a/app/brave_main_delegate.cc b/app/brave_main_delegate.cc
+index a990f05..bc75274 100644
+--- a/app/brave_main_delegate.cc
++++ b/app/brave_main_delegate.cc
+@@ -26,6 +26,11 @@
+ #include "brave/renderer/brave_content_renderer_client.h"
+ #include "brave/utility/brave_content_utility_client.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
++
++#if BUILDFLAG(ENABLE_CEF)
++#include "chrome/browser/policy/chrome_browser_policy_connector.h"
++#endif
+ #include "chrome/app/chrome_main_delegate.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/chrome_paths.h"
+@@ -164,10 +169,17 @@ void BraveMainDelegate::PreSandboxStartup() {
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
+ 
+ #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
++#if BUILDFLAG(ENABLE_CEF)
++  // CEF owns policy paths through its connector, not a PathService key.
++  // The CEF delegate can subsequently override this Brave default.
++  policy::ChromeBrowserPolicyConnector::EnablePlatformPolicySupport(
++      "/etc/brave/policies");
++#else
+   base::PathService::OverrideAndCreateIfNeeded(
+       chrome::DIR_POLICY_FILES,
+       base::FilePath(FILE_PATH_LITERAL("/etc/brave/policies")), true, false);
+ #endif
++#endif
+ 
+ #if BUILDFLAG(IS_LINUX)
+   // Ensure we have read the Linux distro before the process is sandboxed.
+diff --git a/app/brave_main_delegate.h b/app/brave_main_delegate.h
+index 5621b1f..5c923ed 100644
+--- a/app/brave_main_delegate.h
++++ b/app/brave_main_delegate.h
+@@ -39,13 +39,14 @@ class BraveMainDelegate : public ChromeMainDelegate {
+   std::optional<int> PostEarlyInitialization(
+       ChromeMainDelegate::InvokedIn invoked_in) override;
+ 
++  // Allows embedders to restore defaults after resetting application args.
++  static void AppendCommandLineOptions();
++
+  private:
+   FRIEND_TEST_ALL_PREFIXES(BraveMainDelegateUnitTest,
+                            DefaultCommandLineOverrides);
+   FRIEND_TEST_ALL_PREFIXES(BraveMainDelegateUnitTest,
+                            OverrideSwitchFromCommandLine);
+-
+-  static void AppendCommandLineOptions();
+ };
+ 
+ #endif  // BRAVE_APP_BRAVE_MAIN_DELEGATE_H_
+diff --git a/browser/ui/views/toolbar/brave_toolbar_view.cc b/browser/ui/views/toolbar/brave_toolbar_view.cc
+index 4fe0b4c..628186b 100644
+--- a/browser/ui/views/toolbar/brave_toolbar_view.cc
++++ b/browser/ui/views/toolbar/brave_toolbar_view.cc
+@@ -212,8 +212,9 @@ class BraveToolbarView::LayoutGuard {
+ };
+ 
+ BraveToolbarView::BraveToolbarView(BrowserWindowInterface* browser,
+-                                   BrowserView* browser_view)
+-    : ToolbarView(browser, browser_view) {}
++                                   BrowserView* browser_view,
++                                   std::optional<DisplayMode> display_mode)
++    : ToolbarView(browser, browser_view, display_mode) {}
+ 
+ BraveToolbarView::~BraveToolbarView() = default;
+ 
+diff --git a/browser/ui/views/toolbar/brave_toolbar_view.h b/browser/ui/views/toolbar/brave_toolbar_view.h
+index 3f281a9..9e4de1c 100644
+--- a/browser/ui/views/toolbar/brave_toolbar_view.h
++++ b/browser/ui/views/toolbar/brave_toolbar_view.h
+@@ -38,8 +38,10 @@ class BraveToolbarView : public ToolbarView,
+  public:
+   class LayoutGuard;
+ 
+-  explicit BraveToolbarView(BrowserWindowInterface* browser,
+-                            BrowserView* browser_view);
++  explicit BraveToolbarView(
++      BrowserWindowInterface* browser,
++      BrowserView* browser_view,
++      std::optional<DisplayMode> display_mode = std::nullopt);
+   ~BraveToolbarView() override;
+ 
+   BraveBookmarkButton* bookmark_button() const { return bookmark_; }
+diff --git a/chromium_src/chrome/browser/chrome_resource_bundle_helper.cc b/chromium_src/chrome/browser/chrome_resource_bundle_helper.cc
+index 6e2cb00..2f0e562 100644
+--- a/chromium_src/chrome/browser/chrome_resource_bundle_helper.cc
++++ b/chromium_src/chrome/browser/chrome_resource_bundle_helper.cc
+@@ -10,8 +10,10 @@
+ 
+ std::string LoadLocalState(
+     ChromeFeatureListCreator* chrome_feature_list_creator,
++    ui::ResourceBundle::Delegate* resource_bundle_delegate,
+     bool is_running_tests) {
+   std::string ret = LoadLocalState_ChromiumImpl(chrome_feature_list_creator,
++                                                resource_bundle_delegate,
+                                                 is_running_tests);
+   brave::InitializeResourceBundle();
+   return ret;
+diff --git a/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.cc b/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+index cecd2fe..d9fc9f5 100644
+--- a/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -805,8 +805,7 @@ void RenderViewContextMenu::SetAIEngineForTesting(
+ }
+ #endif
+ 
+-void RenderViewContextMenu::InitMenu() {
+-  RenderViewContextMenu_Chromium::InitMenu();
++void RenderViewContextMenu::AppendEmbedderMenuItems() {
+ 
+   // Move "Open link in split view" to the last item of the first section (right
+   // before the first separator) when present.
+diff --git a/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.h b/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.h
+index fc9de6e..f29894e 100644
+--- a/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.h
++++ b/chromium_src/chrome/browser/renderer_context_menu/render_view_context_menu.h
+@@ -76,7 +76,7 @@ class RenderViewContextMenu : public RenderViewContextMenu_Chromium
+  private:
+   friend class RenderViewContextMenuTest;
+   // RenderViewContextMenuBase:
+-  void InitMenu() override;
++  void AppendEmbedderMenuItems() override;
+   void NotifyMenuShown() override;
+ 
+ #if BUILDFLAG(ENABLE_EMAIL_ALIASES)
+diff --git a/chromium_src/net/cookies/cookie_monster.cc b/chromium_src/net/cookies/cookie_monster.cc
+index 1d3ed68..81ad1b7 100644
+--- a/chromium_src/net/cookies/cookie_monster.cc
++++ b/chromium_src/net/cookies/cookie_monster.cc
+@@ -32,14 +32,17 @@ CookieMonster::~CookieMonster() {}
+ CookieMonster_ChromiumImpl*
+ CookieMonster::GetOrCreateEphemeralCookieStoreForTopFrameURL(
+     const GURL& top_frame_url) {
++  ephemeral_cookie_store_used_ = true;
+   std::string domain = URLToEphemeralStorageDomain(top_frame_url);
+   auto it = ephemeral_cookie_stores_.find(domain);
+   if (it != ephemeral_cookie_stores_.end())
+     return it->second.get();
+ 
+-  return ephemeral_cookie_stores_
+-      .emplace(domain, new CookieMonster_ChromiumImpl(nullptr /* store */,
+-                                                      net_log_.net_log()))
++  auto store = std::make_unique<CookieMonster_ChromiumImpl>(
++      nullptr /* store */, net_log_.net_log());
++  store->SetCookieableSchemes(GetCookieableSchemesForChildStore(),
++                             SetCookieableSchemesCallback());
++  return ephemeral_cookie_stores_.emplace(domain, std::move(store))
+       .first->second.get();
+ }
+ 
+@@ -85,14 +88,11 @@ void CookieMonster::DeleteSessionCookiesAsync(DeleteCallback callback) {
+   CookieMonster_ChromiumImpl::DeleteSessionCookiesAsync(std::move(callback));
+ }
+ 
+-void CookieMonster::SetCookieableSchemes(
+-    std::vector<std::string> schemes,
+-    SetCookieableSchemesCallback callback) {
+-  for (auto& it : ephemeral_cookie_stores_) {
+-    it.second->SetCookieableSchemes(schemes, SetCookieableSchemesCallback());
+-  }
+-  CookieMonster_ChromiumImpl::SetCookieableSchemes(std::move(schemes),
+-                                                   std::move(callback));
++bool CookieMonster::CanChangeCookieableSchemes() const {
++  // An ephemeral store is created only on a cookie read/write: that is first
++  // use of the logical store, even if the persistent owner remains uninitialized.
++  return !ephemeral_cookie_store_used_ &&
++         CookieMonster_ChromiumImpl::CanChangeCookieableSchemes();
+ }
+ 
+ void CookieMonster::SetCanonicalCookieAsync(
+diff --git a/chromium_src/net/cookies/cookie_monster.h b/chromium_src/net/cookies/cookie_monster.h
+index ea239a6..01d2268 100644
+--- a/chromium_src/net/cookies/cookie_monster.h
++++ b/chromium_src/net/cookies/cookie_monster.h
+@@ -36,8 +36,6 @@ class NET_EXPORT CookieMonster : public CookieMonster_ChromiumImpl {
+   void DeleteAllMatchingInfoAsync(CookieDeletionInfo delete_info,
+                                   DeleteCallback callback) override;
+   void DeleteSessionCookiesAsync(DeleteCallback) override;
+-  void SetCookieableSchemes(std::vector<std::string> schemes,
+-                            SetCookieableSchemesCallback callback) override;
+ 
+   void SetCanonicalCookieAsync(
+       std::unique_ptr<CanonicalCookie> cookie,
+@@ -52,6 +50,9 @@ class NET_EXPORT CookieMonster : public CookieMonster_ChromiumImpl {
+       GetCookieListCallback callback) override;
+ 
+  private:
++  bool CanChangeCookieableSchemes() const override;
++  // Deleting child stores must not reopen the logical store's first-use gate.
++  bool ephemeral_cookie_store_used_ = false;
+   NetLogWithSource net_log_;
+   std::map<std::string, std::unique_ptr<CookieMonster_ChromiumImpl>>
+       ephemeral_cookie_stores_;
+diff --git a/chromium_src/ui/color/color_id.h b/chromium_src/ui/color/color_id.h
+index 836ff6f..2e5747e 100644
+--- a/chromium_src/ui/color/color_id.h
++++ b/chromium_src/ui/color/color_id.h
+@@ -13,6 +13,7 @@
+ // This isn't undefined because other files use the |COLOR_ID| macro which
+ // depends on this being defined.
+ // CHROMIUM_SRC_NOLINT
++// clang-format off
+ #define BRAVE_MATERIAL_MISSING_COLOR_IDS \
+   E_CPONLY(kColorRefNeutral5)            \
+   E_CPONLY(kColorRefNeutral35)           \
+@@ -31,6 +32,7 @@
+   E_CPONLY(kColorRefTertiary25)          \
+   E_CPONLY(kColorRefTertiary35)          \
+   E_CPONLY(kColorRefTertiary98)
++// clang-format on
+ 
+ #include <ui/color/color_id.h>  // IWYU pragma: export
+ 
+diff --git a/common/brave_content_client.h b/common/brave_content_client.h
+index 19fe6f2..bc93bb5 100644
+--- a/common/brave_content_client.h
++++ b/common/brave_content_client.h
+@@ -15,7 +15,7 @@ class BraveContentClient : public ChromeContentClient {
+   BraveContentClient();
+   ~BraveContentClient() override;
+ 
+- private:
++ protected:
+   // ChromeContentClinet overrides:
+   scoped_refptr<base::RefCountedMemory> GetDataResourceBytes(
+       int resource_id) override;

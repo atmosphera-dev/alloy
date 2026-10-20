@@ -1,0 +1,196 @@
+diff --git a/chrome/browser/media/router/media_router_feature.cc b/chrome/browser/media/router/media_router_feature.cc
+--- a/chrome/browser/media/router/media_router_feature.cc
++++ b/chrome/browser/media/router/media_router_feature.cc
+@@ -73,12 +73,6 @@
+         // BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+ 
+ namespace {
+-const PrefService::Preference* GetMediaRouterPref(
+-    content::BrowserContext* context) {
+-  return user_prefs::UserPrefs::Get(context)->FindPreference(
+-      ::prefs::kEnableMediaRouter);
+-}
+-
+ base::flat_map<content::BrowserContext*, bool>& GetStoredPrefValues() {
+   static base::NoDestructor<base::flat_map<content::BrowserContext*, bool>>
+       stored_pref_values;
+@@ -100,39 +94,9 @@
+ }
+ 
+ bool MediaRouterEnabled(content::BrowserContext* context) {
+-#if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+-  if (!base::FeatureList::IsEnabled(kMediaRouter)) {
+-    return false;
+-  }
+-#endif  // !BUILDFLAG(IS_ANDROID) ||
+-        // BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+-#if BUILDFLAG(IS_CHROMEOS)
+-  // TODO(crbug.com/1380828): Make the Media Router feature configurable via a
+-  // policy for non-user profiles, i.e. sign-in and lock screen profiles.
+-  if (!ash::IsUserBrowserContext(context)) {
+-    return false;
+-  }
+-#endif  // BUILDFLAG(IS_CHROMEOS)
+-
+-  // If the Media Router was already enabled or disabled for |context|, then it
+-  // must remain so.  The Media Router does not support dynamic
+-  // enabling/disabling.
+-  base::flat_map<content::BrowserContext*, bool>& pref_values =
+-      GetStoredPrefValues();
+-  auto const it = pref_values.find(context);
+-  if (it != pref_values.end()) {
+-    return it->second;
+-  }
+-
+-  // Check the enterprise policy.
+-  const PrefService::Preference* pref = GetMediaRouterPref(context);
+-  if (pref->IsManaged() && !pref->IsDefaultValue()) {
+-    CHECK(pref->GetValue()->is_bool());
+-    bool allowed = pref->GetValue()->GetBool();
+-    pref_values.insert(std::make_pair(context, allowed));
+-    return allowed;
+-  }
+-  return true;
++  // Alloy does not construct the Cast/DIAL discovery owner. This cannot be
++  // re-enabled by a feature switch or enterprise preference.
++  return false;
+ }
+ 
+ #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+diff --git a/net/dns/mdns_client.cc b/net/dns/mdns_client.cc
+--- a/net/dns/mdns_client.cc
++++ b/net/dns/mdns_client.cc
+@@ -13,24 +13,6 @@
+ #include "net/log/net_log_source.h"
+ 
+ namespace net {
+-
+-namespace {
+-
+-int Bind(AddressFamily address_family,
+-         uint32_t interface_index,
+-         DatagramServerSocket* socket) {
+-  socket->AllowAddressSharingForMulticast();
+-  socket->SetMulticastInterface(interface_index);
+-
+-  int rv = socket->Listen(dns_util::GetMdnsReceiveEndPoint(address_family));
+-  if (rv < OK)
+-    return rv;
+-
+-  return socket->JoinGroup(
+-      dns_util::GetMdnsGroupEndPoint(address_family).address());
+-}
+-
+-}  // namespace
+ 
+ const base::TimeDelta MDnsTransaction::kTransactionTimeout = base::Seconds(3);
+ 
+@@ -66,15 +48,8 @@
+     AddressFamily address_family,
+     uint32_t interface_index,
+     NetLog* net_log) {
+-  auto socket = std::make_unique<UDPServerSocket>(net_log, NetLogSource());
+-
+-  int rv = Bind(address_family, interface_index, socket.get());
+-  if (rv != OK) {
+-    socket.reset();
+-    VLOG(1) << "MDNS bind failed, address_family=" << address_family
+-            << ", error=" << rv;
+-  }
+-  return socket;
++  // Also close direct users of the shared multicast socket factory.
++  return nullptr;
+ }
+ 
+ }  // namespace net
+diff --git a/net/dns/mdns_client_impl.cc b/net/dns/mdns_client_impl.cc
+--- a/net/dns/mdns_client_impl.cc
++++ b/net/dns/mdns_client_impl.cc
+@@ -179,31 +179,9 @@
+ MDnsConnection::~MDnsConnection() = default;
+ 
+ int MDnsConnection::Init(MDnsSocketFactory* socket_factory) {
+-  std::vector<std::unique_ptr<DatagramServerSocket>> sockets;
+-  socket_factory->CreateSockets(&sockets);
+-
+-  for (std::unique_ptr<DatagramServerSocket>& socket : sockets) {
+-    socket_handlers_.push_back(std::make_unique<MDnsConnection::SocketHandler>(
+-        std::move(socket), this));
+-  }
+-
+-  // All unbound sockets need to be bound before processing untrusted input.
+-  // This is done for security reasons, so that an attacker can't get an unbound
+-  // socket.
+-  int last_failure = ERR_FAILED;
+-  for (size_t i = 0; i < socket_handlers_.size();) {
+-    int rv = socket_handlers_[i]->Start();
+-    if (rv != OK) {
+-      last_failure = rv;
+-      socket_handlers_.erase(socket_handlers_.begin() + i);
+-      VLOG(1) << "Start failed, socket=" << i << ", error=" << rv;
+-    } else {
+-      ++i;
+-    }
+-  }
+-  VLOG(1) << "Sockets ready:" << socket_handlers_.size();
+-  DCHECK_NE(ERR_IO_PENDING, last_failure);
+-  return socket_handlers_.empty() ? last_failure : OK;
++  // Alloy has no native multicast-DNS transport. Deny before even asking a
++  // socket factory to enumerate interfaces, bind or join multicast groups.
++  return ERR_NETWORK_ACCESS_DENIED;
+ }
+ 
+ void MDnsConnection::Send(const scoped_refptr<IOBuffer>& buffer,
+diff --git a/services/network/host_resolver.cc b/services/network/host_resolver.cc
+--- a/services/network/host_resolver.cc
++++ b/services/network/host_resolver.cc
+@@ -179,22 +179,9 @@
+     net::DnsQueryType query_type,
+     mojo::PendingRemote<mojom::MdnsListenClient> response_client,
+     MdnsListenCallback callback) {
+-#if BUILDFLAG(ENABLE_MDNS)
+-  auto listener = std::make_unique<HostResolverMdnsListener>(internal_resolver_,
+-                                                             host, query_type);
+-  int rv =
+-      listener->Start(std::move(response_client),
+-                      base::BindOnce(&HostResolver::OnMdnsListenerCancelled,
+-                                     base::Unretained(this), listener.get()));
+-  if (rv == net::OK) {
+-    bool insertion_result = listeners_.emplace(std::move(listener)).second;
+-    DCHECK(insertion_result);
+-  }
+-
+-  std::move(callback).Run(rv);
+-#else
+-  NOTREACHED();
+-#endif  // BUILDFLAG(ENABLE_MDNS)
++  alloy_guard_->Decide(alloy::kBrowserSocket.unique_id_hash_code,
++                       host.ToString(), "HostResolver.MdnsListen");
++  std::move(callback).Run(net::ERR_NETWORK_ACCESS_DENIED);
+ }
+ 
+ size_t HostResolver::GetNumOutstandingRequestsForTesting() const {
+diff --git a/services/network/network_context.cc b/services/network/network_context.cc
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -2822,15 +2822,11 @@
+ 
+ void NetworkContext::CreateMdnsResponder(
+     mojo::PendingReceiver<mojom::MdnsResponder> responder_receiver) {
+-#if BUILDFLAG(ENABLE_MDNS)
+-  if (!mdns_responder_manager_) {
+-    mdns_responder_manager_ = std::make_unique<MdnsResponderManager>();
+-  }
+-
+-  mdns_responder_manager_->CreateMdnsResponder(std::move(responder_receiver));
+-#else
+-  NOTREACHED();
+-#endif  // BUILDFLAG(ENABLE_MDNS)
++  alloy_guard_->Decide(alloy::kBrowserSocket.unique_id_hash_code,
++                       "mDNS responder", "NetworkContext.CreateMdnsResponder");
++  responder_receiver.ResetWithReason(
++      static_cast<uint32_t>(net::ERR_NETWORK_ACCESS_DENIED),
++      "net::ERR_NETWORK_ACCESS_DENIED");
+ }
+ 
+ void NetworkContext::AddDomainReliabilityContextForTesting(

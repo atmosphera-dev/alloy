@@ -1,0 +1,10 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1947,6 +1947,7 @@
+ 
+     sources = libcef_sources_common
+ 
++    data_deps = [ "//brave/alloy:bundled_data" ]
+     deps = libcef_deps_common
+ 
+     configs += [

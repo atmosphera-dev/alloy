@@ -1,0 +1,22 @@
+{
+  "brave-core": {
+    "url": "https://github.com/brave/brave-core.git",
+    "revision": "5e268a047e51ba615c536db3aabbb782eb34550c",
+    "version": "1.99.31"
+  },
+  "chromium": {
+    "tag": "156.0.8078.25",
+    "revision": "1228231501697ff7a4a0150ea8ae6df37bb99331"
+  },
+  "cef": {
+    "url": "https://github.com/chromiumembedded/cef.git",
+    "branch": "8078",
+    "revision": "47dbc1df023e99f006fb9e850a8d83cc19b4fdd9"
+  },
+  "wakaba_lists": "19b496cfedcc89861341997753703cf18d302d39",
+  "tooling": {
+    "node": "v24.21.0",
+    "pnpm": "11.28.5",
+    "brave_depot_tools": "a03dfbf7f2d1cefa2795d81d59ca4f16c8616a8f"
+  }
+}

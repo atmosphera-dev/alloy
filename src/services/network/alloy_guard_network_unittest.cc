@@ -1,0 +1,315 @@
+// SPDX-FileCopyrightText: 2026 Alex Indigo
+// SPDX-License-Identifier: LGPL-3.0-or-later
+#include "services/network/alloy_capability.h"
+
+#include "base/test/task_environment.h"
+#include "base/test/test_future.h"
+#include "base/functional/callback_helpers.h"
+#include "base/functional/bind.h"
+#include "base/files/file_util.h"
+#include "base/files/scoped_temp_dir.h"
+#include "base/json/json_reader.h"
+#include "base/strings/string_split.h"
+#include "mojo/core/embedder/embedder.h"
+#include "mojo/public/cpp/bindings/remote.h"
+#include "net/base/ip_address.h"
+#include "net/base/net_errors.h"
+#include "net/base/network_change_notifier.h"
+#include "net/base/isolation_info.h"
+#include "net/dns/mdns_client.h"
+#include "net/socket/datagram_server_socket.h"
+#include "net/http/http_status_code.h"
+#include "net/http/http_request_info.h"
+#include "net/http/http_transaction.h"
+#include "net/http/http_transaction_factory.h"
+#include "net/reporting/reporting_uploader.h"
+#include "net/test/embedded_test_server/embedded_test_server.h"
+#include "net/test/embedded_test_server/http_response.h"
+#include "net/url_request/url_request_context.h"
+#include "net/url_request/url_request_context_builder.h"
+#include "net/url_request/url_request_test_util.h"
+#include "services/network/p2p/socket_manager.h"
+#include "services/network/network_context.h"
+#include "services/network/network_service.h"
+#include "services/network/public/mojom/host_resolver.mojom.h"
+#include "services/network/public/mojom/mdns_responder.mojom.h"
+#include "services/network/socket_factory.h"
+#include "services/network/test/test_utils.h"
+#include "services/network/test/fake_test_cert_verifier_params_factory.h"
+#include "testing/gtest/include/gtest/gtest.h"
+#include "url/origin.h"
+
+#include <atomic>
+
+namespace network {
+namespace {
+net::MutableNetworkTrafficAnnotationTag Tag(std::string_view id) {
+  net::MutableNetworkTrafficAnnotationTag tag;
+  tag.unique_id_hash_code = AlloyGuard::Hash(id);
+  return tag;
+}
+
+class AlloyGuardNetworkTest : public testing::Test {
+ protected:
+  base::test::TaskEnvironment tasks_{base::test::TaskEnvironment::MainThreadType::IO};
+};
+
+TEST_F(AlloyGuardNetworkTest, SocketCreationDeniesBeforeBinding) {
+  auto context = net::CreateTestURLRequestContextBuilder()->Build();
+  auto guard = base::MakeRefCounted<AlloyGuard>();
+  SocketFactory factory(nullptr, context.get(), guard);
+  mojo::Remote<mojom::UDPSocket> socket;
+  auto receiver = socket.BindNewPipeAndPassReceiver();
+  base::test::TestFuture<uint32_t, const std::string&> closed;
+  socket.set_disconnect_with_reason_handler(closed.GetCallback());
+  factory.CreateUDPSocket(Tag("alloy_browser_socket"), std::move(receiver), {});
+  ASSERT_TRUE(closed.Wait());
+  EXPECT_EQ(closed.Get<0>(), static_cast<uint32_t>(net::ERR_NETWORK_ACCESS_DENIED));
+  EXPECT_EQ(closed.Get<1>(), "net::ERR_NETWORK_ACCESS_DENIED");
+}
+
+TEST_F(AlloyGuardNetworkTest, ExistingUdpCapabilityRechecksPolicy) {
+  auto context = net::CreateTestURLRequestContextBuilder()->Build();
+  auto guard = base::MakeRefCounted<AlloyGuard>();
+  AlloyGuard::Options on;
+  on.open_search = true;
+  guard->SetOptions(on);
+  SocketFactory factory(nullptr, context.get(), guard);
+  mojo::Remote<mojom::UDPSocket> socket;
+  factory.CreateUDPSocket(Tag("open_search"), socket.BindNewPipeAndPassReceiver(), {});
+  base::test::TestFuture<int32_t, const std::optional<net::IPEndPoint>&> bound;
+  socket->Bind(net::IPEndPoint(net::IPAddress::IPv4Localhost(), 0), nullptr, bound.GetCallback());
+  ASSERT_EQ(bound.Get<0>(), net::OK);
+  ASSERT_TRUE(bound.Get<1>());
+  EXPECT_GT(bound.Get<1>()->port(), 0);
+
+  // The capability and socket still exist. Turning the preference off must
+  // deny at the child operation, before SendTo reaches the kernel.
+  guard->SetOptions({});
+  const uint8_t bytes[] = {1, 2, 3};
+  base::test::TestFuture<int32_t> sent;
+  socket->SendTo(net::IPEndPoint(net::IPAddress::IPv4Localhost(), 9), bytes,
+                 Tag("open_search"), sent.GetCallback());
+  EXPECT_EQ(sent.Get(), net::ERR_NETWORK_ACCESS_DENIED);
+}
+
+TEST_F(AlloyGuardNetworkTest, P2pDnsDenialPrecedesResolverAccess) {
+  auto guard = base::MakeRefCounted<AlloyGuard>();
+  mojo::PendingRemote<mojom::P2PTrustedSocketManagerClient> client;
+  auto client_receiver = client.InitWithNewPipeAndPassReceiver();
+  mojo::Remote<mojom::P2PTrustedSocketManager> trusted;
+  mojo::Remote<mojom::P2PSocketManager> remote;
+  // No URLRequestContext exists: calling its resolver would fail this test.
+  P2PSocketManager manager({}, std::move(client),
+      trusted.BindNewPipeAndPassReceiver(), remote.BindNewPipeAndPassReceiver(),
+      base::DoNothing(), nullptr, guard, AlloyGuard::Hash("alloy_browser_socket"));
+  base::test::TestFuture<const net::IPAddressList&> addresses;
+  base::test::TestFuture<uint32_t, const std::string&> closed;
+  remote.set_disconnect_with_reason_handler(closed.GetCallback());
+  remote->GetHostAddress("must-not-resolve.invalid", std::nullopt, false,
+                         addresses.GetCallback());
+  EXPECT_TRUE(addresses.Get().empty());
+  ASSERT_TRUE(closed.Wait());
+  EXPECT_EQ(closed.Get<0>(), static_cast<uint32_t>(net::ERR_NETWORK_ACCESS_DENIED));
+}
+
+TEST_F(AlloyGuardNetworkTest, LocalDiscoveryDeniedEvenWhenStandaloneDnsIsEnabled) {
+  auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
+  auto service = NetworkService::CreateForTesting();
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto log_path = dir.GetPath().AppendASCII("alloy-guard.log");
+  auto params = CreateNetworkContextParamsForTesting();
+  params->cert_verifier_params = FakeTestCertVerifierParamsFactory::GetCertVerifierParams();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  params->alloy_guard_log = base::File(log_path, base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_APPEND);
+#endif
+  params->alloy_dns_prefetch_enabled = true;
+  mojo::Remote<mojom::NetworkContext> remote;
+  auto context = NetworkContext::CreateForTesting(service.get(), remote.BindNewPipeAndPassReceiver(), std::move(params), {});
+  mojo::Remote<mojom::MdnsResponder> responder;
+  auto responder_receiver = responder.BindNewPipeAndPassReceiver();
+  base::test::TestFuture<uint32_t, const std::string&> closed;
+  responder.set_disconnect_with_reason_handler(closed.GetCallback());
+  remote->CreateMdnsResponder(std::move(responder_receiver));
+  EXPECT_EQ(closed.Get<0>(), static_cast<uint32_t>(net::ERR_NETWORK_ACCESS_DENIED));
+  mojo::Remote<mojom::HostResolver> resolver;
+  remote->CreateHostResolver(std::nullopt, resolver.BindNewPipeAndPassReceiver());
+  remote.FlushForTesting();
+  mojo::PendingRemote<mojom::MdnsListenClient> listener;
+  auto listener_receiver = listener.InitWithNewPipeAndPassReceiver();
+  base::test::TestFuture<int32_t> result;
+  resolver->MdnsListen(net::HostPortPair("discovery.local", 5353), net::DnsQueryType::A,
+                       std::move(listener), result.GetCallback());
+  EXPECT_EQ(result.Get(), net::ERR_NETWORK_ACCESS_DENIED);
+  tasks_.RunUntilIdle();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  std::string log;
+  ASSERT_TRUE(base::ReadFileToString(log_path, &log));
+  auto lines = base::SplitString(log, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+  ASSERT_EQ(lines.size(), 2u) << log;
+  EXPECT_NE(log.find("NetworkContext.CreateMdnsResponder"), std::string::npos);
+  EXPECT_NE(log.find("HostResolver.MdnsListen"), std::string::npos);
+#else
+  EXPECT_FALSE(base::PathExists(log_path));
+#endif
+}
+
+TEST_F(AlloyGuardNetworkTest, NativeMdnsCannotAllocateOrJoinMulticastSockets) {
+  class CountingFactory : public net::MDnsSocketFactory {
+   public:
+    void CreateSockets(std::vector<std::unique_ptr<net::DatagramServerSocket>>*) override { ++calls; }
+    int calls = 0;
+  } factory;
+  auto client = net::MDnsClient::CreateDefault();
+  EXPECT_EQ(client->StartListening(&factory), net::ERR_NETWORK_ACCESS_DENIED);
+  EXPECT_EQ(factory.calls, 0);
+  EXPECT_FALSE(client->IsListening());
+  EXPECT_FALSE(net::CreateAndBindMDnsSocket(net::ADDRESS_FAMILY_IPV4, 0, nullptr));
+  EXPECT_FALSE(net::CreateAndBindMDnsSocket(net::ADDRESS_FAMILY_IPV6, 0, nullptr));
+}
+
+TEST_F(AlloyGuardNetworkTest, NativeRequestsAndReportingCannotBypassFactories) {
+  auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
+  auto service = NetworkService::CreateForTesting();
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto log_path = dir.GetPath().AppendASCII("alloy-guard.log");
+  auto params = CreateNetworkContextParamsForTesting();
+  params->cert_verifier_params = FakeTestCertVerifierParamsFactory::GetCertVerifierParams();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  params->alloy_guard_log = base::File(log_path, base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_APPEND);
+#endif
+  mojo::Remote<mojom::NetworkContext> remote;
+  auto context = NetworkContext::CreateForTesting(service.get(),
+      remote.BindNewPipeAndPassReceiver(), std::move(params), {});
+
+  std::atomic<int> pages = 0;
+  std::atomic<int> collectors = 0;
+  net::EmbeddedTestServer server;
+  server.RegisterRequestHandler(base::BindRepeating(
+      [](std::atomic<int>* pages, std::atomic<int>* collectors,
+         const net::test_server::HttpRequest& request)
+          -> std::unique_ptr<net::test_server::HttpResponse> {
+        if (request.relative_url == "/page") ++*pages;
+        else ++*collectors;
+        auto response = std::make_unique<net::test_server::BasicHttpResponse>();
+        response->set_code(net::HTTP_OK);
+        response->set_content("page-consumer-ok");
+        response->set_content_type("text/plain");
+        return response;
+      }, &pages, &collectors));
+  ASSERT_TRUE(server.Start());
+
+  net::TestDelegate page_consumer;
+  auto page = context->url_request_context()->CreateRequest(server.GetURL("/page"),
+      net::DEFAULT_PRIORITY, &page_consumer,
+      static_cast<net::NetworkTrafficAnnotationTag>(Tag("blink_resource_loader")),
+      net::handles::kInvalidNetworkHandle);
+  page->Start();
+  page_consumer.RunUntilComplete();
+  EXPECT_EQ(page_consumer.request_status(), net::OK);
+  EXPECT_EQ(page_consumer.data_received(), "page-consumer-ok");
+  EXPECT_EQ(pages.load(), 1);
+  page.reset();
+
+  net::TestDelegate blocked_consumer;
+  auto blocked = context->url_request_context()->CreateRequest(server.GetURL("/denied-direct"),
+      net::DEFAULT_PRIORITY, &blocked_consumer,
+      static_cast<net::NetworkTrafficAnnotationTag>(Tag("reporting")),
+      net::handles::kInvalidNetworkHandle);
+  blocked->Start();
+  blocked_consumer.RunUntilComplete();
+  EXPECT_EQ(blocked_consumer.request_status(), net::ERR_NETWORK_ACCESS_DENIED);
+  blocked.reset();
+
+  auto uploader = net::ReportingUploader::Create(context->url_request_context());
+  base::test::TestFuture<net::ReportingUploader::Outcome> upload_consumer;
+  auto upload_url = server.GetURL("/denied-upload");
+  uploader->StartUpload(url::Origin::Create(upload_url), upload_url,
+      net::IsolationInfo::CreateTransient(/*nonce=*/std::nullopt), "{}", 0,
+      false, upload_consumer.GetCallback());
+  EXPECT_EQ(upload_consumer.Get(), net::ReportingUploader::Outcome::FAILURE);
+  EXPECT_EQ(uploader->GetPendingUploadCountForTesting(), 0);
+  tasks_.RunUntilIdle();
+  EXPECT_EQ(collectors.load(), 0);
+
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  std::string log;
+  ASSERT_TRUE(base::ReadFileToString(log_path, &log));
+  const auto lines = base::SplitString(log, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+  ASSERT_EQ(lines.size(), 2u) << log;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    auto row = base::JSONReader::ReadDict(lines[i], base::JSON_PARSE_RFC);
+    ASSERT_TRUE(row);
+    EXPECT_EQ(*row->FindString("annotation_id"), "reporting");
+    EXPECT_EQ(*row->FindString("class"), "browser-service");
+    EXPECT_EQ(*row->FindString("entry_point"), "NetworkServiceNetworkDelegate.OnBeforeURLRequest");
+    EXPECT_EQ(*row->FindString("endpoint"), server.GetURL(i == 0 ? "/denied-direct" : "/denied-upload").spec());
+  }
+#else
+  EXPECT_FALSE(base::PathExists(log_path));
+#endif
+  uploader.reset();
+  context.reset();
+  tasks_.RunUntilIdle();
+}
+
+TEST_F(AlloyGuardNetworkTest, NativeHttpTransactionCannotBypassRequestFactories) {
+  auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
+  auto service = NetworkService::CreateForTesting();
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto path = dir.GetPath().AppendASCII("alloy-guard.log");
+  auto params = CreateNetworkContextParamsForTesting();
+  params->cert_verifier_params = FakeTestCertVerifierParamsFactory::GetCertVerifierParams();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  params->alloy_guard_log = base::File(path, base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_APPEND);
+#endif
+  mojo::Remote<mojom::NetworkContext> remote;
+  auto context = NetworkContext::CreateForTesting(service.get(), remote.BindNewPipeAndPassReceiver(), std::move(params), {});
+  std::atomic<int> received = 0;
+  net::EmbeddedTestServer server;
+  server.RegisterRequestHandler(base::BindRepeating(
+      [](std::atomic<int>* received, const net::test_server::HttpRequest&) -> std::unique_ptr<net::test_server::HttpResponse> {
+        ++*received;
+        auto response = std::make_unique<net::test_server::BasicHttpResponse>();
+        response->set_code(net::HTTP_OK);
+        response->set_content("warm-page");
+        return response;
+      }, &received));
+  ASSERT_TRUE(server.Start());
+  net::TestDelegate page;
+  auto request = context->url_request_context()->CreateRequest(server.GetURL("/warm"), net::DEFAULT_PRIORITY,
+      &page, static_cast<net::NetworkTrafficAnnotationTag>(Tag("blink_resource_loader")), net::handles::kInvalidNetworkHandle);
+  request->Start();
+  page.RunUntilComplete();
+  ASSERT_EQ(page.request_status(), net::OK);
+  EXPECT_EQ(received.load(), 1);
+  request.reset();
+  net::HttpRequestInfo info;
+  info.url = server.GetURL("/direct-native");
+  info.method = "GET";
+  info.traffic_annotation = Tag("reporting");
+  auto transaction = context->url_request_context()->http_transaction_factory()->CreateTransaction(net::DEFAULT_PRIORITY);
+  base::test::TestFuture<int> done;
+  int result = transaction->Start(&info, done.GetCallback(), {});
+  if (result == net::ERR_IO_PENDING) result = done.Get();
+  EXPECT_EQ(result, net::ERR_NETWORK_ACCESS_DENIED);
+  tasks_.RunUntilIdle();
+  EXPECT_EQ(received.load(), 1);
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  std::string log;
+  ASSERT_TRUE(base::ReadFileToString(path, &log));
+  auto lines = base::SplitString(log, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+  ASSERT_EQ(lines.size(), 1u) << log;
+  auto denial = base::JSONReader::ReadDict(lines[0], base::JSON_PARSE_RFC);
+  ASSERT_TRUE(denial);
+  EXPECT_EQ(*denial->FindString("annotation_id"), "reporting");
+  EXPECT_EQ(*denial->FindString("entry_point"), "HttpTransaction.Start");
+#else
+  EXPECT_FALSE(base::PathExists(path));
+#endif
+}
+}  // namespace
+}  // namespace network

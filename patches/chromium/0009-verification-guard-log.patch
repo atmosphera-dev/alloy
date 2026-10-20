@@ -1,0 +1,122 @@
+diff --git a/services/network/BUILD.gn b/services/network/BUILD.gn
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -16,12 +16,15 @@ import("//build/buildflag_header.gni")
+ 
+ buildflag_header("alloy_buildflags") {
+   header = "alloy_buildflags.h"
+-  flags = [ "ALLOY_ENABLE_GUARD_CANARY=$alloy_enable_guard_canary" ]
++  flags = [
++    "ALLOY_ENABLE_GUARD_CANARY=$alloy_enable_guard_canary",
++    "ALLOY_ENABLE_GUARD_LOG=$alloy_enable_guard_log",
++  ]
+ }
+ 
+ source_set("alloy_guard") {
+   sources = [ "alloy_guard.cc", "alloy_guard.h", "alloy_capability.h", "alloy_annotation_catalog.inc" ]
+-  public_deps = [ "//base" ]
++  public_deps = [ "//base", ":alloy_buildflags" ]
+ }
+ 
+ test("alloy_guard_unittests") {
+diff --git a/services/network/network_context.cc b/services/network/network_context.cc
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -740,10 +740,12 @@ NetworkContext::NetworkContext(
+       variations_headers_(std::move(params_->initial_variations_headers)) {
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
++#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+     CHECK(params_->alloy_guard_log.IsValid())
+         << "Alloy requires a browser-opened denial log";
+-    alloy_guard_->Configure(
+-        std::move(params_->alloy_guard_log),
++    alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
++#endif
++    alloy_guard_->SetOptions(
+         {params_->alloy_favicons_enabled, params_->alloy_open_search_enabled,
+          params_->alloy_dns_prefetch_enabled,
+          params_->alloy_preconnect_enabled});
+@@ -959,10 +961,12 @@ NetworkContext::NetworkContext(
+                                         : nullptr) {
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
++#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+     CHECK(params_->alloy_guard_log.IsValid())
+         << "Alloy requires a browser-opened denial log";
+-    alloy_guard_->Configure(
+-        std::move(params_->alloy_guard_log),
++    alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
++#endif
++    alloy_guard_->SetOptions(
+         {params_->alloy_favicons_enabled, params_->alloy_open_search_enabled,
+          params_->alloy_dns_prefetch_enabled,
+          params_->alloy_preconnect_enabled});
+diff --git a/content/browser/network_sandbox.cc b/content/browser/network_sandbox.cc
+--- a/content/browser/network_sandbox.cc
++++ b/content/browser/network_sandbox.cc
+@@ -22,6 +22,7 @@
+ #include "content/public/browser/network_service_util.h"
+ #include "content/public/common/content_client.h"
+ #include "mojo/public/cpp/bindings/remote.h"
++#include "services/network/alloy_buildflags.h"
+ #include "services/network/public/cpp/transferable_directory.h"
+ #include "sql/database.h"
+ 
+@@ -374,6 +375,7 @@ void CreateAndGrantAccessLoggingError(
+ SandboxGrantResult MaybeGrantSandboxAccessToNetworkContextData(
+     const SandboxParameters& sandbox_params,
+     network::mojom::NetworkContextParams* params) {
++#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+   if (!params->alloy_guard_log_path.empty()) {
+     CHECK(base::CreateDirectory(params->alloy_guard_log_path.DirName()));
+     params->alloy_guard_log =
+@@ -381,6 +383,7 @@ SandboxGrantResult MaybeGrantSandboxAccessToNetworkContextData(
+                    base::File::FLAG_OPEN_ALWAYS | base::File::FLAG_APPEND);
+     CHECK(params->alloy_guard_log.IsValid());
+   }
++#endif
+ 
+   CHECK(!BrowserThread::CurrentlyOn(BrowserThread::UI),
+         base::NotFatalUntil::M159);
+diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -92,6 +92,7 @@
+ #include "net/net_buildflags.h"
+ #include "net/ssl/client_cert_store.h"
+ #include "services/cert_verifier/public/mojom/cert_verifier_service_factory.mojom.h"
++#include "services/network/alloy_buildflags.h"
+ #include "services/network/public/cpp/cors/origin_access_list.h"
+ #include "services/network/public/cpp/features.h"
+ #include "services/network/public/mojom/cert_verifier_service.mojom.h"
+@@ -1372,10 +1373,12 @@ void ProfileNetworkContextService::ConfigureNetworkContextParamsInternal(
+ 
+   g_browser_process->system_network_context_manager()
+       ->ConfigureDefaultNetworkContextParams(network_context_params);
++#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+   base::FilePath root;
+   chrome::GetUserCacheDirectory(profile_->GetPath(), &root);
+   network_context_params->alloy_guard_log_path =
+       root.AppendASCII("alloy-guard.log");
++#endif
+ 
+   const PrefService* alloy_prefs = profile_->GetPrefs();
+   network_context_params->alloy_favicons_enabled =
+diff --git a/chrome/browser/net/system_network_context_manager.cc b/chrome/browser/net/system_network_context_manager.cc
+--- a/chrome/browser/net/system_network_context_manager.cc
++++ b/chrome/browser/net/system_network_context_manager.cc
+@@ -1019,11 +1019,13 @@ void SystemNetworkContextManager::AddSSLConfigToNetworkContextParams(
+ 
+ void SystemNetworkContextManager::ConfigureDefaultNetworkContextParams(
+     network::mojom::NetworkContextParams* network_context_params) {
++#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+   base::FilePath root;
+   CHECK(base::PathService::Get(chrome::DIR_USER_DATA, &root));
+   chrome::GetUserCacheDirectory(root, &root);
+   network_context_params->alloy_guard_log_path =
+       root.AppendASCII("alloy-guard.log");
++#endif
+ 
+   variations::UpdateCorsExemptHeaderForVariations(network_context_params);
+ 

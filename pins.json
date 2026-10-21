@@ -13,7 +13,7 @@
     "branch": "8078",
     "revision": "47dbc1df023e99f006fb9e850a8d83cc19b4fdd9"
   },
-  "wakaba_lists": "19b496cfedcc89861341997753703cf18d302d39",
+  "wakaba_lists": "7d994f6c3aa771e2e4a0fb7b6096d14d632282b2",
   "tooling": {
     "node": "v24.21.0",
     "pnpm": "11.28.5",

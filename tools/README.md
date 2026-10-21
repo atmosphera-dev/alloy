@@ -33,8 +33,11 @@ consume list data.
 The list update tools and upstream data live in `wakaba-lists`, not this code
 repository. The applier installs `lists/data/**` at `src/brave/alloy/data/`
 through the same local-edit-safe publication journal as source overlays.
-Builds package those exact bytes beside `libcef.so` in `alloy-data/`; they never
-fetch lists. To refresh release data, run `tools/update_lists.sh` in the lists
+Builds package the files selected by `data/files.gni`, with their exact bytes,
+beside `libcef.so` in `alloy-data/`; they never fetch lists. All assembled
+`lists/components/*/list.txt` files are shipped. Their original `lists/sources/`
+copies remain in `wakaba-lists` as build inputs and are excluded from packaging.
+To refresh release data, run `tools/update_lists.sh` in the lists
 repository, review and commit its changes, then bump Alloy's `wakaba_lists` pin
 and deliver the new archive and matching marker.
 

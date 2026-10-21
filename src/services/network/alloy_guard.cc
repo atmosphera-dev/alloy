@@ -61,6 +61,20 @@ std::string_view AlloyGuard::ClassName(TrafficClass category) {
   return net::AlloyTrafficClassName(category);
 }
 
+AlloyGuard::Decision AlloyGuard::DecideRequest(int hash,
+                                            std::string_view endpoint,
+                                            std::string_view source,
+                                            int owner_hash) {
+  Operation operation = Operation::kRequest;
+  if (net::IsAlloyDownloadContinuation(hash)) {
+    operation = Operation::kDownloadContinuation;
+  } else if (hash == Hash("dns_over_https") && owner_hash > 0) {
+    operation = Operation::kOwnedDns;
+  }
+  return Decide(hash, endpoint, source, operation,
+                owner_hash > 0 ? owner_hash : 0);
+}
+
 AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
                                       std::string_view source,
                                       Operation operation, int owner_hash) {
@@ -71,6 +85,11 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
     const auto origin = Classify(owner_hash);
     result.originating_annotation_id = origin.annotation_id;
     result.traffic_class = origin.traffic_class;
+  } else if (operation == Operation::kDownloadContinuation) {
+    const auto origin = Classify(owner_hash);
+    result.originating_annotation_id = origin.annotation_id;
+    result.traffic_class = net::IsAlloyPageDownloadOwner(owner_hash)
+        ? TrafficClass::kPageDownload : origin.traffic_class;
   }
   base::AutoLock lock(lock_);
   switch (result.traffic_class) {
@@ -106,6 +125,10 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
   if (operation == Operation::kOwnedDns) {
     result.allowed = result.allowed && owner_hash > 0 &&
         (hash == Hash("alloy_native_dns") || hash == Hash("dns_over_https"));
+  } else if (operation == Operation::kDownloadContinuation) {
+    result.allowed = result.allowed &&
+        net::IsAlloyDownloadContinuation(hash) &&
+        net::IsAlloyPageDownloadOwner(owner_hash);
   } else if (owner_hash && (Classify(owner_hash).traffic_class != result.traffic_class ||
                      (owner_hash != hash &&
                       result.traffic_class != TrafficClass::kWebRtc)))
@@ -116,7 +139,8 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
     row.Set("time", base::Time::Now().InMillisecondsFSinceUnixEpoch());
     row.Set("annotation_id", result.annotation_id);
     row.Set("annotation_hash", hash);
-    if (operation == Operation::kOwnedDns) {
+    if (operation == Operation::kOwnedDns ||
+        operation == Operation::kDownloadContinuation) {
       row.Set("originating_annotation_id", result.originating_annotation_id);
       row.Set("originating_annotation_hash", owner_hash);
     }

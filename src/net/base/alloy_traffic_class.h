@@ -23,6 +23,17 @@ constexpr int AlloyAnnotationHash(std::string_view id) {
   return hash;
 }
 
+// These labels describe continuations, never permission on their own.
+constexpr bool IsAlloyDownloadContinuation(int hash) {
+  return hash == AlloyAnnotationHash("download_manager_resume") ||
+         hash == AlloyAnnotationHash("parallel_download_job");
+}
+
+constexpr bool IsAlloyPageDownloadOwner(int hash) {
+  return hash == AlloyAnnotationHash("renderer_initiated_download") ||
+         hash == AlloyAnnotationHash("navigation_url_loader");
+}
+
 // Classification is shared by policy and instrumentation; this is never an
 // admission decision. A socket always carries its actual originating
 // annotation.

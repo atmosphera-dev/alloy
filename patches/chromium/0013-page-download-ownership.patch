@@ -1,0 +1,441 @@
+diff --git a/components/download/database/download_db_conversions.cc b/components/download/database/download_db_conversions.cc
+--- a/components/download/database/download_db_conversions.cc
++++ b/components/download/database/download_db_conversions.cc
+@@ -224,6 +224,7 @@
+   proto.set_range_request_to(in_progress_info.range_request_to);
+   proto.set_fetched_via_service_worker(
+       in_progress_info.fetched_via_service_worker);
++  proto.set_alloy_download_owner(in_progress_info.alloy_download_owner);
+   return proto;
+ }
+ 
+@@ -231,6 +232,7 @@
+ InProgressInfo DownloadDBConversions::InProgressInfoFromProto(
+     const download_pb::InProgressInfo& proto) {
+   InProgressInfo info;
++  info.alloy_download_owner = proto.alloy_download_owner();
+   for (const auto& url : proto.url_chain())
+     info.url_chain.emplace_back(url);
+   info.referrer_url = GURL(proto.referrer_url());
+diff --git a/components/download/database/in_progress/download_entry.h b/components/download/database/in_progress/download_entry.h
+--- a/components/download/database/in_progress/download_entry.h
++++ b/components/download/database/in_progress/download_entry.h
+@@ -52,6 +52,8 @@
+   // True if a Service Worker fetch handler produced the original response.
+   bool fetched_via_service_worker = false;
+ 
++  int alloy_download_owner = 0;
++
+   // Request header key/value pairs that will be added to the download HTTP
+   // request.
+   DownloadUrlParameters::RequestHeadersType request_headers;
+diff --git a/components/download/database/in_progress/in_progress_info.cc b/components/download/database/in_progress/in_progress_info.cc
+--- a/components/download/database/in_progress/in_progress_info.cc
++++ b/components/download/database/in_progress/in_progress_info.cc
+@@ -36,7 +36,8 @@
+          credentials_mode == other.credentials_mode &&
+          range_request_from == other.range_request_from &&
+          range_request_to == other.range_request_to &&
+-         fetched_via_service_worker == other.fetched_via_service_worker;
++         fetched_via_service_worker == other.fetched_via_service_worker &&
++         alloy_download_owner == other.alloy_download_owner;
+ }
+ 
+ }  // namespace download
+diff --git a/components/download/database/in_progress/in_progress_info.h b/components/download/database/in_progress/in_progress_info.h
+--- a/components/download/database/in_progress/in_progress_info.h
++++ b/components/download/database/in_progress/in_progress_info.h
+@@ -135,6 +135,8 @@
+   // Persisted so that resume across browser restart still knows to restart
+   // (vs Range-resume) the download against the SW.
+   bool fetched_via_service_worker = false;
++
++  int alloy_download_owner = 0;
+ };
+ 
+ }  // namespace download
+diff --git a/components/download/database/proto/download_entry.proto b/components/download/database/proto/download_entry.proto
+--- a/components/download/database/proto/download_entry.proto
++++ b/components/download/database/proto/download_entry.proto
+@@ -89,6 +89,7 @@
+   optional string serialized_embedder_download_data = 33;
+   reserved 34;
+   optional bool fetched_via_service_worker = 35;
++  optional int32 alloy_download_owner = 36 [default = 0];
+ }
+ 
+ // Stores various metadata related to a download.
+diff --git a/components/download/internal/common/download_item_impl.cc b/components/download/internal/common/download_item_impl.cc
+--- a/components/download/internal/common/download_item_impl.cc
++++ b/components/download/internal/common/download_item_impl.cc
+@@ -435,6 +435,7 @@
+   DCHECK(base::Uuid::ParseCaseInsensitive(guid_).is_valid());
+ 
+   if (download_entry) {
++    alloy_download_owner_ = download_entry->alloy_download_owner;
+     download_source_ = download_entry->download_source;
+     fetch_error_body_ = download_entry->fetch_error_body;
+     request_headers_ = download_entry->request_headers;
+@@ -499,6 +500,7 @@
+       allow_auto_open_after_completion_(info.allow_auto_open_after_completion)
+ #endif  // BUILDFLAG(IS_ANDROID)
+ {
++  alloy_download_owner_ = info.alloy_download_owner;
+   request_info_.fetched_via_service_worker = info.fetched_via_service_worker;
+   delegate_->Attach();
+   Init(true /* actively downloading */, TYPE_ACTIVE_DOWNLOAD);
+@@ -2641,6 +2643,7 @@
+   // associated renderer) goes away before a response is received.
+   std::unique_ptr<DownloadUrlParameters> download_params(
+       new DownloadUrlParameters(GetURL(), traffic_annotation));
++  download_params->set_alloy_download_owner(alloy_download_owner_);
+   // A resume of a network-fetched download must not be routed through the
+   // SW interceptor: the SW response is a single full body that would be
+   // appended at the resume offset (or restart from network mismatched).
+diff --git a/components/download/internal/common/download_utils.cc b/components/download/internal/common/download_utils.cc
+--- a/components/download/internal/common/download_utils.cc
++++ b/components/download/internal/common/download_utils.cc
+@@ -456,6 +456,7 @@
+   request->url = params->url();
+   request->request_initiator = params->initiator();
+   request->trusted_params = network::ResourceRequest::TrustedParams();
++  request->trusted_params->alloy_download_owner = params->alloy_download_owner();
+   request->has_user_gesture = params->has_user_gesture();
+ 
+   // TODO(crbug.com/382291442): Remove feature guarding once launched.
+@@ -607,6 +608,7 @@
+   download_info.guid = item.GetGuid();
+   download_info.id = item.GetId();
+   InProgressInfo in_progress_info;
++  in_progress_info.alloy_download_owner = item.alloy_download_owner();
+   in_progress_info.url_chain = item.GetUrlChain();
+   in_progress_info.referrer_url = item.GetReferrerUrl();
+   in_progress_info.serialized_embedder_download_data =
+@@ -665,6 +667,7 @@
+       entry->download_info->guid, std::string(), ukm_info->download_source,
+       in_progress_info->fetch_error_body, in_progress_info->request_headers,
+       ukm_info->ukm_download_id);
++  download_entry->alloy_download_owner = in_progress_info->alloy_download_owner;
+   download_entry->fetched_via_service_worker =
+       in_progress_info->fetched_via_service_worker;
+   return download_entry;
+diff --git a/components/download/internal/common/parallel_download_job.cc b/components/download/internal/common/parallel_download_job.cc
+--- a/components/download/internal/common/parallel_download_job.cc
++++ b/components/download/internal/common/parallel_download_job.cc
+@@ -28,6 +28,7 @@
+         url_loader_factory_provider,
+     DownloadJobFactory::WakeLockProviderBinder wake_lock_provider_binder)
+     : DownloadJobImpl(download_item, std::move(cancel_request_callback), true),
++      alloy_download_owner_(create_info.alloy_download_owner),
+       initial_request_offset_(create_info.offset),
+       initial_received_slices_(download_item->GetReceivedSlices()),
+       content_length_(create_info.total_bytes),
+@@ -262,6 +263,7 @@
+   // The parallel requests only use GET method.
+   std::unique_ptr<DownloadUrlParameters> download_params(
+       new DownloadUrlParameters(download_item_->GetURL(), traffic_annotation));
++  download_params->set_alloy_download_owner(alloy_download_owner_);
+   download_params->set_file_path(download_item_->GetFullPath());
+   download_params->set_last_modified(download_item_->GetLastModifiedTime());
+   download_params->set_etag(download_item_->GetETag());
+diff --git a/components/download/internal/common/parallel_download_job.h b/components/download/internal/common/parallel_download_job.h
+--- a/components/download/internal/common/parallel_download_job.h
++++ b/components/download/internal/common/parallel_download_job.h
+@@ -89,6 +89,7 @@
+   virtual void CreateRequest(int64_t offset);
+ 
+   // Information about the initial request when download is started.
++  const int alloy_download_owner_;
+   int64_t initial_request_offset_;
+ 
+   // A snapshot of received slices when creating the parallel download job.
+diff --git a/components/download/internal/common/resource_downloader.cc b/components/download/internal/common/resource_downloader.cc
+--- a/components/download/internal/common/resource_downloader.cc
++++ b/components/download/internal/common/resource_downloader.cc
+@@ -15,6 +15,7 @@
+ #include "components/download/public/common/url_loader_factory_provider.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
++#include "net/base/alloy_traffic_class.h"
+ #include "services/device/public/mojom/wake_lock_provider.mojom.h"
+ #include "services/network/public/cpp/record_ontransfersizeupdate_utils.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -166,6 +167,10 @@
+     std::unique_ptr<DownloadUrlParameters> download_url_parameters,
+     bool is_parallel_request,
+     bool is_background_mode) {
++  const int annotation = download_url_parameters->GetNetworkTrafficAnnotation()
++                             .unique_id_hash_code;
++  alloy_download_owner_ = net::IsAlloyDownloadContinuation(annotation)
++      ? download_url_parameters->alloy_download_owner() : annotation;
+   callback_ = std::move(download_url_parameters->callback());
+   upload_callback_ = download_url_parameters->upload_callback();
+   guid_ = download_url_parameters->guid();
+@@ -211,6 +216,9 @@
+     mojo::ScopedDataPipeConsumerHandle response_body,
+     network::mojom::URLLoaderClientEndpointsPtr endpoints,
+     bool is_transient) {
++  // This entry only takes over an existing page navigation response; it
++  // does not initiate an embedder/WebContents-frame download request.
++  alloy_download_owner_ = net::AlloyAnnotationHash("navigation_url_loader");
+   // Set the URLLoader.
+   url_loader_.Bind(std::move(endpoints->url_loader));
+ 
+@@ -244,6 +252,7 @@
+ void ResourceDownloader::OnResponseStarted(
+     std::unique_ptr<DownloadCreateInfo> download_create_info,
+     mojom::DownloadStreamHandlePtr stream_handle) {
++  download_create_info->alloy_download_owner = alloy_download_owner_;
+   download_create_info->is_new_download = is_new_download_;
+   download_create_info->guid = guid_;
+   download_create_info->serialized_embedder_download_data =
+diff --git a/components/download/internal/common/resource_downloader.h b/components/download/internal/common/resource_downloader.h
+--- a/components/download/internal/common/resource_downloader.h
++++ b/components/download/internal/common/resource_downloader.h
+@@ -133,6 +133,8 @@
+   // Whether this is a new download.
+   bool is_new_download_;
+ 
++  int alloy_download_owner_ = 0;
++
+   // GUID of the download, or empty if this is a new download.
+   std::string guid_;
+ 
+diff --git a/components/download/public/common/download_create_info.h b/components/download/public/common/download_create_info.h
+--- a/components/download/public/common/download_create_info.h
++++ b/components/download/public/common/download_create_info.h
+@@ -56,6 +56,9 @@
+ 
+   bool is_new_download;
+ 
++  // Actual initiating annotation, retained across resume/range requests.
++  int alloy_download_owner = 0;
++
+   // The URL from which we are downloading. This is the final URL after any
+   // redirection by the server for |url_chain|.
+   const GURL& url() const;
+diff --git a/components/download/public/common/download_item_impl.h b/components/download/public/common/download_item_impl.h
+--- a/components/download/public/common/download_item_impl.h
++++ b/components/download/public/common/download_item_impl.h
+@@ -434,6 +434,8 @@
+     return request_headers_;
+   }
+ 
++  int alloy_download_owner() const { return alloy_download_owner_; }
++
+   bool fetch_error_body() const { return fetch_error_body_; }
+ 
+   bool fetched_via_service_worker() const {
+@@ -741,6 +743,7 @@
+ 
+   void UpdateRenameProgress(int64_t bytes_so_far, int64_t bytes_per_sec);
+ 
++  int alloy_download_owner_ = 0;
+   RequestInfo request_info_;
+ 
+   // GUID to identify the download, generated by
+diff --git a/components/download/public/common/download_url_parameters.h b/components/download/public/common/download_url_parameters.h
+--- a/components/download/public/common/download_url_parameters.h
++++ b/components/download/public/common/download_url_parameters.h
+@@ -392,6 +392,9 @@
+   const net::NetworkTrafficAnnotationTag& GetNetworkTrafficAnnotation() {
+     return traffic_annotation_;
+   }
++
++  int alloy_download_owner() const { return alloy_download_owner_; }
++  void set_alloy_download_owner(int owner) { alloy_download_owner_ = owner; }
+ 
+   DownloadSource download_source() const { return download_source_; }
+ 
+@@ -432,6 +435,7 @@
+   bool fetch_error_body_;
+   bool transient_;
+   std::string guid_;
++  int alloy_download_owner_ = 0;
+   const net::NetworkTrafficAnnotationTag traffic_annotation_;
+   std::string request_origin_;
+   DownloadSource download_source_;
+diff --git a/services/network/cors/cors_url_loader_factory.cc b/services/network/cors/cors_url_loader_factory.cc
+--- a/services/network/cors/cors_url_loader_factory.cc
++++ b/services/network/cors/cors_url_loader_factory.cc
+@@ -382,9 +382,11 @@
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
+   if (!context_->alloy_guard()
+-           .Decide(traffic_annotation.unique_id_hash_code,
++           .DecideRequest(traffic_annotation.unique_id_hash_code,
+                    resource_request.url.spec(),
+-                   "URLLoaderFactory.CreateLoaderAndStart")
++                   "URLLoaderFactory.CreateLoaderAndStart",
++                   resource_request.trusted_params
++                       ? resource_request.trusted_params->alloy_download_owner : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
+     mojo::Remote<mojom::URLLoaderClient>(std::move(client))->OnComplete(status);
+@@ -403,9 +405,11 @@
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
+   if (!context_->alloy_guard()
+-           .Decide(traffic_annotation.unique_id_hash_code,
++           .DecideRequest(traffic_annotation.unique_id_hash_code,
+                    resource_request.url.spec(),
+-                   "URLLoaderFactory.CreateLoaderAndStart")
++                   "URLLoaderFactory.CreateLoaderAndStart",
++                   resource_request.trusted_params
++                       ? resource_request.trusted_params->alloy_download_owner : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
+     mojo::Remote<mojom::URLLoaderClient>(std::move(client))->OnComplete(status);
+diff --git a/services/network/network_service_network_delegate.cc b/services/network/network_service_network_delegate.cc
+--- a/services/network/network_service_network_delegate.cc
++++ b/services/network/network_service_network_delegate.cc
+@@ -102,18 +102,11 @@
+     net::URLRequest* request,
+     net::CompletionOnceCallback callback,
+     GURL* new_url) {
+-  const bool owned_dns = request->traffic_annotation().unique_id_hash_code ==
+-                             AlloyGuard::Hash("dns_over_https") &&
+-                         request->originating_traffic_annotation().is_valid();
+   if (!network_context_->alloy_guard()
+-           .Decide(request->traffic_annotation().unique_id_hash_code,
+-                   request->url().spec(),
+-                   "NetworkServiceNetworkDelegate.OnBeforeURLRequest",
+-                   owned_dns ? AlloyGuard::Operation::kOwnedDns
+-                             : AlloyGuard::Operation::kRequest,
+-                   owned_dns ? request->originating_traffic_annotation()
+-                                   .unique_id_hash_code
+-                             : 0)
++           .DecideRequest(request->traffic_annotation().unique_id_hash_code,
++                          request->url().spec(),
++                          "NetworkServiceNetworkDelegate.OnBeforeURLRequest",
++                          request->originating_traffic_annotation().unique_id_hash_code)
+            .allowed) {
+     return net::ERR_NETWORK_ACCESS_DENIED;
+   }
+diff --git a/services/network/public/cpp/resource_request.cc b/services/network/public/cpp/resource_request.cc
+--- a/services/network/public/cpp/resource_request.cc
++++ b/services/network/public/cpp/resource_request.cc
+@@ -197,6 +197,7 @@
+ ResourceRequest::TrustedParams& ResourceRequest::TrustedParams::operator=(
+     const TrustedParams& other) {
+   TRACE_EVENT("loading", "ResourceRequest::TrustedParams.copy");
++  alloy_download_owner = other.alloy_download_owner;
+   isolation_info = other.isolation_info;
+   disable_secure_dns = other.disable_secure_dns;
+   has_user_activation = other.has_user_activation;
+@@ -241,7 +242,8 @@
+ 
+ bool ResourceRequest::TrustedParams::EqualsForTesting(
+     const TrustedParams& other) const {
+-  return isolation_info.IsEqualForTesting(other.isolation_info) &&
++  return alloy_download_owner == other.alloy_download_owner &&
++         isolation_info.IsEqualForTesting(other.isolation_info) &&
+          disable_secure_dns == other.disable_secure_dns &&
+          has_user_activation == other.has_user_activation &&
+          allow_cookies_from_browser == other.allow_cookies_from_browser &&
+diff --git a/services/network/public/cpp/resource_request.h b/services/network/public/cpp/resource_request.h
+--- a/services/network/public/cpp/resource_request.h
++++ b/services/network/public/cpp/resource_request.h
+@@ -111,6 +111,9 @@
+ 
+     bool EqualsForTesting(const TrustedParams& other) const;
+ 
++    // Browser-supplied owner of a resumed/parallel download, not an allow.
++    // Accepted only with continuation labels; renderer factories reject it.
++    int alloy_download_owner = 0;
+     net::IsolationInfo isolation_info;
+     bool disable_secure_dns = false;
+     bool has_user_activation = false;
+diff --git a/services/network/public/cpp/url_request_mojom_traits.cc b/services/network/public/cpp/url_request_mojom_traits.cc
+--- a/services/network/public/cpp/url_request_mojom_traits.cc
++++ b/services/network/public/cpp/url_request_mojom_traits.cc
+@@ -62,6 +62,7 @@
+   if (!data.ReadIsolationInfo(&out->isolation_info)) {
+     return false;
+   }
++  out->alloy_download_owner = data.alloy_download_owner();
+   out->disable_secure_dns = data.disable_secure_dns();
+   out->has_user_activation = data.has_user_activation();
+   out->allow_cookies_from_browser = data.allow_cookies_from_browser();
+diff --git a/services/network/public/cpp/url_request_mojom_traits.h b/services/network/public/cpp/url_request_mojom_traits.h
+--- a/services/network/public/cpp/url_request_mojom_traits.h
++++ b/services/network/public/cpp/url_request_mojom_traits.h
+@@ -88,6 +88,10 @@
+ struct COMPONENT_EXPORT(NETWORK_CPP_BASE)
+     StructTraits<network::mojom::TrustedUrlRequestParamsDataView,
+                  network::ResourceRequest::TrustedParams> {
++  static int32_t alloy_download_owner(
++      const network::ResourceRequest::TrustedParams& trusted_params) {
++    return trusted_params.alloy_download_owner;
++  }
+   static const net::IsolationInfo& isolation_info(
+       const network::ResourceRequest::TrustedParams& trusted_params) {
+     return trusted_params.isolation_info;
+diff --git a/services/network/public/mojom/url_request.mojom b/services/network/public/mojom/url_request.mojom
+--- a/services/network/public/mojom/url_request.mojom
++++ b/services/network/public/mojom/url_request.mojom
+@@ -76,6 +76,9 @@
+ // `disable_secure_dns` optional, and take precedence over the corresponding
+ // URLLoaderFactoryParams value when set, so they behave consistently.
+ struct TrustedUrlRequestParams {
++  // Original browser-owned download annotation; not supplied by renderers.
++  int32 alloy_download_owner = 0;
++
+   // If non-empty, this value will be used to set the SiteForCookies and
+   // NetworkIsolationKey used by the network request.
+   IsolationInfo isolation_info;
+diff --git a/services/network/throttling/throttling_network_transaction.cc b/services/network/throttling/throttling_network_transaction.cc
+--- a/services/network/throttling/throttling_network_transaction.cc
++++ b/services/network/throttling/throttling_network_transaction.cc
+@@ -111,15 +111,10 @@
+ 
+ int ThrottlingNetworkTransaction::CheckAlloyAdmission(
+     std::string_view source) const {
+-  const bool owned_dns = alloy_annotation_.unique_id_hash_code ==
+-                             AlloyGuard::Hash("dns_over_https") &&
+-                         alloy_origin_.is_valid();
+   return alloy_guard_
+-                 ->Decide(alloy_annotation_.unique_id_hash_code, alloy_url_,
+-                          source,
+-                          owned_dns ? AlloyGuard::Operation::kOwnedDns
+-                                    : AlloyGuard::Operation::kRequest,
+-                          owned_dns ? alloy_origin_.unique_id_hash_code : 0)
++                 ->DecideRequest(alloy_annotation_.unique_id_hash_code,
++                                 alloy_url_, source,
++                                 alloy_origin_.unique_id_hash_code)
+                  .allowed
+              ? net::OK
+              : net::ERR_NETWORK_ACCESS_DENIED;
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -466,7 +466,11 @@
+       request.url, request.priority, this, traffic_annotation,
+       factory_params_->target_network.value_or(
+           net::handles::kInvalidNetworkHandle),
+-      /*is_for_websockets=*/false, request.net_log_create_info);
++      /*is_for_websockets=*/false, request.net_log_create_info,
++      request.trusted_params && request.trusted_params->alloy_download_owner
++          ? net::CreateMutableNetworkTrafficAnnotationTag(
++                request.trusted_params->alloy_download_owner)
++          : net::MutableNetworkTrafficAnnotationTag());
+ 
+   // If the request is to a URL that we can determine is an LNA request from
+   // just the URL, then trigger the LNA prompt. We only trigger this for request
+diff --git a/services/network/url_loader_factory.cc b/services/network/url_loader_factory.cc
+--- a/services/network/url_loader_factory.cc
++++ b/services/network/url_loader_factory.cc
+@@ -206,9 +206,11 @@
+     base::WeakPtr<mojom::URLLoaderClient> sync_client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
+   if (!context_->alloy_guard()
+-           .Decide(traffic_annotation.unique_id_hash_code,
++           .DecideRequest(traffic_annotation.unique_id_hash_code,
+                    resource_request.url.spec(),
+-                   "URLLoaderFactory.CreateLoaderAndStart")
++                   "URLLoaderFactory.CreateLoaderAndStart",
++                   resource_request.trusted_params
++                       ? resource_request.trusted_params->alloy_download_owner : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
+     if (sync_client) {

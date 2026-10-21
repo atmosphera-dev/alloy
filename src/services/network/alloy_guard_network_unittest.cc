@@ -258,6 +258,82 @@ TEST_F(AlloyGuardNetworkTest, NativeMdnsCannotAllocateOrJoinMulticastSockets) {
   EXPECT_FALSE(net::CreateAndBindMDnsSocket(net::ADDRESS_FAMILY_IPV6, 0, nullptr));
 }
 
+TEST_F(AlloyGuardNetworkTest, DownloadContinuationsReachOnlyTheirPageOwnedConsumer) {
+  auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
+  auto service = NetworkService::CreateForTesting();
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto log_path = dir.GetPath().AppendASCII("alloy-guard.log");
+  auto params = CreateNetworkContextParamsForTesting();
+  params->cert_verifier_params = FakeTestCertVerifierParamsFactory::GetCertVerifierParams();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  params->alloy_guard_log = base::File(log_path,
+      base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_APPEND);
+#endif
+  mojo::Remote<mojom::NetworkContext> remote;
+  auto context = NetworkContext::CreateForTesting(service.get(),
+      remote.BindNewPipeAndPassReceiver(), std::move(params), {});
+  std::atomic<int> received = 0;
+  net::EmbeddedTestServer server;
+  server.RegisterRequestHandler(base::BindRepeating(
+      [](std::atomic<int>* received, const net::test_server::HttpRequest& request)
+          -> std::unique_ptr<net::test_server::HttpResponse> {
+        ++*received;
+        auto response = std::make_unique<net::test_server::BasicHttpResponse>();
+        response->set_code(net::HTTP_OK);
+        response->set_content("download-continuation-consumer");
+        response->set_content_type("application/octet-stream");
+        return response;
+      }, &received));
+  ASSERT_TRUE(server.Start());
+  int allowed_count = 0;
+  int denied_count = 0;
+  for (auto continuation : {"download_manager_resume", "parallel_download_job"}) {
+    for (auto owner : {"renderer_initiated_download", "navigation_url_loader",
+                       "missing", "reporting", "blink_resource_loader",
+                       "download_manager_resume", "unknown_download_owner"}) {
+      net::TestDelegate consumer;
+      auto request = context->url_request_context()->CreateRequest(
+          server.GetURL("/file"), net::DEFAULT_PRIORITY, &consumer,
+          static_cast<net::NetworkTrafficAnnotationTag>(Tag(continuation)),
+          net::handles::kInvalidNetworkHandle, false, std::nullopt, Tag(owner));
+      request->Start();
+      consumer.RunUntilComplete();
+      if (net::IsAlloyPageDownloadOwner(AlloyGuard::Hash(owner))) {
+        EXPECT_EQ(consumer.request_status(), net::OK);
+        EXPECT_EQ(consumer.data_received(), "download-continuation-consumer");
+        ++allowed_count;
+      } else {
+        EXPECT_EQ(consumer.request_status(), net::ERR_NETWORK_ACCESS_DENIED);
+        EXPECT_TRUE(consumer.data_received().empty());
+        ++denied_count;
+      }
+    }
+  }
+  EXPECT_EQ(allowed_count, 4);
+  EXPECT_EQ(denied_count, 10);
+  EXPECT_EQ(received.load(), allowed_count);
+  tasks_.RunUntilIdle();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  std::string log;
+  ASSERT_TRUE(base::ReadFileToString(log_path, &log));
+  const auto lines = base::SplitString(log, "\n", base::KEEP_WHITESPACE,
+                                       base::SPLIT_WANT_NONEMPTY);
+  ASSERT_EQ(lines.size(), static_cast<size_t>(denied_count));
+  for (const auto& line : lines) {
+    auto row = base::JSONReader::ReadDict(line, base::JSON_PARSE_RFC);
+    ASSERT_TRUE(row);
+    ASSERT_TRUE(row->FindString("originating_annotation_id"));
+    EXPECT_EQ(*row->FindString("entry_point"),
+              "NetworkServiceNetworkDelegate.OnBeforeURLRequest");
+  }
+#else
+  EXPECT_FALSE(base::PathExists(log_path));
+#endif
+  context.reset();
+  tasks_.RunUntilIdle();
+}
+
 TEST_F(AlloyGuardNetworkTest, NativeRequestsAndReportingCannotBypassFactories) {
   auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
   auto service = NetworkService::CreateForTesting();

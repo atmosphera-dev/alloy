@@ -127,6 +127,11 @@
       "patch": "chromium/0012-product-diagnostic-stores.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0013-page-download-ownership.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

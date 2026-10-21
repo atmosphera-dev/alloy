@@ -58,6 +58,10 @@ TEST_F(AlloyGuardTest, ClassesAndMissingAnnotations) {
     EXPECT_EQ(guard->Classify(guard->Hash(id)).traffic_class, category);
   for (int hash : {0, guard->Hash("missing"), guard->Hash("undefined"), -1})
     EXPECT_FALSE(guard->Decide(hash, "endpoint", "missing").allowed);
+  EXPECT_TRUE(guard->DecideRequest(guard->Hash("blink_resource_loader"),
+                                  "page", "boundary", -1).allowed);
+  EXPECT_FALSE(guard->DecideRequest(guard->Hash("reporting"), "collector",
+                                   "boundary", guard->Hash("navigation_url_loader")).allowed);
 }
 
 TEST_F(AlloyGuardTest, TogglesAndRetainedCapabilityRecheck) {
@@ -147,6 +151,38 @@ TEST_F(AlloyGuardTest, ChildCannotLaunderMissingOrUnknownOwner) {
   EXPECT_FALSE(rtc.Check("host:443", "child", page));
 }
 
+TEST_F(AlloyGuardTest, DownloadContinuationsRequireTheOriginalPageOwner) {
+  auto guard = base::MakeRefCounted<AlloyGuard>();
+  for (auto continuation : {"download_manager_resume", "parallel_download_job"}) {
+    const int tag = guard->Hash(continuation);
+    EXPECT_FALSE(guard->Decide(tag, "file", "unowned").allowed);
+    EXPECT_FALSE(guard->DecideRequest(tag, "file", "unowned").allowed);
+    for (auto owner : {"renderer_initiated_download", "navigation_url_loader"}) {
+      const auto result = guard->Decide(tag, "file", "continuation",
+          Op::kDownloadContinuation, guard->Hash(owner));
+      EXPECT_TRUE(result.allowed);
+      EXPECT_EQ(result.traffic_class, C::kPageDownload);
+      EXPECT_EQ(result.annotation_id, continuation);
+      EXPECT_EQ(result.originating_annotation_id, owner);
+      const auto boundary = guard->DecideRequest(tag, "file", "boundary",
+                                                guard->Hash(owner));
+      EXPECT_TRUE(boundary.allowed);
+      EXPECT_EQ(boundary.traffic_class, C::kPageDownload);
+      EXPECT_EQ(boundary.originating_annotation_id, owner);
+    }
+    for (int owner : {0, -1, 123456, guard->Hash("missing"),
+                     guard->Hash("reporting"), guard->Hash("blink_resource_loader"),
+                     guard->Hash("service_worker_script_load"), tag}) {
+      EXPECT_FALSE(guard->Decide(tag, "file", "continuation",
+          Op::kDownloadContinuation, owner).allowed);
+      EXPECT_FALSE(guard->DecideRequest(tag, "file", "boundary", owner).allowed);
+    }
+  }
+  // An inherited page owner is not a general-purpose browser-service exemption.
+  EXPECT_FALSE(guard->Decide(guard->Hash("reporting"), "file", "unrelated",
+      Op::kDownloadContinuation, guard->Hash("navigation_url_loader")).allowed);
+}
+
 TEST_F(AlloyGuardTest, DnsTransportRequiresRealOriginAndRetainsClass) {
   auto guard = base::MakeRefCounted<AlloyGuard>();
   for (auto transport : {"alloy_native_dns", "dns_over_https"}) {
@@ -158,6 +194,10 @@ TEST_F(AlloyGuardTest, DnsTransportRequiresRealOriginAndRetainsClass) {
       EXPECT_EQ(decision.annotation_id, transport);
       EXPECT_EQ(decision.originating_annotation_id, owner);
       EXPECT_EQ(decision.traffic_class, guard->Classify(guard->Hash(owner)).traffic_class);
+      if (hash == guard->Hash("dns_over_https")) {
+        EXPECT_TRUE(guard->DecideRequest(hash, "resolver", "boundary",
+                                        guard->Hash(owner)).allowed);
+      }
     }
     EXPECT_FALSE(guard->Decide(hash, "resolver", "native", Op::kOwnedDns, -1).allowed);
     EXPECT_FALSE(guard->Decide(hash, "resolver", "native", Op::kOwnedDns, guard->Hash("reporting")).allowed);

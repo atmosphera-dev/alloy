@@ -26,7 +26,9 @@ namespace network {
 class AlloyGuard : public base::RefCountedThreadSafe<AlloyGuard> {
  public:
   using TrafficClass = net::AlloyTrafficClass;
-  enum class Operation { kRequest, kStandaloneDns, kPreconnect, kOwnedDns };
+  enum class Operation {
+    kRequest, kStandaloneDns, kPreconnect, kOwnedDns, kDownloadContinuation
+  };
   struct Options {
     bool favicons = true;
     bool open_search = false;
@@ -53,6 +55,11 @@ class AlloyGuard : public base::RefCountedThreadSafe<AlloyGuard> {
                   std::string_view source,
                   Operation operation = Operation::kRequest,
                   int owner_annotation_hash = 0);
+  // Shared request-boundary dispatch: factories, URLRequest and transactions
+  // must not independently interpret transport/continuation ownership.
+  Decision DecideRequest(int annotation_hash, std::string_view endpoint,
+                         std::string_view source,
+                         int owner_annotation_hash = 0);
 
   static constexpr int Hash(std::string_view id) {
     return net::AlloyAnnotationHash(id);

@@ -17,14 +17,14 @@ import threading
 import time
 
 WORK=Path('/home/builder/work/alloy')
-OUT=WORK/'src/out/Release_Alloy'
+OUTPUTS={WORK/'src/out'/name for name in ('Release_Alloy','Verify_Alloy')}
 TRACKERS={
     'gtm':'https://www.googletagmanager.com/gtag/js?id=G-TEST',
     'gpt':'https://securepubads.g.doubleclick.net/tag/js/gpt.js',
     'fb':'https://connect.facebook.net/en_US/fbevents.js',
 }
 CDP=r'''
-const [port, url, resultPath, holdSeconds, spell, queryLog, ruleCount] = process.argv.slice(1);
+const [port, url, resultPath, holdSeconds, spell] = process.argv.slice(1);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const fs=await import('node:fs');
 const readinessStarted=Date.now();
@@ -41,12 +41,25 @@ ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);i
 const call=(method,params={})=>new Promise((resolve,reject)=>{const n=++id;pending.set(n,{resolve,reject});ws.send(JSON.stringify({id:n,method,params}));});
 await call('Network.enable');await call('Page.enable');
 let queryReady=false;
-for(let i=0;i<300;i++){
-  if(fs.existsSync(queryLog)&&fs.readFileSync(queryLog,'utf8').includes(`Loaded ${ruleCount} bundled QueryFilter rules`)){queryReady=true;break;}
+const readinessURL=new URL('ready.html',url).href;
+const readiness=[];
+const readinessDeadline=Date.now()+30000;
+while(Date.now()<readinessDeadline){
+  // Same-site requests are intentionally exempt from query cleaning. Each
+  // attempt starts from the original blank-origin condition, with idle time
+  // for Chromium's startup-idle fence to release the BEST_EFFORT parser.
+  // Rapid navigation would continually reset the loaded-and-idle timer.
+  await call('Page.navigate',{url:'about:blank'});
+  await sleep(4000);
+  await call('Page.navigate',{url:readinessURL+'?fbclid=alloy-query-ready&keep=1'});
   await sleep(100);
+  const observed=await call('Runtime.evaluate',{expression:'location.href',returnByValue:true});
+  readiness.push(observed.result.value);
+  if(observed.result.value===readinessURL+'?keep=1'){queryReady=true;break;}
 }
-if(!queryReady)throw Error('Bundled QueryFilter parser did not complete');
+if(!queryReady)throw Error('Bundled QueryFilter did not clean the readiness URL: '+JSON.stringify(readiness));
 const queryReadyMs=Date.now()-readinessStarted;
+await call('Page.navigate',{url:'about:blank'});
 await call('Page.navigate',{url:url+'?fbclid=alloy-query-probe&keep=1'});
 for(let i=0;i<100;i++){const x=await call('Runtime.evaluate',{expression:'document.readyState',returnByValue:true});if(x.result.value==='complete')break;await sleep(100);}
 await sleep(4000);
@@ -60,7 +73,7 @@ if(spell==='yes'){
 const result=await call('Runtime.evaluate',{expression:'JSON.stringify({outcomes:window.outcomes,neutral:window.neutralExecuted,value:document.querySelector("textarea")?.value,url:location.href})',returnByValue:true});
 await sleep(Number(holdSeconds)*1000);
 const failures=events.filter(e=>e.method==='Network.loadingFailed').map(e=>({...e.params,url:requests[e.params.requestId]}));
-fs.writeFileSync(resultPath,JSON.stringify({target,queryReadyMs,consumer:JSON.parse(result.result.value),failures,events},null,2));
+fs.writeFileSync(resultPath,JSON.stringify({target,queryReadyMs,readinessURL,readiness,consumer:JSON.parse(result.result.value),failures,events},null,2));
 await call('Page.close');ws.close();
 '''
 
@@ -71,8 +84,9 @@ def main():
     p.add_argument('--hold-seconds',type=int,default=0)
     p.add_argument('--spell-consumer',type=Path)
     a=p.parse_args()
-    if socket.gethostname()!='wakaba-build' or a.out.resolve()!=OUT:
-        p.error('Only the approved NUC Alloy output is supported')
+    out=a.out.resolve()
+    if socket.gethostname()!='wakaba-build' or out not in OUTPUTS:
+        p.error('Only the approved NUC Alloy release/verify outputs are supported')
     if not 0<=a.hold_seconds<=900:p.error('Hold duration 0..900 seconds')
     if not a.inside:
         command=['sudo','unshare','--net','--fork','/bin/sh','-c',
@@ -91,6 +105,7 @@ def main():
     log.mkdir()
     (log/'isolation.json').write_text(json.dumps(dict(netns=os.readlink('/proc/self/ns/net'),uid=os.geteuid(),interfaces=interfaces,routes=routes,outside_connect_errno=errno.ENETUNREACH),indent=2)+'\n')
     site=log/'site';site.mkdir()
+    (site/'ready.html').write_text('<!doctype html><title>QueryFilter readiness</title>')
     # The tracker URLs are the spike item-5 test page's exact inputs. Local
     # neutral execution proves the page loaded despite the absence of egress.
     (site/'index.html').write_text('<!doctype html><title>Alloy offline probe</title><h1>Alloy offline probe</h1><textarea spellcheck="true" lang="en-US"></textarea><button>Leave field</button><script>window.outcomes={};</script>')
@@ -103,22 +118,24 @@ def main():
     url=f'http://127.0.0.1:{server.server_port}/index.html'
     profile=log/'profile';profile.mkdir()
     port=9237
-    executable=a.spell_consumer.resolve() if a.spell_consumer else OUT/'cefclient'
+    executable=a.spell_consumer.resolve() if a.spell_consumer else out/'cefclient'
     argv=['xvfb-run','-a','-s','-screen 0 1280x720x24',str(executable),'--off-screen-rendering-enabled',f'--remote-debugging-port={port}','--ozone-platform=x11','--disable-gpu',f'--cache-path={profile}',f'--url=about:blank',f'--log-file={log}/debug.log',f'--log-net-log={log}/netlog.json','--net-log-capture-mode=Everything','--enable-logging=stderr','--vmodule=query_filter_component_installer=1']
     (log/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
     print('OFFLINE_PROBE_EVIDENCE',log,flush=True)
     with (log/'stdio.log').open('w') as stream:
-        process=subprocess.Popen(argv,cwd=OUT,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR='/home/builder/work/tmp'))
+        process=subprocess.Popen(argv,cwd=out,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR='/home/builder/work/tmp'))
         try:
-            expected_rules=len(json.loads((OUT/'alloy-data/lists/local-data/1/query-filter.json').read_text()))
-            result=subprocess.run(['node','--input-type=module','-e',CDP,str(port),url,str(log/'cdp.json'),str(a.hold_seconds),'yes' if a.spell_consumer else 'no',str(log/'stdio.log'),str(expected_rules)],capture_output=True,text=True,timeout=a.hold_seconds+110)
+            result=subprocess.run(['node','--input-type=module','-e',CDP,str(port),url,str(log/'cdp.json'),str(a.hold_seconds),'yes' if a.spell_consumer else 'no'],capture_output=True,text=True,timeout=a.hold_seconds+110)
             (log/'cdp.stdout').write_text(result.stdout);(log/'cdp.stderr').write_text(result.stderr)
             assert result.returncode==0,result.stderr
             proof=json.loads((log/'cdp.json').read_text())
             assert proof['consumer']['neutral'] is True,proof['consumer']
             assert proof['consumer']['url']==url+'?keep=1',proof['consumer']
-            query_log=(log/'stdio.log').read_text()
-            assert f'Loaded {expected_rules} bundled QueryFilter rules' in query_log,query_log[-3000:]
+            assert proof['readiness'][-1]==proof['readinessURL']+'?keep=1',proof['readiness']
+            if out.name=='Verify_Alloy':
+                expected_rules=len(json.loads((out/'alloy-data/lists/local-data/1/query-filter.json').read_text()))
+                query_log=(log/'stdio.log').read_text()
+                assert f'Loaded {expected_rules} bundled QueryFilter rules' in query_log,query_log[-3000:]
             print('ALLOY_BUNDLED_QUERY_FILTER_PASS',proof['consumer']['url'],flush=True)
             for name,url in TRACKERS.items():
                 assert any(f.get('url')==url and f['errorText']=='net::ERR_BLOCKED_BY_CLIENT' for f in proof['failures']),(name,proof['failures'])

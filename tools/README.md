@@ -144,7 +144,11 @@ python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy \
 ```
 
 Both probes use a loopback-only network namespace, fresh profiles, the actual
-bundled QueryFilter parser, tracker failures and a neutral local script. The
+bundled QueryFilter parser, tracker failures and a neutral local script.
+QueryFilter readiness is observed through a bounded navigation whose actual
+URL loses `fbclid` and retains `keep=1`, without depending on product logs.
+The probe also accepts `--out src/out/Verify_Alloy`; verification additionally
+checks the parser's diagnostic rule count against the bundled JSON. The
 native observer additionally reports real CEF accessibility spelling markers.
 Its startup URL and profile settings are copied before CEF initialization;
 callbacks never retain borrowed environment storage across Chromium startup.

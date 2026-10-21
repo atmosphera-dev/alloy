@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "services/network/alloy_capability.h"
 
+#include "base/alloy/buildflags.h"
 #include "base/test/task_environment.h"
 #include "base/test/test_future.h"
 #include "base/functional/callback_helpers.h"
@@ -15,6 +16,7 @@
 #include "net/base/ip_address.h"
 #include "net/base/net_errors.h"
 #include "net/base/network_change_notifier.h"
+#include "net/base/network_delegate_impl.h"
 #include "net/base/isolation_info.h"
 #include "net/dns/mdns_client.h"
 #include "net/socket/datagram_server_socket.h"
@@ -23,6 +25,9 @@
 #include "net/http/http_transaction.h"
 #include "net/http/http_transaction_factory.h"
 #include "net/reporting/reporting_uploader.h"
+#include "net/reporting/reporting_cache_observer.h"
+#include "net/reporting/reporting_policy.h"
+#include "net/reporting/reporting_service.h"
 #include "net/test/embedded_test_server/embedded_test_server.h"
 #include "net/test/embedded_test_server/http_response.h"
 #include "net/url_request/url_request_context.h"
@@ -33,6 +38,7 @@
 #include "services/network/network_service.h"
 #include "services/network/public/mojom/host_resolver.mojom.h"
 #include "services/network/public/mojom/mdns_responder.mojom.h"
+#include "services/network/sct_auditing/sct_auditing_handler.h"
 #include "services/network/socket_factory.h"
 #include "services/network/test/test_utils.h"
 #include "services/network/test/fake_test_cert_verifier_params_factory.h"
@@ -53,6 +59,89 @@ class AlloyGuardNetworkTest : public testing::Test {
  protected:
   base::test::TaskEnvironment tasks_{base::test::TaskEnvironment::MainThreadType::IO};
 };
+
+class TransientReportingObserver : public net::ReportingCacheObserver {
+ public:
+  explicit TransientReportingObserver(net::ReportingService* service)
+      : service_(service) {
+    service_->AddReportingCacheObserver(this);
+  }
+  ~TransientReportingObserver() {
+    service_->RemoveReportingCacheObserver(this);
+  }
+  void OnReportAdded(const net::ReportingReport* report) override {
+    ++added;
+    EXPECT_EQ(report->url, GURL("https://alloy.invalid/report?keep=1"));
+    const auto* value = report->body.FindString("sentinel");
+    ASSERT_TRUE(value);
+    EXPECT_EQ(*value, "transient");
+  }
+  void OnReportUpdated(const net::ReportingReport* report) override {
+    ++updated;
+    last_status = report->status;
+  }
+  int added = 0;
+  int updated = 0;
+  net::ReportingReport::Status last_status = net::ReportingReport::Status::QUEUED;
+
+ private:
+  net::ReportingService* service_;
+};
+
+TEST_F(AlloyGuardNetworkTest, ReportingNotifiesWithoutKeepingProductReports) {
+  auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
+  auto builder = net::CreateTestURLRequestContextBuilder();
+  builder->set_network_delegate(std::make_unique<net::NetworkDelegateImpl>());
+  builder->set_reporting_policy(std::make_unique<net::ReportingPolicy>());
+  auto context = builder->Build();
+  auto* service = context->reporting_service();
+  ASSERT_TRUE(service);
+  TransientReportingObserver observer(service);
+  base::DictValue body;
+  body.Set("sentinel", "transient");
+  service->QueueReport(GURL("https://alloy.invalid/report?keep=1#strip"),
+      std::nullopt, net::NetworkAnonymizationKey(), "Alloy", "default",
+      "network-error", std::move(body), 0, net::ReportingTargetType::kDeveloper);
+  tasks_.RunUntilIdle();
+  EXPECT_EQ(observer.added, 1);
+  auto status = service->StatusAsValue();
+  const auto* rows = status.GetDict().FindList("reports");
+  ASSERT_TRUE(rows);
+#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+  EXPECT_EQ(service->GetReports().size(), 1u);
+  EXPECT_EQ(rows->size(), 1u);
+#else
+  EXPECT_TRUE(service->GetReports().empty());
+  EXPECT_TRUE(rows->empty());
+  EXPECT_EQ(observer.updated, 1);
+  EXPECT_EQ(observer.last_status, net::ReportingReport::Status::DOOMED);
+#endif
+}
+
+TEST_F(AlloyGuardNetworkTest, SctDiagnosticStorageCannotBeReenabledInProduct) {
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto path = dir.GetPath().AppendASCII("pending-reports.json");
+  SCTAuditingHandler handler(nullptr, path);
+  handler.SetMode(mojom::SCTAuditingMode::kEnhancedSafeBrowsingReporting);
+  base::test::TestFuture<void> cleared;
+  handler.ClearPendingReports(cleared.GetCallback());
+  ASSERT_TRUE(cleared.Wait());
+  tasks_.RunUntilIdle();
+#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+  EXPECT_TRUE(handler.is_enabled());
+  ASSERT_TRUE(handler.GetFileWriterForTesting());
+  std::string serialized;
+  ASSERT_TRUE(base::ReadFileToString(path, &serialized));
+  EXPECT_EQ(serialized, "[]");
+#else
+  EXPECT_FALSE(handler.is_enabled());
+  EXPECT_FALSE(handler.GetFileWriterForTesting());
+  EXPECT_FALSE(handler.SerializeData());
+  EXPECT_FALSE(base::PathExists(path));
+#endif
+  EXPECT_TRUE(handler.GetPendingReportersForTesting()->empty());
+}
 
 TEST_F(AlloyGuardNetworkTest, SocketCreationDeniesBeforeBinding) {
   auto context = net::CreateTestURLRequestContextBuilder()->Build();

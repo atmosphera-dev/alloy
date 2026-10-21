@@ -95,6 +95,36 @@ embedder events, but returning false cannot route them into Chromium logging.
 LevelDB's optional diagnostic `LOG` writer shares the build gate; database
 contents and write-ahead journals retain their normal behavior.
 
+The same build gate makes file-based NetLog, SSL-key logging, startup/background
+tracing, CEF tracing and local crash reporting unavailable in product builds.
+`chrome://net-export` is unavailable. `CefBeginTracing` and `CefEndTracing`
+return false without writing a supplied or temporary file. Recording owners
+select memory backing for CDP trace/resource streams until the embedder
+reads/closes them; explicit functional exports retain the file-backed stream
+default. File tracing and DevTools media recording requests are rejected.
+The external Perfetto system backend and background/field tracing are disabled
+in product; the custom backend remains available for memory-only CDP traces.
+WebRTC diagnostic event/text/RTP/audio/data recordings
+are disabled, while the minimal live connection state for power management is
+retained without URLs, configuration, timestamps or diagnostic history.
+V8 diagnostic output flags use its native read-only compile-time representation
+in product builds, including logfile/profiler/compiler graph/dump paths;
+verification retains the upstream mutable diagnostics. Normal optimization
+inputs and all public CEF headers/ABI are retained.
+Reporting/NEL emits its live observer notifications in product, then drops the
+report instead of retaining it for retry/delivery or history queries. Its
+endpoint/policy configuration remains functional state. Verification retains
+the normal report queue.
+
+Persistent BrowserMetrics histograms (including spare files), UKM/UMA databases,
+deferred performance-observer reports/buffers and SCT auditing report queues
+also share the diagnostic build gate. Product cannot create or reopen these
+recording stores; unsupported operations still complete their callbacks.
+Verification retains their original storage behavior. Ordinary web performance
+observation and transient embedder events remain usable. Browsing-state stores
+such as History, Top Sites, Favicons and Site Characteristics are separate from
+this diagnostic-removal work and retain their existing behavior.
+
 `alloy_apply.py --cef-only` measures the uncomposed CEF stage: 117 entries,
 86 clean / 21 hunk-offset / 10 conflict. Full apply requires the exported
 composition in `patches/series.json` and verifies the reconstructed source bytes.

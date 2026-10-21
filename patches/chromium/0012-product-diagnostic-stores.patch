@@ -1,0 +1,412 @@
+diff --git a/components/metrics/persistent_histograms.cc b/components/metrics/persistent_histograms.cc
+--- a/components/metrics/persistent_histograms.cc
++++ b/components/metrics/persistent_histograms.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string_view>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/files/file_enumerator.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+@@ -25,6 +26,7 @@
+ #endif
+ 
+ namespace {
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ // Creating a "spare" file for persistent metrics involves a lot of I/O and
+ // isn't important so delay the operation for a while after startup.
+ #if BUILDFLAG(IS_ANDROID)
+@@ -233,6 +235,7 @@
+   allocator->CreateTrackingHistograms(kBrowserMetricsName);
+ }
+ 
++#endif
+ }  // namespace
+ 
+ BASE_FEATURE(kPersistentHistogramsFeature,
+@@ -251,12 +254,19 @@
+ 
+ base::FilePath GetPersistentHistogramsSpareFilePath(
+     const base::FilePath& metrics_dir) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return base::FilePath();
++#else
+   return GetSpareFilePath(metrics_dir);
++#endif
+ }
+ 
+ void InstantiatePersistentHistograms(const base::FilePath& metrics_dir,
+                                      bool persistent_histograms_enabled,
+                                      std::string_view storage) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   PersistentHistogramsMode mode = PersistentHistogramsMode::kNotEnabled;
+   // Note: The extra feature check is needed so that we don't use the default
+   // value of the storage param if the feature is disabled.
+@@ -269,9 +279,13 @@
+   }
+ 
+   InstantiatePersistentHistogramsImpl(metrics_dir, mode);
++#endif
+ }
+ 
+ void PersistentHistogramsCleanup(const base::FilePath& metrics_dir) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   base::FilePath spare_file = GetSpareFilePath(metrics_dir);
+ 
+   // Schedule the creation of a "spare" file for use on the next run.
+@@ -297,17 +311,25 @@
+       base::BindOnce(&DeleteOldWindowsTempFiles, metrics_dir),
+       kDeleteOldWindowsTempFilesDelay);
+ #endif  // BUILDFLAG(IS_WIN)
++#endif
+ }
+ 
+ void InstantiatePersistentHistogramsWithFeaturesAndCleanup(
+     const base::FilePath& metrics_dir) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   InstantiatePersistentHistograms(
+       metrics_dir, base::FeatureList::IsEnabled(kPersistentHistogramsFeature),
+       kPersistentHistogramsStorage.Get());
+   PersistentHistogramsCleanup(metrics_dir);
++#endif
+ }
+ 
+ bool DeferBrowserMetrics(const base::FilePath& metrics_dir) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   base::GlobalHistogramAllocator* allocator =
+       base::GlobalHistogramAllocator::Get();
+ 
+@@ -323,4 +345,5 @@
+   }
+ 
+   return allocator->MovePersistentFile(deferred_metrics_dir);
+-}
++#endif
++}
+diff --git a/components/segmentation_platform/internal/database/ukm_database_backend.cc b/components/segmentation_platform/internal/database/ukm_database_backend.cc
+--- a/components/segmentation_platform/internal/database/ukm_database_backend.cc
++++ b/components/segmentation_platform/internal/database/ukm_database_backend.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/check_is_test.h"
+ #include "base/feature_list.h"
+ #include "base/files/file_util.h"
+@@ -109,7 +110,9 @@
+ UkmDatabaseBackend::UkmDatabaseBackend(const base::FilePath& database_path,
+                                        bool in_memory)
+     : database_path_(database_path),
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+       in_memory_(in_memory),
++#endif
+       db_(sql::DatabaseOptions().set_wal_mode(true),
+           /*tag=*/"UKMMetrics"),
+       inhibit_transaction_(
+@@ -128,6 +131,10 @@
+ }
+ 
+ bool UkmDatabaseBackend::InitDatabase() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  status_ = Status::INIT_FAILED;
++  return false;
++#else
+   SCOPED_UMA_HISTOGRAM_TIMER("SegmentationPlatform.Database.InitDatabase");
+   base::File::Error error{};
+   bool result = true;
+@@ -161,6 +168,7 @@
+     RestartTransaction(/*purge_stale_data=*/false);
+   }
+   return result;
++#endif
+ }
+ 
+ void UkmDatabaseBackend::StoreUkmEntry(ukm::mojom::UkmEntryPtr entry) {
+diff --git a/components/segmentation_platform/internal/database/ukm_database_backend.h b/components/segmentation_platform/internal/database/ukm_database_backend.h
+--- a/components/segmentation_platform/internal/database/ukm_database_backend.h
++++ b/components/segmentation_platform/internal/database/ukm_database_backend.h
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/containers/flat_map.h"
+ #include "base/files/file_path.h"
+ #include "components/segmentation_platform/internal/database/ukm_database.h"
+@@ -78,7 +79,9 @@
+   void RestartTransaction(bool purge_stale_data);
+ 
+   const base::FilePath database_path_;
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   const bool in_memory_;
++#endif
+   sql::Database db_;
+   int change_count_ = 0;
+   std::unique_ptr<sql::Transaction> current_transaction_;
+diff --git a/content/browser/declarative_performance_observer/declarative_performance_observer_store.cc b/content/browser/declarative_performance_observer/declarative_performance_observer_store.cc
+--- a/content/browser/declarative_performance_observer/declarative_performance_observer_store.cc
++++ b/content/browser/declarative_performance_observer/declarative_performance_observer_store.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/declarative_performance_observer/declarative_performance_observer_store.h"
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -37,7 +38,9 @@
+     FILE_PATH_LITERAL("declarative_performance_observer.db");
+ 
+ // Time-to-live (TTL) for early failure reports stored in the database.
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ constexpr base::TimeDelta kReportsTimeToLive = base::Days(7);
++#endif
+ 
+ // Maximum number of early failure policies to store in the cache/database.
+ constexpr size_t kMaxPolicies = 1000;
+@@ -388,6 +391,9 @@
+   }
+ 
+   bool InitOnDbSequence() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    return false;
++#else
+     DCHECK_CALLED_ON_VALID_SEQUENCE(db_sequence_checker_);
+     if (db_ && db_->is_open()) {
+       return true;
+@@ -510,6 +516,7 @@
+     }
+ 
+     return true;
++#endif
+   }
+ 
+   // Enforces the storage quota limit. If the total size of stored reports plus
+@@ -652,6 +659,9 @@
+     const url::Origin& origin,
+     bool enabled,
+     base::OnceClosure callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  if (callback) std::move(callback).Run();
++#else
+   if (origin.opaque()) {
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, std::move(callback));
+@@ -679,10 +689,14 @@
+       base::BindOnce(&Backend::SetEarlyFailurePolicyOnDbSequence, backend_,
+                      origin, enabled),
+       std::move(callback));
++#endif
+ }
+ 
+ bool DeclarativePerformanceObserverStore::HasEarlyFailurePolicy(
+     const url::Origin& origin) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   auto it = cached_policies_.Get(origin);
+   if (it == cached_policies_.end()) {
+     return false;
+@@ -692,17 +706,22 @@
+     return false;
+   }
+   return true;
++#endif
+ }
+ 
+ void DeclarativePerformanceObserverStore::StoreEarlyFailureReport(
+     const url::Origin& origin,
+     base::DictValue report,
+     base::OnceClosure callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  if (callback) std::move(callback).Run();
++#else
+   db_task_runner_->PostTaskAndReply(
+       FROM_HERE,
+       base::BindOnce(&Backend::StoreEarlyFailureReportOnDbSequence, backend_,
+                      origin, std::move(report)),
+       std::move(callback));
++#endif
+ }
+ 
+ void DeclarativePerformanceObserverStore::TakeEarlyFailureReports(
+diff --git a/content/browser/declarative_performance_observer/declarative_performance_observer.cc b/content/browser/declarative_performance_observer/declarative_performance_observer.cc
+--- a/content/browser/declarative_performance_observer/declarative_performance_observer.cc
++++ b/content/browser/declarative_performance_observer/declarative_performance_observer.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/declarative_performance_observer/declarative_performance_observer.h"
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/check.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "content/browser/declarative_performance_observer/declarative_performance_observer_store.h"
+@@ -312,6 +313,9 @@
+ }
+ 
+ void DeclarativePerformanceObserver::AddEntryToBuffer(base::DictValue entry) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   size_t max_entries = max_buffered_entries_for_testing_
+                            ? max_buffered_entries_for_testing_
+                            : kMaxBufferedEntries;
+@@ -326,6 +330,7 @@
+   current_buffer_bytes_ += entry_size;
+   peak_buffer_bytes_ = std::max(peak_buffer_bytes_, current_buffer_bytes_);
+   buffered_entries_.Append(std::move(entry));
++#endif
+ }
+ 
+ // static
+diff --git a/services/network/sct_auditing/sct_auditing_handler.cc b/services/network/sct_auditing/sct_auditing_handler.cc
+--- a/services/network/sct_auditing/sct_auditing_handler.cc
++++ b/services/network/sct_auditing/sct_auditing_handler.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/base64.h"
+ #include "base/containers/span.h"
+ #include "base/files/file_path.h"
+@@ -37,6 +38,7 @@
+ namespace network {
+ 
+ namespace {
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ 
+ std::string LoadReports(const base::FilePath& path) {
+   std::string result;
+@@ -64,6 +66,7 @@
+       "Security.SCTAuditing.OptOut.DroppedDueToLogNotFound", report_dropped);
+ }
+ 
++#endif
+ }  // namespace
+ 
+ SCTAuditingHandler::SCTAuditingHandler(NetworkContext* context,
+@@ -73,6 +76,9 @@
+       pending_reporters_(cache_size),
+       persistence_path_(persistence_path),
+       foreground_runner_(base::SequencedTaskRunner::GetCurrentDefault()) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   // If no persistence path is set, only store pending reporters in memory.
+   if (persistence_path_.empty()) {
+     return;
+@@ -93,6 +99,7 @@
+   foreground_runner_->PostTask(
+       FROM_HERE, base::BindOnce(&SCTAuditingHandler::OnStartupFinished,
+                                 weak_factory_.GetWeakPtr()));
++#endif
+ }
+ 
+ SCTAuditingHandler::~SCTAuditingHandler() {
+@@ -107,6 +114,9 @@
+     const net::X509Certificate* validated_certificate_chain,
+     const net::SignedCertificateTimestampAndStatusList&
+         signed_certificate_timestamps) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   if (mode_ == mojom::SCTAuditingMode::kDisabled) {
+     return;
+   }
+@@ -182,9 +192,13 @@
+   }
+   AddReporter(std::move(report->key), std::move(report->report),
+               std::move(sct_metadata));
++#endif
+ }
+ 
+ std::optional<std::string> SCTAuditingHandler::SerializeData() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return std::nullopt;
++#else
+   DCHECK(foreground_runner_->RunsTasksInCurrentSequence());
+ 
+   base::ListValue reports;
+@@ -214,9 +228,13 @@
+   }
+ 
+   return base::WriteJson(reports);
++#endif
+ }
+ 
+ void SCTAuditingHandler::DeserializeData(const std::string& serialized) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   DCHECK(foreground_runner_->RunsTasksInCurrentSequence());
+ 
+   // Parse the serialized reports.
+@@ -298,9 +316,13 @@
+   }
+   base::UmaHistogramCounts100("Security.SCTAuditing.NumPersistedReportsLoaded",
+                               num_reporters_deserialized);
++#endif
+ }
+ 
+ void SCTAuditingHandler::OnStartupFinished() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   DCHECK(foreground_runner_->RunsTasksInCurrentSequence());
+   is_after_startup_ = true;
+   // Load the persisted pending reports from disk on a background sequence, and
+@@ -309,6 +331,7 @@
+       FROM_HERE, base::BindOnce(&LoadReports, persistence_path_),
+       base::BindOnce(&SCTAuditingHandler::OnReportsLoadedFromDisk,
+                      weak_factory_.GetWeakPtr()));
++#endif
+ }
+ 
+ void SCTAuditingHandler::AddReporter(
+@@ -317,6 +340,9 @@
+     std::optional<SCTAuditingReporter::SCTHashdanceMetadata> sct_metadata,
+     std::unique_ptr<net::BackoffEntry> backoff_entry,
+     bool already_counted) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   DCHECK(foreground_runner_->RunsTasksInCurrentSequence());
+   if (mode_ == mojom::SCTAuditingMode::kDisabled) {
+     return;
+@@ -343,6 +369,7 @@
+   if (writer_) {
+     writer_->ScheduleWrite(this);
+   }
++#endif
+ }
+ 
+ void SCTAuditingHandler::OnReportsLoadedFromDisk(
+@@ -389,6 +416,9 @@
+ }
+ 
+ void SCTAuditingHandler::SetMode(mojom::SCTAuditingMode mode) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  mode_ = mojom::SCTAuditingMode::kDisabled;
++#else
+   mode_ = mode;
+ 
+   // High-water-mark metrics get logged hourly (rather than once-per-session at
+@@ -402,6 +432,7 @@
+     histogram_timer_.Stop();
+     ClearPendingReports(base::DoNothing());
+   }
++#endif
+ }
+ 
+ base::WeakPtr<SCTAuditingHandler> SCTAuditingHandler::GetWeakPtr() {

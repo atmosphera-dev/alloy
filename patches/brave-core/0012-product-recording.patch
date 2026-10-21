@@ -1,0 +1,14 @@
+diff --git a/chromium_src/components/crash/core/app/crashpad.cc b/chromium_src/components/crash/core/app/crashpad.cc
+--- a/chromium_src/components/crash/core/app/crashpad.cc
++++ b/chromium_src/components/crash/core/app/crashpad.cc
+@@ -6,7 +6,9 @@
+ #include "components/crash/core/app/crashpad.h"
++#include "base/alloy/buildflags.h"
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_LINUX)
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING) && \
++    (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_LINUX))
+ namespace {
+ // Split into two places to avoid patching:
+ // components/brave_vpn/app/v2/agent/main.cc
+ // Need keep it in sync

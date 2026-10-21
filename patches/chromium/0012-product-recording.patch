@@ -1,0 +1,3029 @@
+diff --git a/v8/src/codegen/external-reference.h b/v8/src/codegen/external-reference.h
+--- a/v8/src/codegen/external-reference.h
++++ b/v8/src/codegen/external-reference.h
+@@ -734,7 +734,7 @@
+     CHECK(!IsIsolateFieldId());
+   }
+ 
+-  explicit ExternalReference(void* address)
++  explicit ExternalReference(const void* address)
+       : raw_(reinterpret_cast<Address>(address)) {
+     CHECK(!IsIsolateFieldId());
+   }
+diff --git a/net/reporting/reporting_cache_impl.cc b/net/reporting/reporting_cache_impl.cc
+--- a/net/reporting/reporting_cache_impl.cc
++++ b/net/reporting/reporting_cache_impl.cc
+@@ -10,6 +10,7 @@
+ #include <unordered_set>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/stl_util.h"
+ #include "base/time/clock.h"
+@@ -54,6 +55,13 @@
+       reporting_source, network_anonymization_key, url, user_agent, group_name,
+       type, std::move(body), depth, queued, target_type);
+ 
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  // Reporting/NEL notifications are live events, not a product history or
++  // retry queue. Observers serialize/copy the report during these callbacks.
++  context_->NotifyReportAdded(report.get());
++  report->status = ReportingReport::Status::DOOMED;
++  context_->NotifyReportUpdated(report.get());
++#else
+   auto inserted = reports_.insert(std::move(report));
+   DCHECK(inserted.second);
+ 
+@@ -72,6 +80,7 @@
+   } else {
+     context_->NotifyReportAdded(inserted.first->get());
+   }
++#endif
+ 
+   context_->NotifyCachedReportsUpdated();
+ }
+diff --git a/content/browser/network_service_instance_impl.cc b/content/browser/network_service_instance_impl.cc
+--- a/content/browser/network_service_instance_impl.cc
++++ b/content/browser/network_service_instance_impl.cc
+@@ -11,6 +11,7 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/base_paths.h"
+ #include "base/callback_list.h"
+ #include "base/check.h"
+@@ -485,7 +486,7 @@
+ 
+ // Parses the desired granularity of NetLog capturing specified by the command
+ // line.
+-net::NetLogCaptureMode GetNetCaptureModeFromCommandLine(
++[[maybe_unused]] net::NetLogCaptureMode GetNetCaptureModeFromCommandLine(
+     const base::CommandLine& command_line) {
+   std::string_view switch_name = network::switches::kNetLogCaptureMode;
+ 
+@@ -520,7 +521,7 @@
+   return net::NetLogCaptureMode::kDefault;
+ }
+ 
+-net::NetLogFileFormat GetNetLogFileFormatFromCommandLine(
++[[maybe_unused]] net::NetLogFileFormat GetNetLogFileFormatFromCommandLine(
+     const base::CommandLine& command_line) {
+   std::string_view switch_name = network::switches::kNetLogFileFormat;
+ 
+@@ -539,7 +540,7 @@
+   return net::NetLogFileFormat::kJson;
+ }
+ 
+-std::optional<base::TimeDelta> GetNetLogDurationFromCommandLine(
++[[maybe_unused]] std::optional<base::TimeDelta> GetNetLogDurationFromCommandLine(
+     const base::CommandLine& command_line) {
+   std::string_view switch_name = network::switches::kLogNetLogDuration;
+ 
+@@ -557,7 +558,7 @@
+ }
+ // Parse the maximum file size for the NetLog, if one was specified.
+ // kNoLimit indicates no, valid, maximum size was specified.
+-base::StrictNumeric<uint64_t> GetNetLogMaximumFileSizeFromCommandLine(
++[[maybe_unused]] base::StrictNumeric<uint64_t> GetNetLogMaximumFileSizeFromCommandLine(
+     const base::CommandLine& command_line) {
+   std::string_view switch_name = network::switches::kNetLogMaxSizeMb;
+ 
+@@ -693,6 +694,7 @@
+       g_observed_network_service->remote().QueryVersion(base::BindOnce(
+           [](uint32_t) { g_network_service_is_responding = true; }));
+ 
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+       const base::CommandLine* command_line =
+           base::CommandLine::ForCurrentProcess();
+       if (command_line->HasSwitch(net::switches::kLogNetLog)) {
+@@ -763,6 +765,7 @@
+         }
+       }
+ 
++#endif
+       GetContentClient()->browser()->OnNetworkServiceCreated(
+           g_observed_network_service->remote().get());
+     }
+diff --git a/services/network/network_service.cc b/services/network/network_service.cc
+--- a/services/network/network_service.cc
++++ b/services/network/network_service.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/barrier_closure.h"
+ #include "base/check.h"
+ #include "base/check_is_test.h"
+@@ -667,6 +668,9 @@
+                                  net::NetLogFileFormat file_format,
+                                  base::DictValue constants,
+                                  std::optional<base::TimeDelta> duration) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   if (max_total_size == net::FileNetLogObserver::kNoLimit) {
+     StartNetLogUnbounded(std::move(file), capture_mode, file_format,
+                          std::move(constants));
+@@ -680,6 +684,7 @@
+         base::BindOnce(&NetworkService::StopNetLog, weak_factory_.GetWeakPtr()),
+         *duration);
+   }
++#endif
+ }
+ 
+ void NetworkService::StopNetLog() {
+@@ -712,8 +717,12 @@
+ }
+ 
+ void NetworkService::SetSSLKeyLogFile(base::File file) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   net::SSLClientSocket::SetSSLKeyLogger(
+       std::make_unique<net::SSLKeyLoggerImpl>(std::move(file)));
++#endif
+ }
+ 
+ void NetworkService::CreateNetworkContext(
+diff --git a/services/network/net_log_exporter.cc b/services/network/net_log_exporter.cc
+--- a/services/network/net_log_exporter.cc
++++ b/services/network/net_log_exporter.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/command_line.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+@@ -47,6 +48,10 @@
+                            net::NetLogFileFormat file_format,
+                            uint64_t max_file_size,
+                            StartCallback callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  CloseFileOffThread(std::move(destination));
++  std::move(callback).Run(net::ERR_NOT_IMPLEMENTED);
++#else
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+   DCHECK(destination.IsValid());
+ 
+@@ -80,6 +85,7 @@
+     StartWithScratchDir(std::move(extra_constants), capture_mode, file_format,
+                         max_file_size, std::move(callback), base::FilePath());
+   }
++#endif
+ }
+ 
+ void NetLogExporter::Stop(base::DictValue polled_data, StopCallback callback) {
+diff --git a/components/net_log/net_export_file_writer.cc b/components/net_log/net_export_file_writer.cc
+--- a/components/net_log/net_export_file_writer.cc
++++ b/components/net_log/net_export_file_writer.cc
+@@ -9,6 +9,7 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_file.h"
+@@ -47,7 +48,7 @@
+     FILE_PATH_LITERAL("chrome-net-export-log.jsonl");
+ 
+ // Contains file-related initialization tasks for NetExportFileWriter.
+-NetExportFileWriter::DefaultLogDirResults SetUpDefaultLogDir(
++[[maybe_unused]] NetExportFileWriter::DefaultLogDirResults SetUpDefaultLogDir(
+     const NetExportFileWriter::DirectoryGetter& default_log_base_dir_getter) {
+   NetExportFileWriter::DefaultLogDirResults results;
+   results.default_log_dir_success = false;
+@@ -97,7 +98,7 @@
+   return default_log_directory.Append(kLogFilename);
+ }
+ 
+-scoped_refptr<base::SequencedTaskRunner> CreateFileTaskRunner() {
++[[maybe_unused]] scoped_refptr<base::SequencedTaskRunner> CreateFileTaskRunner() {
+   // The tasks posted to this sequenced task runner do synchronous File I/O.
+   //
+   // These operations can be skipped on shutdown since FileNetLogObserver's API
+@@ -136,6 +137,9 @@
+ }
+ 
+ void NetExportFileWriter::Initialize() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   DCHECK(thread_checker_.CalledOnValidThread());
+ 
+   file_task_runner_ = CreateFileTaskRunner();
+@@ -152,6 +156,7 @@
+       base::BindOnce(&SetUpDefaultLogDir, default_log_base_dir_getter_),
+       base::BindOnce(&NetExportFileWriter::SetStateAfterSetUpDefaultLogDir,
+                      weak_ptr_factory_.GetWeakPtr()));
++#endif
+ }
+ 
+ void NetExportFileWriter::StartNetLog(
+@@ -162,6 +167,9 @@
+     const base::CommandLine::StringType& command_line_string,
+     const std::string& channel_string,
+     network::mojom::NetworkContext* network_context) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   DCHECK(thread_checker_.CalledOnValidThread());
+   DCHECK(file_task_runner_);
+ 
+@@ -194,6 +202,7 @@
+       base::BindOnce(&NetExportFileWriter::StartNetLogAfterCreateFile,
+                      weak_ptr_factory_.GetWeakPtr(), capture_mode, file_format,
+                      max_file_size, std::move(custom_constants)));
++#endif
+ }
+ 
+ void NetExportFileWriter::StartNetLogAfterCreateFile(
+@@ -435,8 +444,12 @@
+ }
+ 
+ base::File NetExportFileWriter::CreateOutputFile(base::FilePath path) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return base::File();
++#else
+   return base::File(path,
+                     base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_WRITE);
++#endif
+ }
+ 
+ }  // namespace net_log
+diff --git a/net/ssl/ssl_key_logger_impl.cc b/net/ssl/ssl_key_logger_impl.cc
+--- a/net/ssl/ssl_key_logger_impl.cc
++++ b/net/ssl/ssl_key_logger_impl.cc
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_file.h"
+ #include "base/functional/bind.h"
+@@ -28,7 +29,7 @@
+ // Bound the number of outstanding writes to bound memory usage. Some
+ // antiviruses point this at a pipe and then read too slowly. See
+ // https://crbug.com/566951 and https://crbug.com/914880.
+-static constexpr size_t kMaxOutstandingLines = 512;
++[[maybe_unused]] static constexpr size_t kMaxOutstandingLines = 512;
+ }  // namespace
+ 
+ // An object which performs the blocking file operations on a background
+@@ -50,17 +51,28 @@
+   Core& operator=(const Core&) = delete;
+ 
+   void SetFile(base::File file) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    return;
++#else
+     file_.reset(base::FileToFILE(std::move(file), "a"));
+     if (!file_)
+       DVLOG(1) << "Could not adopt file";
++#endif
+   }
+ 
+   void OpenFile(const base::FilePath& path) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    return;
++#else
+     task_runner_->PostTask(FROM_HERE,
+                            base::BindOnce(&Core::OpenFileImpl, this, path));
++#endif
+   }
+ 
+   void WriteLine(const std::string& line) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    return;
++#else
+     bool was_empty;
+     {
+       base::AutoLock lock(lock_);
+@@ -74,6 +86,7 @@
+     if (was_empty) {
+       task_runner_->PostTask(FROM_HERE, base::BindOnce(&Core::Flush, this));
+     }
++#endif
+   }
+ 
+  private:
+diff --git a/chrome/browser/ui/webui/net_export_ui.h b/chrome/browser/ui/webui/net_export_ui.h
+--- a/chrome/browser/ui/webui/net_export_ui.h
++++ b/chrome/browser/ui/webui/net_export_ui.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_NET_EXPORT_UI_H_
+ #define CHROME_BROWSER_UI_WEBUI_NET_EXPORT_UI_H_
+ 
++#include "base/alloy/buildflags.h"
+ #include "chrome/common/url_constants.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "content/public/browser/web_ui_controller.h"
+@@ -17,6 +18,10 @@
+   NetExportUIConfig()
+       : DefaultWebUIConfig(content::kChromeUIScheme,
+                            chrome::kChromeUINetExportHost) {}
++
++  bool IsWebUIEnabled(content::BrowserContext* browser_context) override {
++    return BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING);
++  }
+ };
+ 
+ // The C++ back-end for the chrome://net-export webui page.
+diff --git a/content/browser/tracing/tracing_controller_impl_data_endpoint.cc b/content/browser/tracing/tracing_controller_impl_data_endpoint.cc
+--- a/content/browser/tracing/tracing_controller_impl_data_endpoint.cc
++++ b/content/browser/tracing/tracing_controller_impl_data_endpoint.cc
+@@ -6,6 +6,7 @@
+ #include <tuple>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/compiler_specific.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+@@ -96,6 +97,9 @@
+   }
+ 
+   bool OpenFileIfNeededOnBlockingThread() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    return false;
++#else
+     if (file_ != nullptr)
+       return true;
+ 
+@@ -119,6 +123,7 @@
+           << "Failed to open " << file_path_.value();
+     }
+     return file_ != nullptr;
++#endif
+   }
+ 
+   void CloseOnBlockingThread() {
+diff --git a/services/tracing/public/cpp/trace_startup_config.cc b/services/tracing/public/cpp/trace_startup_config.cc
+--- a/services/tracing/public/cpp/trace_startup_config.cc
++++ b/services/tracing/public/cpp/trace_startup_config.cc
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/base64.h"
+ #include "base/command_line.h"
+ #include "base/containers/span.h"
+@@ -184,6 +185,10 @@
+   CHECK(!g_instance) << "TraceStartupConfig already initialized";
+   g_instance = this;
+ 
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
++
+   process_track_uuid_ = GetProcessTrackUuid(command_line);
+ 
+   process_type_ = command_line.GetSwitchValueASCII("type");
+@@ -235,6 +240,7 @@
+       perfetto_config_.set_duration_ms(startup_duration_in_seconds * 1000);
+     }
+   }
++#endif
+ }
+ 
+ TraceStartupConfig::~TraceStartupConfig() {
+diff --git a/services/tracing/public/cpp/startup_tracing_controller.cc b/services/tracing/public/cpp/startup_tracing_controller.cc
+--- a/services/tracing/public/cpp/startup_tracing_controller.cc
++++ b/services/tracing/public/cpp/startup_tracing_controller.cc
+@@ -8,6 +8,7 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+@@ -208,6 +209,9 @@
+   // which then will be subsequently renamed.
+  private:
+   void OpenFile(const base::FilePath& path) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    return;
++#else
+     if (temp_file_policy_ == TempFilePolicy::kUseTemporaryFile) {
+       file_ = base::CreateAndOpenTemporaryFileInDir(path.DirName(),
+                                                     &written_to_file_);
+@@ -228,6 +232,7 @@
+     if (!file_.IsValid()) {
+       LOG(ERROR) << "Startup tracing failed: couldn't open file: " << path;
+     }
++#endif
+   }
+ 
+   // Close the file and rename if needed.
+@@ -263,7 +268,7 @@
+   State state_;
+ 
+   const WriteMode write_mode_;
+-  const TempFilePolicy temp_file_policy_;
++  [[maybe_unused]] const TempFilePolicy temp_file_policy_;
+ 
+   scoped_refptr<base::SequencedTaskRunner> task_runner_;
+ 
+diff --git a/components/tracing/common/background_tracing_utils.cc b/components/tracing/common/background_tracing_utils.cc
+--- a/components/tracing/common/background_tracing_utils.cc
++++ b/components/tracing/common/background_tracing_utils.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/check.h"
+ #include "base/command_line.h"
+ #include "base/feature_list.h"
+@@ -26,7 +27,7 @@
+ namespace tracing {
+ namespace {
+ 
+-bool BlockingWriteTraceToFile(const base::FilePath& output_file,
++[[maybe_unused]] bool BlockingWriteTraceToFile(const base::FilePath& output_file,
+                               std::string file_contents) {
+   if (base::WriteFile(output_file, file_contents)) {
+     LOG(ERROR) << "Background trace written to "
+@@ -44,17 +45,24 @@
+     std::string file_contents,
+     tracing::BackgroundTracingManager::FinishedProcessingCallback
+         done_callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  std::move(done_callback).Run(false);
++#else
+   base::FilePath output_file = output_path.AppendASCII(file_name);
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock()},
+       base::BindOnce(&BlockingWriteTraceToFile, output_file,
+                      std::move(file_contents)),
+       std::move(done_callback));
++#endif
+ }
+ }
+ 
+ bool SetupBackgroundTracingFromProtoConfigFile(
+     const base::FilePath& config_file) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   std::optional<perfetto::protos::gen::ChromeFieldTracingConfig> config;
+   std::string config_text;
+   if (base::ReadFileToString(config_file, &config_text) &&
+@@ -90,9 +98,13 @@
+ 
+   return tracing::BackgroundTracingManager::GetInstance().SetEnabledScenarios(
+       scenarios);
++#endif
+ }
+ 
+ bool SetupBackgroundTracingFromCommandLine() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   auto* command_line = base::CommandLine::ForCurrentProcess();
+ 
+   if (tracing::HasBackgroundTracingOutputPath() &&
+@@ -111,9 +123,13 @@
+   }
+   return SetupBackgroundTracingFromProtoConfigFile(
+       command_line->GetSwitchValuePath(switches::kEnableBackgroundTracing));
++#endif
+ }
+ 
+ bool SetupPresetTracingFromFieldTrial() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   if (IsBackgroundTracingEnabledFromCommandLine()) {
+     return false;
+   }
+@@ -135,9 +151,13 @@
+     return manager.SetEnabledScenarios(enabled_scenarios);
+   }
+   return false;
++#endif
+ }
+ 
+ bool SetupSystemTracingFromFieldTrial() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   if (IsBackgroundTracingEnabledFromCommandLine()) {
+     return false;
+   }
+@@ -148,9 +168,13 @@
+     return false;
+   }
+   return manager.InitializePerfettoTriggerRules(std::move(*trigger_config));
++#endif
+ }
+ 
+ bool SetupFieldTracingFromFieldTrial() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   if (IsBackgroundTracingEnabledFromCommandLine()) {
+     return false;
+   }
+@@ -191,6 +215,7 @@
+       std::move(*tracing_scenarios_config),
+       tracing::BackgroundTracingManager::ANONYMIZE_DATA,
+       kFieldTracingForceUploads.Get(), kFieldTracingUploadLimitKb.Get());
++#endif
+ }
+ 
+ bool SetBackgroundTracingOutputPath() {
+diff --git a/services/tracing/public/cpp/perfetto/perfetto_traced_process.cc b/services/tracing/public/cpp/perfetto/perfetto_traced_process.cc
+--- a/services/tracing/public/cpp/perfetto/perfetto_traced_process.cc
++++ b/services/tracing/public/cpp/perfetto/perfetto_traced_process.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "services/tracing/public/cpp/perfetto/perfetto_traced_process.h"
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -101,7 +102,7 @@
+ }
+ 
+ // Wrapper for |ConnectProducerSocketViaMojo| to be used as a function pointer.
+-void ConnectProducerSocketAsync(perfetto::CreateSocketCallback cb) {
++[[maybe_unused]] void ConnectProducerSocketAsync(perfetto::CreateSocketCallback cb) {
+   PerfettoTracedProcess::Get().DeferOrConnectProducerSocket(std::move(cb));
+ }
+ #endif
+@@ -292,7 +293,7 @@
+   init_args.disallow_merging_with_system_tracks = true;
+   init_args.process_uuid =
+       TraceStartupConfig::GetInstance().GetProcessTrackUuid();
+-#if BUILDFLAG(IS_POSIX)
++#if BUILDFLAG(IS_POSIX) && BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   if (enable_system_backend) {
+     init_args.backends |= perfetto::kSystemBackend;
+     init_args.tracing_policy = this;
+diff --git a/services/tracing/public/cpp/background_tracing/trace_report_database.cc b/services/tracing/public/cpp/background_tracing/trace_report_database.cc
+--- a/services/tracing/public/cpp/background_tracing/trace_report_database.cc
++++ b/services/tracing/public/cpp/background_tracing/trace_report_database.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/files/file_util.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/sequence_checker.h"
+@@ -21,9 +22,13 @@
+ namespace {
+ 
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ const base::FilePath::CharType kLocalTracesDatabasePath[] =
+     FILE_PATH_LITERAL("LocalTraces.db");
++#endif
+ const char kLocalTracesIndexTableName[] = "local_traces_index";
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ const char kLocalTracesPayloadsTableName[] = "local_traces_payloads";
++#endif
+ constexpr int kCurrentVersionNumber = 6;
+ 
+ ClientTraceReport GetReportFromStatement(sql::Statement& statement) {
+@@ -106,6 +111,9 @@
+ }
+ 
+ bool TraceReportDatabase::OpenDatabase(const base::FilePath& path) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   if (database_.is_open()) {
+     DCHECK_EQ(db_file_path_, path.Append(kLocalTracesDatabasePath));
+     return EnsureTableCreated();
+@@ -123,6 +131,7 @@
+   }
+ 
+   return EnsureTableCreated();
++#endif
+ }
+ 
+ bool TraceReportDatabase::OpenDatabaseInMemoryForTesting() {
+@@ -138,6 +147,9 @@
+ }
+ 
+ bool TraceReportDatabase::OpenDatabaseIfExists(const base::FilePath& path) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   if (database_.is_open()) {
+     DCHECK_EQ(db_file_path_, path.Append(kLocalTracesDatabasePath));
+     return database_.DoesTableExist(kLocalTracesIndexTableName) &&
+@@ -160,9 +172,13 @@
+   }
+ 
+   return EnsureTableCreated();
++#endif
+ }
+ 
+ bool TraceReportDatabase::AddTrace(const NewTraceReport& new_report) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if (!is_initialized()) {
+     return false;
+@@ -218,6 +234,7 @@
+     create_payload.Run();
+   }
+   return transaction.Commit();
++#endif
+ }
+ 
+ bool TraceReportDatabase::UserRequestedUpload(const base::Token& uuid) {
+diff --git a/services/tracing/public/cpp/perfetto/perfetto_tracing_backend.cc b/services/tracing/public/cpp/perfetto/perfetto_tracing_backend.cc
+--- a/services/tracing/public/cpp/perfetto/perfetto_tracing_backend.cc
++++ b/services/tracing/public/cpp/perfetto/perfetto_tracing_backend.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "services/tracing/public/cpp/perfetto/perfetto_tracing_backend.h"
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/auto_reset.h"
+ #include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+@@ -393,6 +394,12 @@
+   void EnableTracing(const perfetto::TraceConfig& trace_config,
+                      perfetto::base::ScopedFile file) override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    if (file || trace_config.write_into_file()) {
++      consumer_->OnTracingDisabled("File tracing is unavailable");
++      return;
++    }
++#endif
+     trace_config_ = trace_config;
+ #if BUILDFLAG(IS_WIN)
+     // TODO(crbug.com/40736989): Add support on Windows.
+@@ -406,6 +413,10 @@
+   }
+ 
+   void ChangeTraceConfig(const perfetto::TraceConfig& trace_config) override {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++    if (trace_config.write_into_file()) return;
++#endif
++
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     trace_config_ = trace_config;
+     tracing_session_host_->ChangeTraceConfig(trace_config);
+diff --git a/services/tracing/perfetto/consumer_host.cc b/services/tracing/perfetto/consumer_host.cc
+--- a/services/tracing/perfetto/consumer_host.cc
++++ b/services/tracing/perfetto/consumer_host.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+ #include "base/logging.h"
+@@ -587,6 +588,14 @@
+     mojo::PendingRemote<mojom::TracingSessionClient> tracing_session_client,
+     const perfetto::TraceConfig& trace_config,
+     base::File output_file) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  if (output_file.IsValid() || trace_config.write_into_file()) {
++    mojo::Remote<mojom::TracingSessionClient> client(
++        std::move(tracing_session_client));
++    client->OnTracingDisabled(false);
++    return;
++  }
++#endif
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(!tracing_session_);
+ 
+diff --git a/content/browser/devtools/devtools_stream_file.h b/content/browser/devtools/devtools_stream_file.h
+--- a/content/browser/devtools/devtools_stream_file.h
++++ b/content/browser/devtools/devtools_stream_file.h
+@@ -18,10 +18,12 @@
+ 
+ class CONTENT_EXPORT DevToolsStreamFile : public DevToolsIOContext::Stream {
+  public:
+-  static scoped_refptr<DevToolsStreamFile> Create(DevToolsIOContext* context,
+-                                                  bool binary);
++  enum class Backing { kFile, kMemory };
++  static scoped_refptr<DevToolsStreamFile> Create(
++      DevToolsIOContext* context, bool binary, Backing backing = Backing::kFile);
+ 
+-  DevToolsStreamFile(base::PassKey<DevToolsStreamFile>, bool binary);
++  DevToolsStreamFile(base::PassKey<DevToolsStreamFile>, bool binary,
++                     Backing backing);
+ 
+   const std::string& handle() const { return handle_; }
+   void Append(std::unique_ptr<std::string> data);
+@@ -42,6 +44,9 @@
+ 
+   std::string handle_;
+   const bool binary_;
++  const Backing backing_;
++  std::string memory_;
++  bool memory_initialized_ = false;
+ 
+   base::File file_;
+   scoped_refptr<base::SequencedTaskRunner> task_runner_;
+diff --git a/content/browser/devtools/devtools_stream_file.cc b/content/browser/devtools/devtools_stream_file.cc
+--- a/content/browser/devtools/devtools_stream_file.cc
++++ b/content/browser/devtools/devtools_stream_file.cc
+@@ -33,19 +33,20 @@
+ 
+ scoped_refptr<DevToolsStreamFile> DevToolsStreamFile::Create(
+     DevToolsIOContext* context,
+-    bool binary) {
++    bool binary, Backing backing) {
+   auto stream = base::MakeRefCounted<DevToolsStreamFile>(
+-      base::PassKey<DevToolsStreamFile>(), binary);
++      base::PassKey<DevToolsStreamFile>(), binary, backing);
+   // Registering takes a reference to the stream, so it must happen after the
+   // object has been adopted by `MakeRefCounted`, not during construction.
+   stream->handle_ = stream->Register(context);
+   return stream;
+ }
+ 
+-DevToolsStreamFile::DevToolsStreamFile(base::PassKey<DevToolsStreamFile>,
+-                                       bool binary)
++DevToolsStreamFile::DevToolsStreamFile(
++    base::PassKey<DevToolsStreamFile>, bool binary, Backing backing)
+     : DevToolsIOContext::Stream(impl_task_runner()),
+       binary_(binary),
++      backing_(backing),
+       task_runner_(impl_task_runner()) {}
+ 
+ DevToolsStreamFile::~DevToolsStreamFile() {
+@@ -56,6 +57,10 @@
+   CHECK(task_runner_->RunsTasksInCurrentSequence(), base::NotFatalUntil::M159);
+   if (had_errors_)
+     return false;
++  if (backing_ == Backing::kMemory) {
++    memory_initialized_ = true;
++    return true;
++  }
+   if (file_.IsValid())
+     return true;
+   base::FilePath temp_dir;
+@@ -99,13 +104,15 @@
+                                             ReadCallback callback) {
+   auto data = std::make_unique<std::string>();
+   Status status;
+-  if (!file_.IsValid()) {
++  const bool initialized = backing_ == Backing::kMemory
++                               ? memory_initialized_ : file_.IsValid();
++  if (!initialized) {
+     status = StatusFailure;
+   } else {
+     status = InnerReadOnFileSequence(position, max_size, *data);
+     if (status == StatusFailure) {
+       had_errors_ = true;
+-      file_.Close();
++      if (backing_ == Backing::kFile) file_.Close();
+     }
+   }
+   GetUIThreadTaskRunner({})->PostTask(
+@@ -118,7 +125,8 @@
+     size_t max_size,
+     std::string& buffer) {
+   CHECK(task_runner_->RunsTasksInCurrentSequence(), base::NotFatalUntil::M159);
+-  CHECK(file_.IsValid(), base::NotFatalUntil::M159);
++  CHECK(backing_ == Backing::kMemory ? memory_initialized_ : file_.IsValid(),
++        base::NotFatalUntil::M159);
+ 
+   if (position < 0) {
+     position = last_read_pos_;
+@@ -132,8 +140,14 @@
+       std::min(max_size, static_cast<size_t>(last_written_pos_ - position));
+   buffer.resize(max_size);
+ 
+-  std::optional<size_t> size_got =
+-      file_.ReadNoBestEffort(position, base::as_writable_byte_span(buffer));
++  std::optional<size_t> size_got;
++  if (backing_ == Backing::kMemory) {
++    buffer = memory_.substr(static_cast<size_t>(position), max_size);
++    size_got = buffer.size();
++  } else {
++    size_got = file_.ReadNoBestEffort(position,
++                                   base::as_writable_byte_span(buffer));
++  }
+ 
+   if (!size_got.has_value()) {
+     LOG(ERROR) << "Failed to read temporary file";
+@@ -165,11 +179,15 @@
+   if (!InitOnFileSequenceIfNeeded()) {
+     return;
+   }
+-  if (!file_.WriteAtCurrentPosAndCheck(base::as_byte_span(*data))) {
+-    LOG(ERROR) << "Failed to write temporary file";
+-    had_errors_ = true;
+-    file_.Close();
+-    return;
++  if (backing_ == Backing::kMemory) {
++    memory_.append(*data);
++  } else {
++    if (!file_.WriteAtCurrentPosAndCheck(base::as_byte_span(*data))) {
++      LOG(ERROR) << "Failed to write temporary file";
++      had_errors_ = true;
++      file_.Close();
++      return;
++    }
+   }
+   last_written_pos_ += data->size();
+ }
+diff --git a/content/browser/devtools/protocol/tracing_handler.cc b/content/browser/devtools/protocol/tracing_handler.cc
+--- a/content/browser/devtools/protocol/tracing_handler.cc
++++ b/content/browser/devtools/protocol/tracing_handler.cc
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/format_macros.h"
+ #include "base/functional/bind.h"
+ #include "base/json/json_writer.h"
+@@ -978,7 +979,12 @@
+     endpoint = new DevToolsStreamEndpoint(
+         weak_factory_.GetWeakPtr(),
+         DevToolsStreamFile::Create(
+-            io_context_, gzip_compression_ || proto_format_ /* binary */));
++            io_context_, gzip_compression_ || proto_format_ /* binary */,
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++            DevToolsStreamFile::Backing::kFile));
++#else
++            DevToolsStreamFile::Backing::kMemory));
++#endif
+     if (gzip_compression_) {
+       endpoint = TracingControllerImpl::CreateCompressedStringEndpoint(
+           endpoint, true /* compress_with_background_priority */);
+diff --git a/content/browser/devtools/protocol/network_handler.cc b/content/browser/devtools/protocol/network_handler.cc
+--- a/content/browser/devtools/protocol/network_handler.cc
++++ b/content/browser/devtools/protocol/network_handler.cc
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <variant>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/barrier_closure.h"
+ #include "base/base64.h"
+ #include "base/byte_size.h"
+@@ -4110,7 +4111,13 @@
+     bool is_binary = !base::IsStringUTF8(content);
+     // TODO(sigurds): Use the data-pipe from the network loader.
+     scoped_refptr<DevToolsStreamFile> stream =
+-        DevToolsStreamFile::Create(io_context_, is_binary);
++        DevToolsStreamFile::Create(
++            io_context_, is_binary,
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++            DevToolsStreamFile::Backing::kFile);
++#else
++            DevToolsStreamFile::Backing::kMemory);
++#endif
+     stream->Append(std::make_unique<std::string>(std::move(content)));
+     result->SetStream(stream->handle());
+   }
+diff --git a/content/browser/devtools/protocol/media_recorder.cc b/content/browser/devtools/protocol/media_recorder.cc
+--- a/content/browser/devtools/protocol/media_recorder.cc
++++ b/content/browser/devtools/protocol/media_recorder.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/devtools/protocol/media_recorder.h"
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/functional/bind.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/timer/timer.h"
+@@ -183,7 +184,7 @@
+ #if BUILDFLAG(ENABLE_LIBAOM)
+ // Determines the snapshot size that best-fits the Surface's content to the
+ // remote's requested image size.
+-gfx::Size DetermineSnapshotSize(const gfx::Size& surface_size,
++[[maybe_unused]] gfx::Size DetermineSnapshotSize(const gfx::Size& surface_size,
+                                 int screencast_max_width,
+                                 int screencast_max_height) {
+   if (surface_size.IsEmpty()) {
+@@ -228,6 +229,9 @@
+                               int max_width,
+                               int max_height,
+                               int frame_rate) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return Response::ServerError("Diagnostic recording is unavailable");
++#else
+ #if !BUILDFLAG(ENABLE_LIBAOM)
+   return Response::ServerError(
+       "Video recording is not supported without AV1/libaom enabled.");
+@@ -326,6 +330,7 @@
+   }
+ 
+   return Response::Success();
++#endif
+ #endif
+ }
+ 
+diff --git a/components/crash/core/app/crashpad.cc b/components/crash/core/app/crashpad.cc
+--- a/components/crash/core/app/crashpad.cc
++++ b/components/crash/core/app/crashpad.cc
+@@ -13,6 +13,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/base_paths.h"
+ #include "base/check.h"
+ #include "base/command_line.h"
+@@ -59,7 +60,7 @@
+ 
+ crashpad::CrashReportDatabase* g_database;
+ 
+-void InitializeDatabasePath(const base::FilePath& database_path) {
++[[maybe_unused]] void InitializeDatabasePath(const base::FilePath& database_path) {
+   DCHECK(!g_database_path);
+ 
+   // Intentionally leaked.
+@@ -73,6 +74,9 @@
+                             const std::vector<std::string>& initial_arguments,
+                             bool embedded_handler,
+                             const std::vector<base::FilePath>& attachments) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   static bool initialized = false;
+   DCHECK(!initialized);
+   initialized = true;
+@@ -193,6 +197,7 @@
+ #endif
+   }
+   return true;
++#endif
+ }
+ 
+ }  // namespace
+diff --git a/base/debug/dump_without_crashing.cc b/base/debug/dump_without_crashing.cc
+--- a/base/debug/dump_without_crashing.cc
++++ b/base/debug/dump_without_crashing.cc
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/check.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -49,7 +50,7 @@
+ // This function takes `location` and `time_between_dumps` as an input
+ // and checks if DumpWithoutCrashing() meets the requirements to take the dump
+ // or not.
+-bool ShouldDumpWithoutCrashWithLocation(const base::Location& location,
++[[maybe_unused]] bool ShouldDumpWithoutCrashWithLocation(const base::Location& location,
+                                         base::TimeDelta time_between_dumps) {
+   return ShouldDump(LocationToTimestampMap(), location, time_between_dumps);
+ }
+@@ -60,6 +61,9 @@
+ 
+ bool DumpWithoutCrashing(const base::Location& location,
+                          base::TimeDelta time_between_dumps) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   TRACE_EVENT0("base", "DumpWithoutCrashing");
+   if (dump_without_crashing_function_ &&
+       ShouldDumpWithoutCrashWithLocation(location, time_between_dumps)) {
+@@ -79,6 +83,7 @@
+   base::UmaHistogramEnumeration("Stability.DumpWithoutCrashingStatus",
+                                 DumpWithoutCrashingStatus::kThrottled);
+   return false;
++#endif
+ }
+ 
+ void SetDumpWithoutCrashingFunction(void (*function)()) {
+diff --git a/chrome/browser/media/webrtc/webrtc_logging_controller.cc b/chrome/browser/media/webrtc/webrtc_logging_controller.cc
+--- a/chrome/browser/media/webrtc/webrtc_logging_controller.cc
++++ b/chrome/browser/media/webrtc/webrtc_logging_controller.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/command_line.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+@@ -104,6 +105,9 @@
+ void WebRtcLoggingController::StartLogging(
+     GenericDoneCallback callback,
+     std::optional<WebApiSettings> web_api_settings) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  std::move(callback).Run(false, "Diagnostic recording is unavailable");
++#else
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(!callback.is_null());
+ 
+@@ -127,6 +131,7 @@
+         base::BindOnce(&WebRtcLoggingController::OnAgentDisconnected, this));
+     logging_agent_->Start(receiver_.BindNewPipeAndPassRemote());
+   }
++#endif
+ }
+ 
+ void WebRtcLoggingController::StopLogging(GenericDoneCallback callback) {
+@@ -272,6 +277,9 @@
+ 
+ void WebRtcLoggingController::StartRtpDump(RtpDumpType type,
+                                            GenericDoneCallback callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  std::move(callback).Run(false, "Diagnostic recording is unavailable");
++#else
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if (GetApiType() == webrtc_logging::ApiType::kWeb) {
+     std::move(callback).Run(false, "Not authorized");
+@@ -304,6 +312,7 @@
+   }
+ 
+   DoStartRtpDump(type, std::move(callback));
++#endif
+ }
+ 
+ void WebRtcLoggingController::StopRtpDump(RtpDumpType type,
+@@ -340,6 +349,9 @@
+     int output_period_ms,
+     size_t web_app_id,
+     StartEventLoggingCallback callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  std::move(callback).Run(false, "", "Diagnostic recording is unavailable");
++#else
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if ((api_type == webrtc_logging::ApiType::kWeb &&
+        !IsWebApiDiagnosticLoggingStarted()) ||
+@@ -359,6 +371,7 @@
+   WebRtcEventLogManager::GetInstance()->StartRemoteLogging(
+       render_process_id_, session_id, max_log_size_bytes, output_period_ms,
+       web_app_id, std::move(diagnostic_uuid), local_only, std::move(callback));
++#endif
+ }
+ 
+ base::RepeatingCallback<void(const std::string&)>
+diff --git a/chrome/browser/media/webrtc/webrtc_event_log_manager.cc b/chrome/browser/media/webrtc/webrtc_event_log_manager.cc
+--- a/chrome/browser/media/webrtc/webrtc_event_log_manager.cc
++++ b/chrome/browser/media/webrtc/webrtc_event_log_manager.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <limits>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/barrier_closure.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -333,6 +334,9 @@
+     bool local_only,
+     base::OnceCallback<void(bool, const std::string&, const std::string&)>
+         reply) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  std::move(reply).Run(false, "", kStartRemoteLoggingFailureFeatureDisabled);
++#else
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(reply);
+ 
+@@ -374,6 +378,7 @@
+                      browser_context_id, session_id, browser_context->GetPath(),
+                      max_file_size_bytes, output_period_ms, web_app_id,
+                      std::move(diagnostic_uuid), local_only, std::move(reply)));
++#endif
+ }
+ 
+ void WebRtcEventLogManager::FinishLogging(int render_process_id,
+@@ -703,6 +708,9 @@
+     const base::FilePath& base_path,
+     size_t max_file_size_bytes,
+     base::OnceCallback<void(bool)> reply) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  if (reply) std::move(reply).Run(false);
++#else
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(!base_path.empty());
+   // |this| is destroyed by ~BrowserProcessImpl(), so base::Unretained(this)
+@@ -712,6 +720,7 @@
+       base::BindOnce(&WebRtcEventLogManager::EnableLocalLoggingInternal,
+                      base::Unretained(this), base_path, max_file_size_bytes,
+                      std::move(reply)));
++#endif
+ }
+ 
+ void WebRtcEventLogManager::DisableLocalLogging(
+@@ -766,6 +775,9 @@
+     const base::FilePath& base_path,
+     size_t max_file_size_bytes,
+     base::OnceCallback<void(bool)> reply) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  if (reply) std::move(reply).Run(false);
++#else
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(!base_path.empty());
+   // |this| is destroyed by ~BrowserProcessImpl(), so base::Unretained(this)
+@@ -775,6 +787,7 @@
+       base::BindOnce(&WebRtcEventLogManager::EnableDataChannelLoggingInternal,
+                      base::Unretained(this), base_path, max_file_size_bytes,
+                      std::move(reply)));
++#endif
+ }
+ 
+ void WebRtcEventLogManager::DisableDataChannelLogging(
+diff --git a/content/browser/webrtc/webrtc_internals.cc b/content/browser/webrtc/webrtc_internals.cc
+--- a/content/browser/webrtc/webrtc_internals.cc
++++ b/content/browser/webrtc/webrtc_internals.cc
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+@@ -47,7 +48,7 @@
+ 
+ namespace {
+ 
+-const base::FilePath::CharType kEventLogFilename[] =
++[[maybe_unused]] const base::FilePath::CharType kEventLogFilename[] =
+     FILE_PATH_LITERAL("event_log");
+ 
+ constexpr char kGetUserMedia[] = "getUserMedia";
+@@ -55,7 +56,7 @@
+ 
+ // This is intended to limit DoS attacks against the browser process consisting
+ // of many getUserMedia()/getDisplayMedia() calls. See https://crbug.com/804440.
+-const size_t kMaxMediaEntries = 1000;
++[[maybe_unused]] const size_t kMaxMediaEntries = 1000;
+ 
+ // getUserMedia()/getDisplayMedia() entries older than this are pruned so that
+ // long-lived browser sessions do not accumulate stale requests indefinitely.
+@@ -78,7 +79,8 @@
+ }
+ 
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ // Makes sure that |dict| has a List under path "log".
+ base::ListValue& EnsureLogList(base::DictValue& dict) {
+   base::ListValue* log = dict.FindList("log");
+   if (log)
+     return *log;
+@@ -90,6 +92,7 @@
+   CHECK(value->is_dict(), base::NotFatalUntil::M160);
+   value->GetDict().Remove("log");
+ }
++#endif
+ 
+ }  // namespace
+ 
+@@ -126,8 +127,13 @@
+     : peer_connection_data_(base::ListValue()),
+       selection_type_(SelectionType::kAudioDebugRecordings),
+       command_line_derived_logging_path_(
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+           base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
+-              switches::kWebRtcLocalEventLogging)),
++              switches::kWebRtcLocalEventLogging)
++#else
++          base::FilePath()
++#endif
++          ),
+       event_log_recordings_(false),
+       num_connected_connections_(0),
+       should_block_power_saving_(should_block_power_saving),
+@@ -135,6 +141,7 @@
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   CHECK(!g_webrtc_internals, base::NotFatalUntil::M160);
+ 
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   const base::FilePath default_path =
+       GetContentClient()->browser()->GetDefaultDownloadDirectory();
+   audio_debug_recordings_file_path_ = default_path;
+@@ -165,6 +172,7 @@
+     event_log_recordings_file_path_.clear();
+   }
+ 
++#endif
+   g_webrtc_internals = this;
+ }
+ 
+@@ -209,14 +217,18 @@
+   dict.Set("rid", frame_id.child_id.value());
+   dict.Set("lid", lid);
+   dict.Set("pid", static_cast<int>(pid));
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   dict.Set("rtcConfiguration", rtc_configuration);
+   dict.Set("url", url);
++#endif
+   dict.Set("isOpen", true);
+   dict.Set("connected", false);
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   dict.Set("timestamp", base::Time::Now().InMillisecondsFSinceUnixEpoch());
+ 
+   if (!observers_.empty())
+     SendUpdate("add-peer-connection", dict.Clone());
++#endif
+ 
+   peer_connection_data().Append(std::move(dict));
+ 
+@@ -267,9 +279,12 @@
+     MaybeClosePeerConnection(*it);
+   } else if (type == "setConfiguration") {
+     // Update the configuration we have for this connection.
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+     it->GetDict().Set("rtcConfiguration", value);
+-  }
+-
++#endif
++  }
++
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   // Don't update entries if there aren't any observers.
+   if (observers_.empty())
+     return;
+@@ -289,11 +304,15 @@
+ 
+   // Append the update to the end of the log.
+   EnsureLogList(it->GetDict()).Append(std::move(log_entry));
++#endif
+ }
+ 
+ void WebRTCInternals::OnAddStandardStats(GlobalRenderFrameHostId frame_id,
+                                          int lid,
+                                          base::ListValue value) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ 
+   if (observers_.empty())
+@@ -307,6 +326,7 @@
+   dict.Set("reports", std::move(value));
+ 
+   SendUpdate("add-standard-stats", std::move(dict));
++#endif
+ }
+ 
+ void WebRTCInternals::PruneOldGetUserMediaRequests() {
+@@ -332,6 +352,9 @@
+                                  bool video,
+                                  const std::string& audio_constraints,
+                                  const std::string& video_constraints) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ 
+   PruneOldGetUserMediaRequests();
+@@ -369,6 +392,7 @@
+     if (rph)
+       rph->AddObserver(this);
+   }
++#endif
+ }
+ 
+ void WebRTCInternals::OnGetMediaSuccess(std::string_view request_type,
+@@ -378,6 +402,9 @@
+                                         const std::string& stream_id,
+                                         const std::string& audio_track_info,
+                                         const std::string& video_track_info) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ 
+   PruneOldGetUserMediaRequests();
+@@ -409,6 +436,7 @@
+     if (host)
+       host->AddObserver(this);
+   }
++#endif
+ }
+ 
+ void WebRTCInternals::OnGetMediaFailure(std::string_view request_type,
+@@ -417,6 +445,9 @@
+                                         int request_id,
+                                         const std::string& error,
+                                         const std::string& error_message) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ 
+   PruneOldGetUserMediaRequests();
+@@ -445,6 +476,7 @@
+     if (host)
+       host->AddObserver(this);
+   }
++#endif
+ }
+ 
+ void WebRTCInternals::OnGetUserMedia(GlobalRenderFrameHostId frame_id,
+@@ -511,11 +543,18 @@
+ }
+ 
+ void WebRTCInternals::AddObserver(WebRTCInternalsUIObserver* observer) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   observers_.AddObserver(observer);
++#endif
+ }
+ 
+ void WebRTCInternals::RemoveObserver(WebRTCInternalsUIObserver* observer) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   observers_.RemoveObserver(observer);
+   if (!observers_.empty())
+@@ -538,6 +577,7 @@
+   // TODO(tommi): Consider removing all the peer_connection_data().
+   for (auto& dictionary : peer_connection_data())
+     FreeLogList(&dictionary);
++#endif
+ }
+ 
+ void WebRTCInternals::AddConnectionsObserver(
+@@ -553,6 +593,9 @@
+ }
+ 
+ void WebRTCInternals::UpdateObserver(WebRTCInternalsUIObserver* observer) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   if (peer_connection_data().size() > 0)
+     observer->OnUpdate("update-all-peer-connections", &peer_connection_data_);
+@@ -568,15 +611,20 @@
+   }
+   UpdateWakeLock();
+   UpdateStatsTimer();
++#endif
+ }
+ 
+ void WebRTCInternals::EnableAudioDebugRecordings(
+     content::WebContents* web_contents) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ #if BUILDFLAG(IS_ANDROID)
+   EnableAudioDebugRecordingsOnAllRenderProcessHosts();
+ #else
+   MaybeShowSelectFileDialog(web_contents, SelectionType::kAudioDebugRecordings);
++#endif
+ #endif
+ }
+ 
+@@ -605,6 +653,9 @@
+ 
+ void WebRTCInternals::EnableLocalEventLogRecordings(
+     content::WebContents* web_contents) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   CHECK(web_contents, base::NotFatalUntil::M160);
+   CHECK(CanToggleEventLogRecordings(), base::NotFatalUntil::M160);
+@@ -616,6 +667,7 @@
+   }
+ #else
+   MaybeShowSelectFileDialog(web_contents, SelectionType::kRtcEventLogs);
++#endif
+ #endif
+ }
+ 
+@@ -632,6 +684,9 @@
+ 
+ void WebRTCInternals::EnableDataChannelRecordings(
+     content::WebContents* web_contents) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ #if BUILDFLAG(IS_ANDROID)
+   WebRtcEventLogger* const logger = WebRtcEventLogger::Get();
+@@ -641,6 +696,7 @@
+ #else
+   MaybeShowSelectFileDialog(web_contents,
+                             SelectionType::kDataChannelRecordings);
++#endif
+ #endif
+ }
+ 
+@@ -840,6 +896,9 @@
+ }
+ 
+ void WebRTCInternals::EnableAudioDebugRecordingsOnAllRenderProcessHosts() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   CHECK(!audio_debug_recording_session_, base::NotFatalUntil::M160);
+   mojo::PendingRemote<audio::mojom::DebugRecording> debug_recording;
+@@ -854,6 +913,7 @@
+     i.GetCurrentValue()->EnableAudioDebugRecordings(
+         audio_debug_recordings_file_path_);
+   }
++#endif
+ }
+ 
+ void WebRTCInternals::MaybeClosePeerConnection(base::Value& record) {
+diff --git a/v8/BUILD.gn b/v8/BUILD.gn
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ # LINT.IfChange
+ 
++import("//services/network/alloy.gni")
+ import("//tools/v8_context_snapshot/v8_context_snapshot.gni")
+ import("//brave/v8/sources.gni")
+ import("//build/config/android/config.gni")
+@@ -1248,6 +1249,12 @@
+   } else {
+     defines = enabled_external_v8_defines
+   }
++  if (alloy_enable_diagnostic_logging) {
++    defines += [ "V8_ALLOY_PRODUCT=0" ]
++  } else {
++    defines += [ "V8_ALLOY_PRODUCT=1" ]
++  }
++
+ }
+ 
+ # List of defines that can appear in externally visible cppgc header files and
+diff --git a/v8/src/flags/flag-definitions.h b/v8/src/flags/flag-definitions.h
+--- a/v8/src/flags/flag-definitions.h
++++ b/v8/src/flags/flag-definitions.h
+@@ -257,6 +257,30 @@
+ #define DEFINE_DEBUG_BOOL DEFINE_BOOL_READONLY
+ #endif
+ 
++
++// Alloy product diagnostics are immutable compile-time values.
++#if V8_ALLOY_PRODUCT
++#define ALLOY_DEFINE_BOOL(nam, def, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_BOOL_READONLY(nam, def, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_DEBUG_BOOL(nam, def, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_DEVELOPER_FLAG(nam, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_DEBUG_DEVELOPER_FLAG(nam, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_TEST_ONLY_FLAG(nam, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_PERF_PROF_BOOL(nam, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
++#define ALLOY_DEFINE_STRING(nam, def, cmt) FLAG_READONLY(STRING, const char*, nam, def, cmt)
++#define ALLOY_DEFINE_INT(nam, def, cmt) FLAG_READONLY(INT, int, nam, def, cmt)
++#else
++#define ALLOY_DEFINE_BOOL DEFINE_BOOL
++#define ALLOY_DEFINE_BOOL_READONLY DEFINE_BOOL_READONLY
++#define ALLOY_DEFINE_DEBUG_BOOL DEFINE_DEBUG_BOOL
++#define ALLOY_DEFINE_DEVELOPER_FLAG DEFINE_DEVELOPER_FLAG
++#define ALLOY_DEFINE_DEBUG_DEVELOPER_FLAG DEFINE_DEBUG_DEVELOPER_FLAG
++#define ALLOY_DEFINE_TEST_ONLY_FLAG DEFINE_TEST_ONLY_FLAG
++#define ALLOY_DEFINE_PERF_PROF_BOOL DEFINE_PERF_PROF_BOOL
++#define ALLOY_DEFINE_STRING DEFINE_STRING
++#define ALLOY_DEFINE_INT DEFINE_INT
++#endif
++
+ //
+ // Flags in all modes.
+ //
+@@ -316,7 +340,7 @@
+ // Flags for language modes and experimental language features.
+ DEFINE_BOOL(use_strict, false, "enforce strict mode")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_temporal, "trace temporal code")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_temporal, "trace temporal code")
+ 
+ DEFINE_IMPLICATION(js_import_bytes, js_immutable_arraybuffer)
+ 
+@@ -588,7 +612,7 @@
+             "allocation sites.")
+ DEFINE_BOOL(maglev_poly_calls, true, "Support (inlining) polymorphic calls")
+ DEFINE_BOOL(maglev_truncation, true, "Enable Maglev truncation pass")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_truncation, "trace maglev truncation pass")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_truncation, "trace maglev truncation pass")
+ 
+ DEFINE_EXPERIMENTAL_FEATURE(maglev_licm, "loop invariant code motion")
+ DEFINE_WEAK_IMPLICATION(maglev_future, maglev_speculative_hoist_phi_untagging)
+@@ -603,9 +627,9 @@
+ // it doesn't not enable this pass in the maglev pipeline?
+ DEFINE_BOOL(maglev_range_analysis, true,
+             "Enable Maglev range value analysis pass")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_range_analysis,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_range_analysis,
+                       "Trace Maglev range value analysis pass")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_kna, "Trace Maglev known node aspects")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_kna, "Trace Maglev known node aspects")
+ DEFINE_BOOL(maglev_use_unreliable_maps, true,
+             "Use unreliable unstable maps in Maglev")
+ DEFINE_BOOL(maglev_range_verification, false,
+@@ -682,11 +706,11 @@
+             "enable Turbolev non-eager loop peeling")
+ DEFINE_BOOL(turbolev_eager_loop_peeling_osr, true,
+             "use eager loop peeling in Turbolev OSR compiles")
+-DEFINE_DEVELOPER_FLAG(turbolev_trace_loop_peeling,
++ALLOY_DEFINE_DEVELOPER_FLAG(turbolev_trace_loop_peeling,
+                       "trace turbolev non-eager loop peeling decisions")
+ 
+ DEFINE_STRING(maglev_filter, "*", "optimization filter for the maglev compiler")
+-DEFINE_STRING(maglev_print_filter, "*",
++ALLOY_DEFINE_STRING(maglev_print_filter, "*",
+               "filter for maglev's tracing/printing options")
+ DEFINE_BOOL(maglev_assert, false, "insert extra assertion in maglev code")
+ DEFINE_DEBUG_BOOL(maglev_assert_stack_size, true,
+@@ -696,56 +720,56 @@
+ 
+ DEFINE_IMPLICATION(maglev_assert_types, turboshaft_enable_debug_features)
+ DEFINE_BOOL(maglev_break_on_entry, false, "insert an int3 on maglev entries")
+-DEFINE_BOOL(maglev_print_bytecode, false,
++ALLOY_DEFINE_BOOL(maglev_print_bytecode, false,
+             "print bytecode for maglev compiled code")
+-DEFINE_BOOL(maglev_print_feedback, true,
++ALLOY_DEFINE_BOOL(maglev_print_feedback, true,
+             "print feedback vector for maglev compiled code")
+-DEFINE_BOOL(maglev_print_inlined, true,
++ALLOY_DEFINE_BOOL(maglev_print_inlined, true,
+             "print bytecode / feedback vectors also for inlined code")
+-DEFINE_BOOL(maglev_print_provenance, true,
++ALLOY_DEFINE_BOOL(maglev_print_provenance, true,
+             "print Maglev node provenance, ie, file name, bytecode and offset")
+ 
+-DEFINE_DEVELOPER_FLAG(print_maglev_code, "print maglev code")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_maglev_code, "print maglev code")
+ DEFINE_WEAK_IMPLICATION(print_maglev_code, maglev_print_bytecode)
+ 
+-DEFINE_BOOL(trace_with_compilation_id, true,
++ALLOY_DEFINE_BOOL(trace_with_compilation_id, true,
+             "prefix maglev/turbolev trace line with a compilation id")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_maglev_graph_building,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_graph_building,
+                       "trace maglev graph building")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_graph_optimizer,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_graph_optimizer,
+                       "trace maglev graph optimizer")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_loop_speeling, "trace maglev loop SPeeling")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_loop_speeling, "trace maglev loop SPeeling")
+ DEFINE_WEAK_IMPLICATION(trace_maglev_graph_building, trace_maglev_loop_speeling)
+-DEFINE_DEVELOPER_FLAG(trace_maglev_inlining, "trace maglev inlining")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_kna_processor,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_inlining, "trace maglev inlining")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_kna_processor,
+                       "trace maglev known node aspects processor")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_scope_info, "trace maglev scope info")
+-DEFINE_DEVELOPER_FLAG(trace_maglev, "trace Maglev IR to JSON")
+-DEFINE_STRING(trace_maglev_file_prefix, "maglev",
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_scope_info, "trace maglev scope info")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev, "trace Maglev IR to JSON")
++ALLOY_DEFINE_STRING(trace_maglev_file_prefix, "maglev",
+               "write maglev trace files with given prefix")
+ 
+ #ifdef V8_ENABLE_MAGLEV_GRAPH_PRINTER
+-DEFINE_DEVELOPER_FLAG(print_maglev_deopt_verbose, "print verbose deopt info")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_maglev_deopt_verbose, "print verbose deopt info")
+ DEFINE_WEAK_IMPLICATION(trace_deopt_verbose, print_maglev_deopt_verbose)
+-DEFINE_DEVELOPER_FLAG(print_maglev_graph, "print the final maglev graph")
+-DEFINE_DEVELOPER_FLAG(print_maglev_graphs,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_maglev_graph, "print the final maglev graph")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_maglev_graphs,
+                       "print maglev graph across all phases")
+ DEFINE_WEAK_IMPLICATION(print_maglev_graph, maglev_print_bytecode)
+ DEFINE_IMPLICATION(print_maglev_graphs, print_maglev_graph)
+-DEFINE_DEVELOPER_FLAG(trace_maglev_phi_untagging, "trace maglev phi untagging")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_phi_untagging, "trace maglev phi untagging")
+ DEFINE_WEAK_IMPLICATION(trace_maglev_phi_untagging, maglev_print_bytecode)
+-DEFINE_DEVELOPER_FLAG(trace_maglev_regalloc, "trace maglev register allocation")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_regalloc, "trace maglev register allocation")
+ DEFINE_WEAK_IMPLICATION(trace_maglev_regalloc, maglev_print_bytecode)
+ #else
+-DEFINE_BOOL_READONLY(print_maglev_deopt_verbose, false,
++ALLOY_DEFINE_BOOL_READONLY(print_maglev_deopt_verbose, false,
+                      "print verbose deopt info")
+-DEFINE_BOOL_READONLY(print_maglev_graph, false, "print the final maglev graph")
+-DEFINE_BOOL_READONLY(print_maglev_graphs, false,
++ALLOY_DEFINE_BOOL_READONLY(print_maglev_graph, false, "print the final maglev graph")
++ALLOY_DEFINE_BOOL_READONLY(print_maglev_graphs, false,
+                      "print maglev graph across all phases")
+-DEFINE_BOOL_READONLY(trace_maglev_phi_untagging, false,
++ALLOY_DEFINE_BOOL_READONLY(trace_maglev_phi_untagging, false,
+                      "trace maglev phi untagging")
+-DEFINE_BOOL_READONLY(trace_maglev_regalloc, false,
++ALLOY_DEFINE_BOOL_READONLY(trace_maglev_regalloc, false,
+                      "trace maglev register allocation")
+ #endif  // V8_ENABLE_MAGLEV_GRAPH_PRINTER
+ 
+@@ -814,7 +838,7 @@
+             "Maximum number of strings that are eagerly internalized during "
+             "JSON.parse() based on heuristics. 0 means only strings that "
+             "must be internalized e.g. property keys will be internalized.")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_json_parse_internalization,
+     "Print heuristic internalization stats after each JSON.parse()")
+ 
+@@ -824,7 +848,7 @@
+ 
+ DEFINE_UINT(smi_string_cache_size, 8192, "Full size of SmiStringCache")
+ DEFINE_UINT(double_string_cache_size, 4096, "Full size of DoubleStringCache")
+-DEFINE_DEVELOPER_FLAG(trace_number_string_cache,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_number_string_cache,
+                       "Print NumberString caches stats on GC and at the end")
+ DEFINE_WEAK_IMPLICATION(trace_number_string_cache, native_code_counters)
+ 
+@@ -884,7 +908,7 @@
+            "while in efficiency mode.")
+ 
+ // Flag to select wasm trace mark type
+-DEFINE_STRING(
++ALLOY_DEFINE_STRING(
+     wasm_trace_native, nullptr,
+     "Select which native code sequence to use for wasm trace instruction: "
+     "default or cpuid")
+@@ -967,7 +991,7 @@
+ DEFINE_BOOL(verify_simplified_lowering, false,
+             "verify graph generated by simplified lowering")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_compilation_dependencies, "trace code dependencies")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_compilation_dependencies, "trace code dependencies")
+ // Depend on --trace-deopt-verbose for reporting dependency invalidations.
+ DEFINE_IMPLICATION(trace_compilation_dependencies, trace_deopt_verbose)
+ 
+@@ -1000,17 +1024,17 @@
+ DEFINE_UINT(minor_ms_max_page_age, 4,
+             "max age for a page after which it is force promoted to old space")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_page_promotions, "trace page promotion decisions")
+-DEFINE_DEVELOPER_FLAG(trace_pretenuring,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_page_promotions, "trace page promotion decisions")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_pretenuring,
+                       "trace pretenuring decisions of HAllocate instructions")
+-DEFINE_DEVELOPER_FLAG(trace_pretenuring_statistics,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_pretenuring_statistics,
+                       "trace allocation site pretenuring statistics")
+-DEFINE_DEVELOPER_FLAG(trace_resize_large_object,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_resize_large_object,
+                       "trace resizing of large objects")
+ DEFINE_BOOL(track_field_types, true, "track field types")
+-DEFINE_DEVELOPER_FLAG(trace_block_coverage,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_block_coverage,
+                       "trace collected block coverage information")
+-DEFINE_DEVELOPER_FLAG(trace_protector_invalidation,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_protector_invalidation,
+                       "trace protector cell invalidations")
+ DEFINE_BOOL(
+     zero_unused_memory, true,
+@@ -1139,7 +1163,7 @@
+             "the same object")
+ DEFINE_BOOL(ignition_elide_redundant_tdz_checks, true,
+             "elide TDZ checks dominated by other TDZ checks")
+-DEFINE_DEVELOPER_FLAG(print_bytecode,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_bytecode,
+                       "print bytecode generated by ignition interpreter")
+ DEFINE_BOOL(enable_lazy_source_positions, V8_LAZY_SOURCE_POSITIONS_BOOL,
+             "skip generating source positions during initial compile but "
+@@ -1157,33 +1181,33 @@
+ // fuzzers since it might trigger benign CHECKs that could mask actual sandbox
+ // violations).
+ DEFINE_BOOL(stress_lazy, false, "stress lazy compilation")
+-DEFINE_STRING(print_bytecode_filter, "*",
++ALLOY_DEFINE_STRING(print_bytecode_filter, "*",
+               "filter for selecting which functions to print bytecode")
+ DEFINE_BOOL(omit_default_ctors, true, "omit calling default ctors in bytecode")
+ #ifdef V8_TRACE_UNOPTIMIZED
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_unoptimized,
+     "trace the bytecodes executed by all unoptimized execution")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_ignition, "trace the bytecodes executed by the ignition interpreter")
+-DEFINE_DEVELOPER_FLAG(trace_baseline_exec,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_baseline_exec,
+                       "trace the bytecodes executed by the baseline code")
+ DEFINE_WEAK_IMPLICATION(trace_unoptimized, trace_ignition)
+ DEFINE_WEAK_IMPLICATION(trace_unoptimized, trace_baseline_exec)
+ #endif
+ #ifdef V8_TRACE_FEEDBACK_UPDATES
+-DEFINE_BOOL(
++ALLOY_DEFINE_BOOL(
+     trace_feedback_updates, false,
+     "trace updates to feedback vectors during ignition interpreter execution.")
+ #endif
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_ignition_codegen,
+     "trace the codegen of ignition interpreter bytecode handlers")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_track_allocation_sites,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_track_allocation_sites,
+                       "trace the tracking of allocation sites")
+-DEFINE_DEVELOPER_FLAG(trace_migration, "trace object migration")
+-DEFINE_DEVELOPER_FLAG(trace_generalization, "trace map generalization")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_migration, "trace object migration")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_generalization, "trace map generalization")
+ 
+ 
+ // Flags for Sparkplug
+@@ -1232,8 +1256,8 @@
+             "--short-builtin-calls are also enabled")
+ DEFINE_INT(baseline_batch_compilation_threshold, 4 * KB,
+            "the estimated instruction size of a batch to trigger compilation")
+-DEFINE_DEVELOPER_FLAG(trace_baseline, "trace baseline compilation")
+-DEFINE_DEVELOPER_FLAG(trace_baseline_batch_compilation,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_baseline, "trace baseline compilation")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_baseline_batch_compilation,
+                       "trace baseline batch compilation")
+ DEFINE_WEAK_IMPLICATION(trace_baseline, trace_baseline_batch_compilation)
+ #undef FLAG
+@@ -1276,7 +1300,7 @@
+ // Flags for concurrent recompilation.
+ DEFINE_BOOL(concurrent_recompilation, true,
+             "optimizing hot functions asynchronously on a separate thread")
+-DEFINE_DEVELOPER_FLAG(trace_concurrent_recompilation,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_concurrent_recompilation,
+                       "track concurrent recompilation")
+ DEFINE_INT(concurrent_recompilation_queue_length, 8,
+            "the length of the concurrent compilation queue")
+@@ -1314,9 +1338,9 @@
+                    stress_concurrent_inlining)
+ DEFINE_INT(max_serializer_nesting, 25,
+            "maximum levels for nesting child serializers")
+-DEFINE_DEVELOPER_FLAG(trace_heap_broker_verbose,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_heap_broker_verbose,
+                       "trace the heap broker verbosely (all reports)")
+-DEFINE_DEVELOPER_FLAG(trace_heap_broker,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_heap_broker,
+                       "trace the heap broker (reports on missing data only)")
+ DEFINE_IMPLICATION(trace_heap_broker_verbose, trace_heap_broker)
+ DEFINE_IMPLICATION(trace_heap_broker, trace_pending_allocations)
+@@ -1325,7 +1349,7 @@
+ DEFINE_INT(stress_runs, 0, "number of stress runs")
+ DEFINE_INT(deopt_every_n_times, 0,
+            "deoptimize every n times a deopt point is passed")
+-DEFINE_BOOL(print_deopt_stress, false, "print number of possible deopt points")
++ALLOY_DEFINE_BOOL(print_deopt_stress, false, "print number of possible deopt points")
+ DEFINE_BOOL(disable_loop_stack_checks, false,
+             "disable loop stack checks (for testing/fuzzing only)")
+ 
+@@ -1364,25 +1388,25 @@
+     "make OptimizeMaglevOnNextCall optimize to turbofan instead of maglev")
+ 
+ DEFINE_STRING(turbo_filter, "*", "optimization filter for TurboFan compiler")
+-DEFINE_DEVELOPER_FLAG(trace_turbo, "trace generated TurboFan IR")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbo, "trace generated TurboFan IR")
+ DEFINE_NEG_IMPLICATION(trace_turbo, concurrent_builtin_generation)
+ DEFINE_WEAK_IMPLICATION(trace_turbo, concurrent_turbo_tracing)
+-DEFINE_STRING(trace_turbo_path, nullptr,
++ALLOY_DEFINE_STRING(trace_turbo_path, nullptr,
+               "directory to dump generated TurboFan IR to")
+-DEFINE_STRING(trace_turbo_filter, "*",
++ALLOY_DEFINE_STRING(trace_turbo_filter, "*",
+               "filter for tracing turbofan compilation")
+-DEFINE_DEVELOPER_FLAG(trace_turbo_graph, "trace generated TurboFan graphs")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbo_graph, "trace generated TurboFan graphs")
+ DEFINE_NEG_IMPLICATION(trace_turbo_graph, concurrent_builtin_generation)
+-DEFINE_DEVELOPER_FLAG(trace_turbo_scheduled, "trace TurboFan IR with schedule")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbo_scheduled, "trace TurboFan IR with schedule")
+ DEFINE_IMPLICATION(trace_turbo_scheduled, trace_turbo_graph)
+-DEFINE_STRING(trace_turbo_file_prefix, "turbo",
++ALLOY_DEFINE_STRING(trace_turbo_file_prefix, "turbo",
+               "trace turbo graph to a file with given prefix")
+-DEFINE_STRING(trace_turbo_cfg_file, nullptr,
++ALLOY_DEFINE_STRING(trace_turbo_cfg_file, nullptr,
+               "trace turbo cfg graph (for C1 visualizer) to a given file name")
+-DEFINE_BOOL(trace_turbo_types, true, "trace TurboFan's types")
+-DEFINE_BOOL(trace_turbo_scheduler, false, "trace TurboFan's scheduler")
+-DEFINE_BOOL(trace_turbo_reduction, false, "trace TurboFan's various reducers")
+-DEFINE_BOOL(trace_turbo_bailouts, false, "trace TurboFan's various bailouts")
++ALLOY_DEFINE_BOOL(trace_turbo_types, true, "trace TurboFan's types")
++ALLOY_DEFINE_BOOL(trace_turbo_scheduler, false, "trace TurboFan's scheduler")
++ALLOY_DEFINE_BOOL(trace_turbo_reduction, false, "trace TurboFan's various reducers")
++ALLOY_DEFINE_BOOL(trace_turbo_bailouts, false, "trace TurboFan's various bailouts")
+ #ifdef V8_ENABLE_SLOW_TRACING
+ #define DEFINE_SLOW_TRACING_BOOL DEFINE_BOOL
+ #else
+@@ -1401,7 +1425,7 @@
+ DEFINE_SLOW_TRACING_BOOL(trace_all_uses, false, "trace all use positions")
+ DEFINE_SLOW_TRACING_BOOL(trace_representation, false,
+                          "trace representation types")
+-DEFINE_BOOL(
++ALLOY_DEFINE_BOOL(
+     trace_turbo_stack_accesses, false,
+     "trace stack load/store counters for optimized code in run-time (x64 only)")
+ 
+@@ -1456,7 +1480,7 @@
+ DEFINE_BOOL_READONLY(verify_csa, false,
+                      "verify TurboFan machine graph of code stubs")
+ #endif  // ENABLE_VERIFY_CSA
+-DEFINE_DEVELOPER_FLAG(trace_verify_csa, "trace code stubs verification")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_verify_csa, "trace code stubs verification")
+ DEFINE_STRING(csa_trap_on_node, nullptr,
+               "trigger break point when a node with given id is created in "
+               "given stub. The format is: StubName,NodeId")
+@@ -1514,7 +1538,7 @@
+ DEFINE_VALUE_IMPLICATION(stress_inline, max_inlined_bytecode_size_absolute,
+                          999999)
+ DEFINE_VALUE_IMPLICATION(stress_inline, min_inlining_frequency, 0.)
+-DEFINE_DEVELOPER_FLAG(trace_turbo_inlining, "trace TurboFan inlining")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbo_inlining, "trace TurboFan inlining")
+ DEFINE_BOOL(turbo_inline_array_builtins, true,
+             "inline array builtins in TurboFan code")
+ DEFINE_BOOL(use_osr, true, "use on-stack replacement")
+@@ -1538,11 +1562,11 @@
+ DEFINE_INT(maglev_allocation_folding, 2, "maglev allocation folding level")
+ DEFINE_BOOL(maglev_escape_analysis, true,
+             "avoid inlined allocation of objects that cannot escape")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_escape_analysis,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_escape_analysis,
+                       "trace maglev escape analysis")
+ DEFINE_EXPERIMENTAL_FEATURE(maglev_object_tracking,
+                             "track object changes to avoid escaping them")
+-DEFINE_DEVELOPER_FLAG(trace_maglev_object_tracking,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_maglev_object_tracking,
+                       "trace load/stores from maglev virtual objects")
+ DEFINE_WEAK_IMPLICATION(trace_maglev_graph_building,
+                         trace_maglev_object_tracking)
+@@ -1552,26 +1576,26 @@
+ DEFINE_BOOL_READONLY(turbo_string_builder, false,
+                      "use TurboFan fast string builder")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_osr, "trace on-stack replacement")
+-DEFINE_BOOL(log_or_trace_osr, false,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_osr, "trace on-stack replacement")
++ALLOY_DEFINE_BOOL(log_or_trace_osr, false,
+             "internal helper flag, please use --trace-osr instead.")
+ DEFINE_IMPLICATION(trace_osr, log_or_trace_osr)
+ DEFINE_IMPLICATION(log_function_events, log_or_trace_osr)
+ 
+ DEFINE_BOOL(analyze_environment_liveness, true,
+             "analyze liveness of environment slots and zap dead values")
+-DEFINE_DEVELOPER_FLAG(trace_environment_liveness,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_environment_liveness,
+                       "trace liveness of local variable slots")
+ DEFINE_BOOL(turbo_load_elimination, true, "enable load elimination in TurboFan")
+-DEFINE_DEVELOPER_FLAG(trace_turbo_load_elimination,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbo_load_elimination,
+                       "trace TurboFan load elimination")
+-DEFINE_BOOL(turbo_profiling, false, "enable basic block profiling in TurboFan")
++ALLOY_DEFINE_BOOL(turbo_profiling, false, "enable basic block profiling in TurboFan")
+ DEFINE_NEG_IMPLICATION(turbo_profiling, concurrent_builtin_generation)
+-DEFINE_BOOL(turbo_profiling_verbose, false,
++ALLOY_DEFINE_BOOL(turbo_profiling_verbose, false,
+             "enable basic block profiling in TurboFan, and include each "
+             "function's schedule and disassembly in the output")
+ DEFINE_IMPLICATION(turbo_profiling_verbose, turbo_profiling)
+-DEFINE_STRING(
++ALLOY_DEFINE_STRING(
+     turbo_profiling_output, nullptr,
+     "emit data about basic block usage in builtins to this file "
+     "(requires that V8 was built with v8_enable_builtins_profiling=true)")
+@@ -1584,7 +1608,7 @@
+ DEFINE_BOOL(
+     warn_about_builtin_profile_data, false,
+     "flag for mksnapshot, emit warnings when applying builtin profile data")
+-DEFINE_STRING(
++ALLOY_DEFINE_STRING(
+     dump_builtins_hashes_to_file, nullptr,
+     "flag for mksnapshot, dump CSA builtins graph hashes to this file")
+ 
+@@ -1606,13 +1630,13 @@
+                    turbo_instruction_scheduling)
+ DEFINE_BOOL(turbo_stress_instruction_scheduling, false,
+             "randomly schedule instructions to stress dependency tracking")
+-DEFINE_BOOL(trace_turbo_instruction_scheduling, false,
++ALLOY_DEFINE_BOOL(trace_turbo_instruction_scheduling, false,
+             "trace TurboShaft's instruction scheduler")
+ DEFINE_IMPLICATION(turbo_stress_instruction_scheduling,
+                    experimental_turbo_instruction_scheduling)
+ DEFINE_BOOL(turbo_store_elimination, true,
+             "enable store-store elimination in TurboFan")
+-DEFINE_DEVELOPER_FLAG(trace_store_elimination, "trace store elimination")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_store_elimination, "trace store elimination")
+ DEFINE_BOOL_READONLY(turbo_typer_hardening, true,
+                      "extra bounds checks to protect against some known typer "
+                      "mismatch exploit techniques (best effort)")
+@@ -1732,12 +1756,12 @@
+             "use Turbolev (≈ Maglev + Turboshaft combined) as the 4th tier "
+             "compiler instead of Turbofan")
+ 
+-DEFINE_DEVELOPER_FLAG(print_turbolev_frontend,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_turbolev_frontend,
+                       "print Turbolev frontend (Maglev graphs)")
+ DEFINE_STRING(turbolev_phase_filter, "*",
+               "filter for turbolev phases (comma-separated list of phase names)")
+ 
+-DEFINE_DEVELOPER_FLAG(print_turbolev_inline_functions,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_turbolev_inline_functions,
+                       "print Turbolev inline functions")
+ 
+ DEFINE_EXPERIMENTAL_FEATURE(
+@@ -1756,7 +1780,7 @@
+                             "enable escape analysis for Turbolev")
+ DEFINE_WEAK_IMPLICATION(turbolev_future, turbolev_escape_analysis)
+ #endif
+-DEFINE_DEVELOPER_FLAG(trace_turbolev_escape_analysis,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbolev_escape_analysis,
+                       "enable tracing for Turbolev's escape analysis phase")
+ 
+ DEFINE_BOOL(
+@@ -1790,29 +1814,29 @@
+ DEFINE_BOOL(turboshaft_verify_reductions, false,
+             "check that turboshaft reductions are correct with respect to "
+             "inferred types")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_typing,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_typing,
+                       "print typing steps of turboshaft type inference")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_reduction,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_reduction,
+                       "trace individual Turboshaft reduction steps")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_intermediate_reductions,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_intermediate_reductions,
+                       "trace intermediate Turboshaft reduction steps")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_emitted,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_emitted,
+                       "trace emitted Turboshaft instructions")
+ DEFINE_WEAK_IMPLICATION(turboshaft_trace_intermediate_reductions,
+                         turboshaft_trace_reduction)
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_unrolling,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_unrolling,
+                       "trace Turboshaft's loop unrolling reducer")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_peeling,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_peeling,
+                       "trace Turboshaft's loop peeling reducer")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_load_elimination,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_load_elimination,
+                       "trace Turboshaft's late load elimination")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_store_store_elimination,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_store_store_elimination,
+                       "trace Turboshaft's store store elimination")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_if_else_to_switch,
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_if_else_to_switch,
+                       "trace Turboshaft's if-else to switch reducer")
+-DEFINE_DEVELOPER_FLAG(turboshaft_trace_gvn, "trace Turboshaft's GVN reducer")
+-
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(turboshaft_trace_gvn, "trace Turboshaft's GVN reducer")
++
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_turbolev_graph_building,
+     "trace the translation from Maglev to Turboshaft in Turbolev")
+ DEFINE_IMPLICATION(trace_turbolev_graph_building, turboshaft_trace_emitted)
+@@ -1823,17 +1847,17 @@
+ DEFINE_IMPLICATION(verify_turboshaft, turboshaft_verify_load_store_taggedness)
+ DEFINE_IMPLICATION(verify_turboshaft, turboshaft)
+ #else
+-DEFINE_BOOL_READONLY(turboshaft_trace_reduction, false,
++ALLOY_DEFINE_BOOL_READONLY(turboshaft_trace_reduction, false,
+                      "trace individual Turboshaft reduction steps")
+-DEFINE_BOOL_READONLY(turboshaft_trace_emitted, false,
++ALLOY_DEFINE_BOOL_READONLY(turboshaft_trace_emitted, false,
+                      "trace emitted Turboshaft instructions")
+-DEFINE_BOOL_READONLY(turboshaft_trace_intermediate_reductions, false,
++ALLOY_DEFINE_BOOL_READONLY(turboshaft_trace_intermediate_reductions, false,
+                      "trace intermediate Turboshaft reduction steps")
+-DEFINE_BOOL_READONLY(turboshaft_trace_load_elimination, false,
++ALLOY_DEFINE_BOOL_READONLY(turboshaft_trace_load_elimination, false,
+                      "trace Turboshaft's late load elimination")
+-DEFINE_BOOL_READONLY(turboshaft_trace_store_store_elimination, false,
++ALLOY_DEFINE_BOOL_READONLY(turboshaft_trace_store_store_elimination, false,
+                      "trace Turboshaft's store store elimination")
+-DEFINE_BOOL_READONLY(turboshaft_trace_if_else_to_switch, false,
++ALLOY_DEFINE_BOOL_READONLY(turboshaft_trace_if_else_to_switch, false,
+                      "trace Turboshaft's if-else to switch reducer")
+ DEFINE_BOOL_READONLY(verify_turboshaft, false,
+                      "enable various verifications on Turboshaft")
+@@ -1984,16 +2008,16 @@
+ DEFINE_INT(wasm_num_compilation_tasks, 128,
+            "maximum number of parallel compilation tasks for wasm")
+ DEFINE_VALUE_IMPLICATION(single_threaded, wasm_num_compilation_tasks, 0)
+-DEFINE_DEBUG_BOOL(trace_wasm_native_heap, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_native_heap, false,
+                   "trace wasm native heap events")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_wasm_offheap_memory,
+     "print details of wasm off-heap memory when the memory measurement "
+     "API is used")
+-DEFINE_BOOL(
++ALLOY_DEFINE_BOOL(
+     print_wasm_offheap_memory_size, false,
+     "print off-heap memory consumption per module and engine when they die")
+-DEFINE_DEBUG_BOOL(trace_wasm_serialization, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_serialization, false,
+                   "trace serialization/deserialization")
+ DEFINE_BOOL(wasm_test_streaming, false,
+             "use streaming compilation instead of async compilation for tests")
+@@ -2033,16 +2057,16 @@
+     wasm_caching_timeout_ms, 2000,
+     "only trigger caching if no new code was compiled within this timeout (0 "
+     "to disable this logic and only use --wasm-caching-threshold)")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_compilation_times,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_compilation_times,
+                       "print how long it took to compile each wasm function")
+ DEFINE_INT(wasm_tier_up_filter, -1, "only tier-up function with this index")
+ DEFINE_INT(wasm_eager_tier_up_function, -1,
+            "eagerly tier-up function with this index")
+-DEFINE_DEBUG_BOOL(trace_wasm_decoder, false, "trace decoding of wasm code")
+-DEFINE_DEBUG_BOOL(trace_wasm_compiler, false, "trace compiling of wasm code")
+-DEFINE_DEBUG_BOOL(trace_wasm_streaming, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_decoder, false, "trace decoding of wasm code")
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_compiler, false, "trace compiling of wasm code")
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_streaming, false,
+                   "trace streaming compilation of wasm code")
+-DEFINE_DEBUG_BOOL(trace_wasm_stack_switching, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_stack_switching, false,
+                   "trace wasm stack switching")
+ DEFINE_BOOL(stress_wasm_stack_switching, false,
+             "Always run wasm on a secondary stack, even when it is called "
+@@ -2070,11 +2094,11 @@
+ // and predictable mode.
+ DEFINE_IMPLICATION(single_threaded, wasm_sync_tier_up)
+ DEFINE_IMPLICATION(predictable, wasm_sync_tier_up)
+-DEFINE_DEBUG_BOOL(trace_liftoff, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_liftoff, false,
+                   "trace Liftoff, the baseline compiler for WebAssembly")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_memory,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_memory,
+                       "print all memory updates performed in wasm code")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_wasm_globals,
+     "print all global variable updates performed in wasm code")
+ // Fuzzers use {wasm_tier_mask_for_testing} and {wasm_debug_mask_for_testing}
+@@ -2086,7 +2110,7 @@
+ DEFINE_INT(wasm_debug_mask_for_testing, 0,
+            "bitmask of declared(!) function indices to compile for debugging, "
+            "only applies if the tier is Liftoff")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     wasm_pgo_to_file,
+     "experimental: dump Wasm PGO information to a local file (for testing)")
+ DEFINE_NEG_IMPLICATION(wasm_pgo_to_file, single_threaded)
+@@ -2100,8 +2124,8 @@
+ DEFINE_NEG_IMPLICATION(jitless, wasm_lazy_compilation)
+ #endif  // V8_ENABLE_DRUMBRAKE
+ 
+-DEFINE_DEBUG_BOOL(dump_wasm_module, false, "dump wasm module bytes")
+-DEFINE_STRING(dump_wasm_module_path, nullptr,
++ALLOY_DEFINE_DEBUG_BOOL(dump_wasm_module, false, "dump wasm module bytes")
++ALLOY_DEFINE_STRING(dump_wasm_module_path, nullptr,
+               "directory to dump wasm modules to")
+ DEFINE_EXPERIMENTAL_FEATURE(
+     wasm_fast_api,
+@@ -2199,9 +2223,9 @@
+ DEFINE_BOOL(wasm_inlining_ignore_call_counts, false,
+             "Ignore call counts when considering inlining candidates. The flag "
+             "is supposed to be used for fuzzing")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_inlining, "trace wasm inlining")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_typer, "trace wasm typer")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_simd_shuffle, "trace wasm simd shuffle")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_inlining, "trace wasm inlining")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_typer, "trace wasm typer")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_simd_shuffle, "trace wasm simd shuffle")
+ DEFINE_BOOL(wasm_inlining_call_indirect, true,
+             "enable speculative inlining of Wasm indirect calls")
+ // call_indirect inlining requires the basic inlining machinery, e.g., for
+@@ -2218,21 +2242,21 @@
+     "enable Turbofan's random rescheduling phase for wasm functions")
+ DEFINE_BOOL(wasm_loop_peeling, true, "enable loop peeling for wasm functions")
+ DEFINE_SIZE_T(wasm_loop_peeling_max_size, 1000, "maximum size for peeling")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_loop_peeling, "trace wasm loop peeling")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_loop_peeling, "trace wasm loop peeling")
+ DEFINE_BOOL(wasm_fuzzer_gen_test, false,
+             "generate a test case when running a wasm fuzzer")
+ DEFINE_IMPLICATION(wasm_fuzzer_gen_test, single_threaded)
+-DEFINE_DEVELOPER_FLAG(print_wasm_code, "print WebAssembly code")
+-DEFINE_INT(print_wasm_code_function_index, -1,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_wasm_code, "print WebAssembly code")
++ALLOY_DEFINE_INT(print_wasm_code_function_index, -1,
+            "print WebAssembly code for function at index")
+-DEFINE_DEVELOPER_FLAG(print_wasm_stub_code, "print WebAssembly stub code")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_wasm_stub_code, "print WebAssembly stub code")
+ DEFINE_BOOL(wasm_lazy_compilation, true,
+             "enable lazy compilation for all wasm modules")
+-DEFINE_DEBUG_BOOL(trace_wasm_lazy_compilation, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_lazy_compilation, false,
+                   "trace lazy compilation of wasm functions")
+ 
+ DEFINE_BOOL(wasm_code_gc, true, "enable garbage collection of wasm code")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_code_gc,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_code_gc,
+                       "trace garbage collection of wasm code")
+ DEFINE_BOOL(stress_wasm_code_gc, false,
+             "stress test garbage collection of wasm code")
+@@ -2255,7 +2279,7 @@
+            "size of the thread pool used by the wasm C API, with 0 meaning the "
+            "maximum number of threads")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_wasm, "trace wasm function calls")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm, "trace wasm function calls")
+ // Inlining breaks --trace-wasm, hence disable that if --trace-wasm is enabled.
+ // TODO(40898108,mliedtke,manoskouk): We should fix this; now that inlining is
+ // enabled by default, one cannot trace the production configuration anymore.
+@@ -2272,17 +2296,17 @@
+ DEFINE_BOOL(wasm_pause_waiting_for_debugger, false,
+             "pause at the first Webassembly instruction waiting for a debugger "
+             "to attach")
+-DEFINE_DEVELOPER_FLAG(trace_wasm_gdb_remote,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_gdb_remote,
+                       "trace Webassembly GDB-remote server")
+ #endif  // V8_ENABLE_WASM_GDB_REMOTE_DEBUGGING
+ 
+ // wasm instance management
+-DEFINE_DEBUG_BOOL(trace_wasm_instances, false,
++ALLOY_DEFINE_DEBUG_BOOL(trace_wasm_instances, false,
+                   "trace creation and collection of wasm instances")
+ 
+ // Flags for WASM SIMD256 revectorize
+ #ifdef V8_ENABLE_WASM_SIMD256_REVEC
+-DEFINE_DEVELOPER_FLAG(trace_wasm_revectorize, "trace wasm revectorize")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_revectorize, "trace wasm revectorize")
+ #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+ 
+ #if V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_RISCV64 || \
+@@ -2311,24 +2335,24 @@
+ 
+ DEFINE_BOOL(drumbrake_compact_bytecode, false,
+             "Compress the Wasm interpreter bytecode")
+-DEFINE_DEVELOPER_FLAG(trace_drumbrake_compact_bytecode,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_drumbrake_compact_bytecode,
+                       "Traces the Wasm interpreter compact bytecode")
+ DEFINE_BOOL(drumbrake_fuzzer_timeout, false,
+             "enable timeout for wasm fuzzer (for testing)")
+ DEFINE_SIZE_T(drumbrake_fuzzer_timeout_limit_ms, 250,
+               "timeout for wasm fuzzer (in ms)")
+ #ifdef V8_ENABLE_DRUMBRAKE_TRACING
+-DEFINE_DEVELOPER_FLAG(trace_drumbrake_bytecode_generator,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_drumbrake_bytecode_generator,
+                       "trace drumbrake generation of interpreter bytecode")
+-DEFINE_DEVELOPER_FLAG(trace_drumbrake_execution,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_drumbrake_execution,
+                       "trace drumbrake execution of wasm code")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_drumbrake_execution_verbose,
+     "print more information for the drumbrake execution of wasm code")
+ DEFINE_IMPLICATION(trace_drumbrake_execution_verbose, trace_drumbrake_execution)
+ DEFINE_BOOL(redirect_drumbrake_traces, false,
+             "write drumbrake traces into file <pid>-<isolate id>.dbt")
+-DEFINE_STRING(
++ALLOY_DEFINE_STRING(
+     trace_drumbrake_filter, "*",
+     "filter for selecting which wasm functions to trace in the interpreter")
+ #endif  // V8_ENABLE_DRUMBRAKE_TRACING
+@@ -2398,12 +2422,12 @@
+ // it introduces.
+ DEFINE_IMPLICATION(wasm_code_coverage, wasm_opt)
+ 
+-DEFINE_DEVELOPER_FLAG(trace_wasm_compilation_hints,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_wasm_compilation_hints,
+                       "trace compilation hints parsing and usage")
+ DEFINE_TEST_ONLY_FLAG(
+     wasm_generate_compilation_hints,
+     "enable emitting compilation-hints sections for Wasm to a file")
+-DEFINE_TEST_ONLY_FLAG(trace_wasm_generate_compilation_hints,
++ALLOY_DEFINE_TEST_ONLY_FLAG(trace_wasm_generate_compilation_hints,
+                       "enable tracing wasm compilation hints generation")
+ // Feedback collection is guarded by the --wasm-inlining flag.
+ DEFINE_IMPLICATION(wasm_generate_compilation_hints, wasm_inlining)
+@@ -2496,49 +2520,49 @@
+ 
+ DEFINE_SMI(retain_maps_for_n_gc, 2,
+            "keeps maps alive for <n> old space garbage collections")
+-DEFINE_DEVELOPER_FLAG(trace_gc,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc,
+                       "print one trace line following each garbage collection")
+-DEFINE_DEVELOPER_FLAG(trace_gc_nvp,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_nvp,
+                       "print one detailed trace line in name=value format "
+                       "after each garbage collection")
+-DEFINE_DEVELOPER_FLAG(trace_gc_ignore_scavenger,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_ignore_scavenger,
+                       "do not print trace line after scavenger collection")
+-DEFINE_DEVELOPER_FLAG(trace_memory_reducer, "print memory reducer behavior")
+-DEFINE_DEVELOPER_FLAG(trace_gc_verbose,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_memory_reducer, "print memory reducer behavior")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_verbose,
+                       "print more details following each garbage collection")
+ DEFINE_IMPLICATION(trace_gc_verbose, trace_gc)
+-DEFINE_DEVELOPER_FLAG(trace_gc_freelists,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_freelists,
+                       "prints details of each freelist before and after "
+                       "each major garbage collection")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_gc_freelists_verbose,
+     "prints details of freelists of each page before and after "
+     "each major garbage collection")
+ DEFINE_IMPLICATION(trace_gc_freelists_verbose, trace_gc_freelists)
+-DEFINE_DEVELOPER_FLAG(trace_gc_heap_layout,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_heap_layout,
+                       "print layout of pages in heap before and after gc")
+-DEFINE_BOOL(trace_gc_heap_layout_ignore_minor_gc, true,
++ALLOY_DEFINE_BOOL(trace_gc_heap_layout_ignore_minor_gc, true,
+             "do not print trace line before and after minor-gc")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_evacuation_candidates,
+     "Show statistics about the pages evacuation by the compaction")
+ 
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_pending_allocations,
+     "trace calls to Heap::IsAllocationPending that return true")
+ 
+-DEFINE_INT(trace_allocation_stack_interval, -1,
++ALLOY_DEFINE_INT(trace_allocation_stack_interval, -1,
+            "print stack trace after <n> free-list allocations")
+-DEFINE_INT(trace_duplicate_threshold_kb, 0,
++ALLOY_DEFINE_INT(trace_duplicate_threshold_kb, 0,
+            "print duplicate objects in the heap if their size is more than "
+            "given threshold")
+-DEFINE_DEVELOPER_FLAG(trace_fragmentation, "report fragmentation for old space")
+-DEFINE_DEVELOPER_FLAG(trace_fragmentation_verbose,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_fragmentation, "report fragmentation for old space")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_fragmentation_verbose,
+                       "report fragmentation for old space (detailed)")
+-DEFINE_DEVELOPER_FLAG(minor_ms_trace_fragmentation,
++ALLOY_DEFINE_DEVELOPER_FLAG(minor_ms_trace_fragmentation,
+                       "trace fragmentation after marking")
+-DEFINE_DEVELOPER_FLAG(trace_evacuation, "report evacuation statistics")
+-DEFINE_DEVELOPER_FLAG(trace_mutator_utilization,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_evacuation, "report evacuation statistics")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_mutator_utilization,
+                       "print mutator utilization, allocation speed, gc speed")
+ DEFINE_BOOL(incremental_marking, true, "use incremental marking")
+ DEFINE_BOOL(incremental_marking_task, true, "use tasks for incremental marking")
+@@ -2551,14 +2575,14 @@
+ DEFINE_BOOL(incremental_marking_unified_schedule, false,
+             "Use a single schedule for determining a marking schedule between "
+             "JS and C++ objects.")
+-DEFINE_DEVELOPER_FLAG(trace_unmapper, "Trace the unmapping")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_unmapper, "Trace the unmapping")
+ DEFINE_BOOL(parallel_scavenge, true, "parallel scavenge")
+ DEFINE_BOOL(minor_gc_task, true, "schedule minor GC tasks")
+ DEFINE_UINT(minor_gc_task_trigger, 80,
+             "minor GC task trigger in percent of the current heap limit")
+ DEFINE_BOOL(minor_gc_task_with_lower_priority, true,
+             "schedules the minor GC task with kUserVisible priority.")
+-DEFINE_DEVELOPER_FLAG(trace_parallel_scavenge, "trace parallel scavenge")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_parallel_scavenge, "trace parallel scavenge")
+ DEFINE_EXPERIMENTAL_FEATURE(
+     cppgc_young_generation,
+     "run young generation garbage collections in Oilpan")
+@@ -2586,7 +2610,7 @@
+ DEFINE_INT(ephemeron_fixpoint_iterations, 10,
+            "number of fixpoint iterations it takes to switch to linear "
+            "ephemeron algorithm")
+-DEFINE_DEVELOPER_FLAG(trace_concurrent_marking, "trace concurrent marking")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_concurrent_marking, "trace concurrent marking")
+ DEFINE_BOOL(concurrent_sweeping, true, "use concurrent sweeping")
+ DEFINE_NEG_NEG_IMPLICATION(concurrent_sweeping,
+                            concurrent_array_buffer_sweeping)
+@@ -2610,17 +2634,17 @@
+ DEFINE_FLOAT(ineffective_gc_mutator_utilization_threshold, 0.4,
+              "Threshold on mutator utilization to trigger out-of-memory "
+              "failure near heap limit.")
+-DEFINE_DEVELOPER_FLAG(trace_incremental_marking,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_incremental_marking,
+                       "trace progress of the incremental marking")
+-DEFINE_DEVELOPER_FLAG(print_gc_clearing_dependency_graph,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_gc_clearing_dependency_graph,
+                       "print clearing dependency graph in dot format")
+-DEFINE_DEVELOPER_FLAG(trace_stress_marking, "trace stress marking progress")
+-DEFINE_DEVELOPER_FLAG(trace_stress_scavenge, "trace stress scavenge progress")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_stress_marking, "trace stress marking progress")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_stress_scavenge, "trace stress scavenge progress")
+ DEFINE_DEVELOPER_FLAG(track_gc_object_stats,
+                       "track object counts and memory usage")
+-DEFINE_DEVELOPER_FLAG(trace_gc_object_stats,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_object_stats,
+                       "trace object counts and memory usage")
+-DEFINE_DEVELOPER_FLAG(trace_zone_stats, "trace zone memory usage")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_zone_stats, "trace zone memory usage")
+ DEFINE_GENERIC_IMPLICATION(
+     trace_zone_stats,
+     TracingFlags::zone_stats.store(
+@@ -2628,12 +2652,12 @@
+ DEFINE_SIZE_T(
+     zone_stats_tolerance, 1 * MB,
+     "report a tick only when allocated zone memory changes by this amount")
+-DEFINE_DEVELOPER_FLAG(trace_zone_type_stats, "trace per-type zone memory usage")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_zone_type_stats, "trace per-type zone memory usage")
+ DEFINE_GENERIC_IMPLICATION(
+     trace_zone_type_stats,
+     TracingFlags::zone_stats.store(
+         v8::tracing::TracingCategoryObserver::ENABLED_BY_NATIVE))
+-DEFINE_DEBUG_BOOL(trace_backing_store, false, "trace backing store events")
++ALLOY_DEFINE_DEBUG_BOOL(trace_backing_store, false, "trace backing store events")
+ DEFINE_INT(gc_stats, 0, "Used by tracing internally to enable gc statistics")
+ DEFINE_IMPLICATION(trace_gc_object_stats, track_gc_object_stats)
+ DEFINE_GENERIC_IMPLICATION(
+@@ -2646,7 +2670,7 @@
+         v8::tracing::TracingCategoryObserver::ENABLED_BY_NATIVE))
+ 
+ #ifdef V8_COMPRESS_POINTERS
+-DEFINE_DEVELOPER_FLAG(trace_gc_object_stats_all_objects,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_gc_object_stats_all_objects,
+                       "trace all objects on each gc (warning: large output)")
+ DEFINE_IMPLICATION(trace_gc_object_stats_all_objects, trace_gc_object_stats)
+ #endif  // V8_COMPRESS_POINTERS
+@@ -2657,7 +2681,7 @@
+ DEFINE_IMPLICATION(concurrent_marking, incremental_marking)
+ DEFINE_BOOL(track_detached_contexts, true,
+             "track native contexts that are expected to be garbage collected")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_detached_contexts,
+     "trace native contexts that are expected to be garbage collected")
+ DEFINE_IMPLICATION(trace_detached_contexts, track_detached_contexts)
+@@ -2766,7 +2790,7 @@
+ DEFINE_INT(bytecode_old_time, 180, "number of seconds before we flush code")
+ DEFINE_BOOL(stress_flush_code, false, "stress code flushing")
+ DEFINE_WEAK_IMPLICATION(stress_flush_code, flush_baseline_code)
+-DEFINE_DEVELOPER_FLAG(trace_flush_code, "trace bytecode flushing")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_flush_code, "trace bytecode flushing")
+ DEFINE_BOOL(use_marking_progress_bar, true,
+             "Use a progress bar to scan large objects in increments when "
+             "incremental marking is active.")
+@@ -2837,7 +2861,7 @@
+ 
+ DEFINE_BOOL(idle_gc_on_context_disposal, true, "idle gc on context disposal")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_context_disposal, "trace context disposal")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_context_disposal, "trace context disposal")
+ 
+ // v8::CppHeap flags that allow fine-grained control of how C++ memory is
+ // reclaimed in the garbage collector.
+@@ -2861,7 +2885,7 @@
+              "A special constant to balance between memory and space tradeoff. "
+              "The smaller the more memory it uses.")
+ DEFINE_NEG_IMPLICATION(memory_balancer, memory_reducer)
+-DEFINE_DEVELOPER_FLAG(trace_memory_balancer, "print memory balancer behavior.")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_memory_balancer, "print memory balancer behavior.")
+ DEFINE_BOOL(late_heap_limit_check, true,
+             "skips heap limit check for early GCs on allocation failure.")
+ 
+@@ -2971,7 +2995,7 @@
+ DEFINE_BOOL(sim_abort_on_shadowstack_mismatch, true,
+             "Stop execution when shadowstack match fails in the "
+             "riscv simulator.")
+-DEFINE_DEVELOPER_FLAG(trace_shadowstack,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_shadowstack,
+                       "Trace shadowstack operations in the riscv simulator.")
+ #endif
+ #endif
+@@ -3017,7 +3041,7 @@
+ DEFINE_SMI(stack_trace_limit, 10, "number of stack frames to capture")
+ DEFINE_BOOL(builtins_in_stack_traces, false,
+             "show built-in functions in stack traces")
+-DEFINE_BOOL(experimental_stack_trace_frames, false,
++ALLOY_DEFINE_BOOL(experimental_stack_trace_frames, false,
+             "enable experimental frames (API/Builtins) and stack trace layout")
+ DEFINE_BOOL(disallow_code_generation_from_strings, false,
+             "disallow eval and friends")
+@@ -3082,24 +3106,24 @@
+ DEFINE_BOOL(max_lazy, false, "ignore eager compilation hints")
+ DEFINE_IMPLICATION(max_lazy, lazy)
+ DEFINE_BOOL(compile_hints_magic, false, "enable magic compile hints comments")
+-DEFINE_DEVELOPER_FLAG(trace_opt, "trace optimized compilation")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_opt, "trace optimized compilation")
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     trace_opt_status,
+     "trace the optimization status of functions during tiering events")
+-DEFINE_DEVELOPER_FLAG(trace_opt_verbose,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_opt_verbose,
+                       "extra verbose optimized compilation tracing")
+ DEFINE_IMPLICATION(trace_opt_verbose, trace_opt)
+-DEFINE_DEVELOPER_FLAG(trace_opt_stats, "trace optimized compilation statistics")
+-DEFINE_DEVELOPER_FLAG(trace_deopt, "trace deoptimization")
+-DEFINE_DEVELOPER_FLAG(log_deopt, "log deoptimization")
+-DEFINE_DEVELOPER_FLAG(trace_deopt_verbose,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_opt_stats, "trace optimized compilation statistics")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_deopt, "trace deoptimization")
++ALLOY_DEFINE_DEVELOPER_FLAG(log_deopt, "log deoptimization")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_deopt_verbose,
+                       "extra verbose deoptimization tracing")
+ DEFINE_IMPLICATION(trace_deopt_verbose, trace_deopt)
+-DEFINE_DEVELOPER_FLAG(trace_file_names,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_file_names,
+                       "include file names in trace-opt/trace-deopt output")
+ DEFINE_BOOL(always_osr, false, "always try to OSR functions")
+ 
+-DEFINE_DEVELOPER_FLAG(trace_serializer, "print code serializer trace")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_serializer, "print code serializer trace")
+ #ifdef DEBUG
+ DEFINE_BOOL(external_reference_stats, false,
+             "print statistics on external references used during serialization")
+@@ -3107,23 +3131,23 @@
+ 
+ #ifdef V8_DUMPLING
+ // Dumpling flags start.
+-DEFINE_BOOL(interpreter_dumping, false,
++ALLOY_DEFINE_BOOL(interpreter_dumping, false,
+             "enable frame dumping in the interpreter")
+-DEFINE_BOOL(sparkplug_dumping, false,
++ALLOY_DEFINE_BOOL(sparkplug_dumping, false,
+             "enable frame dumping in baseline compiler")
+-DEFINE_BOOL(maglev_dumping, false, "enable frame dumping in maglev")
+-DEFINE_BOOL(turbofan_dumping, false, "enable frame dumping in turbofan")
++ALLOY_DEFINE_BOOL(maglev_dumping, false, "enable frame dumping in maglev")
++ALLOY_DEFINE_BOOL(turbofan_dumping, false, "enable frame dumping in turbofan")
+ // Needed for function id.
+ DEFINE_NEG_IMPLICATION(interpreter_dumping, enable_lazy_source_positions)
+ DEFINE_NEG_IMPLICATION(sparkplug_dumping, enable_lazy_source_positions)
+ DEFINE_NEG_IMPLICATION(maglev_dumping, enable_lazy_source_positions)
+ DEFINE_NEG_IMPLICATION(turbofan_dumping, enable_lazy_source_positions)
+-DEFINE_STRING(dump_out_filename, "/tmp/output_dump.txt",
++ALLOY_DEFINE_STRING(dump_out_filename, "/tmp/output_dump.txt",
+               "File to save the frame dumps to")
+ DEFINE_INT(dumpling_depth, 3, "depth used in dumpling")
+-DEFINE_STRING(dump_positions_filename, "/tmp/dump_positions.txt",
++ALLOY_DEFINE_STRING(dump_positions_filename, "/tmp/dump_positions.txt",
+               "File to save dump positions to")
+-DEFINE_BOOL(generate_dump_positions, false, "write dump positions to a file")
++ALLOY_DEFINE_BOOL(generate_dump_positions, false, "write dump positions to a file")
+ DEFINE_BOOL(load_dump_positions, false, "load dump positions from a file")
+ DEFINE_NEG_IMPLICATION(generate_dump_positions, load_dump_positions)
+ // Dumpling flags end.
+@@ -3139,7 +3163,7 @@
+                             "enable compiler dispatcher")
+ DEFINE_UINT(lazy_compile_dispatcher_max_threads, 0,
+             "max threads for compiler dispatcher (0 for unbounded)")
+-DEFINE_DEVELOPER_FLAG(trace_compiler_dispatcher,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_compiler_dispatcher,
+                       "trace compiler dispatcher activity")
+ DEFINE_EXPERIMENTAL_FEATURE(
+     parallel_compile_tasks_for_eager_toplevel,
+@@ -3163,7 +3187,7 @@
+ DEFINE_NEG_IMPLICATION(hole_fuzzing, simulator_debugger)
+ DEFINE_NEG_IMPLICATION(sandbox_fuzzing, simulator_debugger)
+ 
+-DEFINE_BOOL(
++ALLOY_DEFINE_BOOL(
+     trace_side_effect_free_debug_evaluate, false,
+     "print debug messages for side-effect-free debug-evaluate for testing")
+ DEFINE_BOOL(hard_abort, true, "abort by crashing")
+@@ -3172,7 +3196,7 @@
+ DEFINE_NEG_IMPLICATION(sandbox_fuzzing, hard_abort)
+ 
+ // disassembler
+-DEFINE_BOOL(log_colour, ENABLE_LOG_COLOUR,
++ALLOY_DEFINE_BOOL(log_colour, ENABLE_LOG_COLOUR,
+             "When logging, try to use coloured output.")
+ 
+ // inspector
+@@ -3192,7 +3216,7 @@
+            "default size of stack region v8 is allowed to use (in kBytes)")
+ 
+ // frames.cc
+-DEFINE_INT(max_stack_trace_source_length, 300,
++ALLOY_DEFINE_INT(max_stack_trace_source_length, 300,
+            "maximum length of function source code printed in a stack trace.")
+ 
+ // execution.cc, messages.cc
+@@ -3208,7 +3232,7 @@
+            "time interval in ms for aggregating memory histograms")
+ 
+ // heap-snapshot-generator.cc
+-DEFINE_BOOL(heap_profiler_trace_objects, false,
++ALLOY_DEFINE_BOOL(heap_profiler_trace_objects, false,
+             "Dump heap object allocations/movements/size_updates")
+ DEFINE_BOOL(heap_profiler_use_embedder_graph, true,
+             "Use the new EmbedderGraph API to get embedder nodes")
+@@ -3225,7 +3249,7 @@
+            "results in taking a snapshot on every invocation.")
+ DEFINE_UINT(heap_snapshot_string_limit, 1024,
+             "truncate strings to this length in the heap snapshot")
+-DEFINE_BOOL(profile_heap_snapshot, false, "dump time spent on heap snapshot")
++ALLOY_DEFINE_BOOL(profile_heap_snapshot, false, "dump time spent on heap snapshot")
+ #ifdef V8_ENABLE_HEAP_SNAPSHOT_VERIFY
+ DEFINE_BOOL(heap_snapshot_verify, false,
+             "verify that heap snapshot matches marking visitor behavior")
+@@ -3237,7 +3261,7 @@
+             "Use constant sample intervals to eliminate test flakiness")
+ 
+ // ic.cc
+-DEFINE_BOOL(log_ic, false,
++ALLOY_DEFINE_BOOL(log_ic, false,
+             "Log inline cache state transitions for tools/ic-processor")
+ DEFINE_IMPLICATION(log_ic, log_code)
+ DEFINE_GENERIC_IMPLICATION(
+@@ -3281,12 +3305,12 @@
+     base::bits::IsPowerOfTwo(v8_flags.homomorphic_ic_count.value()))
+ 
+ // objects.cc
+-DEFINE_DEVELOPER_FLAG(trace_prototype_users,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_prototype_users,
+                       "Trace updates to prototype user tracking")
+-DEFINE_DEVELOPER_FLAG(trace_for_in_enumerate,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_for_in_enumerate,
+                       "Trace for-in enumerate slow-paths")
+-DEFINE_BOOL(log_maps, false, "Log map creation")
+-DEFINE_BOOL(log_maps_details, true, "Also log map details")
++ALLOY_DEFINE_BOOL(log_maps, false, "Log map creation")
++ALLOY_DEFINE_BOOL(log_maps_details, true, "Also log map details")
+ DEFINE_IMPLICATION(log_maps, log_code)
+ 
+ // parser.cc
+@@ -3300,7 +3324,7 @@
+ 
+ // simulator-arm.cc and simulator-arm64.cc.
+ #ifdef USE_SIMULATOR
+-DEFINE_DEVELOPER_FLAG(trace_sim, "Trace simulator execution")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_sim, "Trace simulator execution")
+ DEFINE_BOOL(debug_sim, false, "Enable debugging the simulator")
+ DEFINE_BOOL(check_icache, false,
+             "Check icache flushes in ARM and MIPS simulator")
+@@ -3323,7 +3347,7 @@
+ DEFINE_INT(sim_stack_size, 2 * MB / KB,
+            "Stack size of the ARM64, MIPS64 and PPC64 simulator "
+            "in kBytes (default is 2 MB)")
+-DEFINE_DEVELOPER_FLAG(trace_sim_messages,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_sim_messages,
+                       "Trace simulator debug messages. Implied by --trace-sim.")
+ #endif  // USE_SIMULATOR
+ 
+@@ -3337,7 +3361,7 @@
+ // isolate.cc
+ DEFINE_BOOL(async_stack_traces, true,
+             "include async stack traces in Error.stack")
+-DEFINE_BOOL(stack_trace_on_illegal, false,
++ALLOY_DEFINE_BOOL(stack_trace_on_illegal, false,
+             "print stack trace when an illegal exception is thrown")
+ DEFINE_BOOL(abort_on_uncaught_exception, false,
+             "abort program (dump core) when an uncaught exception is thrown")
+@@ -3362,8 +3386,8 @@
+             "Create more hash collisions by making certain hash functions "
+             "always return the same constant")
+ #endif  // V8_HASHES_COLLIDE
+-DEFINE_DEVELOPER_FLAG(trace_rail, "trace RAIL mode")
+-DEFINE_DEVELOPER_FLAG(
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_rail, "trace RAIL mode")
++ALLOY_DEFINE_DEVELOPER_FLAG(
+     print_all_exceptions,
+     "print exception object and stack trace on each thrown exception")
+ 
+@@ -3382,7 +3406,7 @@
+ DEFINE_BOOL(short_builtin_calls, V8_SHORT_BUILTIN_CALLS_BOOL,
+             "Put embedded builtins code into the code range for shorter "
+             "builtin calls/jumps if system has >=4GB memory")
+-DEFINE_DEVELOPER_FLAG(trace_code_range_allocation,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_code_range_allocation,
+                       "Trace code range allocation process.")
+ 
+ DEFINE_BOOL(better_code_range_allocation,
+@@ -3395,7 +3419,7 @@
+             ".text section")
+ 
+ // runtime.cc
+-DEFINE_BOOL(runtime_call_stats, false, "report runtime call counts and times")
++ALLOY_DEFINE_BOOL(runtime_call_stats, false, "report runtime call counts and times")
+ DEFINE_GENERIC_IMPLICATION(
+     runtime_call_stats,
+     TracingFlags::runtime_stats.store(
+@@ -3412,9 +3436,9 @@
+             "Verify snapshot checksums when deserializing snapshots. Enable "
+             "checksum creation and verification for code caches. Enabled by "
+             "default in debug builds and once per process for Android.")
+-DEFINE_DEVELOPER_FLAG(profile_deserialization,
++ALLOY_DEFINE_DEVELOPER_FLAG(profile_deserialization,
+                       "Print the time it takes to deserialize the snapshot.")
+-DEFINE_DEVELOPER_FLAG(trace_deserialization,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_deserialization,
+                       "Trace the snapshot deserialization.")
+ DEFINE_DEVELOPER_FLAG(serialization_statistics,
+                       "Collect statistics on serialized objects.")
+@@ -3471,56 +3495,56 @@
+             "emit the SIMD scans directly in the regexp compiler, instead of "
+             "via the bytecode peephole pass")
+ #ifdef ENABLE_DISASSEMBLER
+-DEFINE_DEVELOPER_FLAG(trace_regexp_peephole_optimization,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_peephole_optimization,
+                       "trace regexp bytecode peephole optimization")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_bytecodes, "trace regexp bytecode execution")
+-#else
+-DEFINE_BOOL_READONLY(trace_regexp_peephole_optimization, false,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_bytecodes, "trace regexp bytecode execution")
++#else
++ALLOY_DEFINE_BOOL_READONLY(trace_regexp_peephole_optimization, false,
+                      "trace regexp bytecode peephole optimization (requires "
+                      "v8_enable_disassembler = true)")
+-DEFINE_BOOL_READONLY(
++ALLOY_DEFINE_BOOL_READONLY(
+     trace_regexp_bytecodes, false,
+     "trace regexp bytecode execution (requires v8_enable_disassembler = true)")
+ #endif
+ #ifdef V8_ENABLE_REGEXP_DIAGNOSTICS
+-DEFINE_DEVELOPER_FLAG(trace_regexp_exec, "trace regexp execution")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_exec_ool_subjects,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_exec, "trace regexp execution")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_exec_ool_subjects,
+                       "trace regexp execution out-of-line subject strings")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_assembler,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_assembler,
+                       "trace regexp macro assembler calls.")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_compiler, "trace regexp compilation")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_graph_building,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_compiler, "trace regexp compilation")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_graph_building,
+                       "trace regexp AST to graph conversion")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_parser, "trace regexp parsing")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_graph, "trace the regexp graph")
+-DEFINE_DEVELOPER_FLAG(print_regexp_graph, "print the regexp graph")
+-DEFINE_DEVELOPER_FLAG(trace_regexp_tier_up, "trace regexp tiering up execution")
+-#else
+-DEFINE_BOOL_READONLY(trace_regexp_exec, false,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_parser, "trace regexp parsing")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_graph, "trace the regexp graph")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_regexp_graph, "print the regexp graph")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_regexp_tier_up, "trace regexp tiering up execution")
++#else
++ALLOY_DEFINE_BOOL_READONLY(trace_regexp_exec, false,
+                      "trace regexp execution (requires "
+                      "v8_enable_regexp_diagnostics = true).")
+-DEFINE_BOOL_READONLY(trace_regexp_exec_ool_subjects, false,
++ALLOY_DEFINE_BOOL_READONLY(trace_regexp_exec_ool_subjects, false,
+                      "trace regexp execution out-of-line subject strings "
+                      "(requires v8_enable_regexp_diagnostics = true).")
+-DEFINE_BOOL_READONLY(trace_regexp_assembler, false,
++ALLOY_DEFINE_BOOL_READONLY(trace_regexp_assembler, false,
+                      "trace regexp macro assembler calls (requires "
+                      "v8_enable_regexp_diagnostics = true).")
+-DEFINE_BOOL_READONLY(
++ALLOY_DEFINE_BOOL_READONLY(
+     trace_regexp_compiler, false,
+     "trace regexp compilation (requires v8_enable_regexp_diagnostics = true)")
+-DEFINE_BOOL_READONLY(trace_regexp_graph_building, false,
++ALLOY_DEFINE_BOOL_READONLY(trace_regexp_graph_building, false,
+                      "trace regexp AST to graph conversion (requires "
+                      "v8_enable_regexp_diagnostics = true)")
+-DEFINE_BOOL_READONLY(
++ALLOY_DEFINE_BOOL_READONLY(
+     trace_regexp_parser, false,
+     "trace regexp parsing (requires v8_enable_regexp_diagnostics = true)")
+-DEFINE_BOOL_READONLY(
++ALLOY_DEFINE_BOOL_READONLY(
+     trace_regexp_graph, false,
+     "trace the regexp graph (requires v8_enable_regexp_diagnostics = true)")
+-DEFINE_BOOL_READONLY(
++ALLOY_DEFINE_BOOL_READONLY(
+     print_regexp_graph, false,
+     "print the regexp graph (requires v8_enable_regexp_diagnostics = true)")
+-DEFINE_BOOL_READONLY(trace_regexp_tier_up, false,
++ALLOY_DEFINE_BOOL_READONLY(trace_regexp_tier_up, false,
+                      "trace regexp tiering up execution (requires "
+                      "v8_enable_regexp_diagnostics = true)")
+ #endif
+@@ -3539,7 +3563,7 @@
+ DEFINE_UINT64(experimental_regexp_engine_capture_group_opt_max_memory_usage,
+               1024,
+               "maximum memory usage in MB allowed for experimental engine")
+-DEFINE_DEVELOPER_FLAG(trace_experimental_regexp_engine,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_experimental_regexp_engine,
+                       "trace execution of experimental regexp engine")
+ 
+ DEFINE_EXPERIMENTAL_FEATURE(
+@@ -3562,9 +3586,9 @@
+ #endif  // V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_RISCV32
+         // || V8_TARGET_ARCH_RISCV64
+ 
+-DEFINE_DEVELOPER_FLAG(trace_read_only_promotion,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_read_only_promotion,
+                       "trace the read-only promotion pass")
+-DEFINE_DEVELOPER_FLAG(trace_read_only_promotion_verbose,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_read_only_promotion_verbose,
+                       "trace the read-only promotion pass")
+ DEFINE_WEAK_IMPLICATION(trace_read_only_promotion_verbose,
+                         trace_read_only_promotion)
+@@ -3776,7 +3800,7 @@
+ //
+ // Minor mark sweep collector flags.
+ //
+-DEFINE_DEVELOPER_FLAG(trace_minor_ms_parallel_marking,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_minor_ms_parallel_marking,
+                       "trace parallel marking for the young generation")
+ DEFINE_EXPERIMENTAL_FEATURE(minor_ms, "perform young generation mark sweep GCs")
+ DEFINE_IMPLICATION(minor_ms, page_promotion)
+@@ -3841,8 +3865,8 @@
+ //
+ 
+ DEFINE_BOOL(help, false, "Print usage message, including flags, on console")
+-DEFINE_BOOL(print_flag_values, false, "Print all flag values of V8")
+-DEFINE_BOOL(print_feature_flags_json, false,
++ALLOY_DEFINE_BOOL(print_flag_values, false, "Print all flag values of V8")
++ALLOY_DEFINE_BOOL(print_feature_flags_json, false,
+             "Print JS and Wasm feature flags grouped by in-progress, staged, "
+             "and shipped")
+ 
+@@ -3872,14 +3896,14 @@
+ #define FLAG FLAG_READONLY
+ #endif
+ 
+-DEFINE_BOOL(gdbjit, false, "enable GDBJIT interface")
+-DEFINE_BOOL(gdbjit_full, false, "enable GDBJIT interface for all code objects")
+-DEFINE_BOOL(gdbjit_dump, false, "dump elf objects with debug info to disk")
++ALLOY_DEFINE_BOOL(gdbjit, false, "enable GDBJIT interface")
++ALLOY_DEFINE_BOOL(gdbjit_full, false, "enable GDBJIT interface for all code objects")
++ALLOY_DEFINE_BOOL(gdbjit_dump, false, "dump elf objects with debug info to disk")
+ #ifdef ENABLE_GDB_JIT_INTERFACE
+-DEFINE_BOOL(maglev_gdbjit, false, "enable GDBJIT line info for Maglev graph")
++ALLOY_DEFINE_BOOL(maglev_gdbjit, false, "enable GDBJIT line info for Maglev graph")
+ #endif
+ DEFINE_BOOL(torque_dwarf, false, "enable DWARF line info for Torque files")
+-DEFINE_STRING(gdbjit_dump_filter, "",
++ALLOY_DEFINE_STRING(gdbjit_dump_filter, "",
+               "dump only objects containing this substring")
+ 
+ #ifdef ENABLE_GDB_JIT_INTERFACE
+@@ -3910,42 +3934,42 @@
+ #endif
+ 
+ // codegen-ia32.cc / codegen-arm.cc / macro-assembler-*.cc
+-DEFINE_DEVELOPER_FLAG(print_ast, "print source AST")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_ast, "print source AST")
+ 
+ // compiler.cc
+-DEFINE_DEVELOPER_FLAG(print_scopes, "print scopes")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_scopes, "print scopes")
+ 
+ // contexts.cc
+-DEFINE_DEVELOPER_FLAG(trace_contexts, "trace contexts operations")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_contexts, "trace contexts operations")
+ 
+ // heap.cc
+ DEFINE_DEVELOPER_FLAG(code_stats, "report code statistics after GC")
+-DEFINE_DEVELOPER_FLAG(print_handles, "report handles after GC")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_handles, "report handles after GC")
+ DEFINE_BOOL(check_handle_count, false,
+             "Check that there are not too many handles at GC")
+-DEFINE_DEVELOPER_FLAG(print_global_handles, "report global handles after GC")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_global_handles, "report global handles after GC")
+ 
+ // TurboFan debug-only flags.
+-DEFINE_DEVELOPER_FLAG(trace_turbo_escape, "enable tracing in escape analysis")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_turbo_escape, "enable tracing in escape analysis")
+ 
+ // objects.cc
+-DEFINE_DEVELOPER_FLAG(trace_module_status,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_module_status,
+                       "Trace status transitions of ECMAScript modules")
+-DEFINE_DEVELOPER_FLAG(trace_normalization,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_normalization,
+                       "prints when objects are turned into dictionaries.")
+ 
+ // runtime.cc
+-DEFINE_DEVELOPER_FLAG(trace_lazy, "trace lazy compilation")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_lazy, "trace lazy compilation")
+ 
+ // spaces.cc
+-DEFINE_DEVELOPER_FLAG(trace_isolates, "trace isolate state changes")
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_isolates, "trace isolate state changes")
+ 
+ // Regexp
+ DEFINE_BOOL(regexp_possessive_quantifier, false,
+             "enable possessive quantifier syntax for testing")
+ 
+ // Debugger
+-DEFINE_DEVELOPER_FLAG(print_break_location,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_break_location,
+                       "print source location on debug break")
+ 
+ //
+@@ -3959,37 +3983,37 @@
+ #define FLAG FLAG_FULL
+ 
+ // log.cc
+-DEFINE_STRING(logfile, "v8.log",
++ALLOY_DEFINE_STRING(logfile, "v8.log",
+               "Specify the name of the log file, use '-' for console, '+' for "
+               "a temporary file.")
+-DEFINE_BOOL(logfile_per_isolate, true, "Separate log files for each isolate.")
+-
+-DEFINE_BOOL(log, false,
++ALLOY_DEFINE_BOOL(logfile_per_isolate, true, "Separate log files for each isolate.")
++
++ALLOY_DEFINE_BOOL(log, false,
+             "Minimal logging (no API, code, GC, suspect, or handles samples).")
+-DEFINE_BOOL(log_all, false, "Log all events to the log file.")
+-
+-DEFINE_BOOL(log_internal_timer_events, false, "See --log-timer-events")
+-DEFINE_BOOL(log_timer_events, false,
++ALLOY_DEFINE_BOOL(log_all, false, "Log all events to the log file.")
++
++ALLOY_DEFINE_BOOL(log_internal_timer_events, false, "See --log-timer-events")
++ALLOY_DEFINE_BOOL(log_timer_events, false,
+             "Log timer events (incl. console.time* and Date.now).")
+ 
+-DEFINE_BOOL(log_source_code, false, "Log source code.")
+-DEFINE_BOOL(log_source_position, false, "Log detailed source information.")
+-DEFINE_BOOL(log_code, false,
++ALLOY_DEFINE_BOOL(log_source_code, false, "Log source code.")
++ALLOY_DEFINE_BOOL(log_source_position, false, "Log detailed source information.")
++ALLOY_DEFINE_BOOL(log_code, false,
+             "Log code events to the log file without profiling.")
+ DEFINE_WEAK_IMPLICATION(log_code, log_source_code)
+ DEFINE_WEAK_IMPLICATION(log_code, log_source_position)
+-DEFINE_BOOL(log_feedback_vector, false, "Log FeedbackVectors on first creation")
+-DEFINE_BOOL(log_code_disassemble, false,
++ALLOY_DEFINE_BOOL(log_feedback_vector, false, "Log FeedbackVectors on first creation")
++ALLOY_DEFINE_BOOL(log_code_disassemble, false,
+             "Log all disassembled code to the log file.")
+ DEFINE_IMPLICATION(log_code_disassemble, log_code)
+-DEFINE_BOOL(log_function_events, false,
++ALLOY_DEFINE_BOOL(log_function_events, false,
+             "Log function events "
+             "(parse, compile, execute) separately.")
+ 
+ DEFINE_BOOL(detailed_line_info, false,
+             "Always generate detailed line information for CPU profiling.")
+ 
+-DEFINE_BOOL(prof_include_idle, false, "Include idle samples in the profile")
++ALLOY_DEFINE_BOOL(prof_include_idle, false, "Include idle samples in the profile")
+ 
+ #if defined(V8_USE_PERFETTO)
+ DEFINE_BOOL(perfetto_code_logger, false,
+@@ -4007,12 +4031,12 @@
+ #else
+ #define DEFAULT_PROF_SAMPLING_INTERVAL 1000
+ #endif
+-DEFINE_INT(prof_sampling_interval, DEFAULT_PROF_SAMPLING_INTERVAL,
++ALLOY_DEFINE_INT(prof_sampling_interval, DEFAULT_PROF_SAMPLING_INTERVAL,
+            "Interval for --prof samples (in microseconds).")
+ #undef DEFAULT_PROF_SAMPLING_INTERVAL
+ 
+-DEFINE_BOOL(prof_cpp, false, "Like --prof, but ignore generated code.")
+-DEFINE_BOOL(prof_browser_mode, true,
++ALLOY_DEFINE_BOOL(prof_cpp, false, "Like --prof, but ignore generated code.")
++ALLOY_DEFINE_BOOL(prof_browser_mode, true,
+             "Used with --prof, turns on browser-compatible mode for profiling.")
+ 
+ DEFINE_BOOL(prof, false,
+@@ -4024,7 +4048,7 @@
+ // When active, V8 will log code events (like code creation and code moving)
+ // to v8.log and will signal code-moving GC events to synchronize system-level
+ // profilers (like Linux perf) with V8's heap relocations via fake mmaps.
+-DEFINE_DEVELOPER_FLAG(ll_prof, "Enable low-level linux profiler.")
++ALLOY_DEFINE_DEVELOPER_FLAG(ll_prof, "Enable low-level linux profiler.")
+ 
+ #if V8_OS_LINUX || V8_OS_DARWIN
+ #define DEFINE_PERF_PROF_BOOL(nam, cmt) DEFINE_DEVELOPER_FLAG(nam, cmt)
+@@ -4042,25 +4066,25 @@
+ #define DEFAULT_PERF_PROF_PATH "."
+ #endif
+ 
+-DEFINE_PERF_PROF_BOOL(perf_basic_prof,
++ALLOY_DEFINE_PERF_PROF_BOOL(perf_basic_prof,
+                       "Enable basic support for perf profiler.")
+ DEFINE_NEG_IMPLICATION(perf_basic_prof, compact_code_space)
+-DEFINE_STRING(perf_basic_prof_path, DEFAULT_PERF_BASIC_PROF_PATH,
++ALLOY_DEFINE_STRING(perf_basic_prof_path, DEFAULT_PERF_BASIC_PROF_PATH,
+               "directory to write perf-<pid>.map symbol file to")
+-DEFINE_PERF_PROF_BOOL(
++ALLOY_DEFINE_PERF_PROF_BOOL(
+     perf_basic_prof_only_functions,
+     "Only report function code ranges to perf (i.e. no stubs).")
+ DEFINE_PERF_PROF_IMPLICATION(perf_basic_prof_only_functions, perf_basic_prof)
+ 
+-DEFINE_PERF_PROF_BOOL(perf_prof,
++ALLOY_DEFINE_PERF_PROF_BOOL(perf_prof,
+                       "Enable experimental annotate support for perf profiler.")
+-DEFINE_STRING(perf_prof_path, DEFAULT_PERF_PROF_PATH,
++ALLOY_DEFINE_STRING(perf_prof_path, DEFAULT_PERF_PROF_PATH,
+               "directory to write jit-<pid>.dump symbol file to")
+-DEFINE_PERF_PROF_BOOL(
++ALLOY_DEFINE_PERF_PROF_BOOL(
+     perf_prof_annotate_wasm,
+     "Used with --perf-prof, load wasm source map and provide annotate "
+     "support (experimental).")
+-DEFINE_PERF_PROF_BOOL(
++ALLOY_DEFINE_PERF_PROF_BOOL(
+     perf_prof_delete_file,
+     "Remove the perf file right after creating it (for testing only).")
+ DEFINE_NEG_IMPLICATION(perf_prof, compact_code_space)
+@@ -4068,12 +4092,12 @@
+ // --perf-prof-unwinding-info is available only on selected architectures.
+ #if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_X64 || \
+     V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_PPC64
+-DEFINE_PERF_PROF_BOOL(
++ALLOY_DEFINE_PERF_PROF_BOOL(
+     perf_prof_unwinding_info,
+     "Enable unwinding info for perf linux profiler (experimental).")
+ DEFINE_PERF_PROF_IMPLICATION(perf_prof, perf_prof_unwinding_info)
+ #else
+-DEFINE_BOOL_READONLY(
++ALLOY_DEFINE_BOOL_READONLY(
+     perf_prof_unwinding_info, false,
+     "Enable unwinding info for perf linux profiler (experimental).")
+ #endif
+@@ -4088,13 +4112,13 @@
+ DEFINE_STRING(gc_fake_mmap, "/tmp/__v8_gc__",
+               "Specify the name of the file for fake gc mmap used in ll_prof")
+ 
+-DEFINE_BOOL(redirect_code_traces, false,
++ALLOY_DEFINE_BOOL(redirect_code_traces, false,
+             "output deopt information and disassembly into file "
+             "code-<pid>-<isolate id>.asm")
+-DEFINE_STRING(redirect_code_traces_to, nullptr,
++ALLOY_DEFINE_STRING(redirect_code_traces_to, nullptr,
+               "output deopt information and disassembly into the given file")
+ 
+-DEFINE_DEVELOPER_FLAG(print_opt_source,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_opt_source,
+                       "print source code of optimized and inlined functions")
+ 
+ DEFINE_BOOL(vtune_prof_annotate_wasm, false,
+@@ -4111,7 +4135,7 @@
+ DEFINE_BOOL(enable_etw_stack_walking, false,
+             "Enable etw stack walking for windows")
+ DEFINE_WEAK_IMPLICATION(future, enable_etw_stack_walking)
+-DEFINE_BOOL(etw_trace_debug, false,
++ALLOY_DEFINE_BOOL(etw_trace_debug, false,
+             "Enable etw debug logging (only on debug builds)")
+ DEFINE_BOOL(enable_etw_by_custom_filter_only, true,
+             "Enable etw stack walking for windows, but only if explicitly "
+@@ -4119,7 +4143,7 @@
+ #else   // V8_ENABLE_ETW_STACK_WALKING
+ DEFINE_BOOL_READONLY(enable_etw_stack_walking, false,
+                      "Enable etw stack walking for windows")
+-DEFINE_BOOL_READONLY(etw_trace_debug, false,
++ALLOY_DEFINE_BOOL_READONLY(etw_trace_debug, false,
+                      "Enable etw debug logging (only on debug builds)")
+ DEFINE_BOOL_READONLY(
+     enable_etw_by_custom_filter_only, false,
+@@ -4127,7 +4151,7 @@
+     "specified in a WPR profile")
+ #endif  // V8_ENABLE_ETW_STACK_WALKING
+ 
+-DEFINE_BOOL(print_builtin_size, false, "print code size for builtins")
++ALLOY_DEFINE_BOOL(print_builtin_size, false, "print code size for builtins")
+ 
+ //
+ // Disassembler only flags
+@@ -4140,23 +4164,23 @@
+ #endif
+ 
+ // elements.cc
+-DEFINE_DEVELOPER_FLAG(trace_elements_transitions, "trace elements transitions")
+-
+-DEFINE_DEVELOPER_FLAG(trace_creation_allocation_sites,
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_elements_transitions, "trace elements transitions")
++
++ALLOY_DEFINE_DEVELOPER_FLAG(trace_creation_allocation_sites,
+                       "trace the creation of allocation sites")
+ 
+-DEFINE_DEVELOPER_FLAG(print_code, "print generated code")
+-DEFINE_DEVELOPER_FLAG(print_opt_code, "print optimized code")
+-DEFINE_STRING(print_opt_code_filter, "*", "filter for printing optimized code")
+-DEFINE_DEVELOPER_FLAG(print_code_verbose, "print more information for code")
+-DEFINE_DEVELOPER_FLAG(print_builtin_code, "print generated code for builtins")
+-DEFINE_STRING(print_builtin_code_filter, "*",
++ALLOY_DEFINE_DEVELOPER_FLAG(print_code, "print generated code")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_opt_code, "print optimized code")
++ALLOY_DEFINE_STRING(print_opt_code_filter, "*", "filter for printing optimized code")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_code_verbose, "print more information for code")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_builtin_code, "print generated code for builtins")
++ALLOY_DEFINE_STRING(print_builtin_code_filter, "*",
+               "filter for printing builtin code")
+-DEFINE_DEVELOPER_FLAG(print_regexp_code, "print generated regexp code")
+-DEFINE_DEVELOPER_FLAG(print_regexp_bytecode, "print generated regexp bytecode")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_regexp_code, "print generated regexp code")
++ALLOY_DEFINE_DEVELOPER_FLAG(print_regexp_bytecode, "print generated regexp bytecode")
+ 
+ #ifdef ENABLE_DISASSEMBLER
+-DEFINE_DEVELOPER_FLAG(print_all_code,
++ALLOY_DEFINE_DEVELOPER_FLAG(print_all_code,
+                       "enable all flags related to printing code")
+ DEFINE_IMPLICATION(print_all_code, print_code)
+ DEFINE_IMPLICATION(print_all_code, print_opt_code)
+@@ -4449,7 +4473,7 @@
+ DEFINE_BOOL(verify_predictable, false,
+             "this mode is used for checking that V8 behaves predictably")
+ DEFINE_IMPLICATION(verify_predictable, predictable)
+-DEFINE_INT(dump_allocations_digest_at_alloc, -1,
++ALLOY_DEFINE_INT(dump_allocations_digest_at_alloc, -1,
+            "dump allocations digest each n-th allocation")
+ 
+ #define LOG_FLAGS(V)      \
+@@ -4521,3 +4545,13 @@
+ #undef FLAG_MODE_META
+ #undef FLAG_MODE_DEFINE_IMPLICATIONS
+ #undef FLAG_MODE_APPLY
++
++#undef ALLOY_DEFINE_BOOL
++#undef ALLOY_DEFINE_BOOL_READONLY
++#undef ALLOY_DEFINE_DEBUG_BOOL
++#undef ALLOY_DEFINE_DEVELOPER_FLAG
++#undef ALLOY_DEFINE_DEBUG_DEVELOPER_FLAG
++#undef ALLOY_DEFINE_TEST_ONLY_FLAG
++#undef ALLOY_DEFINE_PERF_PROF_BOOL
++#undef ALLOY_DEFINE_STRING
++#undef ALLOY_DEFINE_INT

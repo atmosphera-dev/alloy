@@ -1,0 +1,126 @@
+diff --git a/libcef/browser/trace_subscriber.cc b/libcef/browser/trace_subscriber.cc
+--- a/libcef/browser/trace_subscriber.cc
++++ b/libcef/browser/trace_subscriber.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "cef/libcef/browser/trace_subscriber.h"
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/files/file_util.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_config.h"
+@@ -16,7 +17,7 @@
+ 
+ // Create the temporary file and then execute |callback| on the thread
+ // represented by |message_loop_proxy|.
+-void CreateTemporaryFileOnBackgroundThread(
++[[maybe_unused]] void CreateTemporaryFileOnBackgroundThread(
+     scoped_refptr<base::SequencedTaskRunner> message_loop_proxy,
+     base::OnceCallback<void(const base::FilePath&)> callback) {
+   CEF_REQUIRE_BLOCKING();
+@@ -70,6 +71,9 @@
+ bool CefTraceSubscriber::BeginTracing(
+     const std::string& categories,
+     CefRefPtr<CefCompletionCallback> callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   CEF_REQUIRE_UIT();
+ 
+   if (collecting_trace_data_) {
+@@ -90,10 +94,14 @@
+   TracingController::GetInstance()->StartTracing(
+       base::trace_event::TraceConfig(categories, ""), std::move(done_callback));
+   return true;
++#endif
+ }
+ 
+ bool CefTraceSubscriber::EndTracing(const base::FilePath& tracing_file,
+                                     CefRefPtr<CefEndTracingCallback> callback) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   CEF_REQUIRE_UIT();
+ 
+   if (!collecting_trace_data_) {
+@@ -126,6 +134,7 @@
+                                             std::move(result_callback),
+                                             base::TaskPriority::USER_VISIBLE));
+   return true;
++#endif
+ }
+ 
+ void CefTraceSubscriber::ContinueEndTracing(
+diff --git a/libcef/common/crash_reporting.cc b/libcef/common/crash_reporting.cc
+--- a/libcef/common/crash_reporting.cc
++++ b/libcef/common/crash_reporting.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string_view>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/base_switches.h"
+ #include "base/command_line.h"
+ #include "base/debug/crash_logging.h"
+@@ -86,7 +87,7 @@
+ base::LazyInstance<CefCrashReporterClient>::Leaky g_crash_reporter_client =
+     LAZY_INSTANCE_INITIALIZER;
+ 
+-void InitCrashReporter(const base::CommandLine& command_line,
++[[maybe_unused]] void InitCrashReporter(const base::CommandLine& command_line,
+                        const std::string& process_type) {
+   CefCrashReporterClient* crash_client = g_crash_reporter_client.Pointer();
+   if (!crash_client->HasCrashConfigFile()) {
+@@ -138,7 +139,7 @@
+ #endif  // BUILDFLAG(IS_POSIX)
+ 
+ // Used to exclude command-line flags from crash reporting.
+-bool IsBoringCEFSwitch(const std::string& flag) {
++[[maybe_unused]] bool IsBoringCEFSwitch(const std::string& flag) {
+   if (crash_keys::IsBoringChromeSwitch(flag)) {
+     return true;
+   }
+@@ -191,12 +192,19 @@
+ #if BUILDFLAG(IS_POSIX)
+ // Be aware that logging is not initialized at the time this method is called.
+ void BasicStartupComplete(base::CommandLine* command_line) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   g_crash_reporter_client.Pointer()->ReadCrashConfigFile();
++#endif
+ }
+ #endif
+ 
+ void PreSandboxStartup(const base::CommandLine& command_line,
+                        const std::string& process_type) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+ #if BUILDFLAG(IS_POSIX)
+   // Initialize crash reporting here on macOS and Linux. Crash reporting on
+   // Windows is initialized from context.cc.
+@@ -215,11 +223,15 @@
+   // After platform crash reporting have been initialized, store the command
+   // line for crash reporting.
+   crash_keys::SetSwitchesFromCommandLine(command_line, &IsBoringCEFSwitch);
++#endif
+ }
+ 
+ #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_MAC)
+ void ZygoteForked(base::CommandLine* command_line,
+                   const std::string& process_type) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return;
++#else
+   InitCrashReporter(*command_line, process_type);
+ 
+   if (g_crash_reporting_enabled) {
+@@ -228,6 +240,7 @@
+ 
+   // Reset the command line for the newly spawned process.
+   crash_keys::SetSwitchesFromCommandLine(*command_line, &IsBoringCEFSwitch);
++#endif
+ }
+ #endif
+ 

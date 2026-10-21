@@ -107,6 +107,26 @@
       "patch": "cef/0011-product-logging.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0012-product-recording.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0012-product-recording.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0012-product-recording.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0012-product-diagnostic-stores.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

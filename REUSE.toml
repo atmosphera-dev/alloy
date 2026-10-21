@@ -30,6 +30,12 @@ SPDX-License-Identifier = "Apache-2.0"
 SPDX-FileCopyrightText = ["The Crashpad Authors", "Alex Indigo"]
 
 [[annotations]]
+path = "patches/chromium/0011-product-logging.patch"
+precedence = "override"
+SPDX-License-Identifier = "BSD-3-Clause"
+SPDX-FileCopyrightText = ["The Chromium Authors", "The LevelDB Authors", "Alex Indigo"]
+
+[[annotations]]
 path = "patches/cef/**"
 precedence = "override"
 SPDX-License-Identifier = "BSD-3-Clause"

@@ -87,6 +87,14 @@ src/out/Verify_Alloy/alloy_guard_unittests --test-launcher-retry-limit=0
 Logging assertions run in verification builds; product tests exercise the same
 blocking and allowed-page/DNS consumers and assert that no guard file exists.
 
+`alloy_enable_diagnostic_logging` also defaults to false and is enabled only in
+verification args. Product Chromium/CEF logging has no file destination and
+ignores attempts to enable it through switches or CEF settings; non-fatal
+messages have no stderr or trace fallback. Console callbacks remain transient
+embedder events, but returning false cannot route them into Chromium logging.
+LevelDB's optional diagnostic `LOG` writer shares the build gate; database
+contents and write-ahead journals retain their normal behavior.
+
 `alloy_apply.py --cef-only` measures the uncomposed CEF stage: 117 entries,
 86 clean / 21 hunk-offset / 10 conflict. Full apply requires the exported
 composition in `patches/series.json` and verifies the reconstructed source bytes.

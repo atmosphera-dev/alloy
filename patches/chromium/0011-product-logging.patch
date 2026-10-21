@@ -1,0 +1,303 @@
+diff --git a/base/BUILD.gn b/base/BUILD.gn
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -1188,6 +1188,7 @@
+     ":sanitizer_buildflags",
+     ":synchronization_buildflags",
+     ":tracing_buildflags",
++    "//base/alloy:buildflags",
+     "//base/allocator/partition_allocator:buildflags",
+     "//base/allocator/partition_allocator:raw_ptr",
+     "//base/logging:log_severity",
+diff --git a/base/logging.cc b/base/logging.cc
+--- a/base/logging.cc
++++ b/base/logging.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "base/logging.h"
++
++#include "base/alloy/buildflags.h"
+ 
+ #include <limits.h>
+ #include <stdint.h>
+@@ -118,7 +120,8 @@
+ 
+ namespace {
+ 
+-int g_min_log_level = 0;
++int g_min_log_level = BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++                          ? 0 : LOGGING_FATAL;
+ 
+ // NOTE: Once |g_vlog_info| has been initialized, it might be in use
+ // by another thread. Never delete the old VLogInfo, just create a second
+@@ -203,7 +206,8 @@
+ 
+ // Specifies the process' logging sink(s), represented as a combination of
+ // LoggingDestination values joined by bitwise OR.
+-uint32_t g_logging_destination = LOG_DEFAULT;
++uint32_t g_logging_destination =
++    BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING) ? LOG_DEFAULT : LOG_NONE;
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ // Specifies the format of log header for chrome os.
+@@ -219,7 +223,7 @@
+ #endif
+ 
+ // For LOGGING_ERROR and above, always print to stderr.
+-const int kAlwaysPrintErrorLevel = LOGGING_ERROR;
++[[maybe_unused]] const int kAlwaysPrintErrorLevel = LOGGING_ERROR;
+ 
+ // Which log file to use? This is initialized by InitLogging or
+ // will be lazily initialized to the default value when it is
+@@ -271,7 +275,7 @@
+ #endif
+ }
+ 
+-void DeleteFilePath(const PathString& log_name) {
++[[maybe_unused]] void DeleteFilePath(const PathString& log_name) {
+ #if BUILDFLAG(IS_WIN)
+   DeleteFile(log_name.c_str());
+ #elif BUILDFLAG(IS_POSIX) || BUILDFLAG(IS_FUCHSIA)
+@@ -281,7 +285,7 @@
+ #endif
+ }
+ 
+-PathString GetDefaultLogFile() {
++[[maybe_unused]] PathString GetDefaultLogFile() {
+ #if BUILDFLAG(IS_WIN)
+   // On Windows we use the same path as the exe.
+   wchar_t module_name[MAX_PATH];
+@@ -326,6 +330,9 @@
+ // and can be used for writing. Returns false if the file could not be
+ // initialized. |g_log_file| will be nullptr in this case.
+ bool InitializeLogFileHandle() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return false;
++#else
+   if (g_log_file) {
+     return true;
+   }
+@@ -387,6 +394,7 @@
+ #endif
+ 
+   return true;
++#endif
+ }
+ 
+ void CloseFile(FileHandle log) {
+@@ -491,6 +499,7 @@
+ }
+ 
+ // Invokes macro to record trace event when a log message is emitted.
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+ void TraceLogMessage(const char* file, int line, const std::string& message) {
+   TRACE_EVENT_INSTANT("log", "LogMessage", [&](perfetto::EventContext ctx) {
+     perfetto::protos::pbzero::LogMessage* log = ctx.event()->set_log_message();
+@@ -501,6 +510,7 @@
+         base::trace_event::InternedLogMessage::Get(&ctx, message));
+   });
+ }
++#endif
+ 
+ }  // namespace
+ 
+@@ -517,6 +527,11 @@
+ std::ostream* g_swallow_stream;
+ 
+ bool BaseInitLoggingImpl(const LoggingSettings& settings) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  // All initializers, including CEF settings and repeated init, share this sink.
++  internal::init_rust_logging();
++  return true;
++#else
+ #if BUILDFLAG(IS_CHROMEOS)
+   g_log_format = settings.log_format;
+ #endif
+@@ -572,10 +587,16 @@
+   }
+ 
+   return InitializeLogFileHandle();
++#endif
+ }
+ 
+ void SetMinLogLevel(int level) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  g_min_log_level = LOGGING_FATAL;
++  return;
++#else
+   g_min_log_level = std::min(LOGGING_FATAL, level);
++#endif
+ }
+ 
+ int GetMinLogLevel() {
+@@ -583,6 +604,9 @@
+ }
+ 
+ bool ShouldCreateLogMessage(int severity) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return severity == LOGGING_FATAL;
++#else
+   if (severity < g_min_log_level) {
+     return false;
+   }
+@@ -590,6 +614,7 @@
+   // Return true here unless we know ~LogMessage won't do anything.
+   return g_logging_destination != LOG_NONE || g_log_message_handler ||
+          severity >= kAlwaysPrintErrorLevel;
++#endif
+ }
+ 
+ // Returns true when LOG_TO_STDERR flag is set, or |severity| is high.
+@@ -597,6 +622,9 @@
+ // set, or only LOG_TO_FILE is set, since that is useful for local development
+ // and debugging.
+ bool ShouldLogToStderr(int severity) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return severity == LOGGING_FATAL;
++#else
+   if (g_logging_destination & LOG_TO_STDERR) {
+     return true;
+   }
+@@ -611,6 +639,7 @@
+   }
+   return false;
+ #endif
++#endif
+ }
+ 
+ int GetVlogVerbosity() {
+@@ -618,6 +647,9 @@
+ }
+ 
+ int GetVlogLevelHelper(const char* file, size_t N) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return -1;
++#else
+   DCHECK_GT(N, 0U);
+ 
+   // Note: |g_vlog_info| may change on a different thread during startup
+@@ -625,6 +657,7 @@
+   VlogInfo* vlog_info = GetVlogInfo();
+   return vlog_info ? vlog_info->GetVlogLevel(std::string_view(file, N - 1))
+                    : GetVlogVerbosity();
++#endif
+ }
+ 
+ void SetLogItems(bool enable_process_id,
+@@ -726,6 +759,12 @@
+ }
+ 
+ void LogMessage::Flush() {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  // Direct LogMessage construction (e.g. cef_log) bypasses macro filtering.
++  if (severity_ != LOGGING_FATAL) {
++    return;
++  }
++#endif
+   // Don't let actions from this method affect the system error after returning.
+   base::ScopedClearLastError scoped_clear_last_error;
+ 
+@@ -762,7 +801,9 @@
+ #endif
+   stream_ << std::endl;
+   std::string str_newline(stream_.str());
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   TraceLogMessage(file_, line_, str_newline.substr(message_start_));
++#endif
+ 
+   // FATAL messages should always run the assert handler and crash, even if a
+   // message handler marks them as otherwise handled.
+@@ -1242,6 +1283,11 @@
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+ void RawLog(int level, const char* message) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  if (level != LOGGING_FATAL) {
++    return;
++  }
++#endif
+   if (level >= g_min_log_level && message) {
+     const size_t message_len = strlen(message);
+     WriteToFd(STDERR_FILENO, message, message_len);
+diff --git a/chrome/common/features.gni b/chrome/common/features.gni
+--- a/chrome/common/features.gni
++++ b/chrome/common/features.gni
+@@ -19,6 +19,7 @@
+ import("//net/features.gni")
+ import("//pdf/features.gni")
+ import("//printing/buildflags/buildflags.gni")
++import("//services/network/alloy.gni")
+ import("//services/screen_ai/buildflags/features.gni")
+ import("//services/webnn/public/webnn_features.gni")
+ import("//ui/base/ui_features.gni")
+@@ -34,7 +35,8 @@
+ declare_args() {
+   # Enables the build to have logging enabled by default.
+   # This is intended for use only in developer builds.
+-  chrome_enable_logging_by_default = is_debug || enable_cef
++  chrome_enable_logging_by_default =
++      alloy_enable_diagnostic_logging && (is_debug || enable_cef)
+ 
+   # Platforms for which Chrome supports a certificate management UI that
+   # shows the Chrome Root Store. This is specific to the v2 UI that is
+diff --git a/chrome/common/logging_chrome.cc b/chrome/common/logging_chrome.cc
+--- a/chrome/common/logging_chrome.cc
++++ b/chrome/common/logging_chrome.cc
+@@ -16,6 +16,7 @@
+ 
+ #include "base/base_switches.h"
+ #include "base/command_line.h"
++#include "base/alloy/buildflags.h"
+ #include "base/compiler_specific.h"
+ #include "base/debug/debugger.h"
+ #include "base/debug/dump_without_crashing.h"
+@@ -149,6 +150,9 @@
+     const base::CommandLine& command_line,
+     bool& filename_is_handle) {
+   filename_is_handle = false;
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  return LOG_NONE;
++#else
+ #if defined(NDEBUG)
+   // In Release builds, log only to the log file.
+   const LoggingDestination kDefaultLoggingMode = LOG_TO_FILE;
+@@ -207,6 +211,7 @@
+ #endif
+   }
+   return kDefaultLoggingMode;
++#endif
+ }
+ 
+ }  // anonymous namespace
+diff --git a/third_party/leveldatabase/env_chromium.cc b/third_party/leveldatabase/env_chromium.cc
+--- a/third_party/leveldatabase/env_chromium.cc
++++ b/third_party/leveldatabase/env_chromium.cc
+@@ -12,6 +12,7 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/check_op.h"
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+@@ -942,6 +943,11 @@
+ Status ChromiumEnv::NewLogger(const std::string& fname,
+                               leveldb::Logger** result) {
+   *result = nullptr;
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  // LevelDB info logs are optional diagnostics, separate from its data/WAL.
++  // The common Env owns these across all profile database consumers.
++  return Status::OK();
++#else
+   FilePath path = FilePath::FromUTF8Unsafe(fname);
+   ASSIGN_OR_RETURN(base::File open_result,
+                    filesystem_->OpenFile(path, base::File::FLAG_CREATE_ALWAYS |
+@@ -949,6 +955,7 @@
+                    MakeIOError, fname, "Unable to create log file", kNewLogger);
+   *result = new leveldb::ChromiumLogger(std::move(open_result));
+   return Status::OK();
++#endif
+ }
+ 
+ Status ChromiumEnv::NewSequentialFile(const std::string& fname,

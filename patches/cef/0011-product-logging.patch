@@ -1,0 +1,63 @@
+diff --git a/libcef/common/chrome/chrome_main_delegate_cef.cc b/libcef/common/chrome/chrome_main_delegate_cef.cc
+--- a/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <tuple>
+ 
++#include "base/alloy/buildflags.h"
+ #include "base/base_switches.h"
+ #include "base/command_line.h"
+ #include "base/lazy_instance.h"
+@@ -73,6 +74,10 @@
+ }
+ 
+ void InitLogging(const base::CommandLine* command_line) {
++#if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  logging::SetMinLogLevel(logging::LOGGING_FATAL);
++  return;
++#else
+   logging::LogSeverity log_severity = logging::LOGGING_INFO;
+ 
+   std::string log_severity_str =
+@@ -140,6 +145,7 @@
+     logging::SetLogItems(enable_log_of_process_id, enable_log_of_thread_id,
+                          enable_log_of_time_stamp, enable_log_of_tick_count);
+   }
++#endif
+ }
+ 
+ }  // namespace
+diff --git a/libcef/browser/browser_contents_delegate.cc b/libcef/browser/browser_contents_delegate.cc
+--- a/libcef/browser/browser_contents_delegate.cc
++++ b/libcef/browser/browser_contents_delegate.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/browser_contents_delegate.h"
++
++#include "base/alloy/buildflags.h"
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "cef/libcef/browser/browser_event_util.h"
+@@ -226,12 +228,14 @@
+           break;
+       }
+ 
+-      return handler->OnConsoleMessage(browser(), cef_level, message, source_id,
+-                                       line_no);
+-    }
+-  }
+-
+-  return false;
++      const bool handled = handler->OnConsoleMessage(
++          browser(), cef_level, message, source_id, line_no);
++      return !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING) || handled;
++    }
++  }
++
++  // Suppress Chromium fallback even when no embedder handler is installed.
++  return !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING);
+ }
+ 
+ void CefBrowserContentsDelegate::EnterFullscreenModeForTab(

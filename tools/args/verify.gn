@@ -6,3 +6,4 @@ import("release.gn")
 alloy_enable_guard_canary=true
 alloy_enable_guard_log=true
 alloy_enable_class_marking=true
+alloy_enable_diagnostic_logging=true

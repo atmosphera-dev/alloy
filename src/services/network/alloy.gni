@@ -4,4 +4,5 @@ declare_args() {
   alloy_enable_guard_canary = false
   alloy_enable_guard_log = false
   alloy_enable_class_marking = false
+  alloy_enable_diagnostic_logging = false
 }

@@ -122,3 +122,27 @@ built-in WebSocket supplies CDP without an extra package. Logs and protocol
 proof are retained under `logs/smoke-*/`; startup and all protocol waits are
 bounded. This proves page loading/CDP, not default filter readiness or a
 no-phone-home outcome.
+
+## Offline bundled-data consumers
+
+On the same NUC, build the native spelling observer from this repository against
+the current CEF headers/library, beside the release `libcef.so` and `alloy-data/`:
+
+```sh
+timeout 70 gcc -std=c11 -D_GNU_SOURCE -DUSING_CEF_SHARED \
+  -I /home/builder/work/alloy/src -I /home/builder/work/alloy/src/cef \
+  -I /home/builder/work/alloy/src/out/Release_Alloy/gen/cef \
+  repo/tools/spell_consumer.c -L /home/builder/work/alloy/src/out/Release_Alloy \
+  -Wl,-rpath,/home/builder/work/alloy/src/out/Release_Alloy -lcef \
+  -o src/out/Release_Alloy/alloy_spell_consumer
+python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy
+python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy \
+  --spell-consumer src/out/Release_Alloy/alloy_spell_consumer
+```
+
+Both probes use a loopback-only network namespace, fresh profiles, the actual
+bundled QueryFilter parser, tracker failures and a neutral local script. The
+native observer additionally reports real CEF accessibility spelling markers.
+Its startup URL and profile settings are copied before CEF initialization;
+callbacks never retain borrowed environment storage across Chromium startup.
+The observer is test-only and writes no instrumentation into the product.

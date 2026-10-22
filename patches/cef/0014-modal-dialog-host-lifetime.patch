@@ -1,0 +1,29 @@
+diff --git a/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.h b/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.h
+--- a/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.h
++++ b/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.h
+@@ -23,6 +23,7 @@
+  public:
+   AlloyWebContentsDialogHelper(content::WebContents* web_contents,
+                                CefBrowserPlatformDelegate* browser_delegate);
++  ~AlloyWebContentsDialogHelper() override;
+ 
+   base::RepeatingClosure GetBoundsChangedCallback();
+ 
+diff --git a/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.cc b/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.cc
+--- a/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.cc
++++ b/libcef/browser/alloy/dialogs/alloy_web_contents_dialog_helper.cc
+@@ -19,6 +19,14 @@
+       ->SetDelegate(this);
+ }
+ 
++AlloyWebContentsDialogHelper::~AlloyWebContentsDialogHelper() {
++  // Close/detach every modal observer while this host is still alive.
++  // Dialog widget destruction may otherwise be deferred past browser teardown.
++  for (auto& observer : observer_list_) {
++    observer.OnHostDestroying();
++  }
++}
++
+ base::RepeatingClosure
+ AlloyWebContentsDialogHelper::GetBoundsChangedCallback() {
+   return base::BindRepeating(&AlloyWebContentsDialogHelper::OnBoundsChanged,

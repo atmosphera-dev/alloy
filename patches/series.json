@@ -132,6 +132,11 @@
       "patch": "chromium/0013-page-download-ownership.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0014-modal-dialog-host-lifetime.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

@@ -16,6 +16,7 @@ import threading
 import time
 
 from smoke import terminate_session, wait_for_session_exit, session_processes
+from shared_proto_inventory import inspect_shared_proto
 
 WORK = Path('/home/builder/work/alloy')
 TMP = '/home/builder/work/tmp'
@@ -46,9 +47,10 @@ PATHS = {
     50: ('ClientCertificates',),
     51: ('Extension State', 'Extension Rules', 'Extension Scripts',
          'Local Extension Settings', 'Sync Extension Settings',
-         'Managed Extension Settings'),
+         'Managed Extension Settings', 'DNR Extension Rules'),
     52: ('Sync Data',),
-    53: ('shared_proto_db',),
+    53: ('image_cache', 'Notification Scheduler', 'AutofillAiModelCache'),
+    # Row 53 also inspects logical shared namespaces after clean shutdown.
     54: ('chrome_cart_db', 'commerce_subscription_db', 'discount_infos_db',
          'discounts_db', 'parcel_tracking_db', 'coupon_db'),
     59: ('Bookmarks', 'Bookmarks.bak', 'BookmarkMergedSurfaceOrdering'),
@@ -138,6 +140,8 @@ if(proof.cookie!=='inventory=first' || proof.local!=='first' || proof.session!==
   throw Error('Top-level storage exercise failed '+JSON.stringify(proof));
 if(proof.indexedDB!==true || proof.cache!==true || proof.worker!==true)
   throw Error('Asynchronous storage exercise failed '+JSON.stringify(proof));
+if(!proof.media?.file?.supported || !proof.media?.webrtc?.supported)
+  throw Error('Media capability consumers did not complete '+JSON.stringify(proof));
 await call('Runtime.evaluate',{expression:'document.querySelector("a").click()'});
 for(let i=0;i<200 && !fs.existsSync(downloads+'/inventory.txt');i++)await sleep(100);
 if(fs.readFileSync(downloads+'/inventory.txt','utf8')!=='alloy inventory download\n')
@@ -172,6 +176,14 @@ addEventListener('message',e=>{
   proof.cache=(await(await cache.match('/cached')).text())==='first';
   await navigator.serviceWorker.register('/sw.js');
   await navigator.serviceWorker.ready;proof.worker=true;
+  proof.media={};
+  for (const type of ['file','webrtc']) {
+    const contentType=type==='webrtc' ? 'video/VP9; profile-id="0"' :
+                                      'video/webm; codecs="vp8"';
+    proof.media[type]=await navigator.mediaCapabilities.decodingInfo({type,
+      video:{contentType,width:640,height:480,
+             bitrate:1000000,framerate:30}});
+  }
   const frame=document.createElement('iframe');
   frame.src=location.origin.replace('127.0.0.1','127.0.0.2')+'/frame';
   document.body.append(frame);proof.ready=true;
@@ -318,6 +330,18 @@ def main():
             save(evidence / 'final-paths.json', final)
             for row in hits:
                 hits[row].update(final_hits[row])
+            if 53 in forbidden:
+                utility = out / 'leveldb_leveldbutil'
+                if not utility.is_file():
+                    raise RuntimeError('Build leveldb_leveldbutil for namespace-aware row 53 verification')
+                shared = []
+                for directory in roots[0].rglob('shared_proto_db'):
+                    if directory.is_dir() and not directory.is_symlink():
+                        report = inspect_shared_proto(directory, utility)
+                        shared.append(report)
+                        for item in report['forbidden']:
+                            hits[53].add(item['file']+'#namespace='+str(item['namespace']))
+                save(evidence / 'shared-proto-namespaces.json', shared)
             save(evidence / 'stores.json', {str(row): sorted(paths) for row, paths in hits.items()})
             failed = forbidden & {row for row, paths in hits.items() if paths}
             for row, paths in sorted(hits.items()):

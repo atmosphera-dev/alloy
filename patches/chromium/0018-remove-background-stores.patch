@@ -1,0 +1,1066 @@
+diff --git a/chrome/browser/sync/sync_service_factory.cc b/chrome/browser/sync/sync_service_factory.cc
+--- a/chrome/browser/sync/sync_service_factory.cc
++++ b/chrome/browser/sync/sync_service_factory.cc
+@@ -544,12 +544,8 @@
+ }
+ 
+ SyncServiceFactory::SyncServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "SyncService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("SyncService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   // The SyncServiceImpl depends on various KeyedServices being around
+   // when it is shut down.  Specify those dependencies here to build the proper
+   // destruction order. Note that some of the dependencies are listed here but
+diff --git a/chrome/browser/enterprise/client_certificates/certificate_store_factory.cc b/chrome/browser/enterprise/client_certificates/certificate_store_factory.cc
+--- a/chrome/browser/enterprise/client_certificates/certificate_store_factory.cc
++++ b/chrome/browser/enterprise/client_certificates/certificate_store_factory.cc
+@@ -38,7 +38,7 @@
+ 
+ CertificateStoreFactory::CertificateStoreFactory()
+     : ProfileKeyedServiceFactory("CertificateStore",
+-                                 ProfileSelections::BuildForRegularProfile()) {
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+ #if BUILDFLAG(IS_CHROMEOS)
+   DependsOn(kcer::KcerFactoryAsh::GetInstance());
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+diff --git a/chrome/browser/enterprise/client_certificates/certificate_provisioning_service_factory.cc b/chrome/browser/enterprise/client_certificates/certificate_provisioning_service_factory.cc
+--- a/chrome/browser/enterprise/client_certificates/certificate_provisioning_service_factory.cc
++++ b/chrome/browser/enterprise/client_certificates/certificate_provisioning_service_factory.cc
+@@ -58,7 +58,7 @@
+ 
+ CertificateProvisioningServiceFactory::CertificateProvisioningServiceFactory()
+     : ProfileKeyedServiceFactory("CertificateProvisioningService",
+-                                 ProfileSelections::BuildForRegularProfile()) {
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(CertificateStoreFactory::GetInstance());
+   DependsOn(enterprise::ProfileIdServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/gcm/gcm_profile_service_factory.cc b/chrome/browser/gcm/gcm_profile_service_factory.cc
+--- a/chrome/browser/gcm/gcm_profile_service_factory.cc
++++ b/chrome/browser/gcm/gcm_profile_service_factory.cc
+@@ -137,15 +137,8 @@
+ }
+ 
+ GCMProfileServiceFactory::GCMProfileServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "GCMProfileService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("GCMProfileService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(IdentityManagerFactory::GetInstance());
+ }
+ 
+diff --git a/chrome/browser/gcm/instance_id/instance_id_profile_service_factory.cc b/chrome/browser/gcm/instance_id/instance_id_profile_service_factory.cc
+--- a/chrome/browser/gcm/instance_id/instance_id_profile_service_factory.cc
++++ b/chrome/browser/gcm/instance_id/instance_id_profile_service_factory.cc
+@@ -46,15 +46,8 @@
+ }
+ 
+ InstanceIDProfileServiceFactory::InstanceIDProfileServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "InstanceIDProfileService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("InstanceIDProfileService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   // GCM is needed for device ID.
+   DependsOn(gcm::GCMProfileServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/push_messaging/push_messaging_service_factory.cc b/chrome/browser/push_messaging/push_messaging_service_factory.cc
+--- a/chrome/browser/push_messaging/push_messaging_service_factory.cc
++++ b/chrome/browser/push_messaging/push_messaging_service_factory.cc
+@@ -44,17 +44,8 @@
+ }
+ 
+ PushMessagingServiceFactory::PushMessagingServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "PushMessagingProfileService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("PushMessagingProfileService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(gcm::GCMProfileServiceFactory::GetInstance());
+   DependsOn(instance_id::InstanceIDProfileServiceFactory::GetInstance());
+   DependsOn(HostContentSettingsMapFactory::GetInstance());
+diff --git a/chrome/browser/commerce/shopping_service_factory.cc b/chrome/browser/commerce/shopping_service_factory.cc
+--- a/chrome/browser/commerce/shopping_service_factory.cc
++++ b/chrome/browser/commerce/shopping_service_factory.cc
+@@ -55,17 +55,8 @@
+ }
+ 
+ ShoppingServiceFactory::ShoppingServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "ShoppingService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kRedirectedToOriginal)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("ShoppingService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(BookmarkModelFactory::GetInstance());
+   DependsOn(IdentityManagerFactory::GetInstance());
+   DependsOn(OptimizationGuideKeyedServiceFactory::GetInstance());
+diff --git a/chrome/browser/safe_browsing/notification_telemetry/notification_telemetry_service_factory.cc b/chrome/browser/safe_browsing/notification_telemetry/notification_telemetry_service_factory.cc
+--- a/chrome/browser/safe_browsing/notification_telemetry/notification_telemetry_service_factory.cc
++++ b/chrome/browser/safe_browsing/notification_telemetry/notification_telemetry_service_factory.cc
+@@ -32,11 +32,8 @@
+ }
+ 
+ NotificationTelemetryServiceFactory::NotificationTelemetryServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "NotificationTelemetryService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("NotificationTelemetryService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(PushMessagingServiceFactory::GetInstance());
+ }
+ 
+diff --git a/chrome/browser/invalidation/profile_invalidation_provider_factory.cc b/chrome/browser/invalidation/profile_invalidation_provider_factory.cc
+--- a/chrome/browser/invalidation/profile_invalidation_provider_factory.cc
++++ b/chrome/browser/invalidation/profile_invalidation_provider_factory.cc
+@@ -71,17 +71,8 @@
+ }
+ 
+ ProfileInvalidationProviderFactory::ProfileInvalidationProviderFactory()
+-    : ProfileKeyedServiceFactory(
+-          "InvalidationService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("InvalidationService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(gcm::GCMProfileServiceFactory::GetInstance());
+   DependsOn(instance_id::InstanceIDProfileServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/autofill/autofill_ai_model_cache_factory.cc b/chrome/browser/autofill/autofill_ai_model_cache_factory.cc
+--- a/chrome/browser/autofill/autofill_ai_model_cache_factory.cc
++++ b/chrome/browser/autofill/autofill_ai_model_cache_factory.cc
+@@ -31,9 +31,8 @@
+ }
+ 
+ AutofillAiModelCacheFactory::AutofillAiModelCacheFactory()
+-    : ProfileKeyedServiceFactory(
+-          "AutofillAiModelCache",
+-          ProfileSelections::BuildRedirectedInIncognito()) {
++    : ProfileKeyedServiceFactory("AutofillAiModelCache",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+ }
+ 
+diff --git a/chrome/browser/persisted_state_db/session_proto_db_factory.h b/chrome/browser/persisted_state_db/session_proto_db_factory.h
+--- a/chrome/browser/persisted_state_db/session_proto_db_factory.h
++++ b/chrome/browser/persisted_state_db/session_proto_db_factory.h
+@@ -103,17 +103,9 @@
+ 
+ template <typename T>
+ SessionProtoDBFactory<T>::SessionProtoDBFactory()
+-    : ProfileKeyedServiceFactory(
+-          "SessionProtoDBFactory",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {}
++    : ProfileKeyedServiceFactory("SessionProtoDBFactory",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
++}
+ 
+ template <typename T>
+ SessionProtoDBFactory<T>::~SessionProtoDBFactory() = default;
+diff --git a/components/sync/base/command_line_switches.cc b/components/sync/base/command_line_switches.cc
+--- a/components/sync/base/command_line_switches.cc
++++ b/components/sync/base/command_line_switches.cc
+@@ -11,7 +11,7 @@
+ namespace syncer {
+ 
+ bool IsSyncAllowedByFlag() {
+-  return !base::CommandLine::ForCurrentProcess()->HasSwitch(kDisableSync);
++  return false;
+ }
+ 
+ }  // namespace syncer
+diff --git a/chrome/browser/download/background_download_service_factory.cc b/chrome/browser/download/background_download_service_factory.cc
+--- a/chrome/browser/download/background_download_service_factory.cc
++++ b/chrome/browser/download/background_download_service_factory.cc
+@@ -218,5 +218,5 @@
+ 
+ SimpleFactoryKey* BackgroundDownloadServiceFactory::GetKeyToUse(
+     SimpleFactoryKey* key) const {
+-  return key;
+-}
++  return nullptr;
++}
+diff --git a/chrome/browser/web_applications/web_app_utils.cc b/chrome/browser/web_applications/web_app_utils.cc
+--- a/chrome/browser/web_applications/web_app_utils.cc
++++ b/chrome/browser/web_applications/web_app_utils.cc
+@@ -212,32 +212,7 @@
+     FILE_PATH_LITERAL("Temp");
+ 
+ bool AreWebAppsEnabled(Profile* profile) {
+-  if (!profile || profile->IsSystemProfile()) {
+-    return false;
+-  }
+-
+-#if BUILDFLAG(IS_CHROMEOS)
+-  // Web Apps should not be installed to the ChromeOS system profiles except the
+-  // lock screen app profile.
+-  if (!ash::ProfileHelper::IsUserProfile(profile) &&
+-      !ash::IsShimlessRmaAppBrowserContext(profile)) {
+-    return false;
+-  }
+-  auto* user_manager = user_manager::UserManager::Get();
+-
+-  // Don't enable for Chrome App or ARC Kiosk sessions.
+-  if (user_manager && (user_manager->IsLoggedInAsKioskChromeApp() ||
+-                       user_manager->IsLoggedInAsKioskArcvmApp())) {
+-    return false;
+-  }
+-
+-  // Guest session forces OTR to be turned on.
+-  if (profile->IsGuestSession()) {
+-    return profile->IsOffTheRecord();
+-  }
+-#endif  // BUILDFLAG(IS_CHROMEOS)
+-
+-  return !profile->IsOffTheRecord();
++  return false;
+ }
+ 
+ bool IsWebAppInstallByUserPolicyEnabled(Profile* profile) {
+diff --git a/chrome/browser/extensions/api/gcm/gcm_api.cc b/chrome/browser/extensions/api/gcm/gcm_api.cc
+--- a/chrome/browser/extensions/api/gcm/gcm_api.cc
++++ b/chrome/browser/extensions/api/gcm/gcm_api.cc
+@@ -90,15 +90,8 @@
+ }
+ 
+ bool GcmApiFunction::IsGcmApiEnabled(std::string* error) const {
+-  Profile* profile = Profile::FromBrowserContext(browser_context());
+-
+-  // GCM is not supported in incognito mode.
+-  if (profile->IsOffTheRecord()) {
+-    *error = "GCM is not supported in incognito mode.";
+-    return false;
+-  }
+-
+-  return true;
++  *error = kGCMDisabled;
++  return false;
+ }
+ 
+ gcm::GCMDriver* GcmApiFunction::GetGCMDriver() const {
+diff --git a/chrome/browser/extensions/api/instance_id/instance_id_api.cc b/chrome/browser/extensions/api/instance_id/instance_id_api.cc
+--- a/chrome/browser/extensions/api/instance_id/instance_id_api.cc
++++ b/chrome/browser/extensions/api/instance_id/instance_id_api.cc
+@@ -56,11 +56,7 @@
+ InstanceIDApiFunction::~InstanceIDApiFunction() = default;
+ 
+ ExtensionFunction::ResponseAction InstanceIDApiFunction::Run() {
+-  if (Profile::FromBrowserContext(browser_context())->IsOffTheRecord()) {
+-    return RespondNow(Error(
+-        "chrome.instanceID not supported in incognito mode"));
+-  }
+-  return DoWork();
++  return RespondNow(Error(kDisabled));
+ }
+ 
+ instance_id::InstanceID* InstanceIDApiFunction::GetInstanceID() const {
+diff --git a/chrome/browser/extensions/api/gcm/extension_gcm_app_handler.cc b/chrome/browser/extensions/api/gcm/extension_gcm_app_handler.cc
+--- a/chrome/browser/extensions/api/gcm/extension_gcm_app_handler.cc
++++ b/chrome/browser/extensions/api/gcm/extension_gcm_app_handler.cc
+@@ -50,23 +50,11 @@
+ }
+ 
+ ExtensionGCMAppHandler::ExtensionGCMAppHandler(content::BrowserContext* context)
+-    : profile_(Profile::FromBrowserContext(context)) {
+-  extension_registry_observation_.Observe(ExtensionRegistry::Get(profile_));
+-  js_event_router_ = std::make_unique<GcmJsEventRouter>(profile_);
+-}
++    : profile_(Profile::FromBrowserContext(context)) {}
+ 
+ ExtensionGCMAppHandler::~ExtensionGCMAppHandler() = default;
+ 
+-void ExtensionGCMAppHandler::Shutdown() {
+-  const ExtensionSet& enabled_extensions =
+-      ExtensionRegistry::Get(profile_)->enabled_extensions();
+-  for (ExtensionSet::const_iterator extension = enabled_extensions.begin();
+-       extension != enabled_extensions.end(); ++extension) {
+-    if (IsGCMPermissionEnabled(extension->get())) {
+-      GetGCMDriver()->RemoveAppHandler((*extension)->id());
+-    }
+-  }
+-}
++void ExtensionGCMAppHandler::Shutdown() {}
+ 
+ void ExtensionGCMAppHandler::ShutdownHandler() {
+   js_event_router_.reset();
+diff --git a/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc b/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
+--- a/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
++++ b/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/no_destructor.h"
+ #include "build/build_config.h"
++#include "chrome/browser/notifications/scheduler/internal/noop_notification_schedule_service.h"
+ #include "chrome/browser/notifications/scheduler/notification_background_task_scheduler_impl.h"
+ #include "chrome/browser/notifications/scheduler/public/display_agent.h"
+ #include "chrome/browser/notifications/scheduler/public/finds_agent.h"
+@@ -53,30 +54,7 @@
+ std::unique_ptr<KeyedService>
+ NotificationScheduleServiceFactory::BuildServiceInstanceFor(
+     SimpleFactoryKey* key) const {
+-  auto* profile_key = ProfileKey::FromSimpleFactoryKey(key);
+-  base::FilePath storage_dir = profile_key->GetPath().Append(
+-      chrome::kNotificationSchedulerStorageDirname);
+-  auto client_registrar =
+-      std::make_unique<notifications::NotificationSchedulerClientRegistrar>();
+-#if BUILDFLAG(IS_ANDROID)
+-  auto display_agent = std::make_unique<DisplayAgentAndroid>();
+-  auto background_task_scheduler =
+-      std::make_unique<NotificationBackgroundTaskSchedulerAndroid>();
+-  auto tips_agent = std::make_unique<TipsAgentAndroid>();
+-  auto finds_agent = std::make_unique<FindsAgentAndroid>();
+-#else
+-  auto display_agent = notifications::DisplayAgent::Create();
+-  auto background_task_scheduler =
+-      std::make_unique<NotificationBackgroundTaskSchedulerImpl>();
+-  auto tips_agent = notifications::TipsAgent::Create();
+-  auto finds_agent = notifications::FindsAgent::Create();
+-#endif  // BUILDFLAG(IS_ANDROID)
+-  auto* db_provider = profile_key->GetProtoDatabaseProvider();
+-  return notifications::CreateNotificationScheduleService(
+-      std::move(client_registrar), std::move(background_task_scheduler),
+-      std::move(display_agent), std::move(tips_agent), std::move(finds_agent),
+-      db_provider, storage_dir, profile_key->IsOffTheRecord(),
+-      profile_key->GetPrefs());
++  return std::make_unique<notifications::NoopNotificationScheduleService>();
+ }
+ 
+ SimpleFactoryKey* NotificationScheduleServiceFactory::GetKeyToUse(
+diff --git a/chrome/browser/image_fetcher/image_fetcher_service_factory.cc b/chrome/browser/image_fetcher/image_fetcher_service_factory.cc
+--- a/chrome/browser/image_fetcher/image_fetcher_service_factory.cc
++++ b/chrome/browser/image_fetcher/image_fetcher_service_factory.cc
+@@ -36,16 +36,9 @@
+ 
+ // The path under the browser context's data directory which the image_cache
+ // will be stored.
++#if BUILDFLAG(IS_ANDROID)
+ const base::FilePath::CharType kImageCacheSubdir[] =
+     FILE_PATH_LITERAL("image_cache");
+-
+-base::FilePath GetCachePath(SimpleFactoryKey* key) {
+-  base::FilePath cache_path;
+-  chrome::GetUserCacheDirectory(key->GetPath(), &cache_path);
+-  return cache_path.Append(kImageCacheSubdir);
+-}
+-
+-#if BUILDFLAG(IS_ANDROID)
+ image_fetcher::ImageFetcherService* GetImageFetcherService(
+     SimpleFactoryKey* key) {
+   return ImageFetcherServiceFactory::GetForKey(key);
+@@ -92,39 +85,14 @@
+ std::unique_ptr<KeyedService>
+ ImageFetcherServiceFactory::BuildServiceInstanceFor(
+     SimpleFactoryKey* key) const {
+-  base::FilePath cache_path = GetCachePath(key);
+-  ProfileKey* profile_key = ProfileKey::FromSimpleFactoryKey(key);
+-
+-  scoped_refptr<base::SequencedTaskRunner> task_runner =
+-      base::ThreadPool::CreateSequencedTaskRunner(
+-          {base::MayBlock(), base::TaskPriority::USER_VISIBLE});
+-  base::DefaultClock* clock = base::DefaultClock::GetInstance();
+-
+-  auto metadata_store =
+-      std::make_unique<image_fetcher::ImageMetadataStoreLevelDB>(
+-          profile_key->GetProtoDatabaseProvider(), cache_path, task_runner,
+-          clock);
+-  auto data_store = std::make_unique<image_fetcher::ImageDataStoreDisk>(
+-      cache_path, task_runner);
+-
+-  scoped_refptr<image_fetcher::ImageCache> image_cache =
+-      base::MakeRefCounted<image_fetcher::ImageCache>(
+-          std::move(data_store), std::move(metadata_store),
+-          profile_key->GetPrefs(), clock, task_runner);
+-
+   scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory;
+-  // Network is null for some tests, may be removable after
+-  // https://crbug.com/40634772.
+   if (SystemNetworkContextManager::GetInstance()) {
+     url_loader_factory =
+         SystemNetworkContextManager::GetInstance()->GetSharedURLLoaderFactory();
+   }
+-
+-  auto cached_image_fetcher_service =
+-      std::make_unique<image_fetcher::ImageFetcherService>(
+-          std::make_unique<ImageDecoderImpl>(), std::move(url_loader_factory),
+-          std::move(image_cache), key->IsOffTheRecord());
+-  return cached_image_fetcher_service;
++  return std::make_unique<image_fetcher::ImageFetcherService>(
++      std::make_unique<ImageDecoderImpl>(), std::move(url_loader_factory),
++      nullptr, key->IsOffTheRecord());
+ }
+ 
+ SimpleFactoryKey* ImageFetcherServiceFactory::GetKeyToUse(
+diff --git a/components/image_fetcher/core/image_fetcher_service.cc b/components/image_fetcher/core/image_fetcher_service.cc
+--- a/components/image_fetcher/core/image_fetcher_service.cc
++++ b/components/image_fetcher/core/image_fetcher_service.cc
+@@ -27,12 +27,15 @@
+       image_fetcher_(
+           std::make_unique<ImageFetcherImpl>(std::move(image_decoder),
+                                              url_loader_factory)),
+-      cached_image_fetcher_(
+-          std::make_unique<CachedImageFetcher>(image_fetcher_.get(),
+-                                               image_cache,
+-                                               read_only)),
+-      reduced_mode_image_fetcher_(std::make_unique<ReducedModeImageFetcher>(
+-          cached_image_fetcher_.get())) {}
++      cached_image_fetcher_(image_cache ? std::make_unique<CachedImageFetcher>(
++                                              image_fetcher_.get(),
++                                              image_cache,
++                                              read_only)
++                                        : nullptr),
++      reduced_mode_image_fetcher_(
++          cached_image_fetcher_ ? std::make_unique<ReducedModeImageFetcher>(
++                                      cached_image_fetcher_.get())
++                                : nullptr) {}
+ 
+ ImageFetcherService::ImageFetcherService() {
+   CHECK_IS_TEST();
+@@ -41,6 +44,9 @@
+ ImageFetcherService::~ImageFetcherService() = default;
+ 
+ ImageFetcher* ImageFetcherService::GetImageFetcher(ImageFetcherConfig config) {
++  if (!image_cache_) {
++    return image_fetcher_.get();
++  }
+   switch (config) {
+     case ImageFetcherConfig::kNetworkOnly:
+       return image_fetcher_.get();
+diff --git a/content/browser/browser_context.cc b/content/browser/browser_context.cc
+--- a/content/browser/browser_context.cc
++++ b/content/browser/browser_context.cc
+@@ -72,6 +72,25 @@
+ #include "url/gurl.h"
+ 
+ namespace content {
++namespace {
++class NoStoreVideoStats final : public media::VideoDecodeStatsDB {
++ public:
++  void Initialize(InitializeCB callback) override {
++    std::move(callback).Run(false);
++  }
++  void AppendDecodeStats(const VideoDescKey&,
++                         const DecodeStatsEntry&,
++                         AppendDecodeStatsCB callback) override {
++    std::move(callback).Run(false);
++  }
++  void GetDecodeStats(const VideoDescKey&, GetDecodeStatsCB callback) override {
++    std::move(callback).Run(false, nullptr);
++  }
++  void ClearStats(base::OnceClosure callback) override {
++    std::move(callback).Run();
++  }
++};
++}  // namespace
+ 
+ class PrefetchService;
+ class PrefetchServiceDelegate;
+@@ -460,25 +479,8 @@
+ std::unique_ptr<media::VideoDecodePerfHistory>
+ BrowserContext::CreateVideoDecodePerfHistory() {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
+-
+-  const char kUseInMemoryDBParamName[] = "db_in_memory";
+-  const bool kUseInMemoryDBDefault = false;
+-  bool use_in_memory_db = base::GetFieldTrialParamByFeatureAsBool(
+-      media::kMediaCapabilitiesWithParameters, kUseInMemoryDBParamName,
+-      kUseInMemoryDBDefault);
+-
+-  std::unique_ptr<media::VideoDecodeStatsDB> stats_db;
+-  if (use_in_memory_db) {
+-    stats_db = std::make_unique<media::InMemoryVideoDecodeStatsDBImpl>(nullptr);
+-  } else {
+-    auto* db_provider =
+-        GetDefaultStoragePartition()->GetProtoDatabaseProvider();
+-
+-    stats_db = media::VideoDecodeStatsDBImpl::Create(
+-        GetPath().Append(FILE_PATH_LITERAL("VideoDecodeStats")), db_provider);
+-  }
+-
+-  return std::make_unique<media::VideoDecodePerfHistory>(std::move(stats_db));
++  return std::make_unique<media::VideoDecodePerfHistory>(
++      std::make_unique<NoStoreVideoStats>());
+ }
+ 
+ FederatedIdentityApiPermissionContextDelegate*
+diff --git a/content/browser/browser_context_impl.cc b/content/browser/browser_context_impl.cc
+--- a/content/browser/browser_context_impl.cc
++++ b/content/browser/browser_context_impl.cc
+@@ -52,6 +52,29 @@
+ #endif
+ 
+ namespace content {
++namespace {
++class NoStoreWebrtcStats final : public media::WebrtcVideoStatsDB {
++ public:
++  void Initialize(InitializeCB callback) override {
++    std::move(callback).Run(false);
++  }
++  void AppendVideoStats(const VideoDescKey&,
++                        const VideoStats&,
++                        AppendVideoStatsCB callback) override {
++    std::move(callback).Run(false);
++  }
++  void GetVideoStats(const VideoDescKey&, GetVideoStatsCB callback) override {
++    std::move(callback).Run(false, std::nullopt);
++  }
++  void GetVideoStatsCollection(const VideoDescKey&,
++                               GetVideoStatsCollectionCB callback) override {
++    std::move(callback).Run(false, std::nullopt);
++  }
++  void ClearStats(base::OnceClosure callback) override {
++    std::move(callback).Run();
++  }
++};
++}  // namespace
+ 
+ namespace {
+ 
+@@ -241,19 +264,9 @@
+ 
+ std::unique_ptr<media::WebrtcVideoPerfHistory>
+ BrowserContextImpl::CreateWebrtcVideoPerfHistory() {
+-  // TODO(crbug.com/40172952): Implement in memory path in
+-  // off_the_record_profile_impl.cc and web_engine_browser_context.cc
+-
+-  CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
+-  auto* db_provider =
+-      self_->GetDefaultStoragePartition()->GetProtoDatabaseProvider();
+-
+-  std::unique_ptr<media::WebrtcVideoStatsDB> stats_db =
+-      media::WebrtcVideoStatsDBImpl::Create(
+-          self_->GetPath().Append(FILE_PATH_LITERAL("WebrtcVideoStats")),
+-          db_provider);
+-
+-  return std::make_unique<media::WebrtcVideoPerfHistory>(std::move(stats_db));
++  CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
++  return std::make_unique<media::WebrtcVideoPerfHistory>(
++      std::make_unique<NoStoreWebrtcStats>());
+ }
+ 
+ media::WebrtcVideoPerfHistory* BrowserContextImpl::GetWebrtcVideoPerfHistory() {
+diff --git a/chrome/browser/sync/sync_invalidations_service_factory.cc b/chrome/browser/sync/sync_invalidations_service_factory.cc
+--- a/chrome/browser/sync/sync_invalidations_service_factory.cc
++++ b/chrome/browser/sync/sync_invalidations_service_factory.cc
+@@ -12,6 +12,30 @@
+ #include "components/gcm_driver/instance_id/instance_id_profile_service.h"
+ #include "components/sync/invalidations/sync_invalidations_service_impl.h"
+ 
++namespace {
++class NoStoreSyncInvalidations final : public syncer::SyncInvalidationsService {
++ public:
++  void StartListening() override {}
++  void StopListening() override {}
++  void StopListeningPermanently() override {}
++  void AddListener(syncer::InvalidationsListener*) override {}
++  bool HasListener(syncer::InvalidationsListener*) override { return false; }
++  void RemoveListener(syncer::InvalidationsListener*) override {}
++  void AddTokenObserver(syncer::FCMRegistrationTokenObserver*) override {}
++  void RemoveTokenObserver(syncer::FCMRegistrationTokenObserver*) override {}
++  std::optional<std::string> GetFCMRegistrationToken() const override {
++    return std::string();
++  }
++  void SetInterestedDataTypesHandler(
++      syncer::InterestedDataTypesHandler*) override {}
++  std::optional<syncer::DataTypeSet> GetInterestedDataTypes() const override {
++    return std::nullopt;
++  }
++  void SetInterestedDataTypes(const syncer::DataTypeSet&) override {}
++  void SetCommittedAdditionalInterestedDataTypesCallback(
++      InterestedDataTypesAppliedCallback) override {}
++};
++}  // namespace
+ syncer::SyncInvalidationsService*
+ SyncInvalidationsServiceFactory::GetForProfile(Profile* profile) {
+   return static_cast<syncer::SyncInvalidationsService*>(
+@@ -41,13 +65,5 @@
+ std::unique_ptr<KeyedService>
+ SyncInvalidationsServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  Profile* profile = Profile::FromBrowserContext(context);
+-
+-  gcm::GCMDriver* gcm_driver =
+-      gcm::GCMProfileServiceFactory::GetForProfile(profile)->driver();
+-  instance_id::InstanceIDDriver* instance_id_driver =
+-      instance_id::InstanceIDProfileServiceFactory::GetForProfile(profile)
+-          ->driver();
+-  return std::make_unique<syncer::SyncInvalidationsServiceImpl>(
+-      gcm_driver, instance_id_driver);
++  return std::make_unique<NoStoreSyncInvalidations>();
+ }
+diff --git a/chrome/browser/sync/data_type_store_service_factory.cc b/chrome/browser/sync/data_type_store_service_factory.cc
+--- a/chrome/browser/sync/data_type_store_service_factory.cc
++++ b/chrome/browser/sync/data_type_store_service_factory.cc
+@@ -4,8 +4,45 @@
+ 
+ #include "chrome/browser/sync/data_type_store_service_factory.h"
+ 
++#include "base/functional/bind.h"
++#include "base/task/thread_pool.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/sync/model/data_type_store_service_impl.h"
++namespace {
++class NoStoreDataTypeService final : public syncer::DataTypeStoreService {
++ public:
++  explicit NoStoreDataTypeService(const base::FilePath& profile_path)
++      : path_(profile_path.AppendASCII("Sync Data")),
++        runner_(base::ThreadPool::CreateSequencedTaskRunner({})) {}
++  const base::FilePath& GetSyncDataPath() const override { return path_; }
++  syncer::RepeatingDataTypeStoreFactory GetStoreFactory() override {
++    return base::BindRepeating(&RejectStore);
++  }
++  syncer::RepeatingDataTypeStoreFactory GetStoreFactoryForAccountStorage()
++      override {
++    return GetStoreFactory();
++  }
++  scoped_refptr<base::SequencedTaskRunner> GetBackendTaskRunner() override {
++    return runner_;
++  }
++
++ private:
++  static void RejectStore(syncer::DataType,
++                          syncer::DataTypeStore::InitCallback callback) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            std::move(callback),
++            std::make_optional(syncer::ModelError(
++                FROM_HERE,
++                syncer::ModelError::Type::
++                    kDataTypeStoreServiceBackendInitializationFailed)),
++            std::unique_ptr<syncer::DataTypeStore>()));
++  }
++  const base::FilePath path_;
++  const scoped_refptr<base::SequencedTaskRunner> runner_;
++};
++}  // namespace
+ 
+ // static
+ DataTypeStoreServiceFactory* DataTypeStoreServiceFactory::GetInstance() {
+@@ -38,7 +75,6 @@
+ std::unique_ptr<KeyedService>
+ DataTypeStoreServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  Profile* profile = Profile::FromBrowserContext(context);
+-  return std::make_unique<syncer::DataTypeStoreServiceImpl>(
+-      profile->GetPath(), profile->GetPrefs());
++  return std::make_unique<NoStoreDataTypeService>(
++      Profile::FromBrowserContext(context)->GetPath());
+ }
+diff --git a/components/value_store/value_store_factory_impl.cc b/components/value_store/value_store_factory_impl.cc
+--- a/components/value_store/value_store_factory_impl.cc
++++ b/components/value_store/value_store_factory_impl.cc
+@@ -11,6 +11,52 @@
+ #include "components/value_store/leveldb_value_store.h"
+ 
+ namespace value_store {
++namespace {
++bool IsRemovedExtensionStore(const base::FilePath& directory) {
++  auto parts = directory.GetComponents();
++  if (parts.empty()) {
++    return false;
++  }
++  const auto& name = parts.front();
++  return name == FILE_PATH_LITERAL("Extension State") ||
++         name == FILE_PATH_LITERAL("Extension Rules") ||
++         name == FILE_PATH_LITERAL("Extension Scripts") ||
++         name == FILE_PATH_LITERAL("Local Extension Settings") ||
++         name == FILE_PATH_LITERAL("Sync Extension Settings") ||
++         name == FILE_PATH_LITERAL("Managed Extension Settings");
++}
++class NoStoreExtensionValues final : public ValueStore {
++ public:
++  size_t GetBytesInUse(const std::string&) override { return 0; }
++  size_t GetBytesInUse(const std::vector<std::string>&) override { return 0; }
++  size_t GetBytesInUse() override { return 0; }
++  ReadResult GetKeys() override {
++    return ReadResult(base::DictValue(), Status());
++  }
++  ReadResult Get(const std::string&) override { return Get(); }
++  ReadResult Get(const std::vector<std::string>&) override { return Get(); }
++  ReadResult Get() override { return ReadResult(base::DictValue(), Status()); }
++  WriteResult Set(WriteOptions,
++                  const std::string&,
++                  const base::Value&) override {
++    return Disabled();
++  }
++  WriteResult Set(WriteOptions, const base::DictValue&) override {
++    return Disabled();
++  }
++  WriteResult Remove(const std::string&) override { return Disabled(); }
++  WriteResult Remove(const std::vector<std::string>&) override {
++    return Disabled();
++  }
++  WriteResult Clear() override { return Disabled(); }
++
++ private:
++  static WriteResult Disabled() {
++    return WriteResult(
++        Status(READ_ONLY, "Persistent extension storage is unavailable"));
++  }
++};
++}  // namespace
+ 
+ ValueStoreFactoryImpl::ValueStoreFactoryImpl(const base::FilePath& profile_path)
+     : profile_path_(profile_path) {}
+@@ -26,15 +72,24 @@
+ std::unique_ptr<ValueStore> ValueStoreFactoryImpl::CreateValueStore(
+     const base::FilePath& directory,
+     const std::string& uma_client_name) {
++  if (IsRemovedExtensionStore(directory)) {
++    return std::make_unique<NoStoreExtensionValues>();
++  }
+   return std::make_unique<LeveldbValueStore>(uma_client_name,
+                                              GetDBPath(directory));
+ }
+ 
+ void ValueStoreFactoryImpl::DeleteValueStore(const base::FilePath& directory) {
++  if (IsRemovedExtensionStore(directory)) {
++    return;
++  }
+   base::DeletePathRecursively(GetDBPath(directory));
+ }
+ 
+ bool ValueStoreFactoryImpl::HasValueStore(const base::FilePath& directory) {
++  if (IsRemovedExtensionStore(directory)) {
++    return false;
++  }
+   return base::DirectoryExists(GetDBPath(directory));
+ }
+ 
+diff --git a/components/update_client/crx_cache.cc b/components/update_client/crx_cache.cc
+--- a/components/update_client/crx_cache.cc
++++ b/components/update_client/crx_cache.cc
+@@ -261,16 +261,9 @@
+ };
+ 
+ CrxCache::CrxCache(std::optional<base::FilePath> path) {
+-  if (path) {
+-    delegate_ = base::SequenceBound<CrxCacheImpl>(
+-        base::ThreadPool::CreateSequencedTaskRunner(
+-            {base::MayBlock(), base::TaskPriority::USER_VISIBLE}),
+-        *path);
+-  } else {
+-    delegate_ = base::SequenceBound<CrxCacheError>(
+-        base::ThreadPool::CreateSequencedTaskRunner(
+-            {base::MayBlock(), base::TaskPriority::USER_VISIBLE}));
+-  }
++  delegate_ = base::SequenceBound<CrxCacheError>(
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE}));
+ }
+ 
+ CrxCache::~CrxCache() = default;
+diff --git a/content/browser/storage_partition_impl.cc b/content/browser/storage_partition_impl.cc
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -1508,10 +1508,6 @@
+   content_index_context_ = base::MakeRefCounted<ContentIndexContextImpl>(
+       browser_context_, service_worker_context_);
+ 
+-  background_fetch_context_ = base::MakeRefCounted<BackgroundFetchContext>(
+-      weak_factory_.GetWeakPtr(), service_worker_context_, quota_manager_proxy,
+-      *devtools_background_services_context_.get());
+-
+   background_sync_context_ = base::MakeRefCounted<BackgroundSyncContextImpl>();
+   background_sync_context_->Init(service_worker_context_,
+                                  *devtools_background_services_context_.get());
+@@ -1599,15 +1595,7 @@
+   font_access_manager_ = FontAccessManager::Create();
+ 
+ #if BUILDFLAG(ENABLE_LIBRARY_CDMS)
+-  if (is_in_memory()) {
+-    // Pass an empty path if in_memory so that CdmStorage.db is not stored on
+-    // disk.
+-    cdm_storage_manager_ =
+-        std::make_unique<CdmStorageManager>(base::FilePath());
+-  } else {
+-    cdm_storage_manager_ = std::make_unique<CdmStorageManager>(
+-        partition_path_.Append(kCdmStorageDatabaseFileName));
+-  }
++  cdm_storage_manager_ = std::make_unique<CdmStorageManager>(base::FilePath());
+ #endif  // BUILDFLAG(ENABLE_LIBRARY_CDMS)
+ 
+ 
+diff --git a/content/browser/background_fetch/background_fetch_service_impl.cc b/content/browser/background_fetch/background_fetch_service_impl.cc
+--- a/content/browser/background_fetch/background_fetch_service_impl.cc
++++ b/content/browser/background_fetch/background_fetch_service_impl.cc
+@@ -38,39 +38,7 @@
+     const net::NetworkIsolationKey& network_isolation_key,
+     const ServiceWorkerVersionBaseInfo& info,
+     mojo::PendingReceiver<blink::mojom::BackgroundFetchService> receiver) {
+-  // TODO(rayankans): Remove `network_isolation_key` parameter since it's no
+-  // longer used.
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M158);
+-  RenderProcessHost* render_process_host =
+-      RenderProcessHost::FromID(info.process_id);
+-
+-  if (!render_process_host)
+-    return;
+-
+-  auto* partition = static_cast<StoragePartitionImpl*>(
+-      render_process_host->GetStoragePartition());
+-  scoped_refptr<BackgroundFetchContext> context =
+-      WrapRefCounted(partition->GetBackgroundFetchContext());
+-
+-  // The renderer should have checked and disallowed the request for fenced
+-  // frames and thrown an exception in blink::BackgroundFetchManager. Ignore the
+-  // request and mark it as bad if the renderer side check didn't happen for
+-  // some reason.
+-  scoped_refptr<ServiceWorkerRegistration> registration =
+-      partition->GetServiceWorkerContext()->GetLiveRegistration(
+-          info.registration_id);
+-  if (registration && registration->ancestor_frame_type() ==
+-                          blink::mojom::AncestorFrameType::kFencedFrame) {
+-    bad_message::ReceivedBadMessage(
+-        render_process_host, bad_message::BFSI_CREATE_FOR_WORKER_FENCED_FRAME);
+-    return;
+-  }
+-
+-  mojo::MakeSelfOwnedReceiver(std::make_unique<BackgroundFetchServiceImpl>(
+-                                  std::move(context), info.storage_key,
+-                                  info.storage_key.ToPartialNetIsolationInfo(),
+-                                  render_process_host, /*rfh=*/nullptr),
+-                              std::move(receiver));
+ }
+ 
+ // static
+@@ -79,33 +47,6 @@
+     mojo::PendingReceiver<blink::mojom::BackgroundFetchService> receiver) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M158);
+   CHECK(render_frame_host, base::NotFatalUntil::M158);
+-
+-  if (render_frame_host->IsNestedWithinFencedFrame()) {
+-    // The renderer should have checked and disallowed the request for fenced
+-    // frames and throw exception in blink::BackgroundFetchManager. Ignore the
+-    // request and mark it as bad if it didn't happen for some reason.
+-    // TODO(crbug.com/40205566) Follow-up on this line depending on the
+-    // conclusion at
+-    // https://groups.google.com/a/chromium.org/g/navigation-dev/c/BZLlGsL2-64
+-    bad_message::ReceivedBadMessage(
+-        render_frame_host->GetProcess(),
+-        bad_message::BFSI_CREATE_FOR_FRAME_FENCED_FRAME);
+-    return;
+-  }
+-
+-  auto* rfhi = static_cast<RenderFrameHostImpl*>(render_frame_host);
+-  RenderProcessHost* render_process_host = rfhi->GetProcess();
+-  CHECK(render_process_host, base::NotFatalUntil::M158);
+-
+-  scoped_refptr<BackgroundFetchContext> context =
+-      WrapRefCounted(static_cast<StoragePartitionImpl*>(
+-                         render_process_host->GetStoragePartition())
+-                         ->GetBackgroundFetchContext());
+-  mojo::MakeSelfOwnedReceiver(
+-      std::make_unique<BackgroundFetchServiceImpl>(
+-          std::move(context), rfhi->GetStorageKey(),
+-          rfhi->GetIsolationInfoForSubresources(), rfhi->GetProcess(), rfhi),
+-      std::move(receiver));
+ }
+ 
+ BackgroundFetchServiceImpl::BackgroundFetchServiceImpl(
+diff --git a/content/browser/storage_partition_impl_map.cc b/content/browser/storage_partition_impl_map.cc
+--- a/content/browser/storage_partition_impl_map.cc
++++ b/content/browser/storage_partition_impl_map.cc
+@@ -462,7 +462,9 @@
+             partition->GetPath().Append(kWebSQLDirname)));
+   }
+ 
+-  partition->GetBackgroundFetchContext()->Initialize();
++  if (auto* background_fetch = partition->GetBackgroundFetchContext()) {
++    background_fetch->Initialize();
++  }
+ }
+ 
+ }  // namespace content
+diff --git a/content/browser/media/cdm_registry_impl.cc b/content/browser/media/cdm_registry_impl.cc
+--- a/content/browser/media/cdm_registry_impl.cc
++++ b/content/browser/media/cdm_registry_impl.cc
+@@ -471,8 +471,10 @@
+ 
+   // `status` could be kUninitialized if HW secure capability checking is not
+   // allowed.
+-  const auto [capability, status] = GetCapability(key_system, robustness);
+-
++  auto [capability, status] = GetCapability(key_system, robustness);
++  if (capability) {
++    capability->session_types.erase(media::CdmSessionType::kPersistentLicense);
++  }
+   return {IsEnabled(status) ? capability : std::nullopt, status};
+ }
+ 
+diff --git a/content/browser/media/media_interface_proxy.cc b/content/browser/media/media_interface_proxy.cc
+--- a/content/browser/media/media_interface_proxy.cc
++++ b/content/browser/media/media_interface_proxy.cc
+@@ -523,8 +523,10 @@
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+-void MediaInterfaceProxy::CreateCdm(const media::CdmConfig& cdm_config,
++void MediaInterfaceProxy::CreateCdm(const media::CdmConfig& requested_config,
+                                     CreateCdmCallback create_cdm_cb) {
++  media::CdmConfig cdm_config = requested_config;
++  cdm_config.allow_persistent_state = false;
+   CHECK(thread_checker_.CalledOnValidThread(), base::NotFatalUntil::M160);
+   DVLOG(1) << __func__ << ": cdm_config=" << cdm_config;
+ 
+diff --git a/extensions/browser/api/declarative_net_request/prefs_helper.cc b/extensions/browser/api/declarative_net_request/prefs_helper.cc
+--- a/extensions/browser/api/declarative_net_request/prefs_helper.cc
++++ b/extensions/browser/api/declarative_net_request/prefs_helper.cc
+@@ -58,7 +58,6 @@
+ // However for both of these cases, we want the dynamic ruleset preferences to
+ // stay unchanged. Also, this helps provide flexibility to have the dynamic
+ // ruleset preference schema diverge from the static one.
+-constexpr std::string_view kDynamicRulesetPref = "dnr_dynamic_ruleset";
+ 
+ base::flat_set<int> GetDisabledStaticRuleIdsFromDict(
+     const base::DictValue* disabled_rule_ids_dict,
+@@ -277,17 +276,11 @@
+ 
+ bool PrefsHelper::GetDynamicRulesetChecksum(const ExtensionId& extension_id,
+                                             int& checksum) const {
+-  std::string pref =
+-      ExtensionPrefs::JoinPrefs({kDynamicRulesetPref, kChecksumKey});
+-  return prefs_->ReadPrefAsInteger(extension_id, pref, &checksum);
++  return false;
+ }
+ 
+ void PrefsHelper::SetDynamicRulesetChecksum(const ExtensionId& extension_id,
+-                                            int checksum) {
+-  std::string pref =
+-      ExtensionPrefs::JoinPrefs({kDynamicRulesetPref, kChecksumKey});
+-  prefs_->UpdateExtensionPref(extension_id, pref, base::Value(checksum));
+-}
++                                            int checksum) {}
+ 
+ std::optional<std::set<RulesetID>> PrefsHelper::GetEnabledStaticRulesets(
+     const ExtensionId& extension_id) const {
+diff --git a/extensions/browser/api/declarative_net_request/declarative_net_request_api.cc b/extensions/browser/api/declarative_net_request/declarative_net_request_api.cc
+--- a/extensions/browser/api/declarative_net_request/declarative_net_request_api.cc
++++ b/extensions/browser/api/declarative_net_request/declarative_net_request_api.cc
+@@ -115,46 +115,7 @@
+ 
+ ExtensionFunction::ResponseAction
+ DeclarativeNetRequestUpdateDynamicRulesFunction::Run() {
+-  using Params = dnr_api::UpdateDynamicRules::Params;
+-
+-  auto params = Params::Create(args());
+-  EXTENSION_FUNCTION_VALIDATE(params.has_value());
+-
+-  std::vector<int> rule_ids_to_remove;
+-  if (params->options.remove_rule_ids) {
+-    rule_ids_to_remove = std::move(*params->options.remove_rule_ids);
+-  }
+-
+-  std::vector<dnr_api::Rule> rules_to_add;
+-  if (params->options.add_rules) {
+-    rules_to_add = std::move(*params->options.add_rules);
+-  }
+-
+-  // Early return if there is nothing to do.
+-  if (rule_ids_to_remove.empty() && rules_to_add.empty()) {
+-    return RespondNow(NoArguments());
+-  }
+-
+-  // Collect rules to add in the Extension Telemetry Service.
+-  if (!rules_to_add.empty()) {
+-    ExtensionsBrowserClient::Get()
+-        ->GetSafeBrowsingDelegate()
+-        ->NotifyExtensionApiDeclarativeNetRequest(browser_context(),
+-                                                  extension_id(), rules_to_add);
+-  }
+-
+-  auto* rules_monitor_service =
+-      declarative_net_request::RulesMonitorService::Get(browser_context());
+-  DCHECK(rules_monitor_service);
+-  DCHECK(extension());
+-
+-  auto callback = base::BindOnce(
+-      &DeclarativeNetRequestUpdateDynamicRulesFunction::OnDynamicRulesUpdated,
+-      this);
+-  rules_monitor_service->UpdateDynamicRules(
+-      *extension(), std::move(rule_ids_to_remove), std::move(rules_to_add),
+-      std::move(callback));
+-  return RespondLater();
++  return RespondNow(Error("Persistent extension rules are unavailable"));
+ }
+ 
+ void DeclarativeNetRequestUpdateDynamicRulesFunction::OnDynamicRulesUpdated(
+@@ -175,26 +136,8 @@
+ 
+ ExtensionFunction::ResponseAction
+ DeclarativeNetRequestGetDynamicRulesFunction::Run() {
+-  using Params = dnr_api::GetDynamicRules::Params;
+-
+-  auto params = Params::Create(args());
+-  EXTENSION_FUNCTION_VALIDATE(params.has_value());
+-
+-  auto source = declarative_net_request::FileBackedRulesetSource::CreateDynamic(
+-      browser_context(), extension()->id());
+-
+-  auto read_dynamic_rules = base::BindOnce(
+-      [](const declarative_net_request::FileBackedRulesetSource& source) {
+-        return source.ReadJSONRules();
+-      },
+-      std::move(source));
+-
+-  GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+-      FROM_HERE, std::move(read_dynamic_rules),
+-      base::BindOnce(
+-          &DeclarativeNetRequestGetDynamicRulesFunction::OnDynamicRulesFetched,
+-          this, std::move(params).value()));
+-  return RespondLater();
++  return RespondNow(
++      ArgumentList(dnr_api::GetDynamicRules::Results::Create({})));
+ }
+ 
+ void DeclarativeNetRequestGetDynamicRulesFunction::OnDynamicRulesFetched(

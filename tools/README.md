@@ -219,6 +219,25 @@ checks discovered Web Data persistence, not explicit search settings. Preference
 selectors check nonempty retained activity in shared Preferences files for rows
 36/39/40/77/80. Row 78 checks the derived segmentation databases individually;
 verification-only `segmentation_platform/ukm_db` diagnostics belong to row 61.
+Row 53 checks logical shared-proto client namespaces, allowing retained
+page-download metadata (client 21), OriginTrials (client 44) and catalog metadata.
+It also rejects unused clients' unique fallback directories (`image_cache`,
+`Notification Scheduler`, `AutofillAiModelCache`) alongside the other mapped rows.
+The fixture waits for file and WebRTC video-capability consumers to complete;
+these retain their native unavailable-statistics response without a history DB.
+The NUC-native
+`leveldb_leveldbutil` executable dumps numeric WAL/SST files read-only after clean
+shutdown; token values and origin-bearing key tails are not included in the
+namespace report. Build the helper in each output before forbidding row 53:
+
+```sh
+python3 repo/tools/alloy_build.py --config release --target leveldb_leveldbutil
+python3 repo/tools/alloy_build.py --config verify --target leveldb_leveldbutil
+```
+
+Unused clients' standalone fallback directories are checked by their own rows.
+The retained OriginTrials selector/migration path is unchanged. Unknown key
+formats or native dump errors fail the check rather than imply absence.
 Row 71 shares service-worker and Cache Storage databases with retained
 features and has no independently identifiable file: its owner removal requires
 source verification, not a claim that the shared databases should disappear.

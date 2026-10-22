@@ -1,0 +1,1634 @@
+diff --git a/chrome/browser/history/top_sites_factory.cc b/chrome/browser/history/top_sites_factory.cc
+--- a/chrome/browser/history/top_sites_factory.cc
++++ b/chrome/browser/history/top_sites_factory.cc
+@@ -119,15 +119,7 @@
+ TopSitesFactory::TopSitesFactory()
+     : RefcountedProfileKeyedServiceFactory(
+           "TopSites",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+   DependsOn(TemplateURLServiceFactory::GetInstance());
+   // This dependency is only used when the experimental
+diff --git a/chrome/browser/predictors/autocomplete_action_predictor_factory.cc b/chrome/browser/predictors/autocomplete_action_predictor_factory.cc
+--- a/chrome/browser/predictors/autocomplete_action_predictor_factory.cc
++++ b/chrome/browser/predictors/autocomplete_action_predictor_factory.cc
+@@ -26,17 +26,8 @@
+ }
+ 
+ AutocompleteActionPredictorFactory::AutocompleteActionPredictorFactory()
+-    : ProfileKeyedServiceFactory(
+-          "AutocompleteActionPredictor",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("AutocompleteActionPredictor",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+   DependsOn(PredictorDatabaseFactory::GetInstance());
+ }
+diff --git a/chrome/browser/predictors/loading_predictor_factory.cc b/chrome/browser/predictors/loading_predictor_factory.cc
+--- a/chrome/browser/predictors/loading_predictor_factory.cc
++++ b/chrome/browser/predictors/loading_predictor_factory.cc
+@@ -24,17 +24,8 @@
+ }
+ 
+ LoadingPredictorFactory::LoadingPredictorFactory()
+-    : ProfileKeyedServiceFactory(
+-          "LoadingPredictor",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("LoadingPredictor",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+   DependsOn(PredictorDatabaseFactory::GetInstance());
+ }
+diff --git a/chrome/browser/predictors/predictor_database_factory.cc b/chrome/browser/predictors/predictor_database_factory.cc
+--- a/chrome/browser/predictors/predictor_database_factory.cc
++++ b/chrome/browser/predictors/predictor_database_factory.cc
+@@ -27,17 +27,9 @@
+ }
+ 
+ PredictorDatabaseFactory::PredictorDatabaseFactory()
+-    : ProfileKeyedServiceFactory(
+-          "PredictorDatabase",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {}
++    : ProfileKeyedServiceFactory("PredictorDatabase",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
++}
+ 
+ PredictorDatabaseFactory::~PredictorDatabaseFactory() = default;
+ 
+diff --git a/chrome/browser/autocomplete/shortcuts_backend_factory.cc b/chrome/browser/autocomplete/shortcuts_backend_factory.cc
+--- a/chrome/browser/autocomplete/shortcuts_backend_factory.cc
++++ b/chrome/browser/autocomplete/shortcuts_backend_factory.cc
+@@ -60,15 +60,7 @@
+ ShortcutsBackendFactory::ShortcutsBackendFactory()
+     : RefcountedProfileKeyedServiceFactory(
+           "ShortcutsBackend",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+   DependsOn(TemplateURLServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/critical_actions/critical_action_factory.cc b/chrome/browser/critical_actions/critical_action_factory.cc
+--- a/chrome/browser/critical_actions/critical_action_factory.cc
++++ b/chrome/browser/critical_actions/critical_action_factory.cc
+@@ -37,13 +37,8 @@
+ }
+ 
+ CriticalActionFactory::CriticalActionFactory()
+-    : ProfileKeyedServiceFactory(
+-          "CriticalActionService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              .WithGuest(ProfileSelection::kNone)
+-              .WithSystem(ProfileSelection::kNone)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("CriticalActionService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+ }
+ 
+diff --git a/chrome/browser/context_hub/context_hub_service_factory.cc b/chrome/browser/context_hub/context_hub_service_factory.cc
+--- a/chrome/browser/context_hub/context_hub_service_factory.cc
++++ b/chrome/browser/context_hub/context_hub_service_factory.cc
+@@ -53,11 +53,8 @@
+ }
+ 
+ ContextHubServiceFactory::ContextHubServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "ContextHubService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("ContextHubService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(IdentityManagerFactory::GetInstance());
+   DependsOn(PersonalContextServiceFactory::GetInstance());
+   DependsOn(OptimizationGuideKeyedServiceFactory::GetInstance());
+diff --git a/chrome/browser/optimization_guide/optimization_guide_keyed_service_factory.cc b/chrome/browser/optimization_guide/optimization_guide_keyed_service_factory.cc
+--- a/chrome/browser/optimization_guide/optimization_guide_keyed_service_factory.cc
++++ b/chrome/browser/optimization_guide/optimization_guide_keyed_service_factory.cc
+@@ -43,18 +43,8 @@
+ }
+ 
+ OptimizationGuideKeyedServiceFactory::OptimizationGuideKeyedServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "OptimizationGuideKeyedService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              // Guest Profile follows Regular Profile selection mode.
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              // Do not build the OptimizationGuideKeyedService if it's a
+-              // sign-in or lockscreen profile since it basically is an
+-              // ephemeral profile anyway and we cannot provide hints or models
+-              // to it anyway.
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("OptimizationGuideKeyedService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(BackgroundDownloadServiceFactory::GetInstance());
+   DependsOn(IdentityManagerFactory::GetInstance());
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/browser/optimization_guide/optimization_guide_global_state_holder_keyed_service_factory.cc b/chrome/browser/optimization_guide/optimization_guide_global_state_holder_keyed_service_factory.cc
+--- a/chrome/browser/optimization_guide/optimization_guide_global_state_holder_keyed_service_factory.cc
++++ b/chrome/browser/optimization_guide/optimization_guide_global_state_holder_keyed_service_factory.cc
+@@ -34,11 +34,7 @@
+     OptimizationGuideGlobalStateHolderKeyedServiceFactory()
+     : ProfileKeyedServiceFactory(
+           "OptimizationGuideGlobalStateHolderKeyedService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {}
++          ProfileSelections::BuildNoProfilesSelected()) {}
+ 
+ OptimizationGuideGlobalStateHolderKeyedServiceFactory::
+     ~OptimizationGuideGlobalStateHolderKeyedServiceFactory() = default;
+diff --git a/chrome/browser/history_embeddings/history_embeddings_service_factory.cc b/chrome/browser/history_embeddings/history_embeddings_service_factory.cc
+--- a/chrome/browser/history_embeddings/history_embeddings_service_factory.cc
++++ b/chrome/browser/history_embeddings/history_embeddings_service_factory.cc
+@@ -118,14 +118,8 @@
+ }
+ 
+ HistoryEmbeddingsServiceFactory::HistoryEmbeddingsServiceFactory()
+-    : ProfileKeyedServiceFactory(
+-          "HistoryEmbeddingsService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++    : ProfileKeyedServiceFactory("HistoryEmbeddingsService",
++                                 ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+   DependsOn(PageContentAnnotationsServiceFactory::GetInstance());
+   DependsOn(OptimizationGuideKeyedServiceFactory::GetInstance());
+diff --git a/chrome/browser/ui/omnibox/chrome_omnibox_client.cc b/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+@@ -832,15 +832,17 @@
+     content::WebContents* web_contents = location_bar_->GetWebContents();
+     AutocompleteActionPredictor* action_predictor =
+         predictors::AutocompleteActionPredictorFactory::GetForProfile(profile_);
+-    action_predictor->RegisterTransitionalMatches(user_text, result);
+-    // Confer with the AutocompleteActionPredictor to determine what action,
+-    // if any, we should take. Get the recommended action here even if we
+-    // don't need it so we can get stats for anyone who is opted in to UMA,
+-    // but only get it if the user has actually typed something to avoid
+-    // constructing it before it's needed. Note: This event is triggered as
+-    // part of startup when the initial tab transitions to the start page.
+-    recommended_action = action_predictor->RecommendAction(
+-        user_text, current_match, web_contents);
++    if (action_predictor) {
++      action_predictor->RegisterTransitionalMatches(user_text, result);
++      // Confer with the AutocompleteActionPredictor to determine what action,
++      // if any, we should take. Get the recommended action here even if we
++      // don't need it so we can get stats for anyone who is opted in to UMA,
++      // but only get it if the user has actually typed something to avoid
++      // constructing it before it's needed. Note: This event is triggered as
++      // part of startup when the initial tab transitions to the start page.
++      recommended_action = action_predictor->RecommendAction(
++          user_text, current_match, web_contents);
++    }
+   }
+ 
+   switch (recommended_action) {
+@@ -870,7 +872,9 @@
+ void ChromeOmniboxClient::OnRevert() {
+   AutocompleteActionPredictor* action_predictor =
+       predictors::AutocompleteActionPredictorFactory::GetForProfile(profile_);
+-  action_predictor->UpdateDatabaseFromTransitionalMatches(GURL());
++  if (action_predictor) {
++    action_predictor->UpdateDatabaseFromTransitionalMatches(GURL());
++  }
+ }
+ 
+ void ChromeOmniboxClient::OnURLOpenedFromOmnibox(OmniboxLog* log) {
+@@ -893,8 +897,11 @@
+     }
+   }
+ 
+-  predictors::AutocompleteActionPredictorFactory::GetForProfile(profile_)
+-      ->OnOmniboxOpenedUrl(*log);
++  if (auto* predictor =
++          predictors::AutocompleteActionPredictorFactory::GetForProfile(
++              profile_)) {
++    predictor->OnOmniboxOpenedUrl(*log);
++  }
+ }
+ 
+ void ChromeOmniboxClient::OnBookmarkLaunched() {
+@@ -1116,8 +1123,11 @@
+ 
+   DCHECK(!AutocompleteMatch::IsSearchType(match.type));
+ 
+-  predictors::AutocompleteActionPredictorFactory::GetForProfile(profile_)
+-      ->StartPrerendering(match.destination_url, *web_contents);
++  if (auto* predictor =
++          predictors::AutocompleteActionPredictorFactory::GetForProfile(
++              profile_)) {
++    predictor->StartPrerendering(match.destination_url, *web_contents);
++  }
+ }
+ 
+ void ChromeOmniboxClient::DoPreconnect(const AutocompleteMatch& match) {
+diff --git a/chrome/browser/ui/webui/cr_components/searchbox/searchbox_omnibox_client.cc b/chrome/browser/ui/webui/cr_components/searchbox/searchbox_omnibox_client.cc
+--- a/chrome/browser/ui/webui/cr_components/searchbox/searchbox_omnibox_client.cc
++++ b/chrome/browser/ui/webui/cr_components/searchbox/searchbox_omnibox_client.cc
+@@ -139,8 +139,11 @@
+           SearchPrefetchServiceFactory::GetForProfile(profile_)) {
+     search_prefetch_service->OnURLOpenedFromOmnibox(log);
+   }
+-  predictors::AutocompleteActionPredictorFactory::GetForProfile(profile_)
+-      ->OnOmniboxOpenedUrl(*log);
++  if (auto* predictor =
++          predictors::AutocompleteActionPredictorFactory::GetForProfile(
++              profile_)) {
++    predictor->OnOmniboxOpenedUrl(*log);
++  }
+ }
+ 
+ void SearchboxOmniboxClient::OnAutocompleteAccept(
+diff --git a/chrome/browser/notifications/persistent_notification_handler.cc b/chrome/browser/notifications/persistent_notification_handler.cc
+--- a/chrome/browser/notifications/persistent_notification_handler.cc
++++ b/chrome/browser/notifications/persistent_notification_handler.cc
+@@ -447,6 +447,15 @@
+                            ->GetEngagementLevel(url);
+   }
+ 
++  auto* optimization_service =
++      OptimizationGuideKeyedServiceFactory::GetForProfile(profile);
++  auto* uploader =
++      optimization_service
++          ? optimization_service->GetModelQualityLogsUploaderService()
++          : nullptr;
++  if (!uploader) {
++    return;
++  }
+   // Read notification data from database and upload as log to model quality
+   // service.
+   notification_context->ReadNotificationDataAndRecordInteraction(
+@@ -454,9 +463,7 @@
+       content::PlatformNotificationContext::Interaction::NONE,
+       base::BindOnce(
+           &safe_browsing::SendNotificationContentDetectionDataToMQLSServer,
+-          OptimizationGuideKeyedServiceFactory::GetForProfile(profile)
+-              ->GetModelQualityLogsUploaderService()
+-              ->GetWeakPtr(),
++          uploader->GetWeakPtr(),
+           safe_browsing::NotificationContentDetectionMQLSMetadata(
+               did_show_warning, did_user_unsubscribe, engagement_level)));
+ #endif  // BUILDFLAG(SAFE_BROWSING_AVAILABLE)
+diff --git a/chrome/browser/password_manager/password_change/model_quality_logs_uploader.cc b/chrome/browser/password_manager/password_change/model_quality_logs_uploader.cc
+--- a/chrome/browser/password_manager/password_change/model_quality_logs_uploader.cc
++++ b/chrome/browser/password_manager/password_change/model_quality_logs_uploader.cc
+@@ -620,9 +620,12 @@
+ }
+ 
+ void ModelQualityLogsUploader::UploadFinalLog() {
++  auto* optimization_service =
++      OptimizationGuideKeyedServiceFactory::GetForProfile(profile_);
+   auto* mqls_service =
+-      OptimizationGuideKeyedServiceFactory::GetForProfile(profile_)
+-          ->GetModelQualityLogsUploaderService();
++      optimization_service
++          ? optimization_service->GetModelQualityLogsUploaderService()
++          : nullptr;
+   if (!mqls_service) {
+     return;
+   }
+diff --git a/content/browser/browser_context_impl.cc b/content/browser/browser_context_impl.cc
+--- a/content/browser/browser_context_impl.cc
++++ b/content/browser/browser_context_impl.cc
+@@ -398,15 +398,7 @@
+ 
+ namespace {
+ bool ShouldEnableBtm(BrowserContext* browser_context) {
+-  if (!base::FeatureList::IsEnabled(features::kBtm)) {
+-    return false;
+-  }
+-
+-  if (!GetContentClient()->browser()->ShouldEnableBtm(browser_context)) {
+-    return false;
+-  }
+-
+-  return true;
++  return false;
+ }
+ }  // namespace
+ 
+diff --git a/components/heavy_ad_intervention/heavy_ad_service.cc b/components/heavy_ad_intervention/heavy_ad_service.cc
+--- a/components/heavy_ad_intervention/heavy_ad_service.cc
++++ b/components/heavy_ad_intervention/heavy_ad_service.cc
+@@ -19,13 +19,6 @@
+ 
+ namespace heavy_ad_intervention {
+ 
+-namespace {
+-
+-const base::FilePath::CharType kHeavyAdInterventionOptOutDBFilename[] =
+-    FILE_PATH_LITERAL("heavy_ad_intervention_opt_out.db");
+-
+-}  // namespace
+-
+ // Whether an opt out store should be used or not.
+ bool HeavyAdOptOutStoreDisabled() {
+   return base::GetFieldTrialParamByFeatureAsBool(
+@@ -41,26 +34,7 @@
+ }
+ 
+ void HeavyAdService::Initialize(const base::FilePath& profile_path) {
+-  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  DCHECK(!profile_path.empty());
+-
+-  if (!base::FeatureList::IsEnabled(features::kHeavyAdPrivacyMitigations))
+-    return;
+-
+-  std::unique_ptr<blocklist::OptOutStoreSQL> opt_out_store;
+-  if (!HeavyAdOptOutStoreDisabled()) {
+-    // Get the background thread to run SQLite on.
+-    scoped_refptr<base::SequencedTaskRunner> background_task_runner =
+-        base::ThreadPool::CreateSequencedTaskRunner(
+-            {base::MayBlock(), base::TaskPriority::BEST_EFFORT});
+-
+-    opt_out_store = std::make_unique<blocklist::OptOutStoreSQL>(
+-        content::GetUIThreadTaskRunner({}), background_task_runner,
+-        profile_path.Append(kHeavyAdInterventionOptOutDBFilename));
+-  }
+-
+-  heavy_ad_blocklist_ = std::make_unique<HeavyAdBlocklist>(
+-      std::move(opt_out_store), base::DefaultClock::GetInstance(), this);
++  InitializeOffTheRecord();
+ }
+ 
+ void HeavyAdService::InitializeOffTheRecord() {
+diff --git a/components/performance_manager/persistence/site_data/site_data_cache_factory.cc b/components/performance_manager/persistence/site_data/site_data_cache_factory.cc
+--- a/components/performance_manager/persistence/site_data/site_data_cache_factory.cc
++++ b/components/performance_manager/persistence/site_data/site_data_cache_factory.cc
+@@ -102,34 +102,10 @@
+ void SiteDataCacheFactory::OnBrowserContextCreated(
+     const base::UnguessableToken& browser_context_id,
+     const base::FilePath& context_path,
+-    std::optional<base::UnguessableToken> parent_context_id) {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  DCHECK(!data_cache_map_.contains(browser_context_id));
+-
+-  if (parent_context_id) {
+-    SiteDataCacheInspector* parent_debug =
+-        GetInspectorForBrowserContext(parent_context_id.value());
+-    DCHECK(parent_debug);
+-    DCHECK(data_cache_map_.contains(parent_context_id.value()));
+-    SiteDataCache* data_cache_for_readers =
+-        data_cache_map_[parent_context_id.value()].get();
+-    DCHECK(data_cache_for_readers);
+-    data_cache_map_.emplace(
+-        std::move(browser_context_id),
+-        std::make_unique<NonRecordingSiteDataCache>(
+-            browser_context_id, parent_debug, data_cache_for_readers));
+-  } else {
+-    data_cache_map_.emplace(
+-        std::move(browser_context_id),
+-        std::make_unique<SiteDataCacheImpl>(browser_context_id, context_path));
+-  }
+-}
++    std::optional<base::UnguessableToken> parent_context_id) {}
+ 
+ void SiteDataCacheFactory::OnBrowserContextDestroyed(
+     const base::UnguessableToken& browser_context_id) {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  DCHECK(data_cache_map_.contains(browser_context_id));
+   data_cache_map_.erase(browser_context_id);
+ }
+ 
+diff --git a/components/content_settings/core/browser/content_settings_pref_provider.cc b/components/content_settings/core/browser/content_settings_pref_provider.cc
+--- a/components/content_settings/core/browser/content_settings_pref_provider.cc
++++ b/components/content_settings/core/browser/content_settings_pref_provider.cc
+@@ -45,6 +45,13 @@
+ 
+ namespace {
+ 
++bool IsRemovedActivityStore(ContentSettingsType type) {
++  return type == ContentSettingsType::SITE_ENGAGEMENT ||
++         type == ContentSettingsType::MEDIA_ENGAGEMENT ||
++         type == ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA ||
++         type == ContentSettingsType::PERMISSION_ACTIONS_HISTORY;
++}
++
+ // These settings are no longer used, and should be deleted on profile startup.
+ 
+ #if !BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_ANDROID)
+@@ -168,6 +175,9 @@
+   WebsiteSettingsRegistry* website_settings =
+       WebsiteSettingsRegistry::GetInstance();
+   for (const WebsiteSettingsInfo* info : *website_settings) {
++    if (IsRemovedActivityStore(info->type())) {
++      continue;
++    }
+     content_settings_prefs_.insert(std::make_pair(
+         info->type(), std::make_unique<ContentSettingsPref>(
+                           info->type(), prefs_, &pref_change_registrar_,
+@@ -234,6 +244,9 @@
+   DCHECK(CalledOnValidThread());
+   DCHECK(prefs_);
+ 
++  if (IsRemovedActivityStore(content_type)) {
++    return true;
++  }
+   if (!supports_type(content_type)) {
+     return false;
+   }
+diff --git a/components/site_engagement/content/site_engagement_service.cc b/components/site_engagement/content/site_engagement_service.cc
+--- a/components/site_engagement/content/site_engagement_service.cc
++++ b/components/site_engagement/content/site_engagement_service.cc
+@@ -569,22 +569,11 @@
+ }
+ 
+ base::Time SiteEngagementService::GetLastEngagementTime() const {
+-  if (browser_context_->IsOffTheRecord())
+-    return base::Time();
+-
+-  return base::Time::FromInternalValue(
+-      user_prefs::UserPrefs::Get(browser_context_)
+-          ->GetInt64(prefs::kSiteEngagementLastUpdateTime));
++  return base::Time();
+ }
+ 
+ void SiteEngagementService::SetLastEngagementTime(
+-    base::Time last_engagement_time) const {
+-  if (browser_context_->IsOffTheRecord())
+-    return;
+-  user_prefs::UserPrefs::Get(browser_context_)
+-      ->SetInt64(prefs::kSiteEngagementLastUpdateTime,
+-                 last_engagement_time.ToInternalValue());
+-}
++    base::Time last_engagement_time) const {}
+ 
+ base::TimeDelta SiteEngagementService::GetMaxDecayPeriod() const {
+   return base::Hours(SiteEngagementScore::GetDecayPeriodInHours()) *
+diff --git a/components/permissions/permission_actions_history.cc b/components/permissions/permission_actions_history.cc
+--- a/components/permissions/permission_actions_history.cc
++++ b/components/permissions/permission_actions_history.cc
+@@ -50,13 +50,8 @@
+ // for a permission.
+ // - kTemporaryGrantTimeStampKey: Stores the timestamp of the most recent
+ // temporary grant, including auto-grants.
+-constexpr char kPermissionActionEntryActionKey[] = "action";
+-constexpr char kPermissionActionEntryTimestampKey[] = "time";
+-constexpr char kPermissionActionEntryPromptDispositionKey[] =
+-    "prompt_disposition";
+ 
+ // Entries in permission actions expire after they become this old.
+-constexpr base::TimeDelta kPermissionActionMaxAge = base::Days(90);
+ 
+ // The threshold for temporary grants before a heuristic grant is made.
+ constexpr int kHeuristicGrantThreshold = 3;
+@@ -116,88 +111,23 @@
+ std::vector<PermissionActionsHistory::Entry>
+ PermissionActionsHistory::GetHistory(const base::Time& begin,
+                                      EntryFilter entry_filter) {
+-  const base::DictValue& dictionary =
+-      pref_service_->GetDict(prefs::kPermissionActions);
+-
+-  std::vector<PermissionActionsHistory::Entry> matching_actions;
+-  for (auto permission_entry : dictionary) {
+-    const auto permission_actions =
+-        GetHistoryInternal(begin, permission_entry.first, entry_filter);
+-
+-    matching_actions.insert(matching_actions.end(), permission_actions.begin(),
+-                            permission_actions.end());
+-  }
+-
+-  std::ranges::sort(
+-      matching_actions, {},
+-      [](const PermissionActionsHistory::Entry& entry) { return entry.time; });
+-  return matching_actions;
++  return {};
+ }
+ 
+ std::vector<PermissionActionsHistory::Entry>
+ PermissionActionsHistory::GetHistory(const base::Time& begin,
+                                      RequestType type,
+                                      EntryFilter entry_filter) {
+-  return GetHistoryInternal(begin, PermissionKeyForRequestType(type),
+-                            entry_filter);
++  return {};
+ }
+ 
+ void PermissionActionsHistory::RecordAction(
+     PermissionAction action,
+     RequestType type,
+-    PermissionPromptDisposition prompt_disposition) {
+-  ScopedDictPrefUpdate update(pref_service_, prefs::kPermissionActions);
+-  base::DictValue& update_dict = update.Get();
+-
+-  const std::string_view permission_path(PermissionKeyForRequestType(type));
+-
+-  if (!update_dict.FindListByDottedPath(permission_path)) {
+-    update_dict.SetByDottedPath(permission_path, base::ListValue());
+-  }
+-
+-  base::ListValue* permission_actions =
+-      update_dict.FindListByDottedPath(permission_path);
+-  CHECK(permission_actions);
+-
+-  // Discard permission actions older than |kPermissionActionMaxAge|.
+-  const base::Time cutoff = base::Time::Now() - kPermissionActionMaxAge;
+-  permission_actions->EraseIf([cutoff](const base::Value& entry) {
+-    const std::optional<base::Time> timestamp = base::ValueToTime(
+-        entry.GetDict().Find(kPermissionActionEntryTimestampKey));
+-    return !timestamp || *timestamp < cutoff;
+-  });
+-
+-  // Record the new permission action.
+-  base::DictValue new_action_attributes;
+-  new_action_attributes.Set(kPermissionActionEntryTimestampKey,
+-                            base::TimeToValue(base::Time::Now()));
+-  new_action_attributes.Set(kPermissionActionEntryActionKey,
+-                            static_cast<int>(action));
+-  new_action_attributes.Set(kPermissionActionEntryPromptDispositionKey,
+-                            static_cast<int>(prompt_disposition));
+-  permission_actions->Append(std::move(new_action_attributes));
+-}
++    PermissionPromptDisposition prompt_disposition) {}
+ 
+ void PermissionActionsHistory::ClearHistory(const base::Time& delete_begin,
+-                                            const base::Time& delete_end) {
+-  DCHECK(!delete_end.is_null());
+-  if (delete_begin.is_null() && delete_end.is_max()) {
+-    pref_service_->ClearPref(prefs::kPermissionActions);
+-    return;
+-  }
+-
+-  ScopedDictPrefUpdate update(pref_service_, prefs::kPermissionActions);
+-
+-  for (auto permission_entry : update.Get()) {
+-    permission_entry.second.GetList().EraseIf([delete_begin,
+-                                               delete_end](const auto& entry) {
+-      const std::optional<base::Time> timestamp = base::ValueToTime(
+-          entry.GetDict().Find(kPermissionActionEntryTimestampKey));
+-      return (!timestamp ||
+-              (*timestamp >= delete_begin && *timestamp < delete_end));
+-    });
+-  }
+-}
++                                            const base::Time& delete_end) {}
+ 
+ bool PermissionActionsHistory::RecordTemporaryGrant(
+     const GURL& url,
+@@ -319,49 +249,7 @@
+ PermissionActionsHistory::GetHistoryInternal(const base::Time& begin,
+                                              const std::string& key,
+                                              EntryFilter entry_filter) {
+-  const base::ListValue* permission_actions =
+-      pref_service_->GetDict(prefs::kPermissionActions).FindList(key);
+-
+-  if (!permission_actions)
+-    return {};
+-
+-  std::vector<Entry> matching_actions;
+-
+-  for (const auto& entry : *permission_actions) {
+-    const base::DictValue& entry_dict = entry.GetDict();
+-    const std::optional<base::Time> timestamp =
+-        base::ValueToTime(entry_dict.Find(kPermissionActionEntryTimestampKey));
+-
+-    if (timestamp < begin)
+-      continue;
+-
+-    if (entry_filter != EntryFilter::WANT_ALL_PROMPTS) {
+-      // If we want either the Loud or Quiet UI actions but don't have this
+-      // info due to legacy reasons we ignore the entry.
+-      const std::optional<int> prompt_disposition_int =
+-          entry_dict.FindInt(kPermissionActionEntryPromptDispositionKey);
+-      if (!prompt_disposition_int)
+-        continue;
+-
+-      const PermissionPromptDisposition prompt_disposition =
+-          static_cast<PermissionPromptDisposition>(*prompt_disposition_int);
+-
+-      if (entry_filter == EntryFilter::WANT_LOUD_PROMPTS_ONLY &&
+-          !PermissionUmaUtil::IsPromptDispositionLoud(prompt_disposition)) {
+-        continue;
+-      }
+-
+-      if (entry_filter == EntryFilter::WANT_QUIET_PROMPTS_ONLY &&
+-          !PermissionUmaUtil::IsPromptDispositionQuiet(prompt_disposition)) {
+-        continue;
+-      }
+-    }
+-    const PermissionAction past_action = static_cast<PermissionAction>(
+-        *(entry_dict.FindInt(kPermissionActionEntryActionKey)));
+-    matching_actions.emplace_back(
+-        PermissionActionsHistory::Entry{past_action, timestamp.value()});
+-  }
+-  return matching_actions;
++  return {};
+ }
+ 
+ void PermissionActionsHistory::NotifyAutoGrantedHeuristically(
+diff --git a/components/omnibox/browser/omnibox_prefs.cc b/components/omnibox/browser/omnibox_prefs.cc
+--- a/components/omnibox/browser/omnibox_prefs.cc
++++ b/components/omnibox/browser/omnibox_prefs.cc
+@@ -65,42 +65,13 @@
+ void SetUserPreferenceForZeroSuggestCachedResponse(PrefService* prefs,
+                                                    const std::string& page_url,
+                                                    const std::string& response,
+-                                                   bool is_composebox) {
+-  DCHECK(prefs);
+-
+-  if (is_composebox) {
+-    prefs->SetString(omnibox::kZeroSuggestCachedResultsComposebox, response);
+-    return;
+-  }
+-
+-  if (page_url.empty()) {
+-    prefs->SetString(kZeroSuggestCachedResults, response);
+-  } else {
+-    // Constrain the cache to a single entry by overwriting the existing value.
+-    base::DictValue new_dict;
+-    new_dict.Set(page_url, response);
+-    prefs->SetDict(kZeroSuggestCachedResultsWithURL, std::move(new_dict));
+-  }
+-}
++                                                   bool is_composebox) {}
+ 
+ std::string GetUserPreferenceForZeroSuggestCachedResponse(
+     PrefService* prefs,
+     const std::string& page_url,
+     bool is_composebox) {
+-  DCHECK(prefs);
+-
+-  if (is_composebox) {
+-    return prefs->GetString(omnibox::kZeroSuggestCachedResultsComposebox);
+-  }
+-
+-  if (page_url.empty()) {
+-    return prefs->GetString(omnibox::kZeroSuggestCachedResults);
+-  }
+-
+-  const base::DictValue& dictionary =
+-      prefs->GetDict(omnibox::kZeroSuggestCachedResultsWithURL);
+-  auto* value_ptr = dictionary.FindString(page_url);
+-  return value_ptr ? *value_ptr : std::string();
++  return {};
+ }
+ 
+ }  // namespace omnibox
+diff --git a/components/omnibox/browser/zero_suggest_cache_service.cc b/components/omnibox/browser/zero_suggest_cache_service.cc
+--- a/components/omnibox/browser/zero_suggest_cache_service.cc
++++ b/components/omnibox/browser/zero_suggest_cache_service.cc
+@@ -54,12 +54,7 @@
+   }
+ }
+ 
+-void ZeroSuggestCacheService::ClearCache() {
+-  // Clear user prefs used for cross-session persistence.
+-  prefs_->SetString(omnibox::kZeroSuggestCachedResults, "");
+-  prefs_->SetDict(omnibox::kZeroSuggestCachedResultsWithURL, base::DictValue());
+-  prefs_->SetString(omnibox::kZeroSuggestCachedResultsComposebox, "");
+-}
++void ZeroSuggestCacheService::ClearCache() {}
+ 
+ void ZeroSuggestCacheService::AddObserver(Observer* observer) {
+   observers_.AddObserver(observer);
+diff --git a/components/site_isolation/site_isolation_policy.cc b/components/site_isolation/site_isolation_policy.cc
+--- a/components/site_isolation/site_isolation_policy.cc
++++ b/components/site_isolation/site_isolation_policy.cc
+@@ -269,145 +269,21 @@
+ void SiteIsolationPolicy::PersistIsolatedOrigin(
+     content::BrowserContext* context,
+     const url::Origin& origin,
+-    IsolatedOriginSource source) {
+-  DCHECK(context);
+-  DCHECK(!context->IsOffTheRecord());
+-  DCHECK(!origin.opaque());
+-
+-  // This function currently supports two sources for persistence, for
+-  // user-triggered and web-triggered isolated origins.
+-  if (source == IsolatedOriginSource::USER_TRIGGERED) {
+-    PersistUserTriggeredIsolatedOrigin(context, origin);
+-  } else if (source == IsolatedOriginSource::WEB_TRIGGERED) {
+-    PersistWebTriggeredIsolatedOrigin(context, origin);
+-  } else {
+-    NOTREACHED();
+-  }
+-}
++    IsolatedOriginSource source) {}
+ 
+ // static
+ void SiteIsolationPolicy::PersistUserTriggeredIsolatedOrigin(
+     content::BrowserContext* context,
+-    const url::Origin& origin) {
+-  // User-triggered isolated origins are currently stored in a simple list of
+-  // unlimited size.
+-  // TODO(alexmos): Cap the maximum number of entries and evict older entries.
+-  // See https://crbug.com/1172407.
+-  ScopedListPrefUpdate update(
+-      user_prefs::UserPrefs::Get(context),
+-      site_isolation::prefs::kUserTriggeredIsolatedOrigins);
+-  base::ListValue& list = update.Get();
+-  std::string value(origin.Serialize());
+-  if (!list.contains(value)) {
+-    list.Append(value);
+-  }
+-}
++    const url::Origin& origin) {}
+ 
+ // static
+ void SiteIsolationPolicy::PersistWebTriggeredIsolatedOrigin(
+     content::BrowserContext* context,
+-    const url::Origin& origin) {
+-  // Web-triggered isolated origins are stored in a dictionary of (origin,
+-  // timestamp) pairs.  The number of entries is capped by a field trial param,
+-  // and older entries are evicted.
+-  ScopedDictPrefUpdate update(
+-      user_prefs::UserPrefs::Get(context),
+-      site_isolation::prefs::kWebTriggeredIsolatedOrigins);
+-  base::DictValue& dict = update.Get();
+-
+-  // Add the origin.  If it already exists, this will just update the
+-  // timestamp.
+-  dict.Set(origin.Serialize(), base::TimeToValue(base::Time::Now()));
+-
+-  // Check whether the maximum number of stored sites was exceeded and remove
+-  // one or more entries, starting with the oldest timestamp. Note that more
+-  // than one entry may need to be removed, since the maximum number of entries
+-  // could change over time (via a change in the field trial param).
+-  size_t max_size =
+-      ::features::kSiteIsolationForCrossOriginOpenerPolicyMaxSitesParam.Get();
+-  while (dict.size() > max_size) {
+-    auto oldest_site_time_pair = std::min_element(
+-        dict.begin(), dict.end(), [](auto pair_a, auto pair_b) {
+-          std::optional<base::Time> time_a = base::ValueToTime(pair_a.second);
+-          std::optional<base::Time> time_b = base::ValueToTime(pair_b.second);
+-          // has_value() should always be true unless the prefs were corrupted.
+-          // In that case, prioritize the corrupted entry for removal.
+-          return (time_a.has_value() ? time_a.value() : base::Time::Min()) <
+-                 (time_b.has_value() ? time_b.value() : base::Time::Min());
+-        });
+-    dict.erase(oldest_site_time_pair);
+-  }
+-}
++    const url::Origin& origin) {}
+ 
+ // static
+ void SiteIsolationPolicy::ApplyPersistedIsolatedOrigins(
+-    content::BrowserContext* browser_context) {
+-  auto* policy = content::ChildProcessSecurityPolicy::GetInstance();
+-
+-  // If the user turned off password-triggered isolation, don't apply any
+-  // stored isolated origins, but also don't clear them from prefs, so that
+-  // they can be used if password-triggered isolation is re-enabled later.
+-  if (IsIsolationForPasswordSitesEnabled()) {
+-    std::vector<url::Origin> origins;
+-    for (const auto& value :
+-         user_prefs::UserPrefs::Get(browser_context)
+-             ->GetList(prefs::kUserTriggeredIsolatedOrigins)) {
+-      origins.push_back(url::Origin::Create(GURL(value.GetString())));
+-    }
+-
+-    if (!origins.empty()) {
+-      policy->AddFutureIsolatedOrigins(
+-          origins, IsolatedOriginSource::USER_TRIGGERED, browser_context);
+-    }
+-
+-    base::UmaHistogramCounts1000(
+-        "SiteIsolation.SavedUserTriggeredIsolatedOrigins.Size", origins.size());
+-  }
+-
+-  // Similarly, load saved web-triggered isolated origins only if isolation of
+-  // COOP sites (currently the only source of these origins) is enabled with
+-  // persistence, but don't remove them from prefs otherwise.
+-  if (content::SiteIsolationPolicy::ShouldPersistIsolatedCOOPSites()) {
+-    std::vector<url::Origin> origins;
+-    std::vector<std::string> expired_entries;
+-
+-    auto* pref_service = user_prefs::UserPrefs::Get(browser_context);
+-    const auto& dict =
+-        pref_service->GetDict(prefs::kWebTriggeredIsolatedOrigins);
+-    for (auto site_time_pair : dict) {
+-      // Only isolate origins that haven't expired.
+-      std::optional<base::Time> timestamp =
+-          base::ValueToTime(site_time_pair.second);
+-      base::TimeDelta expiration_timeout =
+-          ::features::
+-              kSiteIsolationForCrossOriginOpenerPolicyExpirationTimeoutParam
+-                  .Get();
+-      if (timestamp.has_value() &&
+-          base::Time::Now() - timestamp.value() <= expiration_timeout) {
+-        origins.push_back(url::Origin::Create(GURL(site_time_pair.first)));
+-      } else {
+-        expired_entries.push_back(site_time_pair.first);
+-      }
+-    }
+-    // Remove expired entries (as well as those with an invalid timestamp).
+-    if (!expired_entries.empty()) {
+-      ScopedDictPrefUpdate update(pref_service,
+-                                  prefs::kWebTriggeredIsolatedOrigins);
+-      base::DictValue& updated_dict = update.Get();
+-      for (const auto& entry : expired_entries) {
+-        updated_dict.Remove(entry);
+-      }
+-    }
+-
+-    if (!origins.empty()) {
+-      policy->AddFutureIsolatedOrigins(
+-          origins, IsolatedOriginSource::WEB_TRIGGERED, browser_context);
+-    }
+-
+-    base::UmaHistogramCounts100(
+-        "SiteIsolation.SavedWebTriggeredIsolatedOrigins.Size", origins.size());
+-  }
+-}
++    content::BrowserContext* browser_context) {}
+ 
+ // static
+ void SiteIsolationPolicy::IsolateStoredOAuthSites(
+diff --git a/chrome/browser/login_detection/login_detection_prefs.cc b/chrome/browser/login_detection/login_detection_prefs.cc
+--- a/chrome/browser/login_detection/login_detection_prefs.cc
++++ b/chrome/browser/login_detection/login_detection_prefs.cc
+@@ -34,54 +34,16 @@
+   registry->RegisterDictionaryPref(kOAuthSignedInSitesPref);
+ }
+ 
+-void RemoveLoginDetectionData(PrefService* prefs) {
+-  prefs->ClearPref(kOAuthSignedInSitesPref);
+-}
++void RemoveLoginDetectionData(PrefService* prefs) {}
+ 
+-void SaveSiteToOAuthSignedInList(PrefService* pref_service, const GURL& url) {
+-  ScopedDictPrefUpdate update(pref_service, kOAuthSignedInSitesPref);
+-  base::DictValue& dict = update.Get();
+-  dict.Set(GetSiteNameForURL(url), base::TimeToValue(base::Time::Now()));
+-
+-  // Try making space by removing sites having invalid sign-in time. This should
+-  // not happen unless the pref is corrupt somehow.
+-  if (dict.size() > GetOauthLoggedInSitesMaxSize()) {
+-    std::vector<std::string> invalid_sites;
+-    for (auto site_entry : dict) {
+-      if (!base::ValueToTime(site_entry.second))
+-        invalid_sites.push_back(site_entry.first);
+-    }
+-    for (const auto& invalid_site : invalid_sites)
+-      dict.Remove(invalid_site);
+-  }
+-
+-  // Limit the dict to its allowed max size, by removing the site entries which
+-  // are signed-in the earliest.
+-  while (dict.size() > GetOauthLoggedInSitesMaxSize()) {
+-    // Holds the pair of site name, its last login time for the site that was
+-    // least recently signed-in to be removed.
+-    std::optional<std::pair<std::string, base::Time>> site_entry_to_remove;
+-    for (auto site_entry : dict) {
+-      base::Time signin_time = *base::ValueToTime(site_entry.second);
+-      if (!site_entry_to_remove || signin_time < site_entry_to_remove->second) {
+-        site_entry_to_remove = std::make_pair(site_entry.first, signin_time);
+-      }
+-    }
+-    dict.Remove(site_entry_to_remove->first);
+-  }
+-}
++void SaveSiteToOAuthSignedInList(PrefService* pref_service, const GURL& url) {}
+ 
+ bool IsSiteInOAuthSignedInList(PrefService* pref_service, const GURL& url) {
+-  return pref_service->GetDict(kOAuthSignedInSitesPref)
+-      .contains(GetSiteNameForURL(url));
++  return false;
+ }
+ 
+ std::vector<url::Origin> GetOAuthSignedInSites(PrefService* pref_service) {
+-  std::vector<url::Origin> sites;
+-  for (const auto site_entry : pref_service->GetDict(kOAuthSignedInSitesPref)) {
+-    sites.push_back(url::Origin::Create(GURL(site_entry.first)));
+-  }
+-  return sites;
++  return {};
+ }
+ 
+ }  // namespace prefs
+diff --git a/services/network/network_context.cc b/services/network/network_context.cc
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -1235,27 +1235,7 @@
+ 
+ void NetworkContext::GetTrustTokenQueryAnswerer(
+     mojo::PendingReceiver<mojom::TrustTokenQueryAnswerer> receiver,
+-    const url::Origin& top_frame_origin) {
+-  // Only called when Trust Tokens is enabled, i.e. trust_token_store_ is
+-  // non-null.
+-  DCHECK(trust_token_store_);
+-  DCHECK(network_service_);
+-
+-  std::optional<SuitableTrustTokenOrigin> suitable_top_frame_origin =
+-      SuitableTrustTokenOrigin::Create(top_frame_origin);
+-
+-  const SynchronousTrustTokenKeyCommitmentGetter* const key_commitment_getter =
+-      network_service_->trust_token_key_commitments();
+-
+-  // It's safe to dereference |suitable_top_frame_origin| here as, during the
+-  // process of vending the TrustTokenQueryAnswerer, the browser ensures that
+-  // the requesting context's top frame origin is suitable for Trust Tokens.
+-  auto answerer = std::make_unique<TrustTokenQueryAnswerer>(
+-      std::move(*suitable_top_frame_origin), trust_token_store_.get(),
+-      key_commitment_getter);
+-
+-  trust_token_query_answerers_.Add(std::move(answerer), std::move(receiver));
+-}
++    const url::Origin& top_frame_origin) {}
+ 
+ void NetworkContext::GetStoredTrustTokenCounts(
+     GetStoredTrustTokenCountsCallback callback) {
+@@ -1330,7 +1310,7 @@
+ }
+ 
+ void NetworkContext::SetBlockTrustTokens(bool block) {
+-  block_trust_tokens_ = block;
++  block_trust_tokens_ = true;
+ }
+ 
+ void NetworkContext::OnProxyLookupComplete(
+@@ -1429,30 +1409,7 @@
+ 
+ void NetworkContext::ClearTrustTokenSessionOnlyData(
+     ClearTrustTokenSessionOnlyDataCallback callback) {
+-  // Only called when Private State Tokens is enabled, i.e.,
+-  // `trust_token_store_` is non-null.
+-  DCHECK(trust_token_store_);
+-  DCHECK(cookie_manager_);
+-
+-  DeleteCookiePredicate cookie_predicate =
+-      cookie_manager_->cookie_settings().CreateDeleteCookieOnExitPredicate();
+-  if (!cookie_predicate) {
+-    std::move(callback).Run(false);
+-    return;
+-  }
+-
+-  auto store_predicate = base::BindRepeating(
+-      [](DeleteCookiePredicate predicate, const std::string& origin) {
+-        return predicate.Run(origin, net::CookieSourceScheme::kSecure);
+-      },
+-      std::move(cookie_predicate));
+-  trust_token_store_->ExecuteOrEnqueue(base::BindOnce(
+-      [](base::RepeatingCallback<bool(const std::string&)> pred,
+-         ClearTrustTokenSessionOnlyDataCallback cb, TrustTokenStore* store) {
+-        bool any_data_deleted = store->ClearDataForPredicate(std::move(pred));
+-        std::move(cb).Run(any_data_deleted);
+-      },
+-      std::move(store_predicate), std::move(callback)));
++  std::move(callback).Run(false);
+ }
+ 
+ void NetworkContext::ClearNetworkingHistoryBetween(
+@@ -3105,27 +3062,6 @@
+     builder.set_network_quality_estimator(
+         network_service_->network_quality_estimator());
+   }
+-  trust_token_store_ = std::make_unique<PendingTrustTokenStore>();
+-
+-  base::FilePath trust_token_path;
+-  if (GetFullDataFilePath(
+-          params_->file_paths,
+-          &network::mojom::NetworkContextFilePaths::trust_token_database_name,
+-          trust_token_path)) {
+-    SQLiteTrustTokenPersister::CreateForFilePath(
+-        base::ThreadPool::CreateSequencedTaskRunner(
+-            {base::MayBlock(), kTrustTokenDatabaseTaskPriority,
+-             base::TaskShutdownBehavior::BLOCK_SHUTDOWN}),
+-        trust_token_path, kTrustTokenWriteBufferingWindow,
+-        base::BindOnce(&NetworkContext::FinishConstructingTrustTokenStore,
+-                       weak_factory_.GetWeakPtr()));
+-  } else {
+-    trust_token_store_->OnStoreReady(std::make_unique<TrustTokenStore>(
+-        std::make_unique<InMemoryTrustTokenPersister>(),
+-        std::make_unique<ExpiryInspectingRecordExpiryDelegate>(
+-            network_service()->trust_token_key_commitments())));
+-  }
+-
+   std::unique_ptr<net::StaticHttpUserAgentSettings> user_agent_settings =
+       std::make_unique<net::StaticHttpUserAgentSettings>(
+           params_->accept_language, params_->user_agent);
+diff --git a/services/network/url_loader_factory.cc b/services/network/url_loader_factory.cc
+--- a/services/network/url_loader_factory.cc
++++ b/services/network/url_loader_factory.cc
+@@ -213,6 +213,17 @@
+                        ? resource_request.trusted_params->alloy_download_owner : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
++    if (sync_client) {
++      sync_client->OnComplete(status);
++    } else {
++      mojo::Remote<mojom::URLLoaderClient>(std::move(client))
++          ->OnComplete(status);
++    }
++    return;
++  }
++
++  if (resource_request.trust_token_params) {
++    URLLoaderCompletionStatus status(net::ERR_TRUST_TOKEN_OPERATION_FAILED);
+     if (sync_client) {
+       sync_client->OnComplete(status);
+     } else {
+diff --git a/chrome/browser/safe_browsing/services_delegate_desktop.cc b/chrome/browser/safe_browsing/services_delegate_desktop.cc
+--- a/chrome/browser/safe_browsing/services_delegate_desktop.cc
++++ b/chrome/browser/safe_browsing/services_delegate_desktop.cc
+@@ -107,21 +107,14 @@
+ 
+ std::unique_ptr<prefs::mojom::TrackedPreferenceValidationDelegate>
+ ServicesDelegateDesktop::CreatePreferenceValidationDelegate(Profile* profile) {
+-  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  return incident_service_->CreatePreferenceValidationDelegate(profile);
++  return nullptr;
+ }
+ 
+ void ServicesDelegateDesktop::RegisterDelayedAnalysisCallback(
+-    DelayedAnalysisCallback callback) {
+-  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  incident_service_->RegisterDelayedAnalysisCallback(std::move(callback));
+-}
++    DelayedAnalysisCallback callback) {}
+ 
+ void ServicesDelegateDesktop::AddDownloadManager(
+-    content::DownloadManager* download_manager) {
+-  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  incident_service_->AddDownloadManager(download_manager);
+-}
++    content::DownloadManager* download_manager) {}
+ 
+ DownloadProtectionService* ServicesDelegateDesktop::GetDownloadService() {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+@@ -148,7 +141,7 @@
+ 
+ IncidentReportingService*
+ ServicesDelegateDesktop::CreateIncidentReportingService() {
+-  return new IncidentReportingService(safe_browsing_service_);
++  return nullptr;
+ }
+ 
+ void ServicesDelegateDesktop::StartOnUIThread(
+diff --git a/chrome/browser/segmentation_platform/segmentation_platform_service_factory.cc b/chrome/browser/segmentation_platform/segmentation_platform_service_factory.cc
+--- a/chrome/browser/segmentation_platform/segmentation_platform_service_factory.cc
++++ b/chrome/browser/segmentation_platform/segmentation_platform_service_factory.cc
+@@ -52,56 +52,8 @@
+ 
+ namespace segmentation_platform {
+ namespace {
+-const char kSegmentationPlatformProfileObserverKey[] =
+-    "segmentation_platform_profile_observer";
+-const char kSegmentationDeviceSwitcherUserDataKey[] =
+-    "segmentation_device_switcher_data";
+-const char kSegmentationTabRankDispatcherUserDataKey[] =
+-    "segmentation_tab_rank_dispatcher_data";
+ const char kSegmentationHomeModulesCardRegistryDataKey[] =
+     "segmentation_home_modules_card_registry";
+-
+-std::unique_ptr<processing::InputDelegateHolder> SetUpInputDelegates(
+-    std::vector<std::unique_ptr<Config>>& configs,
+-    sync_sessions::SessionSyncService* session_sync_service,
+-    TabFetcher* tab_fetcher) {
+-  auto input_delegate_holder =
+-      std::make_unique<processing::InputDelegateHolder>();
+-  for (auto& config : configs) {
+-    for (auto& id : config->input_delegates) {
+-      input_delegate_holder->SetDelegate(id.first, std::move(id.second));
+-    }
+-  }
+-
+-  input_delegate_holder->SetDelegate(
+-      proto::CustomInput::FILL_TAB_METRICS,
+-      std::make_unique<segmentation_platform::processing::LocalTabSource>(
+-          session_sync_service, tab_fetcher));
+-
+-  // Input delegates that are shared by multiple models.are added here.
+-
+-  return input_delegate_holder;
+-}
+-
+-void InitTabDataCollection(
+-    SegmentationPlatformService* service,
+-    sync_sessions::SessionSyncService* session_sync_service,
+-    std::unique_ptr<TabFetcher> tab_fetcher) {
+-  auto rank_dispatcher = std::make_unique<TabRankDispatcher>(
+-      service, session_sync_service, std::move(tab_fetcher));
+-  service->SetUserData(kSegmentationTabRankDispatcherUserDataKey,
+-                       std::move(rank_dispatcher));
+-}
+-
+-void InitializeUkmDatabaseIfNeeded(Profile* profile) {
+-  // The client is initialized in
+-  // `ChromeBrowserMainExtraPartsSegmentationPlatform::PreProfileInit()` for
+-  // production scenarios. But unit tests do not initialize the browser process,
+-  // so this code path initializes the UKM client. Use in-memory since only
+-  // tests should use this path.
+-  UkmDatabaseClientHolder::GetClientInstance(profile).PreProfileInit(
+-      /*in_memory_database=*/true);
+-}
+ 
+ }  // namespace
+ 
+@@ -130,15 +82,7 @@
+               // TODO(crbug.com/41488885): Check if this service is needed for
+               // Ash Internals.
+               .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
+-  DependsOn(
+-      OptimizationGuideGlobalStateHolderKeyedServiceFactory::GetInstance());
+-  DependsOn(HistoryServiceFactory::GetInstance());
+-  DependsOn(DeviceInfoSyncServiceFactory::GetInstance());
+-  DependsOn(SyncServiceFactory::GetInstance());
+-  DependsOn(SessionSyncServiceFactory::GetInstance());
+-  DependsOn(commerce::ShoppingServiceFactory::GetInstance());
+-}
++              .Build()) {}
+ 
+ SegmentationPlatformServiceFactory::~SegmentationPlatformServiceFactory() =
+     default;
+@@ -151,103 +95,7 @@
+ std::unique_ptr<KeyedService>
+ SegmentationPlatformServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  if (context->IsOffTheRecord())
+-    return nullptr;
+-
+-  if (!base::FeatureList::IsEnabled(features::kSegmentationPlatformFeature))
+-    return std::make_unique<DummySegmentationPlatformService>();
+-
+-  Profile* profile = Profile::FromBrowserContext(context);
+-  auto* global_state_holder =
+-      OptimizationGuideGlobalStateHolderKeyedServiceFactory::GetForProfile(
+-          profile);
+-  optimization_guide::OptimizationGuideModelProvider* optimization_guide =
+-      global_state_holder
+-          ? &global_state_holder->GetGlobalState().model_provider()
+-          : nullptr;
+-  sync_sessions::SessionSyncService* session_sync_service =
+-      SessionSyncServiceFactory::GetForProfile(profile);
+-  auto tab_fetcher = std::make_unique<processing::LocalTabHandler>(
+-      session_sync_service, profile);
+-  auto home_modules_card_registry =
+-      home_modules::HomeModulesCardRegistry::Create(
+-          profile->GetPrefs(), g_browser_process->local_state());
+-
+-  InitializeUkmDatabaseIfNeeded(profile);
+-
+-  auto params = std::make_unique<SegmentationPlatformServiceImpl::InitParams>();
+-  auto profile_path = profile->GetPath().value();
+-  params->profile_id = base::NumberToString(
+-      base::PersistentHash(base::as_byte_span(profile_path)));
+-  params->history_service = HistoryServiceFactory::GetForProfile(
+-      profile, ServiceAccessType::IMPLICIT_ACCESS);
+-  params->task_runner = base::ThreadPool::CreateSequencedTaskRunner(
+-      {base::MayBlock(), base::TaskPriority::USER_VISIBLE});
+-  params->storage_dir =
+-      profile->GetPath().Append(chrome::kSegmentationPlatformStorageDirName);
+-  params->db_provider =
+-      profile->GetDefaultStoragePartition()->GetProtoDatabaseProvider();
+-  params->clock = base::DefaultClock::GetInstance();
+-
+-  params->ukm_data_manager =
+-      UkmDatabaseClientHolder::GetClientInstance(profile).GetUkmDataManager();
+-  params->profile_prefs = profile->GetPrefs();
+-  params->configs =
+-      GetSegmentationPlatformConfig(context, home_modules_card_registry.get());
+-  params->input_delegate_holder = SetUpInputDelegates(
+-      params->configs, session_sync_service, tab_fetcher.get());
+-  params->field_trial_register = std::make_unique<FieldTrialRegisterImpl>();
+-  raw_ptr<FieldTrialRegister> field_trial_register =
+-      params->field_trial_register.get();
+-  params->model_provider = std::make_unique<ModelProviderFactoryImpl>(
+-      optimization_guide, params->configs, params->task_runner);
+-  // Guaranteed to outlive the SegmentationPlatformService, which depends on the
+-  // DeviceInfoSynceService.
+-  params->device_info_tracker =
+-      DeviceInfoSyncServiceFactory::GetForProfile(profile)
+-          ->GetDeviceInfoTracker();
+-
+-  // Set up Shopping Service input delegate.
+-  auto shopping_service_callback = base::BindRepeating(
+-      [](base::WeakPtr<content::BrowserContext> context) -> ShoppingService* {
+-        content::BrowserContext* context_ptr = context.get();
+-        if (!context_ptr) {
+-          return nullptr;
+-        }
+-        return commerce::ShoppingServiceFactory::GetForBrowserContext(
+-            context_ptr);
+-      },
+-      context->GetWeakPtr());
+-
+-  params->input_delegate_holder->SetDelegate(
+-      proto::CustomInput::FILL_FROM_SHOPPING_SERVICE,
+-      std::make_unique<ShoppingServiceInputDelegate>(
+-          shopping_service_callback));
+-
+-  std::unique_ptr<SegmentationPlatformServiceImpl> service =
+-      std::make_unique<SegmentationPlatformServiceImpl>(std::move(params));
+-
+-  // Profile manager can be null in unit tests.
+-  if (g_browser_process->profile_manager()) {
+-    service->SetUserData(
+-        kSegmentationPlatformProfileObserverKey,
+-        std::make_unique<SegmentationPlatformProfileObserver>(
+-            service.get(), g_browser_process->profile_manager()));
+-  }
+-  service->SetUserData(kSegmentationDeviceSwitcherUserDataKey,
+-                       std::make_unique<DeviceSwitcherResultDispatcher>(
+-                           service.get(),
+-                           DeviceInfoSyncServiceFactory::GetForProfile(profile)
+-                               ->GetDeviceInfoTracker(),
+-                           profile->GetPrefs(), field_trial_register));
+-
+-  service->SetUserData(kSegmentationHomeModulesCardRegistryDataKey,
+-                       std::move(home_modules_card_registry));
+-
+-  InitTabDataCollection(service.get(), session_sync_service,
+-                        std::move(tab_fetcher));
+-
+-  return service;
++  return std::make_unique<DummySegmentationPlatformService>();
+ }
+ 
+ // static
+diff --git a/chrome/browser/feature_engagement/tracker_factory.cc b/chrome/browser/feature_engagement/tracker_factory.cc
+--- a/chrome/browser/feature_engagement/tracker_factory.cc
++++ b/chrome/browser/feature_engagement/tracker_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/feature_engagement/tracker_factory.h"
+ 
+ #include "base/files/file_path.h"
++#include "base/functional/bind.h"
+ #include "base/no_destructor.h"
+ #include "base/path_service.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -30,6 +31,109 @@
+ #endif
+ 
+ namespace feature_engagement {
++namespace {
++// Stateless UI facade: no event models, database provider or retained events.
++class NoActivityConfiguration final : public Configuration {
++ public:
++  bool HasFeatureConfig(const base::Feature&) const override { return false; }
++  const FeatureConfig& GetFeatureConfig(const base::Feature&) const override {
++    return feature_;
++  }
++  const FeatureConfig& GetFeatureConfigByName(
++      const std::string&) const override {
++    return feature_;
++  }
++  const ConfigMap& GetRegisteredFeatureConfigs() const override {
++    return features_;
++  }
++  const std::vector<std::string> GetRegisteredFeatures() const override {
++    return names_;
++  }
++  const GroupConfig& GetGroupConfig(const base::Feature&) const override {
++    return group_;
++  }
++  const GroupConfig& GetGroupConfigByName(const std::string&) const override {
++    return group_;
++  }
++  const GroupConfigMap& GetRegisteredGroupConfigs() const override {
++    return groups_;
++  }
++  const std::vector<std::string> GetRegisteredGroups() const override {
++    return names_;
++  }
++#if BUILDFLAG(IS_CHROMEOS)
++  void UpdateConfig(const base::Feature&,
++                    const ConfigurationProvider*) override {}
++  const EventPrefixSet& GetRegisteredAllowedEventPrefixes() const override {
++    return prefixes_;
++  }
++#endif
++
++ private:
++  const FeatureConfig feature_;
++  const GroupConfig group_;
++  const ConfigMap features_;
++  const GroupConfigMap groups_;
++  const std::vector<std::string> names_;
++#if BUILDFLAG(IS_CHROMEOS)
++  const EventPrefixSet prefixes_;
++#endif
++};
++
++class NoActivityTracker final : public Tracker {
++ public:
++  void NotifyEvent(const std::string&) override {}
++#if !BUILDFLAG(IS_ANDROID)
++  void NotifyUsedEvent(const base::Feature&) override {}
++  EventList ListEvents(const base::Feature&) const override { return {}; }
++  void ClearEventData(const base::Feature&) override {}
++#endif
++  bool ShouldTriggerHelpUI(const base::Feature&) override { return false; }
++  TriggerDetails ShouldTriggerHelpUIWithSnooze(const base::Feature&) override {
++    return TriggerDetails(false, false);
++  }
++  bool WouldTriggerHelpUI(const base::Feature&) const override { return false; }
++  bool HasEverTriggered(const base::Feature&, bool) const override {
++    return false;
++  }
++  TriggerState GetTriggerState(const base::Feature&) const override {
++    return TriggerState::NOT_READY;
++  }
++  void Dismissed(const base::Feature&) override {}
++  void DismissedWithSnooze(const base::Feature&,
++                           std::optional<SnoozeAction>) override {}
++  std::unique_ptr<DisplayLockHandle> AcquireDisplayLock() override {
++    return nullptr;
++  }
++  void SetPriorityNotification(const base::Feature&) override {}
++  std::optional<std::string> GetPendingPriorityNotification() override {
++    return std::nullopt;
++  }
++  void RegisterPriorityNotificationHandler(const base::Feature&,
++                                           base::OnceClosure) override {}
++  void UnregisterPriorityNotificationHandler(const base::Feature&) override {}
++  bool IsInitialized() const override { return false; }
++  void AddOnInitializedCallback(OnInitializedCallback callback) override {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), false));
++  }
++#if BUILDFLAG(IS_CHROMEOS)
++  void UpdateConfig(const base::Feature&,
++                    const ConfigurationProvider*) override {}
++#endif
++  void SetClockForTesting(const base::Clock&, base::Time) override {}
++  bool IsInFeatureTestMode() const override { return false; }
++
++ protected:
++  const Configuration* GetConfiguration() const override {
++    return &configuration_;
++  }
++
++ private:
++  const NoActivityConfiguration configuration_;
++};
++
++}  // namespace
+ 
+ // static
+ TrackerFactory* TrackerFactory::GetInstance() {
+@@ -66,36 +170,7 @@
+ std::unique_ptr<KeyedService>
+ TrackerFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  Profile* profile = Profile::FromBrowserContext(context);
+-
+-  scoped_refptr<base::SequencedTaskRunner> background_task_runner =
+-      base::ThreadPool::CreateSequencedTaskRunner(
+-          {base::MayBlock(), base::TaskPriority::BEST_EFFORT});
+-
+-  base::FilePath storage_dir = profile->GetPath().Append(
+-      chrome::kFeatureEngagementTrackerStorageDirname);
+-
+-  base::FilePath device_storage_dir;
+-  base::PathService::Get(chrome::DIR_USER_DATA, &device_storage_dir);
+-  device_storage_dir = device_storage_dir.Append(
+-      chrome::kFeatureEngagementTrackerStorageDirname);
+-
+-  leveldb_proto::ProtoDatabaseProvider* db_provider =
+-      profile->GetDefaultStoragePartition()->GetProtoDatabaseProvider();
+-  auto providers =
+-      feature_engagement::Tracker::GetDefaultConfigurationProviders();
+-#if !BUILDFLAG(IS_ANDROID)
+-  providers.emplace_back(
+-      std::make_unique<UserEducationConfigurationProvider>());
+-#endif
+-#if BUILDFLAG(IS_CHROMEOS)
+-  providers.emplace_back(
+-      std::make_unique<growth::CampaignsConfigurationProvider>());
+-#endif
+-
+-  return feature_engagement::Tracker::Create(
+-      storage_dir, device_storage_dir, profile->GetPrefs(),
+-      background_task_runner, db_provider, nullptr, std::move(providers));
++  return std::make_unique<NoActivityTracker>();
+ }
+ 
+ }  // namespace feature_engagement
+diff --git a/chrome/browser/user_education/user_education_service.cc b/chrome/browser/user_education/user_education_service.cc
+--- a/chrome/browser/user_education/user_education_service.cc
++++ b/chrome/browser/user_education/user_education_service.cc
+@@ -26,10 +26,64 @@
+ #include "components/user_education/common/user_education_storage_service.h"
+ #include "components/user_education/product_messaging/product_messaging_policy_impl.h"
+ 
++namespace {
++// Keep required UI interfaces without constructing or consulting an activity
++// persistence backend. No values or callbacks are retained by this facade.
++class NoActivityEducationStorage final
++    : public BrowserUserEducationStorageService {
++ public:
++  using BrowserUserEducationStorageService::BrowserUserEducationStorageService;
++  void Reset(const base::Feature&) override {}
++  std::optional<user_education::FeaturePromoData> ReadPromoData(
++      const base::Feature&) const override {
++    return std::nullopt;
++  }
++  void SavePromoData(const base::Feature&,
++                     const user_education::FeaturePromoData&) override {}
++  void ResetSession() override {}
++  user_education::UserEducationSessionData ReadSessionData() const override {
++    return {};
++  }
++  void SaveSessionData(
++      const user_education::UserEducationSessionData&) override {}
++  user_education::FeaturePromoPolicyData ReadPolicyData() const override {
++    return {};
++  }
++  void SavePolicyData(const user_education::FeaturePromoPolicyData&) override {}
++  void ResetPolicy() override {}
++  user_education::NewBadgeData ReadNewBadgeData(
++      const base::Feature&) const override {
++    return {};
++  }
++  void SaveNewBadgeData(const base::Feature&,
++                        const user_education::NewBadgeData&) override {}
++  void ResetNewBadge(const base::Feature&) override {}
++  user_education::ProductMessagingData ReadProductMessagingData()
++      const override {
++    return {};
++  }
++  void SaveProductMessagingData(
++      const user_education::ProductMessagingData&) override {}
++  void ResetProductMessagingData() override {}
++  std::optional<user_education::NtpPromoData> ReadNtpPromoData(
++      const user_education::NtpPromoIdentifier&) const override {
++    return std::nullopt;
++  }
++  void SaveNtpPromoData(const user_education::NtpPromoIdentifier&,
++                        const user_education::NtpPromoData&) override {}
++  void ResetNtpPromoData(const user_education::NtpPromoIdentifier&) override {}
++  // Explicit NTP-promo configuration is not activity; inherit its native
++  // read/save/reset interface for later encrypted profile-settings routing.
++  RecentSessionData ReadRecentSessionData() const override { return {}; }
++  void SaveRecentSessionData(const RecentSessionData&) override {}
++};
++
++}  // namespace
++
+ UserEducationService::UserEducationService(Profile* profile, bool allows_promos)
+     : profile_(*profile),
+       user_education_storage_service_(
+-          std::make_unique<BrowserUserEducationStorageService>(profile)),
++          std::make_unique<NoActivityEducationStorage>(profile)),
+       feature_promo_session_policy_(
+           std::make_unique<user_education::FeaturePromoSessionPolicyV2>()) {
+   feature_promo_session_policy_->Init(&user_education_session_manager_,
+diff --git a/chrome/browser/user_education/browser_user_education_storage_service.cc b/chrome/browser/user_education/browser_user_education_storage_service.cc
+--- a/chrome/browser/user_education/browser_user_education_storage_service.cc
++++ b/chrome/browser/user_education/browser_user_education_storage_service.cc
+@@ -153,10 +153,6 @@
+ }
+ 
+ // Common logic for clearing recent sessions.
+-void ClearRecentSessionData(Profile& profile) {
+-  profile.GetPrefs()->ClearPref(kRecentSessionStartTimesPath);
+-  profile.GetPrefs()->ClearPref(kRecentSessionEnabledTimePath);
+-}
+ 
+ }  // namespace
+ 
+@@ -197,11 +193,7 @@
+ }
+ 
+ // static
+-void BrowserUserEducationStorageService::ClearUsageHistory(Profile* profile) {
+-  // Recent session data stores timestamps of recent sessions in prefs, so
+-  // should be cleared when the user clears their browsing data.
+-  ClearRecentSessionData(*profile);
+-}
++void BrowserUserEducationStorageService::ClearUsageHistory(Profile* profile) {}
+ 
+ void BrowserUserEducationStorageService::Reset(
+     const base::Feature& iph_feature) {
+@@ -579,6 +571,4 @@
+   }
+ }
+ 
+-void BrowserUserEducationStorageService::ResetRecentSessionData() {
+-  ClearRecentSessionData(*profile_);
+-}
++void BrowserUserEducationStorageService::ResetRecentSessionData() {}
+diff --git a/chrome/browser/user_education/user_education_service_factory.cc b/chrome/browser/user_education/user_education_service_factory.cc
+--- a/chrome/browser/user_education/user_education_service_factory.cc
++++ b/chrome/browser/user_education/user_education_service_factory.cc
+@@ -90,73 +90,13 @@
+ UserEducationServiceFactory::BuildServiceInstanceForBrowserContextImpl(
+     content::BrowserContext* context,
+     bool disable_idle_polling) {
+-  Profile* const profile = Profile::FromBrowserContext(context);
+-
+-  // Create the user education service.
+-  auto result = std::make_unique<UserEducationService>(
+-      profile, ProfileAllowsUserEducation(profile));
+-
+-  // Set up the session manager.
+-  result->user_education_session_manager().Init(
+-      &result->user_education_storage_service(),
+-      disable_idle_polling ? std::make_unique<StubIdleObserver>()
+-                           : CreatePollingIdleObserver(),
+-      std::make_unique<user_education::UserEducationIdlePolicy>());
+-
+-  // Install a session observer. This isn't public, since it's self-contained
+-  // and mostly for tracking state.
+-  result->recent_session_observer_ = CreateRecentSessionObserver(*profile);
+-  result->recent_session_observer_->Init(result->recent_session_tracker());
+-
+-  return result;
++  return std::make_unique<UserEducationService>(
++      Profile::FromBrowserContext(context), /*allows_promos=*/false);
+ }
+ 
+ // static
+ bool UserEducationServiceFactory::ProfileAllowsUserEducation(Profile* profile) {
+-#if BUILDFLAG(CHROME_FOR_TESTING)
+-  if (!chrome_for_testing::IsEnableUserEducationUI()) {
+-    return false;
+-  }
+-#endif
+-
+-  // In order to do user education, the browser must have a UI and not be an
+-  // "off-the-record" or in a demo or guest mode.
+-
+-  if (profile->IsPrimaryOTRProfileWithRegularParent() ||
+-      profile->IsGuestSession() || profiles::IsDemoSession() ||
+-      profiles::IsChromeAppKioskSession()) {
+-    return false;
+-  }
+-
+-#if BUILDFLAG(IS_CHROMEOS)
+-  if (chromeos::IsManagedGuestSession()) {
+-    return false;
+-  }
+-#endif
+-
+-  if (headless::IsHeadlessMode()) {
+-    return false;
+-  }
+-
+-  // If `--no-first-run` is enabled and we have not put IPH into test mode, User
+-  // Education is not eligible. (No FRE implies no startup bubbles, which
+-  // precludes any IPH that might show, as it may be used for performance
+-  // testing.)
+-  //
+-  // If IPH is in test mode (all features blocked, or all but a specific feature
+-  // is blocked) then zero or more IPH are under test and all other IPH are
+-  // already blocked. Since tests are no-FRE, not making this additional check
+-  // would break all IPH tests.
+-  const bool no_first_run =
+-      base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kNoFirstRun);
+-  const bool in_feature_test_mode =
+-      feature_engagement::TrackerFactory::GetForBrowserContext(profile)
+-          ->IsInFeatureTestMode();
+-  if (no_first_run && !in_feature_test_mode) {
+-    return false;
+-  }
+-
+-  return true;
++  return false;
+ }
+ 
+ std::unique_ptr<KeyedService>

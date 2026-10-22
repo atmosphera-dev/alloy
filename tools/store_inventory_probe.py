@@ -59,7 +59,9 @@ PATHS = {
     76: ('Web Applications', 'WebAppStore', 'Isolated Web Apps'),
     77: ('Shortcuts',),
     78: ('optimization_guide_model_store', 'OptimizationHints',
-         'optimization_guide_hint_cache_store', 'segmentation_platform',
+         'optimization_guide_hint_cache_store',
+         'segmentation_platform/SegmentInfoDB', 'segmentation_platform/SignalDB',
+         'segmentation_platform/SignalStorageConfigDB',
          'OptGuideOnDeviceModel'),
     80: (),
     81: ('Web Data',),  # Discovered search shares the removed Web Data owner.
@@ -78,8 +80,15 @@ PATHS = {
 # Exact dotted preference names (JSON nests these keys). Empty defaults do not
 # constitute retained activity. Neither reading nor reporting mutates the file.
 PREFS = {
+    36: ('in_product_help.snoozed_feature', 'in_product_help.new_badge',
+         'in_product_help.session_start_time', 'in_product_help.session_number',
+         'in_product_help.session_last_active_time',
+         'in_product_help.policy_last_heavyweight_promo_time',
+         'in_product_help.shown_notices', 'in_product_help.recent_session_start_times',
+         'in_product_help.recent_session_enabled_time', 'in_product_help.ntp_promos.promos'),
     39: ('profile.content_settings.exceptions.site_engagement',
-         'profile.content_settings.exceptions.media_engagement'),
+         'profile.content_settings.exceptions.media_engagement',
+         'profile.last_engagement_time'),
     40: ('profile.content_settings.permission_actions',
          'profile.content_settings.exceptions.permission_autoblocking_data',
          'profile.content_settings.exceptions.permission_actions_history'),

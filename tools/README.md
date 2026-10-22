@@ -217,7 +217,9 @@ Without the option, present stores are reported without failing. Row 10 checks
 only session **restore copies**, not the live Session Storage database; row 81
 checks discovered Web Data persistence, not explicit search settings. Preference
 selectors check nonempty retained activity in shared Preferences files for rows
-39/40/77/80. Row 71 shares service-worker and Cache Storage databases with retained
+36/39/40/77/80. Row 78 checks the derived segmentation databases individually;
+verification-only `segmentation_platform/ukm_db` diagnostics belong to row 61.
+Row 71 shares service-worker and Cache Storage databases with retained
 features and has no independently identifiable file: its owner removal requires
 source verification, not a claim that the shared databases should disappear.
 Similarly, the probe's bounded fixture does not activate every optional service

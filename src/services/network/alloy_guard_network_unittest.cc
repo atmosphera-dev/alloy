@@ -13,6 +13,7 @@
 #include "base/strings/string_split.h"
 #include "mojo/core/embedder/embedder.h"
 #include "mojo/public/cpp/bindings/remote.h"
+#include "mojo/public/cpp/system/data_pipe_utils.h"
 #include "net/base/ip_address.h"
 #include "net/base/net_errors.h"
 #include "net/base/network_change_notifier.h"
@@ -37,10 +38,14 @@
 #include "services/network/network_context.h"
 #include "services/network/network_service.h"
 #include "services/network/public/mojom/host_resolver.mojom.h"
+#include "services/network/public/mojom/clear_data_filter.mojom.h"
 #include "services/network/public/mojom/mdns_responder.mojom.h"
+#include "services/network/public/cpp/resource_request.h"
+#include "services/network/public/mojom/trust_tokens.mojom.h"
 #include "services/network/sct_auditing/sct_auditing_handler.h"
 #include "services/network/socket_factory.h"
 #include "services/network/test/test_utils.h"
+#include "services/network/test/test_url_loader_client.h"
 #include "services/network/test/fake_test_cert_verifier_params_factory.h"
 #include "testing/gtest/include/gtest/gtest.h"
 #include "url/origin.h"
@@ -141,6 +146,105 @@ TEST_F(AlloyGuardNetworkTest, SctDiagnosticStorageCannotBeReenabledInProduct) {
   EXPECT_FALSE(base::PathExists(path));
 #endif
   EXPECT_TRUE(handler.GetPendingReportersForTesting()->empty());
+}
+
+TEST_F(AlloyGuardNetworkTest, RemovedTrustTokenStoreCompletesConsumersWithoutDiskState) {
+  auto notifier = net::NetworkChangeNotifier::CreateMockIfNeeded();
+  auto service = NetworkService::CreateForTesting();
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto token_path = dir.GetPath().AppendASCII("Trust Tokens");
+  auto params = CreateNetworkContextParamsForTesting();
+  params->cert_verifier_params = FakeTestCertVerifierParamsFactory::GetCertVerifierParams();
+  params->file_paths = mojom::NetworkContextFilePaths::New();
+  params->file_paths->data_directory = dir.GetPath();
+  params->file_paths->trust_token_database_name = token_path.BaseName();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  base::ScopedTempDir log_dir;
+  ASSERT_TRUE(log_dir.CreateUniqueTempDir());
+  params->alloy_guard_log = base::File(log_dir.GetPath().AppendASCII("alloy-guard.log"),
+      base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_APPEND);
+#endif
+  mojo::Remote<mojom::NetworkContext> remote;
+  auto context = NetworkContext::CreateForTesting(service.get(),
+      remote.BindNewPipeAndPassReceiver(), std::move(params), {});
+  ASSERT_FALSE(context->trust_token_store());
+  context->SetBlockTrustTokens(false);
+  EXPECT_TRUE(context->are_trust_tokens_blocked());
+
+  base::test::TestFuture<std::vector<mojom::StoredTrustTokensForIssuerPtr>> counts;
+  remote->GetStoredTrustTokenCounts(counts.GetCallback());
+  EXPECT_TRUE(counts.Get().empty());
+  base::test::TestFuture<bool> session_cleared;
+  remote->ClearTrustTokenSessionOnlyData(session_cleared.GetCallback());
+  EXPECT_FALSE(session_cleared.Get());
+  base::test::TestFuture<void> cleared;
+  remote->ClearTrustTokenData(nullptr, cleared.GetCallback());
+  ASSERT_TRUE(cleared.Wait());
+  mojo::Remote<mojom::TrustTokenQueryAnswerer> query;
+  auto query_receiver = query.BindNewPipeAndPassReceiver();
+  base::test::TestFuture<void> query_closed;
+  query.set_disconnect_handler(query_closed.GetCallback());
+  remote->GetTrustTokenQueryAnswerer(std::move(query_receiver),
+      url::Origin::Create(GURL("https://alloy.invalid")));
+  ASSERT_TRUE(query_closed.Wait());
+
+  std::atomic<int> received = 0;
+  net::EmbeddedTestServer server;
+  server.RegisterRequestHandler(base::BindRepeating(
+      [](std::atomic<int>* received, const net::test_server::HttpRequest&)
+          -> std::unique_ptr<net::test_server::HttpResponse> {
+        ++*received;
+        auto response = std::make_unique<net::test_server::BasicHttpResponse>();
+        response->set_code(net::HTTP_OK);
+        response->set_content("ordinary-page-consumer");
+        response->set_content_type("text/plain");
+        return response;
+      }, &received));
+  ASSERT_TRUE(server.Start());
+  auto factory_params = mojom::URLLoaderFactoryParams::New();
+  factory_params->process_id = OriginatingProcessId::browser();
+  factory_params->is_orb_enabled = false;
+  factory_params->isolation_info = net::IsolationInfo::CreateForInternalRequest(
+      url::Origin::Create(server.base_url()));
+  mojo::Remote<mojom::URLLoaderFactory> factory;
+  remote->CreateURLLoaderFactory(factory.BindNewPipeAndPassReceiver(),
+      std::move(factory_params));
+  ResourceRequest request;
+  request.method = "GET";
+  request.url = server.GetURL("/page");
+  request.request_initiator = url::Origin::Create(server.base_url());
+  request.trust_token_params = OptionalTrustTokenParams(mojom::TrustTokenParams::New());
+  mojo::Remote<mojom::URLLoader> token_loader;
+  TestURLLoaderClient token_client;
+  factory->CreateLoaderAndStart(token_loader.BindNewPipeAndPassReceiver(), 1, 0,
+      request, token_client.CreateRemote(), Tag("blink_resource_loader"));
+  token_client.RunUntilComplete();
+  // The native CORS factory rejects token parameters when no store exists,
+  // before forwarding to the inner loader's operation-failure path.
+  EXPECT_EQ(token_client.completion_status().error_code, net::ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(received.load(), 0);
+
+  request.trust_token_params = std::nullopt;
+  mojo::Remote<mojom::URLLoader> page_loader;
+  TestURLLoaderClient page_client;
+  factory->CreateLoaderAndStart(page_loader.BindNewPipeAndPassReceiver(), 2, 0,
+      request, page_client.CreateRemote(), Tag("blink_resource_loader"));
+  page_client.RunUntilComplete();
+  EXPECT_EQ(page_client.completion_status().error_code, net::OK);
+  std::string body;
+  ASSERT_TRUE(mojo::BlockingCopyToString(page_client.response_body_release(), &body));
+  EXPECT_EQ(body, "ordinary-page-consumer");
+  EXPECT_EQ(received.load(), 1);
+  page_loader.reset();
+  token_loader.reset();
+  factory.reset();
+  query.reset();
+  remote.reset();
+  context.reset();
+  tasks_.RunUntilIdle();
+  EXPECT_FALSE(base::PathExists(token_path));
+  EXPECT_TRUE(base::IsDirectoryEmpty(dir.GetPath()));
 }
 
 TEST_F(AlloyGuardNetworkTest, SocketCreationDeniesBeforeBinding) {

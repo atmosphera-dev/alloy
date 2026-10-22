@@ -147,6 +147,11 @@
       "patch": "brave-core/0015-remove-workspace-restore.patch",
       "root": "brave",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0016-remove-activity-stores.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

@@ -1,0 +1,270 @@
+diff --git a/chrome/browser/webdata_services/web_data_service_factory.cc b/chrome/browser/webdata_services/web_data_service_factory.cc
+--- a/chrome/browser/webdata_services/web_data_service_factory.cc
++++ b/chrome/browser/webdata_services/web_data_service_factory.cc
+@@ -149,7 +149,7 @@
+ 
+ content::BrowserContext* WebDataServiceFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
+-  return GetBrowserContextRedirectedInIncognito(context);
++  return nullptr;
+ }
+ 
+ std::unique_ptr<KeyedService>
+diff --git a/chrome/browser/password_manager/factories/profile_password_store_factory.cc b/chrome/browser/password_manager/factories/profile_password_store_factory.cc
+--- a/chrome/browser/password_manager/factories/profile_password_store_factory.cc
++++ b/chrome/browser/password_manager/factories/profile_password_store_factory.cc
+@@ -108,10 +108,7 @@
+ ProfilePasswordStoreFactory::ProfilePasswordStoreFactory()
+     : RefcountedProfileKeyedServiceFactory(
+           "ProfilePasswordStore",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(AffiliationServiceFactory::GetInstance());
+   DependsOn(CredentialsCleanerRunnerFactory::GetInstance());
+ }
+diff --git a/chrome/browser/password_manager/factories/account_password_store_factory.cc b/chrome/browser/password_manager/factories/account_password_store_factory.cc
+--- a/chrome/browser/password_manager/factories/account_password_store_factory.cc
++++ b/chrome/browser/password_manager/factories/account_password_store_factory.cc
+@@ -141,10 +141,7 @@
+ AccountPasswordStoreFactory::AccountPasswordStoreFactory()
+     : RefcountedProfileKeyedServiceFactory(
+           "AccountPasswordStore",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(AffiliationServiceFactory::GetInstance());
+   DependsOn(CredentialsCleanerRunnerFactory::GetInstance());
+ }
+diff --git a/chrome/browser/affiliations/affiliation_service_factory.cc b/chrome/browser/affiliations/affiliation_service_factory.cc
+--- a/chrome/browser/affiliations/affiliation_service_factory.cc
++++ b/chrome/browser/affiliations/affiliation_service_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/affiliations/affiliation_service_factory.h"
+ 
+ #include "base/files/file_path.h"
++#include "base/functional/bind.h"
+ #include "base/no_destructor.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+@@ -15,6 +16,60 @@
+ #include "content/public/browser/network_service_instance.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
++
++namespace {
++class NoStoreAffiliationService final
++    : public affiliations::AffiliationService {
++ public:
++  void FetchChangePasswordURL(
++      const GURL&,
++      base::OnceCallback<void(GURL)> callback) override {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), GURL()));
++  }
++  GURL GetChangePasswordURL(const GURL&) const override { return GURL(); }
++  void GetAffiliationsAndBranding(const affiliations::FacetURI&,
++                                  ResultCallback callback) override {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback),
++                                  affiliations::AffiliatedFacets(), false));
++  }
++  void Prefetch(const affiliations::FacetURI&, const base::Time&) override {}
++  void CancelPrefetch(const affiliations::FacetURI&,
++                      const base::Time&) override {}
++  void KeepPrefetchForFacets(std::vector<affiliations::FacetURI>) override {}
++  void TrimUnusedCache(std::vector<affiliations::FacetURI>) override {}
++  void GetGroupingInfo(std::vector<affiliations::FacetURI> facets,
++                       GroupsCallback callback) override {
++    std::vector<affiliations::GroupedFacets> groups;
++    for (auto& facet : facets) {
++      groups.emplace_back();
++      groups.back().facets.emplace_back(std::move(facet));
++    }
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(groups)));
++  }
++  void GetPSLExtensions(
++      base::OnceCallback<void(std::vector<std::string>)> callback) override {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(std::move(callback), std::vector<std::string>()));
++  }
++  void UpdateAffiliationsAndBranding(const std::vector<affiliations::FacetURI>&,
++                                     base::OnceClosure callback) override {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, std::move(callback));
++  }
++  void RegisterSource(
++      std::unique_ptr<affiliations::AffiliationSource>) override {}
++  base::WeakPtr<affiliations::AffiliationService> AsWeakPtr() override {
++    return weak_factory_.GetWeakPtr();
++  }
++
++ private:
++  base::WeakPtrFactory<NoStoreAffiliationService> weak_factory_{this};
++};
++}  // namespace
+ 
+ AffiliationServiceFactory::AffiliationServiceFactory()
+     : ProfileKeyedServiceFactory(
+@@ -42,18 +97,5 @@
+ std::unique_ptr<KeyedService>
+ AffiliationServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  Profile* profile = Profile::FromBrowserContext(context);
+-  scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory =
+-      context->GetDefaultStoragePartition()
+-          ->GetURLLoaderFactoryForBrowserProcess();
+-  auto backend_task_runner = base::ThreadPool::CreateSequencedTaskRunner(
+-      {base::MayBlock(), base::TaskPriority::USER_VISIBLE});
+-  auto affiliation_service =
+-      std::make_unique<affiliations::AffiliationServiceImpl>(
+-          url_loader_factory, backend_task_runner);
+-  affiliation_service->Init(
+-      content::GetNetworkConnectionTracker(),
+-      profile->GetPath().Append(affiliations::kAffiliationDatabaseFileName));
+-
+-  return affiliation_service;
++  return std::make_unique<NoStoreAffiliationService>();
+ }
+diff --git a/chrome/browser/strike_database/strike_database_factory.cc b/chrome/browser/strike_database/strike_database_factory.cc
+--- a/chrome/browser/strike_database/strike_database_factory.cc
++++ b/chrome/browser/strike_database/strike_database_factory.cc
+@@ -25,15 +25,7 @@
+ StrikeDatabaseFactory::StrikeDatabaseFactory()
+     : ProfileKeyedServiceFactory(
+           "AutofillStrikeDatabase",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {}
++          ProfileSelections::BuildNoProfilesSelected()) {}
+ 
+ StrikeDatabaseFactory::~StrikeDatabaseFactory() = default;
+ 
+diff --git a/chrome/browser/bookmarks/bookmark_model_factory.cc b/chrome/browser/bookmarks/bookmark_model_factory.cc
+--- a/chrome/browser/bookmarks/bookmark_model_factory.cc
++++ b/chrome/browser/bookmarks/bookmark_model_factory.cc
+@@ -67,18 +67,7 @@
+ BookmarkModelFactory::BookmarkModelFactory()
+     : ProfileKeyedServiceFactory(
+           "BookmarkModel",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              // Use OTR profile for Guest session.
+-              // (Bookmarks can be enabled in Guest sessions under some
+-              // enterprise policies.)
+-              .WithGuest(ProfileSelection::kRedirectedToOriginal)
+-              // No service for system profile.
+-              .WithSystem(ProfileSelection::kNone)
+-              // ChromeOS creates various profiles (login, lock screen...) that
+-              // do not have/need access to bookmarks.
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(AccountBookmarkSyncServiceFactory::GetInstance());
+   DependsOn(BookmarkUndoServiceFactory::GetInstance());
+   DependsOn(ManagedBookmarkServiceFactory::GetInstance());
+diff --git a/chrome/browser/bookmarks/bookmark_merged_surface_service_factory.cc b/chrome/browser/bookmarks/bookmark_merged_surface_service_factory.cc
+--- a/chrome/browser/bookmarks/bookmark_merged_surface_service_factory.cc
++++ b/chrome/browser/bookmarks/bookmark_merged_surface_service_factory.cc
+@@ -48,16 +48,7 @@
+ BookmarkMergedSurfaceServiceFactory::BookmarkMergedSurfaceServiceFactory()
+     : ProfileKeyedServiceFactory(
+           "BookmarkMergedSurfaceService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              // Use OTR profile for Guest session.
+-              // (Bookmarks can be enabled in Guest sessions under some
+-              // enterprise policies.)
+-              .WithGuest(ProfileSelection::kRedirectedToOriginal)
+-              // No service for system profile.
+-              .WithSystem(ProfileSelection::kNone)
+-              .WithAshInternals(ProfileSelection::kNone)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(BookmarkModelFactory::GetInstance());
+   DependsOn(ManagedBookmarkServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/reading_list/reading_list_model_factory.cc b/chrome/browser/reading_list/reading_list_model_factory.cc
+--- a/chrome/browser/reading_list/reading_list_model_factory.cc
++++ b/chrome/browser/reading_list/reading_list_model_factory.cc
+@@ -97,15 +97,7 @@
+ ReadingListModelFactory::ReadingListModelFactory()
+     : ProfileKeyedServiceFactory(
+           "ReadingListModel",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kRedirectedToOriginal)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(DataTypeStoreServiceFactory::GetInstance());
+ }
+ 
+diff --git a/chrome/browser/dom_distiller/dom_distiller_service_factory.cc b/chrome/browser/dom_distiller/dom_distiller_service_factory.cc
+--- a/chrome/browser/dom_distiller/dom_distiller_service_factory.cc
++++ b/chrome/browser/dom_distiller/dom_distiller_service_factory.cc
+@@ -62,15 +62,7 @@
+           "DomDistillerService",
+           // Makes normal profile and off-the-record profile use same service
+           // instance.
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kRedirectedToOriginal)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kRedirectedToOriginal)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+-              .Build()) {}
++          ProfileSelections::BuildNoProfilesSelected()) {}
+ 
+ DomDistillerServiceFactory::~DomDistillerServiceFactory() = default;
+ 
+diff --git a/chrome/browser/extensions/api/reading_list/reading_list_event_router_factory.cc b/chrome/browser/extensions/api/reading_list/reading_list_event_router_factory.cc
+--- a/chrome/browser/extensions/api/reading_list/reading_list_event_router_factory.cc
++++ b/chrome/browser/extensions/api/reading_list/reading_list_event_router_factory.cc
+@@ -27,12 +27,7 @@
+ ReadingListEventRouterFactory::ReadingListEventRouterFactory()
+     : ProfileKeyedServiceFactory(
+           "ReadingListEventRouter",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(EventRouterFactory::GetInstance());
+   DependsOn(ReadingListModelFactory::GetInstance());
+ }
+diff --git a/chrome/browser/sync/sync_service_factory.cc b/chrome/browser/sync/sync_service_factory.cc
+--- a/chrome/browser/sync/sync_service_factory.cc
++++ b/chrome/browser/sync/sync_service_factory.cc
+@@ -303,8 +303,9 @@
+   builder.SetNotebooksService(
+       notebooks::NotebooksServiceFactory::GetForProfile(profile));
+ 
+-  return builder.Build(/*disabled_types=*/{}, sync_service,
+-                       chrome::GetChannel());
++  return builder.Build(
++      /*disabled_types=*/{syncer::BOOKMARKS, syncer::READING_LIST},
++      sync_service, chrome::GetChannel());
+ }
+ 
+ syncer::DataTypeController::TypeVector CreateChromeControllers(

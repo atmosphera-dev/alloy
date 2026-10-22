@@ -152,6 +152,11 @@
       "patch": "chromium/0016-remove-activity-stores.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0017-remove-saved-data-stores.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

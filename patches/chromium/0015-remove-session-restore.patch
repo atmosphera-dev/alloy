@@ -1,0 +1,86 @@
+diff --git a/chrome/browser/sessions/session_service_factory.cc b/chrome/browser/sessions/session_service_factory.cc
+--- a/chrome/browser/sessions/session_service_factory.cc
++++ b/chrome/browser/sessions/session_service_factory.cc
+@@ -63,12 +63,7 @@
+ SessionServiceFactory::SessionServiceFactory()
+     : ProfileKeyedServiceFactory(
+           "SessionService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   // Ensure that session data is cleared before session restore can happen.
+   DependsOn(SessionDataServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/sessions/app_session_service_factory.cc b/chrome/browser/sessions/app_session_service_factory.cc
+--- a/chrome/browser/sessions/app_session_service_factory.cc
++++ b/chrome/browser/sessions/app_session_service_factory.cc
+@@ -63,15 +63,7 @@
+ AppSessionServiceFactory::AppSessionServiceFactory()
+     : ProfileKeyedServiceFactory(
+           "AppSessionService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   // Ensure that session data is cleared before session restore can happen.
+   DependsOn(SessionDataServiceFactory::GetInstance());
+ }
+diff --git a/chrome/browser/sessions/tab_restore_service_factory.cc b/chrome/browser/sessions/tab_restore_service_factory.cc
+--- a/chrome/browser/sessions/tab_restore_service_factory.cc
++++ b/chrome/browser/sessions/tab_restore_service_factory.cc
+@@ -63,15 +63,7 @@
+ TabRestoreServiceFactory::TabRestoreServiceFactory()
+     : ProfileKeyedServiceFactory(
+           "sessions::TabRestoreService",
+-          ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(glic::GlicKeyedServiceFactory::GetInstance());
+ }
+ 
+diff --git a/content/browser/dom_storage/session_storage_namespace_handle_impl.cc b/content/browser/dom_storage/session_storage_namespace_handle_impl.cc
+--- a/content/browser/dom_storage/session_storage_namespace_handle_impl.cc
++++ b/content/browser/dom_storage/session_storage_namespace_handle_impl.cc
+@@ -64,8 +64,9 @@
+   return namespace_id_;
+ }
+ 
+-void SessionStorageNamespaceHandleImpl::SetShouldPersist(bool should_persist) {
+-  should_persist_ = should_persist;
++void SessionStorageNamespaceHandleImpl::SetShouldPersist(bool /*should_persist*/) {
++  // Live namespace storage is not a session/tab restore copy.
++  should_persist_ = false;
+ }
+ 
+ bool SessionStorageNamespaceHandleImpl::should_persist() {
+diff --git a/chrome/browser/sessions/session_restore.cc b/chrome/browser/sessions/session_restore.cc
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -1568,6 +1568,10 @@
+     BrowserWindowInterface* browser,
+     SessionRestore::BehaviorBitmask behavior,
+     const StartupTabs& startup_tabs) {
++  // Profiles without a session service have no persisted session to restore.
++  if (!SessionServiceFactory::GetForProfile(profile)) {
++    return nullptr;
++  }
+ #if DCHECK_IS_ON()
+   // Profiles that are locked because they require signin should not be
+   // restored.

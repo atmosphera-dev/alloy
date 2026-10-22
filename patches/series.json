@@ -137,6 +137,16 @@
       "patch": "cef/0014-modal-dialog-host-lifetime.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0015-remove-session-restore.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0015-remove-workspace-restore.patch",
+      "root": "brave",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

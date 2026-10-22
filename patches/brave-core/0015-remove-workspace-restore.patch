@@ -1,0 +1,12 @@
+diff --git a/browser/workspaces/workspace_service_factory.cc b/browser/workspaces/workspace_service_factory.cc
+--- a/browser/workspaces/workspace_service_factory.cc
++++ b/browser/workspaces/workspace_service_factory.cc
+@@ -28,7 +28,7 @@
+ 
+ WorkspaceServiceFactory::WorkspaceServiceFactory()
+     : ProfileKeyedServiceFactory("WorkspaceService",
+-                                 ProfileSelections::BuildForRegularProfile()) {}
++                                 ProfileSelections::BuildNoProfilesSelected()) {}
+ 
+ WorkspaceServiceFactory::~WorkspaceServiceFactory() = default;
+ 

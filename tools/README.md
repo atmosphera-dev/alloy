@@ -191,3 +191,35 @@ native observer additionally reports real CEF accessibility spelling markers.
 Its startup URL and profile settings are copied before CEF initialization;
 callbacks never retain borrowed environment storage across Chromium startup.
 The observer is test-only and writes no instrumentation into the product.
+
+## Store inventory (NUC only)
+
+```sh
+export TMPDIR=/home/builder/work/tmp
+python3 repo/tools/store_inventory_probe.py --out src/out/Release_Alloy
+python3 repo/tools/store_inventory_probe.py --out src/out/Verify_Alloy --forbid-rows 27,88,93,10
+```
+
+The inventory launches a sandboxed OSR cefclient under Xvfb in a loopback-only
+network namespace, using fresh persistent roots. Its local fixture exercises
+cookies, local/session storage, IndexedDB, Cache Storage, a service worker,
+a cross-site frame and an actual downloaded file. CDP observes the fixture and
+the downloaded bytes before the tool inventories live roots, closes the browser
+normally, waits for all owned children, and inventories again. It preserves all
+roots and evidence under `evidence/store-inventory-<id>/`; it never clears a store
+to establish absence. `live-paths.json` and `final-paths.json` include every path,
+including directories, symlinks and unclassified stores.
+
+`--forbid-rows` accepts comma-separated store-map removal row numbers. It fails
+if a selected row has matching native paths (including directories and SQLite
+sidecars) in either inventory, and otherwise prints `PASS store-absent <row>`.
+Without the option, present stores are reported without failing. Row 10 checks
+only session **restore copies**, not the live Session Storage database; row 81
+checks discovered Web Data persistence, not explicit search settings. Preference
+selectors check nonempty retained activity in shared Preferences files for rows
+39/40/77/80. Row 71 shares service-worker and Cache Storage databases with retained
+features and has no independently identifiable file: its owner removal requires
+source verification, not a claim that the shared databases should disappear.
+Similarly, the probe's bounded fixture does not activate every optional service
+or prove that old files cannot reopen; factory/build coverage is verified
+separately. Both product and verification builds use the same removal assertions.

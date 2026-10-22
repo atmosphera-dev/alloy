@@ -21,3 +21,8 @@ foreach(source, alloy_data_files) {
 group("bundled_data") {
   deps = alloy_data_targets
 }
+
+group("site_records_tests") {
+  testonly = true
+  deps = [ "site_records:alloy_site_records_unittests" ]
+}

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import("//testing/test.gni")
+
+source_set("capabilities") {
+  sources = [
+    "record_capability.cc",
+    "record_capability.h",
+  ]
+  public_deps = [ "//base", "//url" ]
+  deps = [ "//net" ]
+}
+
+test("alloy_site_records_unittests") {
+  sources = [
+    "record_capability_unittest.cc",
+    "test_main.cc",
+  ]
+  deps = [
+    ":capabilities",
+    "//base/test:test_support",
+    "//net:test_support",
+    "//testing/gtest",
+  ]
+}

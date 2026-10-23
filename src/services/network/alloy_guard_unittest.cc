@@ -11,6 +11,7 @@
 #include "base/json/json_reader.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/test/task_environment.h"
+#include "services/network/public/cpp/resource_request.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace network {
@@ -210,6 +211,52 @@ TEST_F(AlloyGuardTest, DnsTransportRequiresRealOriginAndRetainsClass) {
   }
   EXPECT_FALSE(guard->Decide(guard->Hash("reporting"), "collector", "native", Op::kOwnedDns,
                             guard->Hash("blink_resource_loader")).allowed);
+}
+
+TEST_F(AlloyGuardTest, WorkerLoadsRequireTheValidatedPageCreator) {
+  auto guard = base::MakeRefCounted<AlloyGuard>();
+  const int worker = guard->Hash("worker_script_load");
+  EXPECT_FALSE(guard->DecideRequest(worker, "https://host/worker.js", "unowned").allowed);
+  // It is not an annotation-level exemption: extension and browser documents
+  // use the same native fetcher and may request an ordinary HTTPS worker URL.
+  for (auto scheme : {"https", "http", "file", "data", "about", "custom-page"}) {
+    const int owner = net::AlloyWorkerOwnerForPrincipal(scheme, false);
+    const auto result = guard->DecideRequest(worker, "https://host/worker.js", "page", owner);
+    EXPECT_TRUE(result.allowed);
+    EXPECT_EQ(result.annotation_id, "worker_script_load");
+    EXPECT_EQ(result.originating_annotation_id, "blink_resource_loader");
+    EXPECT_EQ(result.traffic_class, C::kPageLoad);
+  }
+  for (int owner : {0, -1, 123456, worker, guard->Hash("reporting"),
+                   guard->Hash("renderer_initiated_download"),
+                   net::AlloyWorkerOwnerForPrincipal("chrome-extension", false),
+                   net::AlloyWorkerOwnerForPrincipal("isolated-app", false),
+                   net::AlloyWorkerOwnerForPrincipal("https", true),
+                   net::AlloyWorkerOwnerForPrincipal("chrome", true),
+                   net::AlloyWorkerOwnerForPrincipal("", false)}) {
+    EXPECT_FALSE(guard->DecideRequest(worker, "https://host/worker.js", "non-page", owner).allowed);
+  }
+  const int page = guard->Hash("blink_resource_loader");
+  EXPECT_FALSE(guard->DecideRequest(guard->Hash("reporting"), "collector", "service", page).allowed);
+  EXPECT_FALSE(guard->Decide(guard->Hash("reporting"), "collector", "forged-operation", Op::kWorkerScript, page).allowed);
+}
+
+TEST_F(AlloyGuardTest, WorkerOwnershipStaysInItsTrustedOperation) {
+  ResourceRequest::TrustedParams params;
+  const int worker = AlloyGuard::Hash("worker_script_load");
+  const int page = AlloyGuard::Hash("blink_resource_loader");
+  params.alloy_download_owner = page;
+  EXPECT_EQ(params.AlloyOriginatingOwner(worker, true), 0);
+  params.alloy_worker_owner = page;
+  EXPECT_EQ(params.AlloyOriginatingOwner(worker, true), page);
+  EXPECT_EQ(params.AlloyOriginatingOwner(worker, false), 0);
+  params.alloy_download_owner = 0;
+  EXPECT_EQ(params.AlloyOriginatingOwner(AlloyGuard::Hash("reporting"), true), 0);
+  ResourceRequest::TrustedParams copied(params);
+  EXPECT_EQ(copied.alloy_worker_owner, page);
+  EXPECT_TRUE(params.EqualsForTesting(copied));
+  copied.alloy_worker_owner = 0;
+  EXPECT_FALSE(params.EqualsForTesting(copied));
 }
 }  // namespace
 }  // namespace network

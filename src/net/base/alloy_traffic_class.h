@@ -34,6 +34,28 @@ constexpr bool IsAlloyPageDownloadOwner(int hash) {
          hash == AlloyAnnotationHash("navigation_url_loader");
 }
 
+constexpr bool IsAlloyWorkerScriptLoad(int hash) {
+  return hash == AlloyAnnotationHash("worker_script_load");
+}
+
+constexpr bool IsAlloyPageWorkerOwner(int hash) {
+  return hash == AlloyAnnotationHash("blink_resource_loader") ||
+         hash == AlloyAnnotationHash("navigation_url_loader");
+}
+
+// Only the browser's validated creator principal and privilege metadata enter
+// here, never the worker URL or a renderer-supplied request field. Native
+// content uses these privileged scheme names too, avoiding Chrome dependencies.
+constexpr int AlloyWorkerOwnerForPrincipal(std::string_view scheme,
+                                          bool browser_document) {
+  if (scheme.empty()) return 0;
+  if (browser_document || scheme == "chrome-extension" ||
+      scheme == "isolated-app") {
+    return AlloyAnnotationHash("alloy_browser_socket");
+  }
+  return AlloyAnnotationHash("blink_resource_loader");
+}
+
 // Classification is shared by policy and instrumentation; this is never an
 // admission decision. A socket always carries its actual originating
 // annotation.

@@ -1,0 +1,242 @@
+--- a/content/browser/worker_host/worker_script_fetcher.cc
++++ b/content/browser/worker_host/worker_script_fetcher.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/worker_host/worker_script_fetcher.h"
+ 
++#include <string_view>
+ #include <variant>
+ 
+ #include "base/feature_list.h"
+@@ -27,6 +28,7 @@
+ #include "content/browser/service_worker/service_worker_main_resource_handle.h"
+ #include "content/browser/storage_partition_impl.h"
+ #include "content/browser/url_loader_factory_params_helper.h"
++#include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/browser/worker_host/dedicated_worker_host.h"
+ #include "content/browser/worker_host/network_restrictions_worker_throttle.h"
+ #include "content/browser/worker_host/worker_script_loader.h"
+@@ -45,9 +47,11 @@
+ #include "content/public/common/content_features.h"
+ #include "content/public/common/referrer.h"
+ #include "content/public/common/url_constants.h"
++#include "content/public/common/url_utils.h"
+ #include "ipc/constants.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "net/base/alloy_traffic_class.h"
+ #include "net/base/isolation_info.h"
+ #include "net/http/http_request_headers.h"
+ #include "net/storage_access_api/status.h"
+@@ -102,6 +106,39 @@
+         }
+       }
+ )");
++
++// Capture authority from the real creator/ancestor document chain, never the
++// requested script URL. Factories below keep these params browser-only/trusted.
++int AlloyWorkerOwner(RenderFrameHostImpl& ancestor,
++                     const url::Origin& creator_origin) {
++  auto owner_for = [](const url::Origin& origin, const GURL& document_url,
++                      bool browser_document) {
++    const auto& tuple = origin.GetTupleOrPrecursorTupleIfOpaque();
++    const std::string_view scheme =
++        tuple.scheme().empty() ? document_url.scheme() : tuple.scheme();
++    return net::AlloyWorkerOwnerForPrincipal(
++        scheme, browser_document || HasWebUIScheme(tuple.GetURL()) ||
++                    HasWebUIScheme(document_url));
++  };
++  if (const int owner =
++          owner_for(creator_origin, ancestor.GetLastCommittedURL(), false);
++      !net::IsAlloyPageWorkerOwner(owner)) {
++    return owner;
++  }
++  for (auto* frame = &ancestor; frame;
++       frame = frame->GetParentOrOuterDocument()) {
++    auto* contents = WebContentsImpl::FromRenderFrameHostImpl(frame);
++    const bool browser_document =
++        frame->GetWebUI() ||
++        (contents && contents->privileged_params().has_value());
++    const int owner = owner_for(frame->GetLastCommittedOrigin(),
++                                frame->GetLastCommittedURL(), browser_document);
++    if (!net::IsAlloyPageWorkerOwner(owner)) {
++      return owner;
++    }
++  }
++  return net::AlloyAnnotationHash("blink_resource_loader");
++}
+ 
+ // TODO(nhiroki): Align this function with AddAdditionalRequestHeaders() in
+ // navigation_request.cc, FrameFetchContext, and WorkerFetchContext.
+@@ -348,6 +385,8 @@
+   resource_request->credentials_mode = credentials_mode;
+   // To be used for the first party context check.
+   resource_request->trusted_params = network::ResourceRequest::TrustedParams();
++  resource_request->trusted_params->alloy_worker_owner =
++      AlloyWorkerOwner(ancestor_render_frame_host, request_initiator);
+   resource_request->trusted_params->isolation_info =
+       ancestor_render_frame_host.GetStorageKey().ToPartialNetIsolationInfo();
+   resource_request->storage_access_api_status = storage_access_api_status;
+--- a/services/network/cors/cors_url_loader_factory.cc
++++ b/services/network/cors/cors_url_loader_factory.cc
+@@ -382,11 +382,14 @@
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
+   if (!context_->alloy_guard()
+-           .DecideRequest(traffic_annotation.unique_id_hash_code,
+-                   resource_request.url.spec(),
+-                   "URLLoaderFactory.CreateLoaderAndStart",
+-                   resource_request.trusted_params
+-                       ? resource_request.trusted_params->alloy_download_owner : 0)
++           .DecideRequest(
++               traffic_annotation.unique_id_hash_code,
++               resource_request.url.spec(),
++               "URLLoaderFactory.CreateLoaderAndStart",
++               resource_request.trusted_params
++                   ? resource_request.trusted_params->AlloyOriginatingOwner(
++                         traffic_annotation.unique_id_hash_code, is_trusted_)
++                   : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
+     mojo::Remote<mojom::URLLoaderClient>(std::move(client))->OnComplete(status);
+@@ -405,11 +408,14 @@
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
+   if (!context_->alloy_guard()
+-           .DecideRequest(traffic_annotation.unique_id_hash_code,
+-                   resource_request.url.spec(),
+-                   "URLLoaderFactory.CreateLoaderAndStart",
+-                   resource_request.trusted_params
+-                       ? resource_request.trusted_params->alloy_download_owner : 0)
++           .DecideRequest(
++               traffic_annotation.unique_id_hash_code,
++               resource_request.url.spec(),
++               "URLLoaderFactory.CreateLoaderAndStart",
++               resource_request.trusted_params
++                   ? resource_request.trusted_params->AlloyOriginatingOwner(
++                         traffic_annotation.unique_id_hash_code, is_trusted_)
++                   : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
+     mojo::Remote<mojom::URLLoaderClient>(std::move(client))->OnComplete(status);
+--- a/services/network/public/cpp/resource_request.cc
++++ b/services/network/public/cpp/resource_request.cc
+@@ -198,6 +198,7 @@
+     const TrustedParams& other) {
+   TRACE_EVENT("loading", "ResourceRequest::TrustedParams.copy");
+   alloy_download_owner = other.alloy_download_owner;
++  alloy_worker_owner = other.alloy_worker_owner;
+   isolation_info = other.isolation_info;
+   disable_secure_dns = other.disable_secure_dns;
+   has_user_activation = other.has_user_activation;
+@@ -242,7 +243,8 @@
+ 
+ bool ResourceRequest::TrustedParams::EqualsForTesting(
+     const TrustedParams& other) const {
+-  return alloy_download_owner == other.alloy_download_owner &&
++  return alloy_worker_owner == other.alloy_worker_owner &&
++         alloy_download_owner == other.alloy_download_owner &&
+          isolation_info.IsEqualForTesting(other.isolation_info) &&
+          disable_secure_dns == other.disable_secure_dns &&
+          has_user_activation == other.has_user_activation &&
+--- a/services/network/public/cpp/resource_request.h
++++ b/services/network/public/cpp/resource_request.h
+@@ -14,6 +14,7 @@
+ #include "base/debug/crash_logging.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/unguessable_token.h"
++#include "net/base/alloy_traffic_class.h"
+ #include "net/base/isolation_info.h"
+ #include "net/base/request_priority.h"
+ #include "net/cookies/site_for_cookies.h"
+@@ -114,6 +115,15 @@
+     // Browser-supplied owner of a resumed/parallel download, not an allow.
+     // Accepted only with continuation labels; renderer factories reject it.
+     int alloy_download_owner = 0;
++    // Browser-captured creator authority for worker_script_load only.
++    int alloy_worker_owner = 0;
++    int AlloyOriginatingOwner(int annotation, bool trusted_factory) const {
++      if (!trusted_factory) {
++        return 0;
++      }
++      return net::IsAlloyWorkerScriptLoad(annotation) ? alloy_worker_owner
++                                                      : alloy_download_owner;
++    }
+     net::IsolationInfo isolation_info;
+     bool disable_secure_dns = false;
+     bool has_user_activation = false;
+--- a/services/network/public/cpp/url_request_mojom_traits.cc
++++ b/services/network/public/cpp/url_request_mojom_traits.cc
+@@ -63,6 +63,7 @@
+     return false;
+   }
+   out->alloy_download_owner = data.alloy_download_owner();
++  out->alloy_worker_owner = data.alloy_worker_owner();
+   out->disable_secure_dns = data.disable_secure_dns();
+   out->has_user_activation = data.has_user_activation();
+   out->allow_cookies_from_browser = data.allow_cookies_from_browser();
+--- a/services/network/public/cpp/url_request_mojom_traits.h
++++ b/services/network/public/cpp/url_request_mojom_traits.h
+@@ -88,6 +88,10 @@
+ struct COMPONENT_EXPORT(NETWORK_CPP_BASE)
+     StructTraits<network::mojom::TrustedUrlRequestParamsDataView,
+                  network::ResourceRequest::TrustedParams> {
++  static int32_t alloy_worker_owner(
++      const network::ResourceRequest::TrustedParams& trusted_params) {
++    return trusted_params.alloy_worker_owner;
++  }
+   static int32_t alloy_download_owner(
+       const network::ResourceRequest::TrustedParams& trusted_params) {
+     return trusted_params.alloy_download_owner;
+--- a/services/network/public/mojom/url_request.mojom
++++ b/services/network/public/mojom/url_request.mojom
+@@ -78,6 +78,8 @@
+ struct TrustedUrlRequestParams {
+   // Original browser-owned download annotation; not supplied by renderers.
+   int32 alloy_download_owner = 0;
++  // Validated creator authority, not a relabel of the actual worker annotation.
++  int32 alloy_worker_owner = 0;
+ 
+   // If non-empty, this value will be used to set the SiteForCookies and
+   // NetworkIsolationKey used by the network request.
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -467,9 +467,13 @@
+       factory_params_->target_network.value_or(
+           net::handles::kInvalidNetworkHandle),
+       /*is_for_websockets=*/false, request.net_log_create_info,
+-      request.trusted_params && request.trusted_params->alloy_download_owner
++      request.trusted_params && request.trusted_params->AlloyOriginatingOwner(
++                                    traffic_annotation.unique_id_hash_code,
++                                    factory_params_->is_trusted)
+           ? net::CreateMutableNetworkTrafficAnnotationTag(
+-                request.trusted_params->alloy_download_owner)
++                request.trusted_params->AlloyOriginatingOwner(
++                    traffic_annotation.unique_id_hash_code,
++                    factory_params_->is_trusted))
+           : net::MutableNetworkTrafficAnnotationTag());
+ 
+   // If the request is to a URL that we can determine is an LNA request from
+--- a/services/network/url_loader_factory.cc
++++ b/services/network/url_loader_factory.cc
+@@ -206,11 +206,15 @@
+     base::WeakPtr<mojom::URLLoaderClient> sync_client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
+   if (!context_->alloy_guard()
+-           .DecideRequest(traffic_annotation.unique_id_hash_code,
+-                   resource_request.url.spec(),
+-                   "URLLoaderFactory.CreateLoaderAndStart",
+-                   resource_request.trusted_params
+-                       ? resource_request.trusted_params->alloy_download_owner : 0)
++           .DecideRequest(
++               traffic_annotation.unique_id_hash_code,
++               resource_request.url.spec(),
++               "URLLoaderFactory.CreateLoaderAndStart",
++               resource_request.trusted_params
++                   ? resource_request.trusted_params->AlloyOriginatingOwner(
++                         traffic_annotation.unique_id_hash_code,
++                         params_->is_trusted)
++                   : 0)
+            .allowed) {
+     URLLoaderCompletionStatus status(net::ERR_NETWORK_ACCESS_DENIED);
+     if (sync_client) {

@@ -27,7 +27,8 @@ class AlloyGuard : public base::RefCountedThreadSafe<AlloyGuard> {
  public:
   using TrafficClass = net::AlloyTrafficClass;
   enum class Operation {
-    kRequest, kStandaloneDns, kPreconnect, kOwnedDns, kDownloadContinuation
+    kRequest, kStandaloneDns, kPreconnect, kOwnedDns, kDownloadContinuation,
+    kWorkerScript
   };
   struct Options {
     bool favicons = true;

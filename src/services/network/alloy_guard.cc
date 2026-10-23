@@ -66,7 +66,9 @@ AlloyGuard::Decision AlloyGuard::DecideRequest(int hash,
                                             std::string_view source,
                                             int owner_hash) {
   Operation operation = Operation::kRequest;
-  if (net::IsAlloyDownloadContinuation(hash)) {
+  if (net::IsAlloyWorkerScriptLoad(hash)) {
+    operation = Operation::kWorkerScript;
+  } else if (net::IsAlloyDownloadContinuation(hash)) {
     operation = Operation::kDownloadContinuation;
   } else if (hash == Hash("dns_over_https") && owner_hash > 0) {
     operation = Operation::kOwnedDns;
@@ -85,6 +87,10 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
     const auto origin = Classify(owner_hash);
     result.originating_annotation_id = origin.annotation_id;
     result.traffic_class = origin.traffic_class;
+  } else if (operation == Operation::kWorkerScript) {
+    result.originating_annotation_id = Classify(owner_hash).annotation_id;
+    if (net::IsAlloyPageWorkerOwner(owner_hash))
+      result.traffic_class = TrafficClass::kPageLoad;
   } else if (operation == Operation::kDownloadContinuation) {
     const auto origin = Classify(owner_hash);
     result.originating_annotation_id = origin.annotation_id;
@@ -125,6 +131,9 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
   if (operation == Operation::kOwnedDns) {
     result.allowed = result.allowed && owner_hash > 0 &&
         (hash == Hash("alloy_native_dns") || hash == Hash("dns_over_https"));
+  } else if (operation == Operation::kWorkerScript) {
+    result.allowed = result.allowed && net::IsAlloyWorkerScriptLoad(hash) &&
+        net::IsAlloyPageWorkerOwner(owner_hash);
   } else if (operation == Operation::kDownloadContinuation) {
     result.allowed = result.allowed &&
         net::IsAlloyDownloadContinuation(hash) &&
@@ -139,7 +148,7 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
     row.Set("time", base::Time::Now().InMillisecondsFSinceUnixEpoch());
     row.Set("annotation_id", result.annotation_id);
     row.Set("annotation_hash", hash);
-    if (operation == Operation::kOwnedDns ||
+    if (operation == Operation::kWorkerScript || operation == Operation::kOwnedDns ||
         operation == Operation::kDownloadContinuation) {
       row.Set("originating_annotation_id", result.originating_annotation_id);
       row.Set("originating_annotation_hash", owner_hash);

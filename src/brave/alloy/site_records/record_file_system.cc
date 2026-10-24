@@ -457,11 +457,17 @@ struct RecordFileSystem::Impl {
     if (status != FileStatus::kOk) {
       return status;
     }
-    status = DecodeEntry(value.bytes, entry);
-    if (status != FileStatus::kOk || entry->purpose != purpose ||
-        entry->parent != parent || entry->name != name) {
+    // Callers may resolve a name into the same entry that supplied parent/name.
+    // Decode and validate separately: assigning a heap-sized name first would
+    // invalidate the borrowed input string_view and produce false integrity
+    // failures (journals, temp names, nested paths, stat/remove/rename alike).
+    NamespaceEntry decoded;
+    status = DecodeEntry(value.bytes, &decoded);
+    if (status != FileStatus::kOk || decoded.purpose != purpose ||
+        decoded.parent != parent || decoded.name != name) {
       return FileStatus::kIntegrity;
     }
+    *entry = std::move(decoded);
     return FileStatus::kOk;
   }
 
@@ -1663,6 +1669,20 @@ bool RecordFile::KeysClearedForTesting() const {
     return state_->contents->KeysClearedForTesting();
   }
   return state_->contents->KeysClearedForTesting();
+}
+
+FileStatus RecordFile::GetLock(RecordFileLock* out) {
+  const auto owner = owner_.lock();
+  if (!owner) return FileStatus::kDenied;
+  std::lock_guard lock(owner->impl_->mutex);
+  RecordFileSystem::Impl::Record* record;
+  const auto status = owner->impl_->CheckHandle(*this,
+      StorageAccess::kReadRecordFiles, &record);
+  if (status == FileStatus::kOk) {
+    const auto found = state_->locks.find(this);
+    *out = found == state_->locks.end() ? RecordFileLock::kNone : found->second;
+  }
+  return status;
 }
 
 }  // namespace alloy::site_records

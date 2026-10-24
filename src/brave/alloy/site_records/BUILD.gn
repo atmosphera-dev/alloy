@@ -61,6 +61,19 @@ source_set("profiles") {
   ]
 }
 
+source_set("sqlite_files") {
+  sources = [
+    "record_sqlite_vfs.cc",
+    "record_sqlite_vfs.h",
+  ]
+  public_deps = [
+    ":record_files",
+    "//sql",
+    "//third_party/sqlite",
+  ]
+  deps = [ "//third_party/boringssl" ]
+}
+
 executable("alloy_profile_cpp_consumer") {
   testonly = true
   use_libcxx_modules = false
@@ -89,6 +102,7 @@ test("alloy_site_records_unittests") {
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",
     "record_file_system_unittest.cc",
+    "record_sqlite_vfs_unittest.cc",
     "test_main.cc",
   ]
   deps = [
@@ -96,6 +110,7 @@ test("alloy_site_records_unittests") {
     ":document_settings",
     ":record_files",
     ":profiles",
+    ":sqlite_files",
     "//brave/third_party/argon2",
     "//base/test:test_support",
     "//components/content_settings/core/browser",
@@ -106,6 +121,7 @@ test("alloy_site_records_unittests") {
     "//components/sync_preferences",
     "//gin:gin_test",
     "//v8",
+    "//sql:test_support",
     "//net:test_support",
     "//mojo/core/embedder",
     "//services/network:alloy_guard",

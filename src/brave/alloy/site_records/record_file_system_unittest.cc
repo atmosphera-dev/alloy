@@ -700,5 +700,30 @@ TEST_F(RecordFileSystemTest, ReplacingOutputHandleClosesOutsideCommitBarrier) {
   EXPECT_EQ(marker, Read(file, 100));
 }
 
+TEST_F(RecordFileSystemTest, HeapSizedNamesResolveBeforeReplacingTheirInputs) {
+  const std::string directory(60, 'd');
+  const std::string filename(80, 'f');
+  const std::string moved(90, 'm');
+  ASSERT_EQ(FileStatus::kOk, fs_->CreateDirectory(cap_, kPurpose, directory));
+  std::shared_ptr<RecordFile> file;
+  ASSERT_EQ(FileStatus::kOk, fs_->OpenFile(cap_, kPurpose, directory + "/" + filename,
+      RecordOpen::kCreate, &file));
+  const std::string value = "long-name-data";
+  ASSERT_EQ(FileStatus::kOk, file->Write(0, base::as_byte_span(value)));
+  ASSERT_EQ(FileStatus::kOk, file->Close());
+  RecordFileInfo info;
+  ASSERT_EQ(FileStatus::kOk, fs_->Stat(cap_, kPurpose, directory + "/" + filename, &info));
+  std::vector<RecordDirectoryEntry> entries;
+  ASSERT_EQ(FileStatus::kOk, fs_->List(cap_, kPurpose, directory, &entries));
+  ASSERT_EQ(1u, entries.size());
+  EXPECT_EQ(filename, entries[0].name);
+  ASSERT_EQ(FileStatus::kOk, fs_->Rename(cap_, kPurpose, directory + "/" + filename,
+      directory + "/" + moved));
+  ASSERT_EQ(FileStatus::kOk, fs_->Remove(cap_, kPurpose, directory + "/" + moved));
+  ASSERT_EQ(FileStatus::kOk, fs_->Remove(cap_, kPurpose, directory));
+  Reopen();
+  EXPECT_EQ(FileStatus::kNotFound, fs_->Stat(cap_, kPurpose, directory, &info));
+}
+
 }  // namespace
 }  // namespace alloy::site_records

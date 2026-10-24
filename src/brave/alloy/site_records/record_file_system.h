@@ -155,6 +155,7 @@ class RecordFile {
   FileStatus Lock(RecordFileLock lock);
   FileStatus Unlock(RecordFileLock lock = RecordFileLock::kNone);
   FileStatus HasReservedLock(bool* out);
+  FileStatus GetLock(RecordFileLock* out);
   bool KeysClearedForTesting() const;
 
  private:

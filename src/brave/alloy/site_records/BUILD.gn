@@ -26,6 +26,27 @@ source_set("document_settings") {
   ]
 }
 
+source_set("record_files") {
+  sources = [
+    "authenticated_objects.cc",
+    "authenticated_objects.h",
+    "encrypted_file_contents.cc",
+    "encrypted_file_contents.h",
+    "encrypted_tree.cc",
+    "encrypted_tree.h",
+    "record_file_system.cc",
+    "record_file_system.h",
+  ]
+  public_deps = [
+    ":capabilities",
+    "//base",
+  ]
+  deps = [
+    "//crypto",
+    "//third_party/boringssl",
+  ]
+}
+
 test("alloy_site_records_unittests") {
   sources = [
     "cookie_mode_unittest.cc",
@@ -37,11 +58,17 @@ test("alloy_site_records_unittests") {
     "request_context_policy_unittest.cc",
     "renderer_cache_unittest.cc",
     "stateless_network_unittest.cc",
+    "authenticated_objects_unittest.cc",
+    "encrypted_file_contents_unittest.cc",
+    "encrypted_tree_unittest.cc",
+    "record_file_crash_unittest.cc",
+    "record_file_system_unittest.cc",
     "test_main.cc",
   ]
   deps = [
     ":capabilities",
     ":document_settings",
+    ":record_files",
     "//base/test:test_support",
     "//components/content_settings/core/browser",
     "//components/permissions",

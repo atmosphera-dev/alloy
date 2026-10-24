@@ -21,6 +21,18 @@ WORK = Path('/home/builder/work/alloy')
 ROOT = WORK / 'src'
 CONFIG_OUT = {'release': 'Release_Alloy', 'verify': 'Verify_Alloy'}
 
+# The gate compiles the actual support consumed by native profile/device tests,
+# plus overrides local to content's unit/browser-test translation units. Keep
+# these in the build gate so unbuilt test doubles cannot hide an API mismatch.
+GATE_TARGETS = [
+    'cefclient', 'alloy_guard_unittests', 'alloy_traffic_unittests',
+    'alloy_site_records_unittests', 'alloy_navigation_mock_unittests',
+    'alloy_api_test_support', 'leveldb_leveldbutil',
+    'obj/content/test/content_unittests/storage_partition_impl_unittest.o',
+    'obj/content/test/content_browsertests/renderer_accessible_http_cache_browsertest.o',
+    'obj/chrome/browser/policy/unit_tests/browser_dm_token_storage_linux_unittest.o',
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -29,8 +41,12 @@ def main():
                         help='Committed build configuration (default release)')
     parser.add_argument('--target', action='append',
                         help='GN/Ninja target (repeatable; default cefclient)')
+    parser.add_argument('--gate', action='store_true',
+                        help='Also build Alloy tests and native API/test-double support')
     parser.add_argument('--timeout', type=int, default=32400)
     args = parser.parse_args()
+    targets = list(dict.fromkeys((args.target or ['cefclient']) +
+                                (GATE_TARGETS if args.gate else [])))
     out = ROOT / 'out' / CONFIG_OUT[args.config]
     if socket.gethostname() != 'wakaba-build' or ROOT.resolve() != ROOT:
         parser.error('Only the approved NUC Alloy source tree is supported')
@@ -57,7 +73,7 @@ def main():
         commands = [([sys.executable, 'tools/version_manager.py', '-u', '--fast-check'], ROOT / 'cef', 600),
                     ([str(ROOT / 'buildtools/linux64/gn'), 'gen', str(out)], ROOT, 600)]
         if not args.prepare_only:
-            commands.append((['autoninja', '-C', str(out), *(args.target or ['cefclient'])], ROOT, args.timeout))
+            commands.append((['autoninja', '-C', str(out), *targets], ROOT, args.timeout))
         start = time.time()
         for command, cwd, limit in commands:
             print('COMMAND', command, 'CWD', cwd, 'START', time.strftime('%FT%TZ', time.gmtime()), flush=True)
@@ -67,10 +83,10 @@ def main():
             if result.returncode:
                 return result.returncode
         if not args.prepare_only:
-            if 'cefclient' in (args.target or ['cefclient']) and (
+            if 'cefclient' in targets and (
                     not (out / 'cefclient').is_file() or not (out / 'libcef.so').is_file()):
                 raise RuntimeError('Build exited without expected artifacts')
-            print('ALLOY_CEFCLIENT_BUILD_FINISHED' if 'cefclient' in (args.target or ['cefclient'])
+            print('ALLOY_CEFCLIENT_BUILD_FINISHED' if 'cefclient' in targets
                   else 'ALLOY_TARGET_BUILD_FINISHED', flush=True)
     return 0
 

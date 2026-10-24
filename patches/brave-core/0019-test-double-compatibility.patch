@@ -1,0 +1,43 @@
+--- a/browser/renderer_context_menu/test/render_view_context_menu_unittest.cc
++++ b/browser/renderer_context_menu/test/render_view_context_menu_unittest.cc
+@@ -83,6 +83,8 @@
+   using RenderViewContextMenu::RenderViewContextMenu;
+ 
+   void Show() override {}
++  // This fixture has no native popup or running menu loop.
++  bool IsRunning() override { return false; }
+ 
+   void SetBrowser(BrowserWindowInterface* browser) { browser_ = browser; }
+ 
+--- a/browser/ui/views/frame/layout/brave_browser_view_tabbed_layout_impl_unittest.cc
++++ b/browser/ui/views/frame/layout/brave_browser_view_tabbed_layout_impl_unittest.cc
+@@ -42,6 +42,8 @@
+   views::LayoutAlignment GetWindowTitleAlignment() const override {
+     return views::LayoutAlignment::kStart;
+   }
++  // This no-top-UI fixture has no embedder inset adjustment.
++  void UpdateDialogTopInsetInBrowserView(int*) const override {}
+   bool IsToolbarVisible() const override { return false; }
+   bool IsBookmarkBarVisible() const override { return false; }
+   bool IsInfobarVisible() const override { return false; }
+--- a/components/brave_mobile_subscription/renderer/android/subscription_render_frame_observer_browsertest.cc
++++ b/components/brave_mobile_subscription/renderer/android/subscription_render_frame_observer_browsertest.cc
+@@ -31,7 +31,6 @@
+ #if BUILDFLAG(ENABLE_AI_CHAT)
+             ai_chat::features::kAIChat,
+ #endif
+-            brave_origin::features::kBraveOrigin,
+         },
+         {});
+   }
+--- a/test/base/testing_brave_browser_process.cc
++++ b/test/base/testing_brave_browser_process.cc
+@@ -50,8 +50,6 @@
+ 
+ // static
+ void TestingBraveBrowserProcess::StartTearDown() {
+-  // Reset BraveOriginPolicyManager to prevent dangling pointer to local_state_.
+-  brave_origin::BraveOriginPolicyManager::GetInstance()->Shutdown();
+ #if BUILDFLAG(ENABLE_TOR)
+   // TorProfileManager is a base::NoDestructor singleton whose
+   // TorBrowserCollectionObserver observes GlobalBrowserCollection for the

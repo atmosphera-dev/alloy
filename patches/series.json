@@ -172,6 +172,16 @@
       "patch": "chromium/0019-navigation-throttle-mock.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0019-test-double-compatibility.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0019-test-double-compatibility.patch",
+      "root": "brave",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

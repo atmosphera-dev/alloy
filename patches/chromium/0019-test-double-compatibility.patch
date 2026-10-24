@@ -1,0 +1,371 @@
+--- a/chrome/browser/apps/platform_apps/app_browsertest.cc
++++ b/chrome/browser/apps/platform_apps/app_browsertest.cc
+@@ -117,6 +117,8 @@
+   }
+ 
+   void Show() override {}
++  // This fixture has no native popup or running menu loop.
++  bool IsRunning() override { return false; }
+ };
+ 
+ // This class keeps track of tabs as they are added to the browser. It will be
+--- a/chrome/browser/policy/browser_dm_token_storage_linux_unittest.cc
++++ b/chrome/browser/policy/browser_dm_token_storage_linux_unittest.cc
+@@ -14,6 +14,8 @@
+ #include "base/run_loop.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/test/scoped_path_override.h"
++#include "cef/libcef/features/features.h"
++#include "chrome/browser/policy/chrome_browser_policy_connector.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "content/public/test/browser_task_environment.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+@@ -64,12 +66,27 @@
+   base::ScopedTempDir fake_policy_dir;
+ 
+   ASSERT_TRUE(fake_policy_dir.CreateUniqueTempDir());
++  base::FilePath dir_policy_files_path;
++#if BUILDFLAG(ENABLE_CEF)
++  base::FilePath previous;
++  const bool had_previous =
++      ChromeBrowserPolicyConnector::GetDirPolicyFilesPath(&previous);
++  base::ScopedClosureRunner restore(base::BindOnce(
++      [](base::FilePath previous, bool enabled) {
++        ChromeBrowserPolicyConnector::EnablePlatformPolicySupport(
++            enabled ? previous.AsUTF8Unsafe() : std::string());
++      },
++      previous, had_previous));
++  ChromeBrowserPolicyConnector::EnablePlatformPolicySupport(
++      fake_policy_dir.GetPath().AsUTF8Unsafe());
++  ASSERT_TRUE(ChromeBrowserPolicyConnector::GetDirPolicyFilesPath(
++      &dir_policy_files_path));
++#else
+   path_override = std::make_unique<base::ScopedPathOverride>(
+       chrome::DIR_POLICY_FILES, fake_policy_dir.GetPath());
+-
+-  base::FilePath dir_policy_files_path;
+   ASSERT_TRUE(
+       base::PathService::Get(chrome::DIR_POLICY_FILES, &dir_policy_files_path));
++#endif
+   base::FilePath enrollment_token_file_path =
+       dir_policy_files_path.Append(kEnrollmentTokenFilename);
+ 
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu_test_util.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu_test_util.cc
+@@ -114,6 +114,11 @@
+ void TestRenderViewContextMenu::Show() {
+ }
+ 
++bool TestRenderViewContextMenu::IsRunning() {
++  // Show() is deliberately a no-op: this fixture never opens a platform menu.
++  return false;
++}
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ const policy::DlpRulesManager* TestRenderViewContextMenu::GetDlpRulesManager()
+     const {
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu_test_util.h
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu_test_util.h
+@@ -120,6 +120,7 @@
+ 
+   // RenderViewContextMenu:
+   void Show() override;
++  bool IsRunning() override;
+   std::optional<IndigoReplacementInfo> GetIndigoReplacementInfo()
+       const override;
+ #if BUILDFLAG(IS_CHROMEOS)
+--- a/chrome/browser/ui/browser_window/test/mock_browser_window_interface.cc
++++ b/chrome/browser/ui/browser_window/test/mock_browser_window_interface.cc
+@@ -4,9 +4,17 @@
+ 
+ #include "chrome/browser/ui/browser_window/test/mock_browser_window_interface.h"
+ 
++#include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "ui/base/unowned_user_data/unowned_user_data_host.h"
+ 
+ MockBrowserWindowInterface::MockBrowserWindowInterface() {
++#if !BUILDFLAG(IS_ANDROID)
++  // Share native classification, including CEF popup delegates; callers may
++  // still override this query explicitly.
++  ON_CALL(*this, IsNormalBrowser()).WillByDefault([this] {
++    return BrowserWindowFeatures::IsNormalBrowser(this);
++  });
++#endif
+   ON_CALL(*this, GetUnownedUserDataHost())
+       .WillByDefault(testing::ReturnRef(unowned_user_data_host_));
+ }
+--- a/chrome/browser/ui/browser_window/test/mock_browser_window_interface.h
++++ b/chrome/browser/ui/browser_window/test/mock_browser_window_interface.h
+@@ -74,6 +74,7 @@
+               (tabs::TabInterface * tab_interface),
+               (override));
+   MOCK_METHOD(bool, IsActive, (), (const, override));
++  MOCK_METHOD(bool, IsNormalBrowser, (), (const, override));
+   MOCK_METHOD(base::CallbackListSubscription,
+               RegisterDidBecomeActive,
+               (DidBecomeActiveCallback callback),
+--- a/chrome/test/base/BUILD.gn
++++ b/chrome/test/base/BUILD.gn
+@@ -199,6 +199,7 @@
+   ]
+   public_deps = [ "//base" ]
+   deps = [
++    "//chrome/browser/policy",
+     "//chrome/common",
+     "//components/os_crypt/common:switches",
+     "//components/password_manager/core/browser:password_switches",
+--- a/chrome/test/base/test_launcher_utils.cc
++++ b/chrome/test/base/test_launcher_utils.cc
+@@ -14,6 +14,8 @@
+ #include "base/path_service.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "build/build_config.h"
++#include "cef/libcef/features/features.h"
++#include "chrome/browser/policy/chrome_browser_policy_connector.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/common/url_constants.h"
+@@ -136,8 +138,13 @@
+   // Also make sure that the machine policy directory is inside the clear
+   // profile. Otherwise the machine's policies could affect tests.
+   base::FilePath policy_files = user_data_dir.AppendASCII("policies");
++#if BUILDFLAG(ENABLE_CEF)
++  policy::ChromeBrowserPolicyConnector::EnablePlatformPolicySupport(
++      policy_files.AsUTF8Unsafe());
++#else
+   success = success &&
+             base::PathService::Override(chrome::DIR_POLICY_FILES, policy_files);
++#endif
+ #endif
+ 
+   return success;
+--- a/chrome/test/base/testing_browser_process.cc
++++ b/chrome/test/base/testing_browser_process.cc
+@@ -422,7 +422,10 @@
+ policy::ChromeBrowserPolicyConnector*
+ TestingBrowserProcess::browser_policy_connector() {
+   if (!browser_policy_connector_) {
+-#if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC) && BUILDFLAG(ENABLE_CEF)
++    // CEF has no ambient policy-directory path key. Fixtures opt in explicitly.
++    policy::ChromeBrowserPolicyConnector::EnablePlatformPolicySupport({});
++#elif BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
+     // Make sure that the machine policy directory does not exist so that
+     // machine-wide policies do not affect tests.
+     // Note that passing false as last argument to OverrideAndCreateIfNeeded
+--- a/components/viz/service/display_embedder/software_output_device_win_unittest.cc
++++ b/components/viz/service/display_embedder/software_output_device_win_unittest.cc
+@@ -38,7 +38,10 @@
+               (const gfx::Size& size,
+                base::UnsafeSharedMemoryRegion memory_region),
+               (override));
+-  MOCK_METHOD(void, Draw, (DrawCallback), (override));
++  MOCK_METHOD(void,
++              Draw,
++              (const gfx::Rect& damage_rect, DrawCallback),
++              (override));
+ 
+  private:
+   mojo::Receiver<mojom::LayeredWindowUpdater> receiver_{this};
+@@ -78,7 +81,8 @@
+   // Verify that calling BeginPaint() then EndPaint() triggers the Draw() IPC
+   // and then run the DrawCallback.
+   device_.BeginPaint(gfx::Rect(kDefaultSize));
+-  EXPECT_CALL(updater_, Draw(_)).WillOnce(RunOnceClosure<0>());
++  EXPECT_CALL(updater_, Draw(gfx::Rect(kDefaultSize), _))
++      .WillOnce(RunOnceClosure<1>());
+   device_.EndPaint();
+   updater_.FlushForTesting();
+   testing::Mock::VerifyAndClearExpectations(&updater_);
+@@ -101,7 +105,8 @@
+   // Verify that calling BeginPaint() then EndPaint() triggers the Draw() IPC
+   // and then run the DrawCallback.
+   device_.BeginPaint(gfx::Rect(kDefaultSize));
+-  EXPECT_CALL(updater_, Draw(_)).WillOnce(RunOnceClosure<0>());
++  EXPECT_CALL(updater_, Draw(gfx::Rect(kDefaultSize), _))
++      .WillOnce(RunOnceClosure<1>());
+   device_.EndPaint();
+   updater_.FlushForTesting();
+   testing::Mock::VerifyAndClearExpectations(&updater_);
+--- a/components/viz/test/fake_display_client.cc
++++ b/components/viz/test/fake_display_client.cc
+@@ -20,9 +20,9 @@
+     gfx::CALayerParams ca_layer_params) {}
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN)
+ void FakeDisplayClient::CreateLayeredWindowUpdater(
+     mojo::PendingReceiver<mojom::LayeredWindowUpdater> receiver) {}
++#if BUILDFLAG(IS_WIN)
+ void FakeDisplayClient::AddChildWindowToBrowser(
+     gpu::SurfaceHandle child_window) {}
+ #endif
+--- a/components/viz/test/fake_display_client.h
++++ b/components/viz/test/fake_display_client.h
+@@ -30,9 +30,9 @@
+       gfx::CALayerParams ca_layer_params) override;
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN)
+   void CreateLayeredWindowUpdater(
+       mojo::PendingReceiver<mojom::LayeredWindowUpdater> receiver) override;
++#if BUILDFLAG(IS_WIN)
+   void AddChildWindowToBrowser(gpu::SurfaceHandle child_window) override;
+ #endif
+ 
+--- a/components/viz/test/mock_display_client.h
++++ b/components/viz/test/mock_display_client.h
+@@ -32,9 +32,9 @@
+ #if BUILDFLAG(IS_APPLE)
+   MOCK_METHOD1(OnDisplayReceivedCALayerParams, void(gfx::CALayerParams));
+ #endif
+-#if BUILDFLAG(IS_WIN)
+   MOCK_METHOD1(CreateLayeredWindowUpdater,
+                void(mojo::PendingReceiver<mojom::LayeredWindowUpdater>));
++#if BUILDFLAG(IS_WIN)
+   MOCK_METHOD1(AddChildWindowToBrowser, void(gpu::SurfaceHandle child_window));
+ #endif
+ #if BUILDFLAG(IS_ANDROID)
+--- a/content/browser/network/renderer_accessible_http_cache_browsertest.cc
++++ b/content/browser/network/renderer_accessible_http_cache_browsertest.cc
+@@ -123,7 +123,7 @@
+   TestContentBrowserClient() = default;
+   ~TestContentBrowserClient() override = default;
+ 
+-  void ConfigureNetworkContextParams(
++  bool ConfigureNetworkContextParams(
+       BrowserContext* context,
+       bool in_memory,
+       const base::FilePath& relative_partition_path,
+@@ -141,9 +141,10 @@
+       path = path.AppendASCII("Cache");
+       network_context_params->file_paths->http_cache_directory = path;
+     }
+-    ContentBrowserTestContentBrowserClient::ConfigureNetworkContextParams(
+-        context, in_memory, relative_partition_path, network_context_params,
+-        cert_verifier_creation_params);
++    return ContentBrowserTestContentBrowserClient::
++        ConfigureNetworkContextParams(
++            context, in_memory, relative_partition_path, network_context_params,
++            cert_verifier_creation_params);
+   }
+ };
+ 
+--- a/content/browser/storage_partition_impl_unittest.cc
++++ b/content/browser/storage_partition_impl_unittest.cc
+@@ -2208,7 +2208,7 @@
+       : cache_dir_(cache_dir),
+         enable_encrypted_cache_(enable_encrypted_cache) {}
+ 
+-  void ConfigureNetworkContextParams(
++  bool ConfigureNetworkContextParams(
+       BrowserContext* context,
+       bool in_memory,
+       const base::FilePath& relative_partition_path,
+@@ -2222,6 +2222,7 @@
+     }
+     network_context_params->enable_encrypted_http_cache =
+         enable_encrypted_cache_;
++    return true;
+   }
+ 
+  private:
+--- a/net/cookies/cookie_store_test_helpers.cc
++++ b/net/cookies/cookie_store_test_helpers.cc
+@@ -195,6 +195,18 @@
+   ADD_FAILURE();
+ }
+ 
++void DelayedCookieMonster::AddCookieableSchemes(
++    const std::vector<std::string>& schemes,
++    SetCookieableSchemesCallback callback) {
++  cookie_monster_->AddCookieableSchemes(schemes, std::move(callback));
++}
++
++void DelayedCookieMonster::RemoveCookieableSchemes(
++    const std::vector<std::string>& schemes,
++    SetCookieableSchemesCallback callback) {
++  cookie_monster_->RemoveCookieableSchemes(schemes, std::move(callback));
++}
++
+ //
+ // CookieURLHelper
+ //
+--- a/net/cookies/cookie_store_test_helpers.h
++++ b/net/cookies/cookie_store_test_helpers.h
+@@ -104,6 +104,10 @@
+ 
+   void SetCookieableSchemes(std::vector<std::string> schemes,
+                             SetCookieableSchemesCallback callback) override;
++  void AddCookieableSchemes(const std::vector<std::string>& schemes,
++                            SetCookieableSchemesCallback callback) override;
++  void RemoveCookieableSchemes(const std::vector<std::string>& schemes,
++                               SetCookieableSchemesCallback callback) override;
+ 
+  private:
+   // Be called immediately from CookieMonster.
+--- a/net/dns/host_resolver_dns_task_unittest.cc
++++ b/net/dns/host_resolver_dns_task_unittest.cc
+@@ -76,7 +76,8 @@
+                const NetworkAnonymizationKey& anonymization_key,
+ 
+                handles::NetworkHandle target_network,
+-               CallbackType callback),
++               CallbackType callback,
++               const SocketTag& socket_tag),
+               (const, override));
+ };
+ 
+@@ -442,11 +443,11 @@
+     // need to ensure that HostResolverDnsTask does end up calling relying on
+     // it.
+     auto prefer_ipv6_address_sorter = std::make_unique<MockAddressSorter>();
+-    EXPECT_CALL(*prefer_ipv6_address_sorter, Sort(_, _, kTargetNetwork, _))
++    EXPECT_CALL(*prefer_ipv6_address_sorter, Sort(_, _, kTargetNetwork, _, _))
+         .WillOnce([](const std::vector<IPEndPoint>& endpoints,
+                      const NetworkAnonymizationKey& anonymization_key,
+                      handles::NetworkHandle target_network,
+-                     AddressSorter::CallbackType callback) {
++                     AddressSorter::CallbackType callback, const SocketTag&) {
+           EXPECT_THAT(endpoints,
+                       UnorderedElementsAre(
+                           IPEndPoint(IPAddress(0x20, 0x01, 0x0d, 0xb8, 0, 0, 0,
+--- a/net/dns/host_resolver_manager_unittest.cc
++++ b/net/dns/host_resolver_manager_unittest.cc
+@@ -13654,28 +13654,29 @@
+               (const std::vector<IPEndPoint>& endpoints,
+                const NetworkAnonymizationKey& anonymization_key,
+                handles::NetworkHandle target_network,
+-               CallbackType callback),
++               CallbackType callback,
++               const SocketTag& socket_tag),
+               (const, override));
+ 
+   void ExpectCall(const std::vector<IPEndPoint>& expected,
+                   std::vector<IPEndPoint> sorted) {
+-    EXPECT_CALL(*this, Sort(expected, _, _, _))
++    EXPECT_CALL(*this, Sort(expected, _, _, _, _))
+         .WillOnce([sorted](const std::vector<IPEndPoint>& endpoints,
+                            const NetworkAnonymizationKey& anonymization_key,
+                            handles::NetworkHandle target_network,
+-                           AddressSorter::CallbackType callback) {
++                           AddressSorter::CallbackType callback,
++                           const SocketTag&) {
+           std::move(callback).Run(true, std::move(sorted));
+         });
+   }
+ 
+   void ExpectCallAndFailSort(const std::vector<IPEndPoint>& expected) {
+-    EXPECT_CALL(*this, Sort(expected, _, _, _))
++    EXPECT_CALL(*this, Sort(expected, _, _, _, _))
+         .WillOnce([](const std::vector<IPEndPoint>& endpoints,
+                      const NetworkAnonymizationKey& anonymization_key,
+                      handles::NetworkHandle target_network,
+-                     AddressSorter::CallbackType callback) {
+-          std::move(callback).Run(false, {});
+-        });
++                     AddressSorter::CallbackType callback,
++                     const SocketTag&) { std::move(callback).Run(false, {}); });
+   }
+ };
+ 

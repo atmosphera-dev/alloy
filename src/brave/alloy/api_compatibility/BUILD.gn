@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import("//testing/test.gni")
+
+source_set("test_main") {
+  testonly = true
+  sources = [ "test_main.cc" ]
+  configs += [ "//cef/libcef/features:config" ]
+  deps = [
+    "//base/test:test_support",
+    # CEF's internal-test support brings the composed embedder definitions via
+    # libcef_static, matching the support path in cef/BUILD.gn.
+    "//cef:libcef_test_support",
+    # ceftests obtains CEF's exported API/version entry points from libcef.
+    "//cef:libcef",
+    "//chrome/browser:chrome_content_browser_client",
+    "//chrome/common",
+    "//chrome/test/base:chrome_unit_test_suite",
+    "//chrome/utility",
+    "//content/test:test_support",
+    "//mojo/core/embedder",
+    "//services/network:alloy_buildflags",
+    "//services/network/public/mojom",
+  ]
+}
+
+test("alloy_api_compatibility_unittests") {
+  sources = [ "api_compatibility_unittest.cc" ]
+  deps = [
+    ":test_main",
+    "//base/test:test_support",
+    "//chrome/browser/renderer_context_menu:test_support",
+    "//chrome/browser/policy",
+    "//chrome/browser/ui/browser_window/test:test_support",
+    "//chrome/test:test_support",
+    "//chrome/test/base:chrome_render_view_host_test_harness",
+    "//components/viz/test:test_support",
+    "//mojo/public/cpp/bindings",
+    "//net:test_support",
+    "//services/viz/privileged/mojom",
+    "//testing/gmock",
+    "//testing/gtest",
+  ]
+}

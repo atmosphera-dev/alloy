@@ -26,3 +26,8 @@ group("site_records_tests") {
   testonly = true
   deps = [ "site_records:alloy_site_records_unittests" ]
 }
+
+group("navigation_mock_tests") {
+  testonly = true
+  deps = [ "navigation_mock:alloy_navigation_mock_unittests" ]
+}

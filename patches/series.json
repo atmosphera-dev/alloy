@@ -167,6 +167,11 @@
       "patch": "chromium/0019-page-worker-ownership.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0019-navigation-throttle-mock.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

@@ -1,0 +1,150 @@
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -9187,13 +9187,14 @@
+ }
+ 
+ void NavigationRequest::RegisterThrottleForTesting(
+-    std::unique_ptr<NavigationThrottle> navigation_throttle) {
++    std::unique_ptr<NavigationThrottle> navigation_throttle,
++    bool first) {
+   // Throttles will already have run the first time the page was navigated, we
+   // won't run them again on activation. See instead CommitDeferringCondition.
+   CHECK(!IsPageActivation())
+       << "Attempted to register a NavigationThrottle for an activating "
+          "navigation which will not work.";
+-  throttle_registry_->AddThrottle(std::move(navigation_throttle));
++  throttle_registry_->AddThrottle(std::move(navigation_throttle), first);
+ }
+ bool NavigationRequest::IsDeferredForTesting() {
+   return IsDeferred();
+--- a/content/browser/renderer_host/navigation_request.h
++++ b/content/browser/renderer_host/navigation_request.h
+@@ -463,7 +463,8 @@
+   net::ResolveErrorInfo GetResolveErrorInfo() override;
+   net::IsolationInfo GetIsolationInfo() override;
+   void RegisterThrottleForTesting(
+-      std::unique_ptr<NavigationThrottle> navigation_throttle) override;
++      std::unique_ptr<NavigationThrottle> navigation_throttle,
++      bool first = false) override;
+   bool IsDeferredForTesting() override;
+   bool IsCommitDeferringConditionDeferredForTesting() override;
+   CommitDeferringCondition* GetCommitDeferringConditionForTesting() override;
+--- a/content/public/browser/navigation_handle.h
++++ b/content/public/browser/navigation_handle.h
+@@ -867,8 +867,10 @@
+   // but returned by the implementation of
+   // ContentBrowserClient::CreateThrottlesForNavigation. This ensures proper
+   // ordering of the throttles.
++  // `first` preserves the registry's priority within test registration.
+   virtual void RegisterThrottleForTesting(
+-      std::unique_ptr<NavigationThrottle> navigation_throttle) = 0;
++      std::unique_ptr<NavigationThrottle> navigation_throttle,
++      bool first = false) = 0;
+ 
+   // Returns whether this navigation is currently deferred.
+   virtual bool IsDeferredForTesting() = 0;
+--- a/content/public/test/mock_navigation_handle.h
++++ b/content/public/test/mock_navigation_handle.h
+@@ -263,6 +263,17 @@
+   MOCK_METHOD(void,
+               RegisterThrottleForTesting,
+               (std::unique_ptr<NavigationThrottle>));
++  MOCK_METHOD(void,
++              RegisterFirstThrottleForTesting,
++              (std::unique_ptr<NavigationThrottle>));
++  void RegisterThrottleForTesting(std::unique_ptr<NavigationThrottle> throttle,
++                                  bool first) override {
++    if (first) {
++      RegisterFirstThrottleForTesting(std::move(throttle));
++    } else {
++      RegisterThrottleForTesting(std::move(throttle));
++    }
++  }
+   MOCK_METHOD(bool, IsDeferredForTesting, ());
+   MOCK_METHOD(bool, IsCommitDeferringConditionDeferredForTesting, ());
+   MOCK_METHOD(void,
+--- a/content/public/test/mock_navigation_throttle_registry.cc
++++ b/content/public/test/mock_navigation_throttle_registry.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/public/test/mock_navigation_throttle_registry.h"
++
++#include <algorithm>
+ 
+ #include "base/check_deref.h"
+ #include "base/notimplemented.h"
+@@ -25,14 +27,24 @@
+ }
+ 
+ void MockNavigationThrottleRegistry::AddThrottle(
+-    std::unique_ptr<NavigationThrottle> throttle) {
++    std::unique_ptr<NavigationThrottle> throttle,
++    bool first) {
+   CHECK(throttle);
+   switch (registration_mode_) {
+     case RegistrationMode::kAutoRegistrationForTesting:
+-      GetNavigationHandle().RegisterThrottleForTesting(std::move(throttle));
++      GetNavigationHandle().RegisterThrottleForTesting(std::move(throttle),
++                                                       first);
+       break;
+     case RegistrationMode::kHold:
+-      throttles_.push_back(std::move(throttle));
++      // Existing tests can clear or take entries through throttles(). A clear
++      // must not leave stale priority metadata for a later ordinary insertion.
++      first_count_ = std::min(first_count_, throttles_.size());
++      if (first) {
++        throttles_.insert(throttles_.begin(), std::move(throttle));
++        ++first_count_;
++      } else {
++        throttles_.push_back(std::move(throttle));
++      }
+       break;
+   }
+ }
+@@ -53,10 +65,21 @@
+   CHECK_EQ(registration_mode_, RegistrationMode::kHold);
+ 
+   auto& handle = GetNavigationHandle();
+-  for (auto& it : throttles_) {
+-    handle.RegisterThrottleForTesting(std::move(it));
++  first_count_ = std::min(first_count_, throttles_.size());
++  // Native front insertion reverses order, so replay the priority prefix
++  // backwards. Existing entries in the real registry stay behind that prefix.
++  for (size_t i = first_count_; i > 0; --i) {
++    if (throttles_[i - 1]) {
++      handle.RegisterThrottleForTesting(std::move(throttles_[i - 1]), true);
++    }
++  }
++  for (size_t i = first_count_; i < throttles_.size(); ++i) {
++    if (throttles_[i]) {
++      handle.RegisterThrottleForTesting(std::move(throttles_[i]), false);
++    }
+   }
+   throttles_.clear();
++  first_count_ = 0;
+ }
+ 
+ bool MockNavigationThrottleRegistry::HasThrottle(const std::string& name) {
+--- a/content/public/test/mock_navigation_throttle_registry.h
++++ b/content/public/test/mock_navigation_throttle_registry.h
+@@ -49,7 +49,8 @@
+ 
+   // Implements NavigationThrottleRegistry:
+   NavigationHandle& GetNavigationHandle() override;
+-  void AddThrottle(std::unique_ptr<NavigationThrottle> throttle) override;
++  void AddThrottle(std::unique_ptr<NavigationThrottle> throttle,
++                   bool first = false) override;
+ 
+   // Following methods are not supported in this mock, and returns false always.
+   bool HasThrottle(const std::string& name) override;
+@@ -72,6 +73,9 @@
+   raw_ptr<NavigationHandle> navigation_handle_;
+   const RegistrationMode registration_mode_;
+   std::vector<std::unique_ptr<NavigationThrottle>> throttles_;
++  // First-priority entries form the front prefix. Keep their registration
++  // priority when moving held entries to the real navigation registry.
++  size_t first_count_ = 0;
+ };
+ 
+ }  // namespace content

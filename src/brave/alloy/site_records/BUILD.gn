@@ -85,6 +85,18 @@ executable("alloy_profile_cpp_consumer") {
   ]
 }
 
+source_set("leveldb_files") {
+  sources = [
+    "record_leveldb_env.cc",
+    "record_leveldb_env.h",
+  ]
+  public_deps = [
+    ":record_files",
+    "//third_party/leveldatabase",
+  ]
+  deps = [ "//base/alloy:buildflags" ]
+}
+
 test("alloy_site_records_unittests") {
   sources = [
     "cookie_mode_unittest.cc",
@@ -102,6 +114,7 @@ test("alloy_site_records_unittests") {
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",
     "record_file_system_unittest.cc",
+    "record_leveldb_env_unittest.cc",
     "record_sqlite_vfs_unittest.cc",
     "test_main.cc",
   ]
@@ -111,6 +124,7 @@ test("alloy_site_records_unittests") {
     ":record_files",
     ":profiles",
     ":sqlite_files",
+    ":leveldb_files",
     "//brave/third_party/argon2",
     "//base/test:test_support",
     "//components/content_settings/core/browser",

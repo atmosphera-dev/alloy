@@ -253,6 +253,8 @@ std::vector<uint8_t> RecordBinding(base::UnguessableToken profile,
 struct RecordFileState {
   NamespaceEntry entry;
   std::unique_ptr<EncryptedFileContents> contents;
+  std::vector<uint8_t> pending_append;
+  ~RecordFileState() { Cleanse(pending_append); }
   bool linked = true;
   bool dirty = false;
   size_t handles = 0;
@@ -287,6 +289,8 @@ struct RecordFileSystem::Impl {
       Cleanse(info.metadata);
       info.metadata.clear();
       for (auto& [id, file] : files) {
+        Cleanse(file->pending_append);
+        file->pending_append.clear();
         file->contents->Revoke();
         WipeString(&file->entry.name);
         file->locks.clear();
@@ -541,7 +545,7 @@ struct RecordFileSystem::Impl {
     auto info = EntryInfo(entry);
     const auto found = record.files.find(entry.root.file_id);
     if (found != record.files.end()) {
-      info.length = found->second->contents->root().length;
+      info.length = found->second->contents->root().length + found->second->pending_append.size();
       info.modified_us = found->second->entry.modified_us;
     }
     return info;
@@ -663,6 +667,19 @@ struct RecordFileSystem::Impl {
     return record.objects->Prune(live);
   }
 
+  FileStatus FlushAppend(Record& record, RecordFileState& file) {
+    if (file.pending_append.empty()) return FileStatus::kOk;
+    record.gc_needed = true;
+    const auto status = file.contents->Write(file.contents->root().length,
+                                               file.pending_append);
+    if (status == FileStatus::kOk) {
+      Cleanse(file.pending_append);
+      file.pending_append.clear();
+      file.dirty = true;
+    }
+    return status;
+  }
+
   FileStatus Commit() {
     auto status = Admission();
     if (status != FileStatus::kOk) {
@@ -675,6 +692,8 @@ struct RecordFileSystem::Impl {
     for (auto& [id, record] : records) {
       auto names = record->names;
       for (auto& [file_id, file] : record->files) {
+        status = FlushAppend(*record, *file);
+        if (status != FileStatus::kOk) return status;
         if (file->dirty && file->linked) {
           file->entry.root = file->contents->root();
           status = PutEntry(*record, file->entry, &names);
@@ -800,6 +819,8 @@ struct RecordFileSystem::Impl {
     }
     if (create || mode == RecordOpen::kCreateOrTruncate) {
       if (!create) {
+        status = FlushAppend(*record, *state);
+        if (status != FileStatus::kOk) return status;
         status = state->contents->SetLength(0);
         if (status != FileStatus::kOk) {
           return status;
@@ -1487,6 +1508,7 @@ FileStatus RecordFile::Read(uint64_t offset, base::span<uint8_t> bytes,
   RecordFileSystem::Impl::Record* record;
   auto status = owner->impl_->CheckHandle(*this, StorageAccess::kReadRecordFiles,
                                           &record);
+  if (status == FileStatus::kOk) status = owner->impl_->FlushAppend(*record, *state_);
   if (status == FileStatus::kOk) {
     status = state_->contents->Read(offset, bytes, read);
   }
@@ -1502,6 +1524,7 @@ FileStatus RecordFile::Write(uint64_t offset, base::span<const uint8_t> bytes) {
   RecordFileSystem::Impl::Record* record;
   auto status = owner->impl_->CheckHandle(*this, StorageAccess::kWriteRecordFiles,
                                           &record);
+  if (status == FileStatus::kOk) status = owner->impl_->FlushAppend(*record, *state_);
   if (status == FileStatus::kOk) {
     record->gc_needed = true;
     status = state_->contents->Write(offset, bytes);
@@ -1510,6 +1533,42 @@ FileStatus RecordFile::Write(uint64_t offset, base::span<const uint8_t> bytes) {
       state_->entry.modified_us = NowMicros();
     }
   }
+  return owner->impl_->Observe(status);
+}
+
+FileStatus RecordFile::AppendBuffered(base::span<const uint8_t> bytes) {
+  const auto owner = owner_.lock();
+  if (!owner) return FileStatus::kDenied;
+  std::lock_guard lock(owner->impl_->mutex);
+  RecordFileSystem::Impl::Record* record;
+  auto status = owner->impl_->CheckHandle(*this, StorageAccess::kWriteRecordFiles, &record);
+  if (status != FileStatus::kOk) return status;
+  const uint64_t length = state_->contents->root().length + state_->pending_append.size();
+  if (bytes.size() > EncryptedFileContents::kMaxLength - length) return FileStatus::kInvalid;
+  constexpr size_t kLimit = 32768;
+  state_->pending_append.reserve(kLimit);  // Never reallocate uncleansed data.
+  while (!bytes.empty()) {
+    const size_t amount = std::min(bytes.size(), kLimit - state_->pending_append.size());
+    const auto part = bytes.first(amount);
+    state_->pending_append.insert(state_->pending_append.end(), part.begin(), part.end());
+    state_->dirty = true;
+    state_->entry.modified_us = NowMicros();
+    bytes = bytes.subspan(amount);
+    if (state_->pending_append.size() == kLimit) {
+      status = owner->impl_->FlushAppend(*record, *state_);
+      if (status != FileStatus::kOk) return owner->impl_->Observe(status);
+    }
+  }
+  return FileStatus::kOk;
+}
+
+FileStatus RecordFile::FlushBuffered() {
+  const auto owner = owner_.lock();
+  if (!owner) return FileStatus::kDenied;
+  std::lock_guard lock(owner->impl_->mutex);
+  RecordFileSystem::Impl::Record* record;
+  auto status = owner->impl_->CheckHandle(*this, StorageAccess::kWriteRecordFiles, &record);
+  if (status == FileStatus::kOk) status = owner->impl_->FlushAppend(*record, *state_);
   return owner->impl_->Observe(status);
 }
 
@@ -1522,6 +1581,7 @@ FileStatus RecordFile::SetLength(uint64_t length) {
   RecordFileSystem::Impl::Record* record;
   auto status = owner->impl_->CheckHandle(*this, StorageAccess::kWriteRecordFiles,
                                           &record);
+  if (status == FileStatus::kOk) status = owner->impl_->FlushAppend(*record, *state_);
   if (status == FileStatus::kOk) {
     record->gc_needed = true;
     status = state_->contents->SetLength(length);
@@ -1544,7 +1604,7 @@ FileStatus RecordFile::GetInfo(RecordFileInfo* out) {
       StorageAccess::kReadRecordFiles, &record);
   if (status == FileStatus::kOk) {
     *out = EntryInfo(state_->entry);
-    out->length = state_->contents->root().length;
+    out->length = state_->contents->root().length + state_->pending_append.size();
   }
   return status;
 }
@@ -1582,6 +1642,8 @@ FileStatus RecordFile::Close() {
   }
   if (status == FileStatus::kOk && state_->handles == 0 &&
       (!state_->dirty || !state_->linked)) {
+    Cleanse(state_->pending_append);
+    state_->pending_append.clear();
     state_->contents->Revoke();
     record->files.erase(state_->contents->root().file_id);
     record->gc_needed = true;
@@ -1666,9 +1728,9 @@ bool RecordFile::KeysClearedForTesting() const {
   const auto owner = owner_.lock();
   if (owner) {
     std::lock_guard lock(owner->impl_->mutex);
-    return state_->contents->KeysClearedForTesting();
+    return state_->contents->KeysClearedForTesting() && state_->pending_append.empty();
   }
-  return state_->contents->KeysClearedForTesting();
+  return state_->contents->KeysClearedForTesting() && state_->pending_append.empty();
 }
 
 FileStatus RecordFile::GetLock(RecordFileLock* out) {

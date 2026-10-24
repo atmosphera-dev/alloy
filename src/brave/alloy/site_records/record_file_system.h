@@ -148,6 +148,10 @@ class RecordFile {
   RecordFile& operator=(const RecordFile&) = delete;
   FileStatus Read(uint64_t offset, base::span<uint8_t> bytes, size_t* read);
   FileStatus Write(uint64_t offset, base::span<const uint8_t> bytes);
+  // Bounded coordinator-owned append buffering; all file operations observe
+  // pending bytes and lock/revoke wipes them together with the file keys.
+  FileStatus AppendBuffered(base::span<const uint8_t> bytes);
+  FileStatus FlushBuffered();
   FileStatus SetLength(uint64_t length);
   FileStatus GetInfo(RecordFileInfo* out);
   FileStatus Sync();

@@ -17,15 +17,15 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import socket
 import subprocess
 import sys
 import tempfile
 
 import prune_origin
+from workspace import temp_path, validate_source, workspace_path
 
 REPO = Path(__file__).resolve().parents[1]
-WORK = Path('/home/builder/work/alloy')
+WORK = workspace_path(REPO)
 ROOT = WORK / 'src'
 STATE = WORK / 'apply-state'
 
@@ -63,7 +63,7 @@ def patch_files(body, strip):
 def run(args, cwd, check=True):
     p = subprocess.run(list(map(str, args)), cwd=cwd, capture_output=True,
                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
-                                TMPDIR='/home/builder/work/tmp'), timeout=180)
+                                TMPDIR=str(temp_path(WORK))), timeout=180)
     if check and p.returncode:
         raise RuntimeError(f'{args}:\n{p.stdout.decode(errors="replace")}\n'
                            f'{p.stderr.decode(errors="replace")}')
@@ -151,8 +151,10 @@ def main():
     parser.add_argument('--cef-only', action='store_true')
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
-    if socket.gethostname() != 'wakaba-build' or args.root.resolve() != ROOT or WORK.resolve() != WORK:
-        parser.error(f'Only the approved NUC workspace {ROOT} is supported')
+    try:
+        validate_source(WORK, args.root, REPO)
+    except RuntimeError as error:
+        parser.error(str(error))
     if args.report and args.report.resolve().is_relative_to(ROOT):
         parser.error('Report must be outside src, to preserve no-touch reapplication')
     pins = json.loads((REPO / 'pins.json').read_text())

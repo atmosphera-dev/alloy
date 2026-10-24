@@ -15,6 +15,17 @@ This port retains the approved dedicated **physical NUC `wakaba-build.home`**, a
 and collects evidence only. If this NUC is unavailable, stop rather than fall
 back. Other execution targets need their own authorization and topology review.
 
+The second approved workspace `/home/builder/work/alloy-b` is selected by its
+delivered `repo/` location and uses its own disk-backed `tmp/`. See
+[`../tools/README.md`](../tools/README.md#second-owned-build-workspace).
+Use `alloy-b-…` unit/run names there. Its routed lanes use B-only names,
+`10.77.3.0/30` / `10.77.4.0/30`, proxy ports 18083/18084 and nft table
+`alloy_b_harness`; scheduler and controller still acquire the original
+workspace's shared `harness-run.lock` / `controller.lock`. A config's `workspace`
+records that selection for immutable run snapshots and provider subprocesses.
+The selection must contain the harness source location: a config cannot switch
+code delivered in B into A (or vice versa). This check also covers run snapshots.
+
 | # | Input | Contract |
 |---|---|---|
 | 1 | `--build` | Existing CEF output directory with `cefclient`, `libcef.so`, `args.gn`; guard log, canary and class-marking flags must all be true. Build with `tools/alloy_build.py --config verify` |

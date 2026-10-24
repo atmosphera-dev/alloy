@@ -67,7 +67,7 @@ def lane_start(d, lane, runtime):
 def collect(d):
     guard()
     assert os.geteuid() == 0
-    owner = lock(ROOT / 'controller.lock')
+    owner = lock(NETWORK_LOCK_ROOT / 'controller.lock')
     log = Log(d / 'controller.jsonl')
     stopped = False
     def stop(*_):

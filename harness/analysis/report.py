@@ -28,9 +28,12 @@ parser.add_argument('--tag',required=True)
 parser.add_argument('--out',type=Path,help='Exclusive analysis output, outside a sealed run for readback')
 args=parser.parse_args()
 campaign=args.campaign.resolve();config=json.loads((campaign/'config.json').read_text())
-W=Path('/home/builder/work/alloy'); E=campaign/'analysis'
+os.environ['ALLOY_HARNESS_CONFIG']=str(campaign/'config.json')
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from common import ROOT as W, TMP, guard
+E=campaign/'analysis'
 LANES=[l['name'] for l in config['lanes']]
-assert socket.gethostname()=='wakaba-build' and os.environ['TMPDIR']=='/home/builder/work/tmp'
+guard()
 assert os.geteuid()==0
 start=time.monotonic(); deadline=start+595
 lock=(W/'harness-analysis.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -190,7 +193,8 @@ def nft_counts(value):
     return {r['rule']['comment']:next(e['counter']['packets'] for e in r['rule']['expr'] if 'counter' in e)
             for r in value['nftables'] if 'rule' in r and r['rule'].get('comment','').startswith('class:')}
 nftpath=campaign/'final-nft.json'
-latest=json.loads(nftpath.read_text()) if nftpath.exists() else json.loads(run(['nft','-j','list','table','inet','alloy_harness'],'nft-snapshot',limit=20))
+table='alloy_b_harness' if W.name=='alloy-b' else 'alloy_harness'
+latest=json.loads(nftpath.read_text()) if nftpath.exists() else json.loads(run(['nft','-j','list','table','inet',table],'nft-snapshot',limit=20))
 dump(out/'nft.json',latest)
 baseline=nft_counts(json.loads((campaign/'baseline-nft.json').read_text()))
 delta={k:v-baseline[k] for k,v in nft_counts(latest).items()}

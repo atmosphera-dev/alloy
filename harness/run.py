@@ -39,30 +39,35 @@ def main():
     modes = args.lanes.split(',')
     if not modes or len(set(modes)) != len(modes) or any(m not in ('observe', 'enforce') for m in modes):
         parser.error('--lanes is observe, enforce or observe,enforce')
+    from common import ROOT, TMP, SCRIPTS, SECONDARY, NETWORK_LOCK_ROOT, guard, lock, now, run, save, state, unit
     if os.geteuid() != 0:
         # Keep the user's transient-unit supervision, including signal forwarding.
-        os.execvp('sudo', ['sudo', '-n', 'env', 'TMPDIR=/home/builder/work/tmp',
+        os.execvp('sudo', ['sudo', '-n', 'env', 'TMPDIR='+TMP,
                   'PYTHONDONTWRITEBYTECODE=1', 'PYTHONUNBUFFERED=1', sys.executable,
                   str(Path(__file__).resolve()), *sys.argv[1:]])
-    os.environ.update(TMPDIR='/home/builder/work/tmp', PYTHONDONTWRITEBYTECODE='1')
-    from common import ROOT, TMP, SCRIPTS, guard, lock, now, run, save, state, unit
+    os.environ.update(TMPDIR=TMP, PYTHONDONTWRITEBYTECODE='1')
     guard()
-    owner = lock(ROOT / 'harness-run.lock')
+    owner = lock(NETWORK_LOCK_ROOT / 'harness-run.lock')
     build = args.build.resolve()
+    assert build in {ROOT / 'src/out' / name for name in ('Release_Alloy', 'Verify_Alloy')}
     assert all((build / name).is_file() for name in ('cefclient', 'libcef.so', 'args.gn'))
     flags = (build / 'args.gn').read_text()
     for name in ('alloy_enable_guard_log', 'alloy_enable_guard_canary', 'alloy_enable_class_marking'):
         assert re.search(r'\b' + name + r'\s*=\s*true\b', flags), 'Requires verification config: ' + name
-    d = (args.out or ROOT / 'harness-runs' / ('alloy-' + args.mode + '-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))).resolve()
+    run_prefix = 'alloy-b-' if ROOT == SECONDARY else 'alloy-'
+    d = (args.out or ROOT / 'harness-runs' / (run_prefix + args.mode + '-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))).resolve()
     assert d.is_relative_to(ROOT) and not d.is_relative_to(build) and d != ROOT
     d.parent.mkdir(parents=True, exist_ok=True)
     d.mkdir(exist_ok=False)
     target = 7200 if args.mode == 'gate' else 86400
-    lanes = [dict(name='alloy-osr-' + m, build='alloy-osr', mode=m, n=n, ns='alloy-osr-' + m,
-                  host=f'10.77.{n}.1', guest=f'10.77.{n}.2', veth=f'alh{n}', peer=f'alg{n}', port=18080+n,
+    prefix = 'alloy-b-osr-' if ROOT == SECONDARY else 'alloy-osr-'
+    offset = 2 if ROOT == SECONDARY else 0
+    interface = 'alb' if ROOT == SECONDARY else 'al'
+    lanes = [dict(name=prefix + m, build='alloy-osr', mode=m, n=n, ns=prefix + m,
+                  host=f'10.77.{n+offset}.1', guest=f'10.77.{n+offset}.2', veth=f'{interface}h{n}', peer=f'{interface}g{n}', port=18080+n+offset,
                   binary=str(build / 'cefclient'), seed=51000+n)
              for n, m in enumerate(modes, 1)]
-    config = dict(time=now(), campaign_origin=time.time(), build=str(build), mode=args.mode,
+    config = dict(time=now(), workspace=str(ROOT), campaign_origin=time.time(), build=str(build), mode=args.mode,
                   target=target, lanes=lanes, out=str(d), source=str(build.parents[1]),
                   artifacts={name: digest(build / name) for name in ('cefclient', 'libcef.so')},
                   harness_sha256={str(p.relative_to(SCRIPTS)): digest(p) for p in SCRIPTS.rglob('*') if p.is_file() and '__pycache__' not in str(p)})
@@ -71,6 +76,8 @@ def main():
     # Retain the canonical table at its normal relative path beside that copy.
     snapshot=d/'source'
     shutil.copytree(SCRIPTS,snapshot/'harness',ignore=shutil.ignore_patterns('__pycache__'))
+    (snapshot/'tools').mkdir()
+    shutil.copy2(SCRIPTS.parent/'tools/workspace.py', snapshot/'tools/workspace.py')
     table=snapshot/'src/net/base/alloy_traffic_classes.inc'
     table.parent.mkdir(parents=True)
     shutil.copy2(SCRIPTS.parent/'src/net/base/alloy_traffic_classes.inc',table)

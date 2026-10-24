@@ -368,3 +368,56 @@ unresolved syscall is accepted as filesystem evidence. Raw live/final root and
 seed-byte inventories, actual consumer readbacks and normal exit are additional
 gates. Fanotify does not promise mmap/msync modification notifications; the
 inventories and native backing-owner checks remain necessary alongside it.
+
+## Second owned build workspace
+
+Tools select their workspace from the delivered repository's location: either
+`/home/builder/work/alloy/repo/` (the original default) or
+`/home/builder/work/alloy-b/repo/`. There is no arbitrary-root override. Both
+roots must belong to `builder` on `wakaba-build`; symlinked workspace directories,
+foreign roots and the spike checkout are refused before taking locks or writing.
+`--root` and `--out` must select that repository's own source/output tree.
+All pin, local-edit, full-apply and publication-journal checks remain in force.
+
+The second workspace owns its `repo/`, `src/`, `lists/`, `apply-state/`, `logs/`,
+`evidence/`, `support/` and `tmp/`. Deliver the same pinned lists archive and
+`wakaba-lists.commit` marker there. Its temporary directory is
+`/home/builder/work/alloy-b/tmp`; the original workspace keeps
+`/home/builder/work/tmp` for compatibility. For example, on the NUC:
+
+```sh
+cd /home/builder/work/alloy-b
+export TMPDIR=/home/builder/work/alloy-b/tmp
+python3 repo/tools/alloy_apply.py --root src --report evidence/apply.json
+python3 repo/tools/alloy_build.py --config release
+python3 repo/tools/alloy_build.py --config verify
+python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy
+```
+
+Use durable units named `alloy-b-…`, with WorkingDirectory, log paths and TMPDIR
+all inside `alloy-b`. A source copy must include its matching `apply-state/`;
+never hard-link it to another workspace. Regenerate GN outputs in the new root
+with `alloy_build.py`, and audit copied symlinks/generated absolute paths before
+using the outputs. Do not run checkout init/sync on an already-composed copy.
+
+Offline blocking, worker and inventory probes create anonymous `unshare --net`
+namespaces with only loopback and no routes. Their loopback ports are private to
+each invocation and do not collide across workspaces. Routed harness operations
+use B-only namespace/veth/proxy names and subnets `10.77.3.0/30` and
+`10.77.4.0/30`, with the B nft table `alloy_b_harness`. They serialize against
+the original lane using `/home/builder/work/alloy/harness-run.lock` and
+`/home/builder/work/alloy/controller.lock`; these are the only shared locks.
+B's anonymous offline probes also hold both locks around their privileged
+namespace lifetime. Lock acquisition waits at most 120 seconds per lock, within
+each command's overall timeout, and fails safely if the network owner stays busy.
+Standalone protected-smoke runners must hold both shared locks throughout setup,
+consumers and cleanup, and set `workspace` in their harness config to
+`/home/builder/work/alloy-b`. Source/build/publication locks remain workspace-local.
+
+Workspace contract checks (including original-root compatibility without writing
+to the original workspace) run on the NUC:
+
+```sh
+timeout 60 env TMPDIR=/home/builder/work/alloy-b/tmp PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s repo/tools/tests -v
+```

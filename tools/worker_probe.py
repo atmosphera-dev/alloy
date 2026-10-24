@@ -16,7 +16,11 @@ import threading
 import time
 import traceback
 
-W = Path('/home/builder/work/alloy')
+from workspace import namespace_prefix, temp_path, validate_output, workspace_path
+
+REPO = Path(__file__).resolve().parents[1]
+W = workspace_path(REPO)
+TMP = str(temp_path(W))
 PAGE = b'''<!doctype html><title>WORKER_PENDING</title><script>
 const dedicated=url=>new Promise((resolve,reject)=>{
   const w=new Worker(url);w.onmessage=e=>{w.terminate();resolve(e.data)};
@@ -82,13 +86,13 @@ def main():
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    assert socket.gethostname()=='wakaba-build' and os.environ['TMPDIR']=='/home/builder/work/tmp'
+    assert os.environ['TMPDIR']==TMP
     out = args.out.resolve()
-    assert out in (W/'src/out/Release_Alloy',W/'src/out/Verify_Alloy')
+    validate_output(W,out,REPO)
     if not args.inside:
-        command = ['sudo','-n','unshare','--net','--fork','/bin/sh','-c',
+        command = namespace_prefix(W) + ['unshare','--net','--fork','/bin/sh','-c',
             'ip link set lo up && exec runuser -u builder -- "$@"','alloy-worker-probe',
-            'env','TMPDIR=/home/builder/work/tmp','PYTHONDONTWRITEBYTECODE=1',
+            'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
             'python3',str(Path(__file__).resolve()),'--out',str(out),'--inside']
         return subprocess.run(['timeout','--kill-after=30','150',*command], timeout=190).returncode
     assert os.geteuid()==1000

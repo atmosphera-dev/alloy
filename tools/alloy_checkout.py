@@ -8,11 +8,12 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 
+from workspace import temp_path, validate_source, workspace_path
+
 REPO = Path(__file__).resolve().parents[1]
-WORK = Path('/home/builder/work/alloy')
+WORK = workspace_path(REPO)
 ROOT = WORK / 'src'
 
 
@@ -52,12 +53,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     args = parser.parse_args()
-    if socket.gethostname() != 'wakaba-build' or args.root.resolve() != ROOT:
-        parser.error(f'Only the approved NUC workspace {ROOT} is supported')
-    if WORK.resolve() != WORK:
-        parser.error('Workspace must not be a symlink')
+    try:
+        validate_source(WORK, args.root, REPO)
+    except RuntimeError as error:
+        parser.error(str(error))
     WORK.mkdir(exist_ok=True)
-    os.environ['TMPDIR'] = '/home/builder/work/tmp'
+    os.environ['TMPDIR'] = str(temp_path(WORK))
     os.environ['DEPOT_TOOLS_UPDATE'] = '0'
     pins = json.loads((REPO / 'pins.json').read_text())
     with (WORK / 'checkout.lock').open('a') as lock:

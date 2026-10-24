@@ -14,9 +14,10 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import socket
 import subprocess
 import sys
+
+from workspace import validate_source, workspace_path
 
 FLAG = 'is_brave_origin_branded'
 CFLAG = 'IS_BRAVE_ORIGIN_BRANDED'
@@ -652,8 +653,11 @@ def main():
     parser.add_argument('--audit', action='store_true')
     args = parser.parse_args()
     root = args.root.resolve()
-    if socket.gethostname() != 'wakaba-build' or root != Path('/home/builder/work/alloy/src'):
-        parser.error('Only the approved NUC Alloy source tree is supported')
+    try:
+        repo = Path(__file__).resolve().parents[1]
+        validate_source(workspace_path(repo), root, repo)
+    except RuntimeError as error:
+        parser.error(str(error))
     if args.report and args.report.resolve().is_relative_to(root):
         parser.error('Report must be outside src')
     if not args.audit:

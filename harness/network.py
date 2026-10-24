@@ -5,7 +5,7 @@ from common import *
 import re
 from analysis.dscp import classes
 
-TABLE = 'alloy_harness'
+TABLE = 'alloy_b_harness' if ROOT == SECONDARY else 'alloy_harness'
 
 
 def ipv4_settings():

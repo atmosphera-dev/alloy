@@ -11,13 +11,14 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import time
 
+from workspace import temp_path, validate_source, workspace_path
+
 REPO = Path(__file__).resolve().parents[1]
-WORK = Path('/home/builder/work/alloy')
+WORK = workspace_path(REPO)
 ROOT = WORK / 'src'
 CONFIG_OUT = {'release': 'Release_Alloy', 'verify': 'Verify_Alloy'}
 
@@ -48,13 +49,15 @@ def main():
     targets = list(dict.fromkeys((args.target or ['cefclient']) +
                                 (GATE_TARGETS if args.gate else [])))
     out = ROOT / 'out' / CONFIG_OUT[args.config]
-    if socket.gethostname() != 'wakaba-build' or ROOT.resolve() != ROOT:
-        parser.error('Only the approved NUC Alloy source tree is supported')
+    try:
+        validate_source(WORK, ROOT, REPO)
+    except RuntimeError as error:
+        parser.error(str(error))
     state = json.loads((WORK / 'apply-state/state.json').read_text())
     if state.get('mode') != 'full' or state['report']['unresolved'] or 'pending' in state:
         raise RuntimeError('Full apply must succeed before building')
     depot = ROOT / 'brave/vendor/depot_tools'
-    env = dict(os.environ, TMPDIR='/home/builder/work/tmp', DEPOT_TOOLS_UPDATE='0',
+    env = dict(os.environ, TMPDIR=str(temp_path(WORK)), DEPOT_TOOLS_UPDATE='0',
                PATH=f'{depot}:{ROOT}/third_party/rust-toolchain/bin:{depot}/python2-bin:{depot}/python-bin:/usr/bin:/bin',
                PYTHONPATH=':'.join(str(ROOT / p) for p in ['brave/script', 'tools/grit/grit/extern',
                                                          'brave/vendor/requests', 'build', 'third_party/depot_tools']),

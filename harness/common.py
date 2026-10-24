@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Shared disk-backed, append-only harness primitives. Execute only on the NUC."""
 import datetime, fcntl, json, os, pathlib, subprocess, time, sys, threading
-ROOT = pathlib.Path('/home/builder/work/alloy')
 SCRIPTS = pathlib.Path(__file__).resolve().parent
-TMP = '/home/builder/work/tmp'
 CONFIG = json.loads(pathlib.Path(os.environ['ALLOY_HARNESS_CONFIG']).read_text()) if os.environ.get('ALLOY_HARNESS_CONFIG') else {}
+sys.path.insert(0, str(SCRIPTS.parent / 'tools'))
+from workspace import PRIMARY, SECONDARY, temp_path, validate_workspace, workspace_path
+ROOT = pathlib.Path(CONFIG['workspace']) if 'workspace' in CONFIG else workspace_path(SCRIPTS.parent)
+if not SCRIPTS.is_relative_to(ROOT):
+    raise RuntimeError('Harness configuration cannot select another workspace')
+TMP = str(temp_path(ROOT))
+NETWORK_LOCK_ROOT = PRIMARY
 LANES = CONFIG.get('lanes', [])
 def guard():
-    assert subprocess.check_output(['hostname'],text=True,timeout=5).strip()=='wakaba-build'
+    validate_workspace(ROOT)
     assert os.environ.get('TMPDIR')==TMP
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def run(args, timeout=30, check=True, **kw):
@@ -41,7 +46,17 @@ class Log:
     def close(self):
         if self.fp: self.fp.close()
 def lock(path):
-    fp=open(path,'a+'); fcntl.flock(fp,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    fp=open(path,'a+')
+    deadline=time.monotonic()+120
+    while True:
+        try:
+            fcntl.flock(fp,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if ROOT!=SECONDARY or path not in (PRIMARY/'harness-run.lock',PRIMARY/'controller.lock') or time.monotonic()>=deadline:
+                fp.close()
+                raise
+            time.sleep(.2)
     fp.seek(0); fp.truncate(); fp.write(json.dumps(dict(pid=os.getpid(),time=now(),cgroup=pathlib.Path('/proc/self/cgroup').read_text()))); fp.flush()
     return fp
 def unit(name,args, directory, user='builder', properties=None, env=None, runtime=12000):

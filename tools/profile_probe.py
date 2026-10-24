@@ -23,8 +23,11 @@ import traceback
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-W = Path('/home/builder/work/alloy')
+sys.dont_write_bytecode = True
+from workspace import PRIMARY, temp_path, validate_output, workspace_path
+
 REPO = Path(__file__).resolve().parents[1]
+W = workspace_path(REPO)
 
 NOISE_FUNCTION = r'''function(canvas){
   canvas.width=32;canvas.height=32;
@@ -573,7 +576,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         # Brave deliberately defaults its local-file API off. Test the opt-in
         # native path explicitly, in addition to the unchanged default-state run.
         argv.append('--enable-features=FileSystemAccessAPI')
-    env = dict(os.environ, TMPDIR='/home/builder/work/tmp',
+    env = dict(os.environ, TMPDIR=str(temp_path(W)),
                ALLOY_PROFILE_URL='about:blank', ALLOY_PROFILE_ROOT=str(roots['profile']),
                  ALLOY_PROFILE_NETWORK=mode, HOME=str(roots['home']),
                  ALLOY_PROFILE_SELECTED_FILE=str(selected_file),
@@ -733,15 +736,15 @@ def main():
     if args.exercise_files and args.exercise_certificates:
         parser.error('file and certificate consumer matrices are separate runs')
     assert socket.gethostname() == 'wakaba-build'
-    assert os.environ['TMPDIR'] == '/home/builder/work/tmp'
+    assert os.environ['TMPDIR'] == str(temp_path(W))
     out = args.out.resolve()
-    assert out in (W/'src/out/Release_Alloy', W/'src/out/Verify_Alloy')
+    validate_output(W, out, REPO)
     if not args.inside:
-        command = ['sudo', '-n', 'flock', '--wait', '1800', str(W/'harness-run.lock'),
-                   'flock', '--wait', '1800', str(W/'controller.lock'),
+        command = ['sudo', '-n', 'flock', '--wait', '1800', str(PRIMARY/'harness-run.lock'),
+                   'flock', '--wait', '1800', str(PRIMARY/'controller.lock'),
                    'unshare', '--net', '--fork', '/bin/sh', '-c',
                    'ip link set lo up && exec runuser -u builder -- "$@"', 'alloy-profile-probe',
-                   'env', 'TMPDIR=/home/builder/work/tmp', 'PYTHONDONTWRITEBYTECODE=1',
+                   'env', 'TMPDIR='+str(temp_path(W)), 'PYTHONDONTWRITEBYTECODE=1',
                     'python3', str(Path(__file__).resolve()), '--out', str(out),
                     '--check', args.check, '--inside']
         if args.exercise_files:

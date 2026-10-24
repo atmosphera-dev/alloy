@@ -16,8 +16,11 @@ import sys
 import threading
 import time
 
-WORK=Path('/home/builder/work/alloy')
-OUTPUTS={WORK/'src/out'/name for name in ('Release_Alloy','Verify_Alloy')}
+from workspace import namespace_prefix, temp_path, validate_output, workspace_path
+
+REPO=Path(__file__).resolve().parents[1]
+WORK=workspace_path(REPO)
+TMP=str(temp_path(WORK))
 TRACKERS={
     'gtm':'https://www.googletagmanager.com/gtag/js?id=G-TEST',
     'gpt':'https://securepubads.g.doubleclick.net/tag/js/gpt.js',
@@ -85,13 +88,15 @@ def main():
     p.add_argument('--spell-consumer',type=Path)
     a=p.parse_args()
     out=a.out.resolve()
-    if socket.gethostname()!='wakaba-build' or out not in OUTPUTS:
-        p.error('Only the approved NUC Alloy release/verify outputs are supported')
+    try:
+        validate_output(WORK,out,REPO)
+    except RuntimeError as error:
+        p.error(str(error))
     if not 0<=a.hold_seconds<=900:p.error('Hold duration 0..900 seconds')
     if not a.inside:
-        command=['sudo','unshare','--net','--fork','/bin/sh','-c',
+        command=namespace_prefix(WORK)+['unshare','--net','--fork','/bin/sh','-c',
                  'ip link set lo up && exec runuser -u builder -- "$@"','alloy-offline',
-                 'env','TMPDIR=/home/builder/work/tmp','PYTHONDONTWRITEBYTECODE=1',
+                 'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
                  'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
         return subprocess.run(['timeout','--kill-after=20s',str(a.hold_seconds+150),*command],timeout=a.hold_seconds+180).returncode
     assert os.geteuid()!=0,'Browser must run as builder with its sandbox enabled'
@@ -102,7 +107,7 @@ def main():
     with socket.socket() as s:
         assert s.connect_ex(('1.1.1.1',443))==errno.ENETUNREACH
     log=WORK/'evidence/item03'/f'probe-{time.time_ns()}'
-    log.mkdir()
+    log.mkdir(parents=True)
     (log/'isolation.json').write_text(json.dumps(dict(netns=os.readlink('/proc/self/ns/net'),uid=os.geteuid(),interfaces=interfaces,routes=routes,outside_connect_errno=errno.ENETUNREACH),indent=2)+'\n')
     site=log/'site';site.mkdir()
     (site/'ready.html').write_text('<!doctype html><title>QueryFilter readiness</title>')
@@ -123,7 +128,7 @@ def main():
     (log/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
     print('OFFLINE_PROBE_EVIDENCE',log,flush=True)
     with (log/'stdio.log').open('w') as stream:
-        process=subprocess.Popen(argv,cwd=out,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR='/home/builder/work/tmp'))
+        process=subprocess.Popen(argv,cwd=out,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR=TMP))
         try:
             result=subprocess.run(['node','--input-type=module','-e',CDP,str(port),url,str(log/'cdp.json'),str(a.hold_seconds),'yes' if a.spell_consumer else 'no'],capture_output=True,text=True,timeout=a.hold_seconds+110)
             (log/'cdp.stdout').write_text(result.stdout);(log/'cdp.stderr').write_text(result.stderr)

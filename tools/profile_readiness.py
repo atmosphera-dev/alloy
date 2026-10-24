@@ -10,14 +10,21 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 import time
 
 import gdb
 
 assert socket.gethostname() == 'wakaba-build'
-assert os.environ['TMPDIR'] == '/home/builder/work/tmp'
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace import temp_path, validate_workspace, workspace_path
+REPO = Path(__file__).resolve().parents[1]
+WORK = workspace_path(REPO)
+validate_workspace(WORK, REPO)
+assert os.environ['TMPDIR'] == str(temp_path(WORK))
 receipt = Path(os.environ['ALLOY_PROFILE_READY'])
-assert receipt.is_relative_to(Path('/home/builder/work/alloy/evidence'))
+assert receipt.is_relative_to(WORK / 'evidence')
 completed = {}
 destroyed = {}
 entries = []

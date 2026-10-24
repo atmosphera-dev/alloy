@@ -17,9 +17,11 @@ import time
 
 from smoke import terminate_session, wait_for_session_exit, session_processes
 from shared_proto_inventory import inspect_shared_proto
+from workspace import namespace_prefix, temp_path, validate_output, workspace_path
 
-WORK = Path('/home/builder/work/alloy')
-TMP = '/home/builder/work/tmp'
+REPO = Path(__file__).resolve().parents[1]
+WORK = workspace_path(REPO)
+TMP = str(temp_path(WORK))
 # Store-map row -> native path, including an empty directory and SQL sidecars.
 # Row 10 here is ONLY restore copies; live Session Storage is not removed by R.
 PATHS = {
@@ -260,9 +262,10 @@ def main():
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     out = args.out.resolve()
-    if socket.gethostname() != 'wakaba-build' or out not in {
-            WORK / 'src/out/Release_Alloy', WORK / 'src/out/Verify_Alloy'}:
-        parser.error('Only the approved NUC Alloy release/verify outputs are supported')
+    try:
+        validate_output(WORK, out, REPO)
+    except RuntimeError as error:
+        parser.error(str(error))
     if os.environ.get('TMPDIR') != TMP:
         parser.error('TMPDIR must be ' + TMP)
     if not re.fullmatch(r'(?:[0-9]+(?:,[0-9]+)*)?', args.forbid_rows):
@@ -271,7 +274,7 @@ def main():
     if forbidden - PATHS.keys():
         parser.error('Unmapped removal rows: ' + str(sorted(forbidden - PATHS.keys())))
     if not args.inside:
-        command = ['sudo', '-n', 'unshare', '--net', '--fork', '/bin/sh', '-c',
+        command = namespace_prefix(WORK) + ['unshare', '--net', '--fork', '/bin/sh', '-c',
                    'ip link set lo up && exec runuser -u builder -- "$@"', 'alloy-inventory',
                    'env', 'TMPDIR=' + TMP, 'PYTHONDONTWRITEBYTECODE=1',
                    sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], '--inside']

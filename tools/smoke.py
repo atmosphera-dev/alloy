@@ -14,7 +14,10 @@ import sys
 import tempfile
 import time
 
-WORK = Path('/home/builder/work/alloy')
+from workspace import temp_path, validate_output, workspace_path
+
+REPO = Path(__file__).resolve().parents[1]
+WORK = workspace_path(REPO)
 URL = 'http://nomad.home:8090/content/wikipedia_en_all_mini_2025-12/Internet'
 
 CDP = r'''
@@ -142,9 +145,10 @@ def main():
     parser.add_argument('--probe-blocking', action='store_true')
     args = parser.parse_args()
     out = args.out.resolve()
-    if socket.gethostname() != 'wakaba-build' or out not in (
-            WORK / 'src/out/Release_Alloy', WORK / 'src/out/Verify_Alloy'):
-        parser.error('Only the approved NUC Alloy output is supported')
+    try:
+        validate_output(WORK, out, REPO)
+    except RuntimeError as error:
+        parser.error(str(error))
     if args.probe_blocking:
         return subprocess.run([sys.executable, str(Path(__file__).with_name('probe_blocking.py')),
                                '--out', str(out)], timeout=180).returncode
@@ -169,7 +173,7 @@ def main():
         (logdir / 'command.json').write_text(json.dumps(command, indent=2) + '\n')
         with (logdir / 'stdio.log').open('w') as log:
             process = subprocess.Popen(command, cwd=out, stdout=log, stderr=subprocess.STDOUT,
-                                       env=dict(os.environ, TMPDIR='/home/builder/work/tmp'),
+                                       env=dict(os.environ, TMPDIR=str(temp_path(WORK))),
                                        start_new_session=True)
             probe = subprocess.run(['node', '--input-type=module', '-e', CDP,
                                     str(args.port), URL, str(args.timeout - 5)],

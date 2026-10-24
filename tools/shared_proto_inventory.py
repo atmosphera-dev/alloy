@@ -4,10 +4,12 @@
 """NUC-only, read-only native LevelDB inspection of shared-proto namespaces."""
 from pathlib import Path
 import re
-import socket
 import subprocess
 
-WORK = Path('/home/builder/work/alloy')
+from workspace import validate_output, workspace_path
+
+REPO = Path(__file__).resolve().parents[1]
+WORK = workspace_path(REPO)
 # SharedProtoDatabaseClient::PrefixForDatabase uses '<ProtoDbType>_'. The
 # retained page-download metadata is 21 and OriginTrials is 44; __global is
 # shared-catalog metadata. Neither retained backend is changed by removals.
@@ -15,10 +17,9 @@ RETAINED = frozenset({21, 44})
 
 
 def inspect_shared_proto(directory, utility):
-    if socket.gethostname() != 'wakaba-build':
-        raise RuntimeError('Shared-proto inspection runs only on the approved NUC')
     directory, utility = Path(directory), Path(utility)
-    if not directory.is_relative_to(WORK) or not utility.is_relative_to(WORK/'src/out'):
+    validate_output(WORK, utility.parent, REPO)
+    if not directory.resolve().is_relative_to(WORK) or not utility.resolve().is_relative_to(WORK/'src/out'):
         raise ValueError('Only owned NUC roots/output tools are supported')
     rows, forbidden = [], []
     for path in sorted(directory.rglob('*')):

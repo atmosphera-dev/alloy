@@ -1,0 +1,14 @@
+diff --git a/net/disk_cache/simple/simple_backend_impl.cc b/net/disk_cache/simple/simple_backend_impl.cc
+--- a/net/disk_cache/simple/simple_backend_impl.cc
++++ b/net/disk_cache/simple/simple_backend_impl.cc
+@@ -724,7 +724,9 @@ SimpleBackendImpl::DiskStatResult SimpleBackendImpl::InitCacheStructureOnDisk(
+   // that case we can delete the index files and start over.  Also, some
+   // consistency failures may leave an empty directory directly and we can
+   // retry those cases as well.
+-  if (!IsOK(consistency)) {
++  // Encrypted paths are virtual. Never pass them to native recovery helpers,
++  // or turn an authenticated-store failure into a silent cache reset.
++  if (!IsOK(consistency) && !file_operations->IsEncrypted()) {
+     bool deleted_files = disk_cache::DeleteIndexFilesIfCacheIsEmpty(path);
+     SIMPLE_CACHE_UMA(BOOLEAN, "DidDeleteIndexFilesAfterFailedConsistency",
+                      cache_type, deleted_files);

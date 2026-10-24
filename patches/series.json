@@ -512,6 +512,11 @@
       "patch": "cef/0020-encrypted-profiles.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0021-encrypted-cache-recovery.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

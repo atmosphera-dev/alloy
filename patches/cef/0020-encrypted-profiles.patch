@@ -11,7 +11,7 @@
  }
 --- a/include/internal/cef_types.h
 +++ b/include/internal/cef_types.h
-@@ -4260,3 +4260,14 @@
+@@ -4260,3 +4260,26 @@
    ALLOY_NETWORK_STATE_CUT = 1,
  } alloy_network_state_t;
 +
@@ -25,6 +25,18 @@
 +  ALLOY_PROFILE_TRANSITION = 2,
 +  ALLOY_PROFILE_ERROR = 3,
 +} alloy_profile_state_t;
++
++///
++/// EXPERIMENTAL: Secret Service result. MISSING includes a missing default
++/// collection or profile entry. FAILED includes protocol/integrity/I/O errors.
++///
++typedef enum {
++  ALLOY_KEYRING_OK = 0,
++  ALLOY_KEYRING_UNAVAILABLE = 1,
++  ALLOY_KEYRING_LOCKED = 2,
++  ALLOY_KEYRING_MISSING = 3,
++  ALLOY_KEYRING_FAILED = 4,
++} alloy_keyring_result_t;
  #endif
 --- a/tools/cef_parser.py
 +++ b/tools/cef_parser.py

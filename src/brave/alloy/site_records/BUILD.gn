@@ -53,10 +53,13 @@ source_set("profiles") {
     "encrypted_profile.h",
     "key_source.cc",
     "key_source.h",
+    "secret_service_key_source.cc",
+    "secret_service_key_source.h",
   ]
   public_deps = [ ":record_files" ]
   deps = [
     "//brave/third_party/argon2",
+    "//dbus",
     "//third_party/boringssl",
   ]
 }
@@ -97,6 +100,15 @@ source_set("leveldb_files") {
   deps = [ "//base/alloy:buildflags" ]
 }
 
+executable("alloy_keyring_consumer") {
+  testonly = true
+  sources = [ "keyring_consumer.cc" ]
+  deps = [
+    ":profiles", ":sqlite_files", ":leveldb_files", ":cache_files",
+    "//base", "//base:i18n", "//base/test:test_support", "//net:test_support", "//url",
+  ]
+}
+
 source_set("cache_files") {
   sources = [
     "record_cache_files.cc",
@@ -122,6 +134,7 @@ test("alloy_site_records_unittests") {
     "authenticated_objects_unittest.cc",
     "encrypted_file_contents_unittest.cc",
     "encrypted_profile_unittest.cc",
+    "secret_service_key_source_unittest.cc",
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",
     "record_file_system_unittest.cc",

@@ -65,7 +65,51 @@ profiles cannot be unlocked by substituting this external-source mechanism.
 Native C callers transfer one counted source reference per refptr argument;
 the generated C++ wrapper does this automatically. This is CEF's existing
 reference-transfer contract, not a retained key-source lifetime in the profile.
-The separate OS-keyring source is added through the same engine contract.
+The separate OS-keyring source uses the same engine contract. Provisioning is
+separate from lookup: `KeySource::Create` defaults to `Derive` for password and
+external sources, while Secret Service provisions only on creation. Unlock is
+always lookup-only.
+
+### Linux Secret Service
+
+`AlloyCreateProfileWithKeyring(path, result)` selects the built-in OS-keyring
+source. `UnlockWithKeyring()` returns `alloy_keyring_result_t`: OK, UNAVAILABLE,
+LOCKED, MISSING or FAILED. MISSING includes an absent default collection or
+profile entry; FAILED covers source mismatch, protocol, integrity and I/O errors.
+Every failure refuses profile admission. Password and external APIs are still
+explicitly selectable and cannot substitute for a stored keyring source.
+
+This follows pinned Chromium's `FreedesktopSecretKeyProvider` Secret Service
+protocol and `//dbus` access library (the upstream `gnome-libsecret` option name
+does not mean that revision uses libsecret). It does not call OSCrypt or reuse
+its global Safe Storage secret, KDF, fixed/basic fallback, KWallet selection,
+automatic service activation or metrics. It requires an already-running provider
+and unlocked default collection on the local Unix session bus. Locked keyrings
+are errors: the embedder/user can unlock the keyring separately and retry.
+Alloy never starts a daemon, creates a collection or launches an unlock prompt.
+
+Each profile has a fresh random 256-bit KEK. The existing random source salt is
+its opaque lookup ID; attributes contain only `application=alloy`,
+`xdg:schema=org.alloy.ProfileKey.v1` and `profile=<64 hex digits>`. The label is
+`Alloy profile key`; no path, domain, profile name, history or password is exposed
+to keyring labels/search attributes. Creation refuses duplicate matches and
+reads back the committed secret. Lookup refuses missing/ambiguous entries,
+malformed secrets, incorrect session binding or unexpected protocol responses.
+Deleting the entry makes the profile inaccessible; unlock never regenerates it.
+An interrupted/failed profile creation can leave an unreachable opaque keyring
+entry; it cannot create a working plaintext/fixed-key profile or replace an
+existing profile's key.
+
+Each blocking operation uses a private D-Bus connection, resolves the existing
+unique service owner once, disables activation on requests, bounds each call to
+three seconds, closes its Secret Service session and shuts down the connection.
+The local `plain` Secret Service session is the same transport used by Chromium;
+the session bus and provider are trusted with the KEK. Engine-owned key buffers
+and serialized secret byte arrays are cleansed before release. No source key or
+connection is retained across calls; normal profile lock revocation/wiping is
+shared with the password source. Locking Alloy does not lock the user's entire
+keyring or erase its persistent entry. Keyring backup/OS access policy remains
+the provider's responsibility. Wakaba uses password profiles, not this source.
 
 ## Bootstrap and profile-private state
 
@@ -110,3 +154,17 @@ before `CefInitialize`, including custom provider transport/refcounts, Unicode
 passwords, reopen, wrong credentials, cancellation, encrypted marker scans and
 a corrupted-root refusal that preserves the on-disk files. Store/browser probes
 are added with the corresponding integrations.
+
+`tools/profile_probe.py --check keyring` runs generated C ABI/C++ wrapper and
+cold-process native consumers in an explicitly owned throwaway gnome-keyring on
+a fresh private D-Bus session, private HOME/XDG directories and disk TMPDIR.
+It proves five records with real SQLite, LevelDB and Simple Cache stores, record
+files and profile-private settings survive create, lock, process exit and keyring
+unlock; encrypted names/data contain no fixture markers; locked/missing/unavailable
+providers fail without changing profile bytes; removed entries are not recreated;
+an absent provider is not activated. The storage unit suite can run through
+`tools/test_keyring.py --root <new-B-evidence-path> -- <suite argv...>` for actual
+provider, per-profile isolation, missing-key and key-wipe tests. Without that
+explicit private-session opt-in, tests requiring a provider skip rather than
+access a real user keyring. Item 6 adds browser store routing: this foundational
+probe does not yet prove cookie/localStorage/IndexedDB/browser-cache persistence.

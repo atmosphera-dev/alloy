@@ -54,10 +54,42 @@ static int CEF_CALLBACK derive(alloy_key_source_t* api, const void* salt,
   return 1;
 }
 int main(int argc, char** argv) {
-  if (argc != 2 && argc != 3) return 2;
+  if (argc != 2 && argc != 3 && argc != 4) return 2;
   const char* hash = cef_api_hash(CEF_API_VERSION, 0);
   check(hash && strcmp(hash, CEF_API_HASH_PLATFORM) == 0, "experimental-api-hash");
   if (failures) return 1;
+  if (argc == 4) {
+    if (strcmp(argv[1], "--keyring")) return 2;
+    cef_string_t path = string(argv[3]);
+    int result = ALLOY_KEYRING_FAILED;
+    if (!strcmp(argv[2], "create-locked") || !strcmp(argv[2], "create-unavailable")) {
+      alloy_profile_t* refused = alloy_create_profile_with_keyring(&path, &result);
+      check(refused == NULL, "keyring-create-refused");
+      check(result == (!strcmp(argv[2], "create-locked") ? ALLOY_KEYRING_LOCKED :
+                        ALLOY_KEYRING_UNAVAILABLE), "keyring-create-error-result");
+      drop(refused); cef_string_clear(&path);
+      if (failures) return 1;
+      printf("PASS profile-api-keyring-%s\n", argv[2]); return 0;
+    }
+    const int create = !strcmp(argv[2], "create");
+    alloy_profile_t* profile = create ? alloy_create_profile_with_keyring(&path, &result)
+                                     : alloy_open_profile(&path);
+    check(profile != NULL, "keyring-open-create"); if (!profile) return 1;
+    if (create) {
+      check(result == ALLOY_KEYRING_OK, "keyring-created-result");
+      check(profile->lock(profile), "keyring-created-lock");
+    }
+    result = profile->unlock_with_keyring(profile);
+    const int expected = !strcmp(argv[2], "missing") ? ALLOY_KEYRING_MISSING :
+        !strcmp(argv[2], "locked") ? ALLOY_KEYRING_LOCKED :
+        !strcmp(argv[2], "unavailable") ? ALLOY_KEYRING_UNAVAILABLE : ALLOY_KEYRING_OK;
+    check(result == expected, "keyring-result");
+    check(profile->get_state(profile) == (expected == ALLOY_KEYRING_OK ?
+        ALLOY_PROFILE_UNLOCKED : ALLOY_PROFILE_LOCKED), "keyring-state");
+    check(profile->lock(profile), "keyring-lock"); drop(profile); cef_string_clear(&path);
+    if (failures) return 1;
+    printf("PASS profile-api-keyring-%s\n", argv[2]); return 0;
+  }
   if (argc == 3) {
     if (strcmp(argv[1], "--corrupt") != 0) return 2;
     cef_string_t path = string(argv[2]), password = string("PUBLIC_API_PASSWORD_23fc75a9");

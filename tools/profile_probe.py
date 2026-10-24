@@ -762,14 +762,14 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=['stateless', 'core'], default='core')
+    parser.add_argument('--check', choices=['stateless', 'core', 'keyring'], default='core')
     parser.add_argument('--exercise-files', action='store_true',
                         help='Additionally enable Brave FileSystemAccessAPI for native file-grant checks')
     parser.add_argument('--exercise-certificates', action='store_true',
                         help='Run real certificate callbacks and late decisions without ignoring certificate errors')
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.check == 'core':
+    if args.check in ('core', 'keyring'):
         from profile_store_probe import main as store_main
         return store_main()
     if args.exercise_files and args.exercise_certificates:

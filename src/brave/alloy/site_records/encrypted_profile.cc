@@ -35,7 +35,7 @@ FileStatus EncryptedProfile::Create(const base::FilePath& path, KeySource& sourc
     return status;
   }
   SecretKey kek;
-  status = source.Derive(parameters, &kek);
+  status = source.Create(parameters, &kek);
   if (status != FileStatus::kOk) {
     return status;
   }

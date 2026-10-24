@@ -21,12 +21,15 @@ WORK = workspace_path(REPO)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=['core'], default='core')
+    parser.add_argument('--check', choices=['core', 'keyring'], default='core')
     args = parser.parse_args()
     out = args.out.resolve()
     validate_output(WORK, out, REPO)
     env = dict(os.environ, TMPDIR=str(temp_path(WORK)),
                PYTHONDONTWRITEBYTECODE='1', LD_LIBRARY_PATH=str(out))
+    if args.check == 'keyring':
+        from keyring_probe import probe
+        return probe(out, env)
     evidence = WORK / 'evidence' / ('profile-core-' + out.name + '-' + str(time.time_ns()))
     evidence.mkdir(mode=0o700)
     roots = evidence / 'profiles'

@@ -8,11 +8,26 @@
 #include <vector>
 
 #include "brave/alloy/site_records/encrypted_profile.h"
+#include "brave/alloy/site_records/secret_service_key_source.h"
+#include "base/files/file_util.h"
 #include "cef/libcef/common/api_version_util.h"
 #include "third_party/icu/source/common/unicode/ustring.h"
 
 namespace {
 namespace sr = alloy::site_records;
+
+alloy_keyring_result_t KeyringResult(sr::FileStatus status,
+                                    const sr::SecretServiceKeySource& source) {
+  if (status == sr::FileStatus::kOk) return ALLOY_KEYRING_OK;
+  switch (source.result()) {
+    case sr::KeyringResult::kUnavailable: return ALLOY_KEYRING_UNAVAILABLE;
+    case sr::KeyringResult::kLocked: return ALLOY_KEYRING_LOCKED;
+    case sr::KeyringResult::kMissing: return ALLOY_KEYRING_MISSING;
+    case sr::KeyringResult::kOk:
+    case sr::KeyringResult::kFailed: return ALLOY_KEYRING_FAILED;
+  }
+  return ALLOY_KEYRING_FAILED;
+}
 
 std::unique_ptr<sr::PasswordKeySource> PasswordSource(const CefString& password) {
   // Convert into one caller-sized buffer. CefString::ToString and the generic
@@ -73,6 +88,10 @@ class AlloyProfileImpl final : public AlloyProfile {
     return profile_->Unlock(bridge) == sr::FileStatus::kOk;
   }
   bool Lock() override { return profile_->Lock() == sr::FileStatus::kOk; }
+  alloy_keyring_result_t UnlockWithKeyring() override {
+    sr::SecretServiceKeySource source;
+    return KeyringResult(profile_->Unlock(source), source);
+  }
   alloy_profile_state_t GetState() override {
     switch (profile_->state()) {
       case sr::ProfileState::kLocked: return ALLOY_PROFILE_LOCKED;
@@ -116,5 +135,21 @@ CefRefPtr<AlloyProfile> AlloyOpenProfile(const CefString& path) {
   CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
   std::unique_ptr<sr::EncryptedProfile> profile;
   return sr::EncryptedProfile::Open(ProfilePath(path), &profile) == sr::FileStatus::kOk
+      ? CefRefPtr<AlloyProfile>(new AlloyProfileImpl(std::move(profile))) : nullptr;
+}
+
+CefRefPtr<AlloyProfile> AlloyCreateProfileWithKeyring(
+    const CefString& path, int& result) {
+  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
+  result = ALLOY_KEYRING_FAILED;
+  const auto file_path = ProfilePath(path);
+  // Refuse normal duplicate creation before provisioning an unreachable key.
+  // The file layer still enforces exclusive ownership at publication time.
+  if (base::PathExists(file_path) || base::IsLink(file_path)) return nullptr;
+  sr::SecretServiceKeySource source;
+  std::unique_ptr<sr::EncryptedProfile> profile;
+  const auto status = sr::EncryptedProfile::Create(file_path, source, &profile);
+  result = KeyringResult(status, source);
+  return status == sr::FileStatus::kOk
       ? CefRefPtr<AlloyProfile>(new AlloyProfileImpl(std::move(profile))) : nullptr;
 }

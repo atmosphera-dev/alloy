@@ -47,10 +47,28 @@ class Source final : public AlloyKeySource {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) return 2;
+  if (argc != 2 && argc != 3) return 2;
   const auto* hash = cef_api_hash(CEF_API_VERSION, 0);
   Check(hash && std::strcmp(hash, CEF_API_HASH_PLATFORM) == 0, "api-hash");
   if (failures) return 1;
+  if (argc == 3) {
+    if (std::strcmp(argv[1], "--keyring")) return 2;
+    int result = ALLOY_KEYRING_FAILED;
+    auto keyring_profile = AlloyCreateProfileWithKeyring(argv[2], result);
+    Check(keyring_profile && result == ALLOY_KEYRING_OK, "keyring-create");
+    if (!keyring_profile) return 1;
+    Check(keyring_profile->Lock(), "keyring-lock");
+    keyring_profile = nullptr;
+    keyring_profile = AlloyOpenProfile(argv[2]);
+    Check(static_cast<bool>(keyring_profile), "keyring-reopen");
+    if (!keyring_profile) return 1;
+    Check(keyring_profile->UnlockWithKeyring() == ALLOY_KEYRING_OK, "keyring-unlock");
+    Check(keyring_profile->GetState() == ALLOY_PROFILE_UNLOCKED, "keyring-state");
+    Check(keyring_profile->Lock(), "keyring-relock");
+    if (failures) return 1;
+    std::puts("PASS profile-api-keyring-cpp-wrapper");
+    return 0;
+  }
   CefString malformed;
   malformed.FromString16(std::u16string(1, static_cast<char16_t>(0xd800)));
   Check(!AlloyCreateProfile(std::string(argv[1]) + "/invalid-unicode", malformed),

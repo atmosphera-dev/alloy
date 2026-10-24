@@ -24,6 +24,10 @@ class KeySource {
  public:
   virtual ~KeySource() = default;
   virtual KeySourceKind kind() const = 0;
+  // Provisioning is separate from lookup. An unlock must never recreate a
+  // deleted provider key. Stateless derivation sources keep their old contract.
+  virtual FileStatus Create(const KeySourceParameters& parameters,
+                            SecretKey* key) { return Derive(parameters, key); }
   // Called outside the profile lifecycle mutex. The output is an operation-
   // scoped KEK; neither the profile nor this interface retains a KEK on disk.
   virtual FileStatus Derive(const KeySourceParameters& parameters,

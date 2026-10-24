@@ -61,6 +61,15 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   virtual bool UnlockWithKeySource(CefRefPtr<AlloyKeySource> source) = 0;
 
   ///
+  /// Unlock using this profile's Linux Secret Service entry. The keyring must
+  /// already be running and unlocked. Never prompts, starts a daemon, creates
+  /// a missing entry or falls back to another key source. A failed unlock admits
+  /// no access; FAILED also covers source mismatch/integrity/I/O errors.
+  ///
+  /*--cef(default_retval=ALLOY_KEYRING_FAILED)--*/
+  virtual alloy_keyring_result_t UnlockWithKeyring() = 0;
+
+  ///
   /// Flush completed writes, lock and wipe keys. Returns true only when this
   /// synchronous lock completed successfully. During an in-flight unlock it
   /// requests cancellation and returns false; state remains TRANSITION until
@@ -94,6 +103,18 @@ CefRefPtr<AlloyProfile> AlloyCreateProfile(const CefString& path,
 /*--cef(added=experimental)--*/
 CefRefPtr<AlloyProfile> AlloyCreateProfileWithKeySource(
     const CefString& path, CefRefPtr<AlloyKeySource> source);
+
+///
+/// EXPERIMENTAL: Create and unlock a Linux Secret Service profile. Provision a
+/// fresh random per-profile KEK in the already-running, unlocked default
+/// collection. Returns NULL on failure and sets |result| to an
+/// alloy_keyring_result_t value. Existing
+/// paths are refused. No prompt, daemon activation, fixed key or fallback.
+/// The keyring holds only an opaque random profile ID and KEK, never site data.
+///
+/*--cef(added=experimental)--*/
+CefRefPtr<AlloyProfile> AlloyCreateProfileWithKeyring(
+    const CefString& path, int& result);
 
 ///
 /// EXPERIMENTAL: Open an existing profile while locked. Only public bootstrap

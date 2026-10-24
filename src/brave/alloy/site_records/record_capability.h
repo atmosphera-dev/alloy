@@ -40,6 +40,11 @@ enum class StorePurpose {
   kOriginTrials,
   kNotifications,
   kBlobSpill,
+  kProfileSettings,
+  kProfileCertificates,
+  kProfileCustomFilters,
+  kProfileDictionary,
+  kProfileAssets,
   // Live document/network working state is distinct from storage admission.
   // Its owner must retire this generation at the relevant lifetime boundary.
   kDocumentWorkingState,
@@ -54,6 +59,8 @@ enum class StorageAccess {
   kReadParentProfile,
   kRunBackgroundJob,
 };
+
+bool IsProfileStorePurpose(StorePurpose purpose);
 
 // Browser-side ownership resolution supplies the validated document/hop URL
 // and origin, not values claimed in a renderer message or a resource URL. The

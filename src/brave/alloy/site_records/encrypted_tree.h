@@ -34,7 +34,8 @@ class EncryptedTree {
 
   FileStatus Get(const ObjectRef& root,
                  const ObjectId& key,
-                 std::vector<uint8_t>* value) const;
+                 std::vector<uint8_t>* value,
+                 ObjectRef* authenticated_leaf = nullptr) const;
   FileStatus Put(const ObjectRef& root,
                  const ObjectId& key,
                  base::span<const uint8_t> value,

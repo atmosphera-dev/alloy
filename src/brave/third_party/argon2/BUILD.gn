@@ -1,0 +1,41 @@
+# Copyright (c) The Brave Authors. All rights reserved.
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: MPL-2.0
+# Alloy uses the already-pinned official reference; source/license unchanged.
+config("warnings") {
+  cflags = []
+  if (is_clang) {
+    cflags += [
+      "-Wno-implicit-fallthrough",
+      "-Wno-deprecated-declarations",
+    ]
+  }
+}
+
+config("external_config") {
+  include_dirs = [ "//brave/third_party/argon2/src/include" ]
+}
+
+static_library("argon2") {
+  configs += [ ":warnings" ]
+  public_configs = [ ":external_config" ]
+  visibility = [
+    "//brave/alloy/site_records:*",
+    "//brave/browser/brave_wallet:external_wallets_importer",
+    "//brave/components/brave_wallet/browser",
+    "//brave/components/brave_wallet/common",
+  ]
+  defines = [ "ARGON2_NO_THREADS" ]
+  sources = [
+    "src/src/argon2.c",
+    "src/src/blake2/blake2-impl.h",
+    "src/src/blake2/blake2.h",
+    "src/src/blake2/blake2b.c",
+    "src/src/blake2/blamka-round-ref.h",
+    "src/src/core.c",
+    "src/src/core.h",
+    "src/src/encoding.c",
+    "src/src/encoding.h",
+    "src/src/ref.c",
+  ]
+}

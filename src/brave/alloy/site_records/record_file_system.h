@@ -85,6 +85,11 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
                                base::span<const uint8_t> metadata);
   RecordCapability Capability(base::UnguessableToken record,
                                StorePurpose purpose);
+  // A separate profile-private tree uses profile-derived keys. It is not a
+  // site record, never appears in ListRecords and cannot be site-deleted.
+  RecordCapability ProfileCapability(StorePurpose purpose);
+  FileStatus RecordKeyEnvelopePathForTesting(base::UnguessableToken record,
+                                             base::FilePath* out);
 
   // R13: publish key/root removal and unlink superseded key envelopes first,
   // revoke/wipe every handle, then invoke engine teardown outside the mutex,

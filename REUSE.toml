@@ -12,6 +12,12 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 SPDX-FileCopyrightText = "Alex Indigo"
 
 [[annotations]]
+path = ["src/brave/third_party/argon2/BUILD.gn", "src/brave/third_party/argon2/README.chromium"]
+precedence = "override"
+SPDX-License-Identifier = "MPL-2.0"
+SPDX-FileCopyrightText = ["The Brave Authors", "Alex Indigo"]
+
+[[annotations]]
 path = "patches/brave-core/**"
 precedence = "override"
 SPDX-License-Identifier = "MPL-2.0"

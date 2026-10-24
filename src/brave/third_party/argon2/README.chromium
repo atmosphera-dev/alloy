@@ -1,0 +1,20 @@
+Name: Argon2 reference implementation
+URL: https://github.com/P-H-C/phc-winner-argon2
+Version: N/A
+Revision: 62358ba2123abd17fccf2a108a301d4b52c01a7c
+Update Mechanism: Manual
+License: Apache-2.0
+License File: src/LICENSE
+Shipped: yes
+Security Critical: yes
+
+Description:
+Official Argon2 reference C implementation, already pinned by brave/DEPS.
+Alloy password profiles use Argon2id v1.3 through the existing scalar reference
+target. The full upstream LICENSE and original author notices remain in src/.
+Apache-2.0 is selected from the upstream Apache-2.0/CC0 choice.
+
+Local Modifications:
+None to upstream source. BUILD.gn additionally permits the Alloy site_records
+consumer. ARGON2_NO_THREADS is retained; it changes scheduling, not lane count
+or the Argon2 result.

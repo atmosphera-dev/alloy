@@ -36,6 +36,11 @@ bool IsKnownPurpose(StorePurpose purpose) {
     case StorePurpose::kOriginTrials:
     case StorePurpose::kNotifications:
     case StorePurpose::kBlobSpill:
+    case StorePurpose::kProfileSettings:
+    case StorePurpose::kProfileCertificates:
+    case StorePurpose::kProfileCustomFilters:
+    case StorePurpose::kProfileDictionary:
+    case StorePurpose::kProfileAssets:
     case StorePurpose::kDocumentWorkingState:
     case StorePurpose::kNetworkWorkingState:
       return true;
@@ -49,6 +54,14 @@ bool IsWorkingState(StorePurpose purpose) {
 }
 
 }  // namespace
+
+bool IsProfileStorePurpose(StorePurpose purpose) {
+  return purpose == StorePurpose::kProfileSettings ||
+         purpose == StorePurpose::kProfileCertificates ||
+         purpose == StorePurpose::kProfileCustomFilters ||
+         purpose == StorePurpose::kProfileDictionary ||
+         purpose == StorePurpose::kProfileAssets;
+}
 
 std::string RecordDomainForPrincipal(const GURL& principal_url,
                                      const url::Origin& origin) {

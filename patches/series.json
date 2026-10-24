@@ -507,6 +507,11 @@
       "patch": "chromium/0062-permission-connection-lifecycle.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0020-encrypted-profiles.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

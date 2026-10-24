@@ -234,24 +234,27 @@ TEST_F(RecordFileSystemTest, CataloguePrunedBeforeTeardownAndDataUnlink) {
   ASSERT_EQ(FileStatus::kOk,
             file->Write(0, base::as_byte_span(std::string_view("private"))));
   ASSERT_EQ(FileStatus::kOk, file->Sync());
-  const auto physical = PhysicalFiles();
   const auto record_path = path_.AppendASCII(ObjectName(record_.directory));
-  std::vector<base::FilePath> key_pages;
-  for (const auto& [path, bytes] : physical) {
-    if (path.DirName() != record_path && path.BaseName().value() != "root") {
-      key_pages.push_back(path);
-    }
-  }
-  ASSERT_FALSE(key_pages.empty());
+  base::FilePath key_page;
+  ASSERT_EQ(FileStatus::kOk,
+            fs_->RecordKeyEnvelopePathForTesting(record_.id, &key_page));
+  ASSERT_TRUE(base::PathExists(key_page));
   bool called = false;
   RecordDeletion deletion;
   ASSERT_EQ(FileStatus::kOk, fs_->DeleteRecord(record_.id, [&] {
     called = true;
     EXPECT_FALSE(cap_.active());
     EXPECT_TRUE(file->KeysClearedForTesting());
-    for (const auto& path : key_pages) {
-      EXPECT_FALSE(base::PathExists(path));
+    EXPECT_FALSE(base::PathExists(key_page));
+    // Only the profile-private catalogue leaf remains. It contains no wrapped
+    // site key; retaining that live leaf is not retaining deleted-key history.
+    base::FileEnumerator pages(key_page.DirName(), false,
+                               base::FileEnumerator::FILES);
+    size_t count_pages = 0;
+    while (!pages.Next().empty()) {
+      ++count_pages;
     }
+    EXPECT_EQ(1u, count_pages);
     EXPECT_TRUE(base::DirectoryExists(record_path));
     std::vector<RecordInfo> records;
     EXPECT_EQ(FileStatus::kOk, fs_->ListRecords(&records));

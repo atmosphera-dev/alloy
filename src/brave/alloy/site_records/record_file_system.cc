@@ -208,8 +208,11 @@ StorePurpose PurposeForTag(uint32_t tag) {
       StorePurpose::kTransportSecurity, StorePurpose::kServerProperties,
       StorePurpose::kReportingConfiguration, StorePurpose::kSharedDictionaries,
       StorePurpose::kMediaDeviceSalts, StorePurpose::kOriginTrials,
-      StorePurpose::kNotifications, StorePurpose::kBlobSpill});
-  // DecodeEntry rejects tags outside 1..22 before this internal call.
+      StorePurpose::kNotifications, StorePurpose::kBlobSpill,
+      StorePurpose::kProfileSettings, StorePurpose::kProfileCertificates,
+      StorePurpose::kProfileCustomFilters, StorePurpose::kProfileDictionary,
+      StorePurpose::kProfileAssets});
+  // DecodeEntry rejects tags outside 1..27 before this internal call.
   return base::span(purposes)[tag - 1];
 }
 
@@ -225,7 +228,7 @@ FileStatus DecodeEntry(base::span<const uint8_t> bytes, NamespaceEntry* entry) {
   entry->directory = type == 1;
   entry->modified_us = static_cast<int64_t>(in.U64());
   entry->root = in.FileRoot();
-  if (!in.Done() || type > 1 || entry->purpose < 1 || entry->purpose > 22 ||
+  if (!in.Done() || type > 1 || entry->purpose < 1 || entry->purpose > 27 ||
       !ValidComponent(entry->name) ||
       (entry->directory && (entry->root.length != 0 ||
                             entry->root.revision != 0 ||
@@ -259,6 +262,7 @@ struct RecordFileState {
 struct RecordFileSystem::Impl {
   struct Record {
     RecordInfo info;
+    bool profile_private = false;
     SecretKey key;
     SecretKey namespace_key;
     SecretKey naming_key;
@@ -306,6 +310,7 @@ struct RecordFileSystem::Impl {
   std::unique_ptr<ObjectDirectory> root;
   std::unique_ptr<ObjectDirectory> catalogue_objects;
   std::map<base::UnguessableToken, std::unique_ptr<Record>> records;
+  base::UnguessableToken private_record;
   std::set<ObjectId> deleting;
   FileFault fault;
 
@@ -380,6 +385,36 @@ struct RecordFileSystem::Impl {
         profile, record.info.id, record.info.generation, StorageMode::kEncrypted);
   }
 
+  ObjectId PrivateDirectory() const {
+    Encoder out;
+    out.U32(0);  // Cannot be a canonical host/domain.
+    out.Text("alloy-profile-files-v1");
+    return KeyedName(lookup_key, out.bytes);
+  }
+
+  SecretKey PrivateKey(const RecordInfo& info) const {
+    return DeriveKey(profile_key, RecordBinding(profile, info),
+        base::as_byte_span(std::string_view("alloy-profile-private-key-v1")));
+  }
+
+  FileStatus CreatePrivateTree() {
+    auto record = std::make_unique<Record>();
+    record->profile_private = true;
+    record->info.id = base::UnguessableToken::Create();
+    record->info.generation = base::UnguessableToken::Create();
+    record->info.directory = PrivateDirectory();
+    record->info.created_us = NowMicros();
+    record->key = PrivateKey(record->info);
+    InitializeRecordKeys(*record);
+    auto status = root->Child(record->info.directory, true, &record->objects);
+    if (status == FileStatus::kOk) {
+      record->dirty = true;
+      private_record = record->info.id;
+      records.emplace(record->info.id, std::move(record));
+    }
+    return status;
+  }
+
   std::set<ObjectId> LiveDirectories() const {
     std::set<ObjectId> live{catalogue_directory};
     live.insert(deleting.begin(), deleting.end());
@@ -398,7 +433,8 @@ struct RecordFileSystem::Impl {
     const auto found = records.find(cap.record());
     if (!cap.Allows(purpose, access) || cap.profile() != profile ||
         found == records.end() ||
-        cap.generation() != found->second->info.generation) {
+        cap.generation() != found->second->info.generation ||
+        IsProfileStorePurpose(purpose) != found->second->profile_private) {
       return FileStatus::kDenied;
     }
     *out = found->second.get();
@@ -487,7 +523,8 @@ struct RecordFileSystem::Impl {
           NamespaceEntry entry;
           auto status = DecodeEntry(value, &entry);
           if (status != FileStatus::kOk ||
-              key != NameKey(record, entry.purpose, entry.parent, entry.name)) {
+              key != NameKey(record, entry.purpose, entry.parent, entry.name) ||
+              IsProfileStorePurpose(PurposeForTag(entry.purpose)) != record.profile_private) {
             return FileStatus::kIntegrity;
           }
           return visitor(key, entry);
@@ -506,7 +543,7 @@ struct RecordFileSystem::Impl {
 
   FileStatus PutRecord(Record& record, ObjectRef* into) {
     Encoder value;
-    value.U32(1);
+    value.U32(record.profile_private ? 2 : 1);
     value.Token(record.info.id);
     value.Token(record.info.generation);
     value.Text(record.info.domain);
@@ -527,9 +564,11 @@ struct RecordFileSystem::Impl {
                          base::span<const uint8_t> value) {
     auto record = std::make_unique<Record>();
     Decoder in(value);
-    if (in.U32() != 1) {
+    const auto kind = in.U32();
+    if (kind != 1 && kind != 2) {
       return FileStatus::kIntegrity;
     }
+    record->profile_private = kind == 2;
     record->info.directory = directory;
     record->info.id = in.Token();
     record->info.generation = in.Token();
@@ -540,15 +579,23 @@ struct RecordFileSystem::Impl {
     const auto wrapped = in.Blob(80);
     record->wrapped_key.assign(wrapped.begin(), wrapped.end());
     record->names = in.Ref();
-    const auto expected = KeyedName(lookup_key,
-        base::as_byte_span(record->info.domain));
-    if (!in.Done() || record->info.domain.empty() ||
+    const auto expected = record->profile_private ? PrivateDirectory()
+        : KeyedName(lookup_key, base::as_byte_span(record->info.domain));
+    if (!in.Done() || record->info.domain.empty() != record->profile_private ||
         record->info.directory != expected || directory == catalogue_directory ||
-        records.contains(record->info.id)) {
+        records.contains(record->info.id) ||
+        (record->profile_private && (!private_record.is_empty() ||
+                                      !record->wrapped_key.empty()))) {
       return FileStatus::kIntegrity;
     }
-    auto status = UnwrapKey(wrapping_key, record->wrapped_key,
-                             RecordBinding(profile, record->info), &record->key);
+    auto status = FileStatus::kOk;
+    if (record->profile_private) {
+      record->key = PrivateKey(record->info);
+      private_record = record->info.id;
+    } else {
+      status = UnwrapKey(wrapping_key, record->wrapped_key,
+                          RecordBinding(profile, record->info), &record->key);
+    }
     if (status != FileStatus::kOk) {
       return status;
     }
@@ -786,6 +833,9 @@ FileStatus RecordFileSystem::Create(const base::FilePath& path,
   status = impl->root->Child(impl->catalogue_directory, true,
                               &impl->catalogue_objects);
   if (status == FileStatus::kOk) {
+    status = impl->CreatePrivateTree();
+  }
+  if (status == FileStatus::kOk) {
     status = impl->Commit();
   }
   if (status == FileStatus::kOk) {
@@ -833,6 +883,9 @@ FileStatus RecordFileSystem::Open(const base::FilePath& path,
       [&](const ObjectId& id, base::span<const uint8_t> bytes) {
         return impl->LoadRecord(id, bytes);
       });
+  if (status == FileStatus::kOk && impl->private_record.is_empty()) {
+    return FileStatus::kIntegrity;
+  }
   if (status != FileStatus::kOk) {
     return status;
   }
@@ -970,7 +1023,9 @@ FileStatus RecordFileSystem::ListRecords(std::vector<RecordInfo>* out) {
   }
   out->clear();
   for (const auto& [id, record] : impl_->records) {
-    out->push_back(record->info);
+    if (!record->profile_private) {
+      out->push_back(record->info);
+    }
   }
   return FileStatus::kOk;
 }
@@ -1000,8 +1055,39 @@ RecordCapability RecordFileSystem::Capability(base::UnguessableToken id,
   std::lock_guard lock(impl_->mutex);
   const auto found = impl_->records.find(id);
   return impl_->Admission() == FileStatus::kOk &&
-                 found != impl_->records.end() && PersistentStoreTag(purpose)
+                 found != impl_->records.end() && PersistentStoreTag(purpose) &&
+                 found->second->profile_private == IsProfileStorePurpose(purpose)
              ? found->second->issuer->Issue(purpose) : RecordCapability();
+}
+
+RecordCapability RecordFileSystem::ProfileCapability(StorePurpose purpose) {
+  std::lock_guard lock(impl_->mutex);
+  const auto found = impl_->records.find(impl_->private_record);
+  return impl_->Admission() == FileStatus::kOk &&
+                 found != impl_->records.end() && PersistentStoreTag(purpose) &&
+                 IsProfileStorePurpose(purpose)
+             ? found->second->issuer->Issue(purpose) : RecordCapability();
+}
+
+FileStatus RecordFileSystem::RecordKeyEnvelopePathForTesting(
+    base::UnguessableToken id, base::FilePath* out) {
+  std::lock_guard lock(impl_->mutex);
+  auto status = impl_->Admission();
+  if (status != FileStatus::kOk) {
+    return status;
+  }
+  const auto found = impl_->records.find(id);
+  if (found == impl_->records.end() || found->second->profile_private) {
+    return FileStatus::kNotFound;
+  }
+  WipedBytes value;
+  ObjectRef leaf;
+  status = impl_->CatalogueTree().Get(impl_->catalogue,
+      found->second->info.directory, &value.bytes, &leaf);
+  if (status == FileStatus::kOk) {
+    *out = impl_->catalogue_objects->path().AppendASCII(ObjectName(leaf.id));
+  }
+  return status;
 }
 
 FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
@@ -1015,6 +1101,9 @@ FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
   const auto found = impl_->records.find(id);
   if (found == impl_->records.end()) {
     return FileStatus::kNotFound;
+  }
+  if (found->second->profile_private) {
+    return FileStatus::kDenied;
   }
   auto record = std::move(found->second);
   const auto directory = record->info.directory;

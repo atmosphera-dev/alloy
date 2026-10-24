@@ -147,7 +147,8 @@ FileStatus EncryptedTree::Store(const Node& node, ObjectRef* result) {
 
 FileStatus EncryptedTree::Get(const ObjectRef& root,
                                const ObjectId& key,
-                               std::vector<uint8_t>* value) const {
+                               std::vector<uint8_t>* value,
+                               ObjectRef* authenticated_leaf) const {
   auto ref = root;
   Bound bound;
   while (!ref.empty()) {
@@ -160,6 +161,9 @@ FileStatus EncryptedTree::Get(const ObjectRef& root,
       return FileStatus::kNotFound;
     }
     if (node.leaf) {
+      if (authenticated_leaf) {
+        *authenticated_leaf = ref;
+      }
       Cleanse(*value);
       *value = std::move(node.value);
       return FileStatus::kOk;

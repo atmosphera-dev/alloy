@@ -47,6 +47,31 @@ source_set("record_files") {
   ]
 }
 
+source_set("profiles") {
+  sources = [
+    "encrypted_profile.cc",
+    "encrypted_profile.h",
+    "key_source.cc",
+    "key_source.h",
+  ]
+  public_deps = [ ":record_files" ]
+  deps = [
+    "//brave/third_party/argon2",
+    "//third_party/boringssl",
+  ]
+}
+
+executable("alloy_profile_cpp_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "profile_api_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [
+    "//cef:libcef",
+    "//cef:libcef_dll_wrapper",
+  ]
+}
+
 test("alloy_site_records_unittests") {
   sources = [
     "cookie_mode_unittest.cc",
@@ -60,6 +85,7 @@ test("alloy_site_records_unittests") {
     "stateless_network_unittest.cc",
     "authenticated_objects_unittest.cc",
     "encrypted_file_contents_unittest.cc",
+    "encrypted_profile_unittest.cc",
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",
     "record_file_system_unittest.cc",
@@ -69,6 +95,8 @@ test("alloy_site_records_unittests") {
     ":capabilities",
     ":document_settings",
     ":record_files",
+    ":profiles",
+    "//brave/third_party/argon2",
     "//base/test:test_support",
     "//components/content_settings/core/browser",
     "//components/permissions",

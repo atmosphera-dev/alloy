@@ -35,6 +35,11 @@ constexpr auto kStoredPurposes = std::to_array<StorePurpose>({
     StorePurpose::kOriginTrials,
     StorePurpose::kNotifications,
     StorePurpose::kBlobSpill,
+    StorePurpose::kProfileSettings,
+    StorePurpose::kProfileCertificates,
+    StorePurpose::kProfileCustomFilters,
+    StorePurpose::kProfileDictionary,
+    StorePurpose::kProfileAssets,
 });
 
 constexpr auto kAccesses = std::to_array<StorageAccess>({

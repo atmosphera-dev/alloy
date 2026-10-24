@@ -1,0 +1,146 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1162,3 +1162,8 @@
+   deps += [ "//brave/alloy/site_records:capabilities" ]
++  sources += [ "libcef/browser/alloy/profile_store.cc" ]
++  deps += [
++    "//brave/alloy/site_records:profiles",
++    "//third_party/icu:icuuc",
++  ]
+ 
+ }
+--- a/include/internal/cef_types.h
++++ b/include/internal/cef_types.h
+@@ -4260,3 +4260,14 @@
+   ALLOY_NETWORK_STATE_CUT = 1,
+ } alloy_network_state_t;
++
++///
++/// EXPERIMENTAL: Encrypted profile lifecycle state. TRANSITION does not
++/// acknowledge that keys have been wiped; ERROR requires explicit lock/reopen.
++///
++typedef enum {
++  ALLOY_PROFILE_LOCKED = 0,
++  ALLOY_PROFILE_UNLOCKED = 1,
++  ALLOY_PROFILE_TRANSITION = 2,
++  ALLOY_PROFILE_ERROR = 3,
++} alloy_profile_state_t;
+ #endif
+--- a/tools/cef_parser.py
++++ b/tools/cef_parser.py
+@@ -98,9 +98,16 @@
+   return result
+ 
+ 
++def get_wrapper_file_base(cppname):
++  """Preserve Alloy's namespace; retain every existing Cef wrapper path."""
++  return get_capi_name(cppname if cppname.startswith('Alloy') else cppname[3:], False)
++
++
+ def get_wrapper_type_enum(cppname):
+   """ Returns the wrapper type enumeration value for the specified C++ class
+         name. """
++  if cppname.startswith('Alloy'):
++    return 'WT_' + get_capi_name(cppname, False).upper()
+   return 'WT_' + get_capi_name(cppname, False)[4:].upper()
+ 
+ 
+@@ -323,7 +330,7 @@
+           directory = dir + '/'
+       type = 'cpptoc' if cpptoc else 'ctocpp'
+       paths.add('libcef_dll/' + type + '/'+directory+ \
+-                get_capi_name(item[3:], False)+'_' + type + '.h')
++                get_wrapper_file_base(item)+'_' + type + '.h')
+ 
+   if body.find('shutdown_checker') > 0:
+     paths.add('libcef_dll/shutdown_checker.h')
+@@ -1034,7 +1041,7 @@
+       'cef_api_hash.h', 'cef_application_mac.h', 'cef_version_info.h'
+   ]
+   header.add_directory(include_dir, excluded_files)
+-  for subdir in ('test', 'views'):
++  for subdir in ('test', 'views', 'alloy'):
+     subdir_path = os.path.join(include_dir, subdir)
+     if os.path.isdir(subdir_path):
+       header.add_directory(subdir_path)
+--- a/tools/make_cpptoc_header.py
++++ b/tools/make_cpptoc_header.py
+@@ -17,7 +17,7 @@
+   defname = ''
+   if not directory is None:
+     defname += directory + '_'
+-  defname += get_capi_name(clsname[3:], False)
++  defname += get_wrapper_file_base(clsname)
+   defname = defname.upper()
+ 
+   result = get_copyright()
+@@ -145,7 +145,7 @@
+   # give the output file the same directory offset as the input file
+   cls = header.get_class(clsname)
+   dir = os.path.dirname(os.path.join(dir, cls.get_file_name()))
+-  file = os.path.join(dir, get_capi_name(clsname[3:], False) + '_cpptoc.h')
++  file = os.path.join(dir, get_wrapper_file_base(clsname) + '_cpptoc.h')
+ 
+   newcontents = make_cpptoc_header(header, clsname)
+   return (file, newcontents)
+--- a/tools/make_ctocpp_header.py
++++ b/tools/make_ctocpp_header.py
+@@ -54,7 +54,7 @@
+   defname = ''
+   if not directory is None:
+     defname += directory + '_'
+-  defname += get_capi_name(clsname[3:], False)
++  defname += get_wrapper_file_base(clsname)
+   defname = defname.upper()
+ 
+   result = get_copyright()
+@@ -179,7 +179,7 @@
+   # give the output file the same directory offset as the input file
+   cls = header.get_class(clsname)
+   dir = os.path.dirname(os.path.join(dir, cls.get_file_name()))
+-  file = os.path.join(dir, get_capi_name(clsname[3:], False) + '_ctocpp.h')
++  file = os.path.join(dir, get_wrapper_file_base(clsname) + '_ctocpp.h')
+ 
+   newcontents = make_ctocpp_header(header, clsname)
+   return (file, newcontents)
+--- a/tools/make_cpptoc_impl.py
++++ b/tools/make_cpptoc_impl.py
+@@ -807,7 +807,7 @@
+     raise Exception('Class does not exist: ' + clsname)
+ 
+-  prefixname = get_capi_name(clsname[3:], False)
++  prefixname = get_wrapper_file_base(clsname)
+ 
+   base_class_name = header.get_base_class_name(clsname)
+   base_scoped = True if base_class_name == 'CefBaseScoped' else False
+   if base_scoped:
+@@ -1004,5 +1004,5 @@
+     cls = header.get_class(clsname)
+     dir = os.path.dirname(os.path.join(dir, cls.get_file_name()))
+-    file = os.path.join(dir, get_capi_name(clsname[3:], False) + '_cpptoc.cc')
++    file = os.path.join(dir, get_wrapper_file_base(clsname) + '_cpptoc.cc')
+ 
+   set_notify_context(file)
+--- a/tools/make_ctocpp_impl.py
++++ b/tools/make_ctocpp_impl.py
+@@ -945,5 +945,5 @@
+     cls = header.get_class(clsname)
+     dir = os.path.dirname(os.path.join(dir, cls.get_file_name()))
+-    file = os.path.join(dir, get_capi_name(clsname[3:], False) + '_ctocpp.cc')
++    file = os.path.join(dir, get_wrapper_file_base(clsname) + '_ctocpp.cc')
+ 
+   set_notify_context(file)
+--- a/tools/make_gypi_file.py
++++ b/tools/make_gypi_file.py
+@@ -50,4 +50,4 @@
+   for clsname in classes:
+     cls = header.get_class(clsname)
+-    filename = get_capi_name(clsname[3:], False)
++    filename = get_wrapper_file_base(clsname)
+     dir = cls.get_file_directory()
+@@ -66,4 +66,4 @@
+   for clsname in classes:
+     cls = header.get_class(clsname)
+-    filename = get_capi_name(clsname[3:], False)
++    filename = get_wrapper_file_base(clsname)
+     dir = cls.get_file_directory()

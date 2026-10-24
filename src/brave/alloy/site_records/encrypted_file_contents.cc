@@ -126,6 +126,11 @@ uint32_t PersistentStoreTag(StorePurpose purpose) {
     case StorePurpose::kOriginTrials: return 20;
     case StorePurpose::kNotifications: return 21;
     case StorePurpose::kBlobSpill: return 22;
+    case StorePurpose::kProfileSettings: return 23;
+    case StorePurpose::kProfileCertificates: return 24;
+    case StorePurpose::kProfileCustomFilters: return 25;
+    case StorePurpose::kProfileDictionary: return 26;
+    case StorePurpose::kProfileAssets: return 27;
     case StorePurpose::kDocumentWorkingState:
     case StorePurpose::kNetworkWorkingState:
       return 0;

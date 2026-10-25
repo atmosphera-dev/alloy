@@ -9,13 +9,12 @@
 #include "base/memory/ref_counted.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/unguessable_token.h"
+#include "brave/alloy/site_records/storage_mode.h"
 #include "url/origin.h"
 
 class GURL;
 
 namespace alloy::site_records {
-
-enum class StorageMode { kStateless, kMemory, kEncrypted };
 
 // A capability is bound to one store, not a general permission to use a record.
 enum class StorePurpose {

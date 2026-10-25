@@ -1,0 +1,117 @@
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.cc
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+@@ -4,6 +4,10 @@
+ // found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/chrome/chrome_content_browser_client_cef.h"
++#include "content/public/browser/generated_code_cache_settings.h"
++#include "content/public/browser/allow_service_worker_result.h"
++#include "content/public/browser/browser_context.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <tuple>
+ 
+@@ -630,6 +634,53 @@
+   return true;
+ }
+ 
++content::AllowServiceWorkerResult ChromeContentBrowserClientCef::AllowServiceWorker(
++    const GURL& scope, const net::SiteForCookies& site_for_cookies,
++    const std::optional<url::Origin>& top_frame_origin,
++    const blink::StorageKey& storage_key, const GURL& script_url,
++    content::BrowserContext* context) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*context);
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kServiceWorkers)
++                     .Allows(alloy::site_records::StorePurpose::kServiceWorkers,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return content::AllowServiceWorkerResult::No();
++  }
++
++  return BraveContentBrowserClient::AllowServiceWorker(scope, site_for_cookies,
++      top_frame_origin, storage_key, script_url, context);
++}
++
++bool ChromeContentBrowserClientCef::AllowSharedWorker(
++    const GURL& worker_url, const net::SiteForCookies& site_for_cookies,
++    const std::optional<url::Origin>& top_frame_origin, const std::string& name,
++    const blink::StorageKey& storage_key,
++    blink::mojom::SharedWorkerSameSiteCookies same_site_cookies,
++    content::BrowserContext* context, int render_process_id, int render_frame_id) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*context);
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kBackgroundJobs)
++                     .Allows(alloy::site_records::StorePurpose::kBackgroundJobs,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return false;
++  }
++
++  return BraveContentBrowserClient::AllowSharedWorker(worker_url, site_for_cookies,
++      top_frame_origin, name, storage_key, same_site_cookies, context,
++      render_process_id, render_frame_id);
++}
++
++content::GeneratedCodeCacheSettings
++ChromeContentBrowserClientCef::GetGeneratedCodeCacheSettings(
++    content::BrowserContext* context) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*context);
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kCodeCache)
++                     .Allows(alloy::site_records::StorePurpose::kCodeCache,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return content::GeneratedCodeCacheSettings(false, 0, base::FilePath());
++  }
++
++  return BraveContentBrowserClient::GetGeneratedCodeCacheSettings(context);
++}
++
+ void ChromeContentBrowserClientCef::CreateThrottlesForNavigation(
+     content::NavigationThrottleRegistry& registry) {
+   BraveContentBrowserClient::CreateThrottlesForNavigation(registry);
+@@ -671,6 +722,16 @@
+       cef_context ? cef_context->GetCookieableSchemes()
+                   : CefBrowserContext::GetGlobalCookieableSchemes();
+ 
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*context);
++      policy && policy->StorageCapability(alloy::site_records::StorePurpose::kCookies)
++                    .mode() == alloy::site_records::StorageMode::kStateless) {
++    network_context_params->alloy_stateless = true;
++    network_context_params->file_paths.reset();
++    network_context_params->http_cache_enabled = false;
++    network_context_params->shared_dictionary_enabled = false;
++    network_context_params->device_bound_sessions_enabled = false;
++    network_context_params->cookieable_schemes = std::vector<std::string>();
++  }
+   return true;
+ }
+ 
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.h
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.h
+@@ -117,6 +117,20 @@
+       const net::IsolationInfo& isolation_info,
+       mojo::PendingRemote<network::mojom::URLLoaderFactory>* out_factory)
+       override;
++  content::AllowServiceWorkerResult AllowServiceWorker(
++      const GURL& scope, const net::SiteForCookies& site_for_cookies,
++      const std::optional<url::Origin>& top_frame_origin,
++      const blink::StorageKey& storage_key, const GURL& script_url,
++      content::BrowserContext* context) override;
++  bool AllowSharedWorker(
++      const GURL& worker_url, const net::SiteForCookies& site_for_cookies,
++      const std::optional<url::Origin>& top_frame_origin, const std::string& name,
++      const blink::StorageKey& storage_key,
++      blink::mojom::SharedWorkerSameSiteCookies same_site_cookies,
++      content::BrowserContext* context, int render_process_id,
++      int render_frame_id) override;
++  content::GeneratedCodeCacheSettings GetGeneratedCodeCacheSettings(
++      content::BrowserContext* context) override;
+   void CreateThrottlesForNavigation(
+       content::NavigationThrottleRegistry& registry) override;
+   bool ConfigureNetworkContextParams(
+--- a/libcef_dll/libcef.lst
++++ b/libcef_dll/libcef.lst
+@@ -4,6 +4,6 @@
+ 
+ {
+   /* Only export necessary symbols from libcef.so. */
+-  global: cef_*;
++  global: cef_*; alloy_*;
+   local: *;
+ };

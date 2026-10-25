@@ -1,0 +1,197 @@
+--- a/chrome/browser/spellchecker/spellcheck_custom_dictionary.h
++++ b/chrome/browser/spellchecker/spellcheck_custom_dictionary.h
+@@ -123,9 +123,14 @@
+     bool is_valid_file;
+   };
+ 
+-  // The dictionary will be saved in |dictionary_directory_name|.
++  // Stateless contexts still use the native empty dictionary and readiness
++  // notifications, but never admit local/account words or file operations.
++  enum class Storage { kProfile, kNone };
++
++  // The dictionary will be saved in |dictionary_directory_name| for kProfile.
+   explicit SpellcheckCustomDictionary(
+-      const base::FilePath& dictionary_directory_name);
++      const base::FilePath& dictionary_directory_name,
++      Storage storage = Storage::kProfile);
+ 
+   SpellcheckCustomDictionary(const SpellcheckCustomDictionary&) = delete;
+   SpellcheckCustomDictionary& operator=(const SpellcheckCustomDictionary&) =
+@@ -233,7 +238,9 @@
+   // changed.
+   void Notify(const Change& dictionary_change);
+ 
+-  // Task runner where the file operations takes place.
++  const Storage storage_;
++
++  // Task runner where the file operations takes place. Absent for kNone.
+   scoped_refptr<base::SequencedTaskRunner> task_runner_;
+ 
+   // In-memory cache of the custom words file. When
+--- a/chrome/browser/spellchecker/spellcheck_custom_dictionary.cc
++++ b/chrome/browser/spellchecker/spellcheck_custom_dictionary.cc
+@@ -244,11 +244,17 @@
+ }
+ 
+ SpellcheckCustomDictionary::SpellcheckCustomDictionary(
+-    const base::FilePath& dictionary_directory_name)
+-    : task_runner_(
+-          base::ThreadPool::CreateSequencedTaskRunner({base::MayBlock()})),
+-      custom_dictionary_path_(
+-          dictionary_directory_name.Append(chrome::kCustomDictionaryFileName)),
++    const base::FilePath& dictionary_directory_name,
++    Storage storage)
++    : storage_(storage),
++      task_runner_(storage == Storage::kNone
++                       ? nullptr
++                       : base::ThreadPool::CreateSequencedTaskRunner(
++                             {base::MayBlock()})),
++      custom_dictionary_path_(storage == Storage::kNone
++                                  ? base::FilePath()
++                                  : dictionary_directory_name.Append(
++                                        chrome::kCustomDictionaryFileName)),
+       is_loaded_(false) {}
+ 
+ SpellcheckCustomDictionary::~SpellcheckCustomDictionary() = default;
+@@ -260,6 +266,9 @@
+ 
+ bool SpellcheckCustomDictionary::AddWord(const std::string& word) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (storage_ == Storage::kNone) {
++    return false;
++  }
+   std::unique_ptr<Change> dictionary_change(new Change);
+   dictionary_change->AddWord(word);
+   int result = dictionary_change->Sanitize(GetWords());
+@@ -272,6 +281,9 @@
+ 
+ bool SpellcheckCustomDictionary::RemoveWord(const std::string& word) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (storage_ == Storage::kNone) {
++    return false;
++  }
+   std::unique_ptr<Change> dictionary_change(new Change);
+   dictionary_change->RemoveWord(word);
+   int result = dictionary_change->Sanitize(GetWords());
+@@ -287,6 +299,9 @@
+ }
+ 
+ void SpellcheckCustomDictionary::Clear() {
++  if (storage_ == Storage::kNone) {
++    return;
++  }
+   std::unique_ptr<Change> dictionary_change(new Change);
+   dictionary_change->Clear();
+   Apply(*dictionary_change);
+@@ -318,6 +333,12 @@
+ 
+ void SpellcheckCustomDictionary::Load() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (storage_ == Storage::kNone) {
++    auto result = std::make_unique<LoadFileResult>();
++    result->is_valid_file = true;
++    OnLoaded(std::move(result));
++    return;
++  }
+   task_runner_->PostTaskAndReplyWithResult(
+       FROM_HERE,
+       base::BindOnce(&SpellcheckCustomDictionary::LoadDictionaryFile,
+@@ -339,6 +360,11 @@
+     syncer::DataType type,
+     const syncer::SyncDataList& initial_sync_data,
+     std::unique_ptr<syncer::SyncChangeProcessor> sync_processor) {
++  if (storage_ == Storage::kNone) {
++    return syncer::ModelError(
++        FROM_HERE,
++        syncer::ModelError::Type::kSpellcheckCustomDictionaryUpdateFailed);
++  }
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(!sync_processor_.get());
+   DCHECK(sync_processor.get());
+@@ -388,6 +414,11 @@
+ SpellcheckCustomDictionary::ProcessSyncChanges(
+     const base::Location& from_here,
+     const syncer::SyncChangeList& change_list) {
++  if (storage_ == Storage::kNone) {
++    return syncer::ModelError(
++        FROM_HERE,
++        syncer::ModelError::Type::kSpellcheckCustomDictionaryUpdateFailed);
++  }
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   auto dictionary_change = std::make_unique<Change>();
+   for (const syncer::SyncChange& change : change_list) {
+@@ -500,6 +531,9 @@
+ void SpellcheckCustomDictionary::ApplyToSet(const Change& dictionary_change,
+                                             std::set<std::string>* words) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (storage_ == Storage::kNone) {
++    return;
++  }
+   if (dictionary_change.clear()) {
+     words->clear();
+   }
+@@ -524,6 +558,9 @@
+ void SpellcheckCustomDictionary::FixInvalidFile(
+     std::unique_ptr<LoadFileResult> load_file_result) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (storage_ == Storage::kNone) {
++    return;
++  }
+   task_runner_->PostTask(
+       FROM_HERE,
+       base::BindOnce(&SavePassedWordsToDictionaryFileReliably,
+@@ -533,6 +570,9 @@
+ void SpellcheckCustomDictionary::Save(
+     std::unique_ptr<Change> dictionary_change) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (storage_ == Storage::kNone) {
++    return;
++  }
+   fix_invalid_file_.Cancel();
+   task_runner_->PostTask(
+       FROM_HERE,
+--- a/chrome/browser/spellchecker/spellcheck_service.cc
++++ b/chrome/browser/spellchecker/spellcheck_service.cc
+@@ -24,6 +24,7 @@
+ #include "base/task/thread_pool.h"
+ #include "base/timer/elapsed_timer.h"
+ #include "base/values.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profiles_state.h"
+@@ -190,8 +191,12 @@
+       base::BindRepeating(&SpellcheckService::InitForAllRenderers,
+                           base::Unretained(this)));
+ 
+-  custom_dictionary_ =
+-      std::make_unique<SpellcheckCustomDictionary>(context_->GetPath());
++  const bool stateless =
++      alloy::site_records::RequestContextPolicy::IsStateless(*context_);
++  custom_dictionary_ = std::make_unique<SpellcheckCustomDictionary>(
++      stateless ? base::FilePath() : context_->GetPath(),
++      stateless ? SpellcheckCustomDictionary::Storage::kNone
++                : SpellcheckCustomDictionary::Storage::kProfile);
+   custom_dictionary_->AddObserver(this);
+ 
+   // Determine if dictionary initialization should be deferred or skipped in
+--- a/chrome/browser/spellchecker/spellcheck_factory.cc
++++ b/chrome/browser/spellchecker/spellcheck_factory.cc
+@@ -32,6 +32,7 @@
+     : ProfileKeyedServiceFactory(
+           "SpellcheckService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+--- a/chrome/browser/spellchecker/BUILD.gn
++++ b/chrome/browser/spellchecker/BUILD.gn
+@@ -77,6 +77,7 @@
+   public_deps = [ ":spellchecker" ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//brave/alloy:data_paths",
+     "//chrome/app/resources:locale_settings",
+     "//chrome/browser/profiles:profile",

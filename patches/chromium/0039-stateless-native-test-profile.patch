@@ -1,0 +1,151 @@
+--- a/chrome/test/base/testing_profile.cc
++++ b/chrome/test/base/testing_profile.cc
+@@ -24,6 +24,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/test/test_file_util.h"
+ #include "base/threading/thread_restrictions.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/autocomplete/in_memory_url_index_factory.h"
+ #include "chrome/browser/autofill/personal_data_manager_factory.h"
+@@ -38,6 +39,7 @@
+ #include "chrome/browser/enterprise/isolated_mode/isolated_mode_settings_service_factory.h"
+ #include "chrome/browser/history/history_service_factory.h"
+ #include "chrome/browser/origin_trials/origin_trials_factory.h"
++#include "chrome/browser/permissions/permission_manager_factory.h"
+ #include "chrome/browser/policy/profile_policy_connector.h"
+ #include "chrome/browser/policy/schema_registry_service.h"
+ #include "chrome/browser/policy/schema_registry_service_builder.h"
+@@ -75,6 +77,7 @@
+ #include "components/leveldb_proto/public/proto_database_provider.h"
+ #include "components/omnibox/browser/autocomplete_classifier.h"
+ #include "components/omnibox/browser/in_memory_url_index.h"
++#include "components/permissions/permission_manager.h"
+ #include "components/policy/core/common/cloud/cloud_external_data_manager.h"
+ #include "components/policy/core/common/cloud/mock_user_cloud_policy_store.h"
+ #include "components/policy/core/common/cloud/profile_cloud_policy_manager.h"
+@@ -349,6 +352,11 @@
+ }
+ 
+ void TestingProfile::Init(bool is_supervised_profile, CreateMode create_mode) {
++  if (IsOffTheRecord()) {
++    if (auto mode = GetOTRProfileID().GetAlloyStatelessNetworkState()) {
++      alloy::site_records::RequestContextPolicy::AttachStateless(*this, *mode);
++    }
++  }
+   if (!g_browser_process) {
+     // This is intentionally not a CHECK because that would exonerate any
+     // EXPECT_CHECK_DEATH()s for the wrong reason by printing "Check failed" to
+@@ -401,20 +409,23 @@
+ 
+   if (prefs_.get()) {
+     user_prefs::UserPrefs::Set(this, prefs_.get());
+-  } else if (IsOffTheRecord()) {
++  } else if (IsOffTheRecord() &&
++             !alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
+     CreateIncognitoPrefService();
+   } else {
+     CreateTestingPrefService();
+   }
+ 
+-  if (is_supervised_profile)
++  if (is_supervised_profile) {
+     SetIsSupervisedProfile();
++  }
+ 
+   key_->SetPrefs(prefs_.get());
+   SimpleKeyMap::GetInstance()->Associate(this, key_.get());
+ 
+-  if (!base::PathExists(profile_path_))
++  if (!base::PathExists(profile_path_)) {
+     base::CreateDirectory(profile_path_);
++  }
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   // Initialize |account_manager::AccountManager|.
+@@ -570,8 +581,12 @@
+ }
+ 
+ TestingProfile::~TestingProfile() {
+-  if (!profile_destruction_callback_.is_null())
++  if (auto* policy = alloy::site_records::RequestContextPolicy::Get(*this)) {
++    policy->Revoke();
++  }
++  if (!profile_destruction_callback_.is_null()) {
+     std::move(profile_destruction_callback_).Run();
++  }
+ 
+   // If this profile owns OffTheRecord profiles, tear them down first.
+   otr_profiles_.clear();
+@@ -778,14 +793,22 @@
+ void TestingProfile::CreateTestingPrefService() {
+   DCHECK(!prefs_.get());
+ 
++  // A stateless double uses native independent testing stores before any
++  // keyed service is constructed, rather than the parent's supervised store.
++  scoped_refptr<TestingPrefStore> supervised_store;
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++    supervised_store = base::MakeRefCounted<TestingPrefStore>();
++  } else {
++    supervised_store = supervised_user::CreateTestingPrefStore(
++        supervised_user::FamilyLinkSettingsServiceFactory::GetForKey(
++            key_.get()),
++        g_browser_process->device_parental_controls());
++  }
+   // Construct testing_prefs_ by hand to add the supervised user pref store.
+   testing_prefs_ = new sync_preferences::TestingPrefServiceSyncable(
+       /*managed_prefs=*/base::MakeRefCounted<TestingPrefStore>(),
+       /*supervised_user_prefs=*/
+-      supervised_user::CreateTestingPrefStore(
+-          supervised_user::FamilyLinkSettingsServiceFactory::GetForKey(
+-              key_.get()),
+-          g_browser_process->device_parental_controls()),
++      supervised_store,
+       /*extension_prefs=*/base::MakeRefCounted<TestingPrefStore>(),
+       /*user_prefs=*/base::MakeRefCounted<TestingPrefStore>(),
+       /*recommended_prefs=*/base::MakeRefCounted<TestingPrefStore>(),
+@@ -1017,8 +1040,16 @@
+ 
+ content::PermissionControllerDelegate*
+ TestingProfile::GetPermissionControllerDelegate() {
+-  return permission_controller_delegate_ ? permission_controller_delegate_.get()
+-                                         : nullptr;
++  if (permission_controller_delegate_) {
++    return permission_controller_delegate_.get();
++  }
++  // Typed stateless profiles exercise the native controller and its document
++  // services, just like OffTheRecordProfileImpl, without owning a second
++  // manager.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++    return PermissionManagerFactory::GetForProfile(this);
++  }
++  return nullptr;
+ }
+ 
+ content::ClientHintsControllerDelegate*
+--- a/chrome/test/base/BUILD.gn
++++ b/chrome/test/base/BUILD.gn
+@@ -308,6 +308,7 @@
+   ]
+   public_deps = [ ":testing_profile" ]
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     ":testing_browser_process",
+     "//chrome/browser:browser_features",
+     "//chrome/browser:chrome_content_browser_client",
+@@ -319,6 +320,7 @@
+     "//chrome/browser/device_reauth",
+     "//chrome/browser/history",
+     "//chrome/browser/origin_trials",
++    "//chrome/browser/permissions",
+     "//chrome/browser/prefs",
+     "//chrome/browser/prefs:util",
+     "//chrome/browser/profiles:misc",
+@@ -335,6 +337,7 @@
+     "//components/device_reauth",
+     "//components/guest_view/buildflags",
+     "//components/history/core/test",
++    "//components/permissions",
+     "//components/policy/core/common:test_support",
+     "//components/prefs:test_support",
+     "//components/profile_metrics",

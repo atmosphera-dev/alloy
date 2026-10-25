@@ -1,0 +1,1359 @@
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -261,8 +261,12 @@
+   const bool block_trust_tokens = content_setting == CONTENT_SETTING_BLOCK;
+   profile->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()->SetBlockTrustTokens(
+-            block_trust_tokens);
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetBlockTrustTokens(block_trust_tokens);
++            });
+       });
+ }
+ 
+@@ -280,7 +284,12 @@
+ void FlushClientCertCache(Profile* profile) {
+   profile->ForEachLoadedStoragePartition(
+       [](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()->FlushClientCertCache();
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->FlushClientCertCache();
++            });
+       });
+ }
+ 
+@@ -696,11 +705,16 @@
+   const PrefService* prefs = profile_->GetPrefs();
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* partition) {
+-        partition->GetNetworkContext()->SetAlloyTrafficOptions(
+-            prefs->GetBoolean(alloy::kFaviconsEnabled),
+-            prefs->GetBoolean(alloy::kOpenSearchEnabled),
+-            prefs->GetBoolean(alloy::kDnsPrefetchEnabled),
+-            prefs->GetBoolean(alloy::kPreconnectEnabled));
++        partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetAlloyTrafficOptions(
++                  prefs->GetBoolean(alloy::kFaviconsEnabled),
++                  prefs->GetBoolean(alloy::kOpenSearchEnabled),
++                  prefs->GetBoolean(alloy::kDnsPrefetchEnabled),
++                  prefs->GetBoolean(alloy::kPreconnectEnabled));
++            });
+       });
+ }
+ 
+@@ -721,8 +735,12 @@
+   const std::string accept_language = ComputeAcceptLanguage();
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()->SetAcceptLanguage(
+-            accept_language);
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetAcceptLanguage(accept_language);
++            });
+       });
+ }
+ 
+@@ -747,8 +765,12 @@
+   const bool enable_referrers = enable_referrers_.GetValue();
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()->SetEnableReferrers(
+-            enable_referrers);
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetEnableReferrers(enable_referrers);
++            });
+       });
+ }
+ 
+@@ -775,9 +797,13 @@
+   std::vector<network::mojom::NetworkContext*> contexts;
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()->SetCTPolicy(GetCTPolicy());
+-        storage_partition->GetCertVerifierServiceUpdater()->SetCTPolicy(
+-            GetCTPolicy());
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetCTPolicy(GetCTPolicy());
++              verifier_updater->SetCTPolicy(GetCTPolicy());
++            });
+       });
+ }
+ 
+@@ -967,9 +993,13 @@
+ #endif
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetCertVerifierServiceUpdater()
+-            ->UpdateAdditionalCertificates(
+-                GetCertificatePolicy(storage_partition->GetPath()));
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              verifier_updater->UpdateAdditionalCertificates(
++                  GetCertificatePolicy(storage_partition->GetPath()));
++            });
+       });
+ }
+ 
+@@ -980,56 +1010,65 @@
+             cert_infos) {
+   profile_->ForEachLoadedStoragePartition([&](content::StoragePartition*
+                                                   storage_partition) {
+-    cert_verifier::mojom::AdditionalCertificatesPtr additional_certs =
+-        GetCertificatePolicy(storage_partition->GetPath());
+-
+-    for (const auto& cert_info : cert_infos) {
+-      std::optional<bssl::CertificateTrustType> trust =
+-          net::ServerCertificateDatabase::GetUserCertificateTrust(cert_info);
+-      if (!trust) {
+-        continue;
+-      }
+-      switch (trust.value()) {
+-        case bssl::CertificateTrustType::UNSPECIFIED:
+-          additional_certs->all_certificates.push_back(cert_info.der_cert);
+-          break;
+-
+-        case bssl::CertificateTrustType::DISTRUSTED: {
+-          std::string_view spki_piece;
+-          bool success = net::asn1::ExtractSPKIFromDERCert(
+-              base::as_string_view(cert_info.der_cert), &spki_piece);
+-          if (success) {
+-            additional_certs->distrusted_spkis.push_back(
+-                base::ToVector(base::as_byte_span(spki_piece)));
++    storage_partition->ForEachNetworkContext(
++        [&](network::mojom::NetworkContext* network_context,
++            cert_verifier::mojom::CertVerifierServiceUpdater*
++                verifier_updater) {
++          cert_verifier::mojom::AdditionalCertificatesPtr additional_certs =
++              GetCertificatePolicy(storage_partition->GetPath());
++
++          for (const auto& cert_info : cert_infos) {
++            std::optional<bssl::CertificateTrustType> trust =
++                net::ServerCertificateDatabase::GetUserCertificateTrust(
++                    cert_info);
++            if (!trust) {
++              continue;
++            }
++            switch (trust.value()) {
++              case bssl::CertificateTrustType::UNSPECIFIED:
++                additional_certs->all_certificates.push_back(
++                    cert_info.der_cert);
++                break;
++
++              case bssl::CertificateTrustType::DISTRUSTED: {
++                std::string_view spki_piece;
++                bool success = net::asn1::ExtractSPKIFromDERCert(
++                    base::as_string_view(cert_info.der_cert), &spki_piece);
++                if (success) {
++                  additional_certs->distrusted_spkis.push_back(
++                      base::ToVector(base::as_byte_span(spki_piece)));
++                }
++                break;
++              }
++
++              case bssl::CertificateTrustType::TRUSTED_ANCHOR:
++                if (!cert_info.cert_metadata.has_constraints() ||
++                    (cert_info.cert_metadata.constraints().dns_names_size() ==
++                         0 &&
++                     cert_info.cert_metadata.constraints().cidrs_size() == 0)) {
++                  additional_certs->trust_anchors_with_enforced_constraints
++                      .push_back(cert_info.der_cert);
++                } else {
++                  MaybeAddCertWithConstraints(
++                      cert_info,
++                      &additional_certs
++                           ->trust_anchors_with_additional_constraints);
++                }
++                break;
++
++              case bssl::CertificateTrustType::TRUSTED_ANCHOR_OR_LEAF:
++                MaybeAddCertWithConstraints(
++                    cert_info, &additional_certs->trust_anchors_and_leafs);
++                break;
++              case bssl::CertificateTrustType::TRUSTED_LEAF:
++                MaybeAddCertWithConstraints(cert_info,
++                                            &additional_certs->trust_leafs);
++                break;
++            }
+           }
+-          break;
+-        }
+-
+-        case bssl::CertificateTrustType::TRUSTED_ANCHOR:
+-          if (!cert_info.cert_metadata.has_constraints() ||
+-              (cert_info.cert_metadata.constraints().dns_names_size() == 0 &&
+-               cert_info.cert_metadata.constraints().cidrs_size() == 0)) {
+-            additional_certs->trust_anchors_with_enforced_constraints.push_back(
+-                cert_info.der_cert);
+-          } else {
+-            MaybeAddCertWithConstraints(
+-                cert_info,
+-                &additional_certs->trust_anchors_with_additional_constraints);
+-          }
+-          break;
+-
+-        case bssl::CertificateTrustType::TRUSTED_ANCHOR_OR_LEAF:
+-          MaybeAddCertWithConstraints(
+-              cert_info, &additional_certs->trust_anchors_and_leafs);
+-          break;
+-        case bssl::CertificateTrustType::TRUSTED_LEAF:
+-          MaybeAddCertWithConstraints(cert_info,
+-                                      &additional_certs->trust_leafs);
+-          break;
+-      }
+-    }
+-    storage_partition->GetCertVerifierServiceUpdater()
+-        ->UpdateAdditionalCertificates(std::move(additional_certs));
++          verifier_updater->UpdateAdditionalCertificates(
++              std::move(additional_certs));
++        });
+   });
+ }
+ #endif  // BUILDFLAG(CHROME_ROOT_STORE_CERT_MANAGEMENT_UI)
+@@ -1095,9 +1134,13 @@
+ 
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()
+-            ->SetSplitAuthCacheByNetworkAnonymizationKey(
+-                split_auth_cache_by_network_isolation_key);
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetSplitAuthCacheByNetworkAnonymizationKey(
++                  split_auth_cache_by_network_isolation_key);
++            });
+       });
+ }
+ 
+@@ -1108,8 +1151,12 @@
+ 
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()
+-            ->SetCorsNonWildcardRequestHeadersSupport(value);
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->SetCorsNonWildcardRequestHeadersSupport(value);
++            });
+       });
+ }
+ 
+@@ -1205,8 +1252,12 @@
+   }
+   profile_->ForEachLoadedStoragePartition(
+       [&](content::StoragePartition* storage_partition) {
+-        storage_partition->GetNetworkContext()->FlushCachedClientCertIfNeeded(
+-            host, certificate);
++        storage_partition->ForEachNetworkContext(
++            [&](network::mojom::NetworkContext* network_context,
++                cert_verifier::mojom::CertVerifierServiceUpdater*
++                    verifier_updater) {
++              network_context->FlushCachedClientCertIfNeeded(host, certificate);
++            });
+       });
+ }
+ 
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3635,6 +3635,8 @@
+   }
+   deps += [ "//brave/alloy/site_records:capabilities" ]
+ 
++  sources += [ "alloy_network_generation.cc", "alloy_network_generation.h" ]
++
+ }
+ 
+ if (is_android) {
+--- a/content/browser/direct_sockets/direct_sockets_service_impl.cc
++++ b/content/browser/direct_sockets/direct_sockets_service_impl.cc
+@@ -12,6 +12,8 @@
+ #include "base/functional/callback_helpers.h"
+ #include "base/memory/weak_ptr.h"
+ #include "build/build_config.h"
++#include "content/browser/alloy_network_generation.h"
++#include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/service_worker/service_worker_context_core.h"
+ #include "content/browser/service_worker/service_worker_context_wrapper.h"
+ #include "content/browser/service_worker/service_worker_version.h"
+@@ -663,7 +665,8 @@
+   }
+   return std::visit(
+       absl::Overload{[](RenderFrameHost* rfh) {
+-                       return rfh->GetStoragePartition()->GetNetworkContext();
++                       return GetAlloyNetworkContextForDocument(
++                           RenderFrameHostImpl::From(rfh));
+                      },
+                      [](base::WeakPtr<SharedWorkerHost> shared_worker)
+                          -> network::mojom::NetworkContext* {
+--- a/content/browser/loader/navigation_early_hints_manager.cc
++++ b/content/browser/loader/navigation_early_hints_manager.cc
+@@ -7,6 +7,7 @@
+ #include "base/memory/raw_ref.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "content/browser/connection_allowlist_utils.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/global_request_id.h"
+@@ -392,9 +393,15 @@
+     : browser_context_(browser_context),
+       storage_partition_(storage_partition),
+       frame_tree_node_id_(frame_tree_node_id),
++      alloy_network_generation_(std::move(params.alloy_network_generation)),
+       loader_factory_(std::move(params.loader_factory)),
+       origin_(params.origin),
+       isolation_info_(std::move(params.isolation_info)) {
++  const auto* policy =
++      alloy::site_records::RequestContextPolicy::Get(browser_context);
++  CHECK(!policy ||
++        policy->network_state() != alloy::site_records::NetworkState::kCut ||
++        alloy_network_generation_);
+   shared_loader_factory_ =
+       base::MakeRefCounted<network::WeakWrapperSharedURLLoaderFactory>(
+           loader_factory_.get());
+@@ -507,7 +514,9 @@
+     return network_context_for_testing_;
+   }
+ 
+-  return storage_partition_->GetNetworkContext();
++  return alloy_network_generation_
++             ? alloy_network_generation_->GetNetworkContext()
++             : storage_partition_->GetNetworkContext();
+ }
+ 
+ void NavigationEarlyHintsManager::MaybePreconnect(
+--- a/content/browser/loader/navigation_early_hints_manager.h
++++ b/content/browser/loader/navigation_early_hints_manager.h
+@@ -13,6 +13,7 @@
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/common/content_export.h"
+ #include "content/public/browser/frame_tree_node_id.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -60,6 +61,7 @@
+   NavigationEarlyHintsManagerParams& operator=(
+       const NavigationEarlyHintsManagerParams&) = delete;
+ 
++  scoped_refptr<AlloyNetworkGeneration> alloy_network_generation;
+   url::Origin origin;
+   net::IsolationInfo isolation_info;
+   mojo::Remote<network::mojom::URLLoaderFactory> loader_factory;
+@@ -164,6 +166,7 @@
+   const raw_ref<BrowserContext> browser_context_;
+   const raw_ref<StoragePartition> storage_partition_;
+   const FrameTreeNodeId frame_tree_node_id_;
++  scoped_refptr<AlloyNetworkGeneration> alloy_network_generation_;
+   mojo::Remote<network::mojom::URLLoaderFactory> loader_factory_;
+   // This needs to be declared last because it holds a pointer on
+   // `loader_factory`, and thus needs to be destroyed before factory gets
+--- a/content/browser/loader/navigation_url_loader_impl.cc
++++ b/content/browser/loader/navigation_url_loader_impl.cc
+@@ -28,6 +28,7 @@
+ #include "build/build_config.h"
+ #include "components/download/public/common/download_stats.h"
+ #include "content/browser/about_url_loader_factory.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
+ #include "content/browser/client_hints/client_hints.h"
+ #include "content/browser/data_url_loader_factory.h"
+@@ -2311,6 +2312,8 @@
+     bool* bypass_redirect_checks,
+     bool allow_same_site_none_cookies_override,
+     scoped_refptr<base::SingleThreadTaskRunner> network_response_task_runner) {
++  auto generation =
++      frame_tree_node->navigation_request()->GetAlloyNetworkGeneration();
+   mojo::PendingRemote<network::mojom::TrustedURLLoaderHeaderClient>
+       header_client;
+ 
+@@ -2361,17 +2364,20 @@
+             std::move(header_client), std::move(factory_builder),
+             storage_partition, std::move(devtools_cookie_overrides),
+             std::move(cookie_overrides),
+-            network::GetNoOpNetworkRestrictionsId()));
++            network::GetNoOpNetworkRestrictionsId(),
++            generation ? generation->GetNetworkContext() : nullptr));
+   } else {
+-    if (!devtools_cookie_overrides.empty() || !cookie_overrides.empty() ||
+-        factory_builder.RequiresFreshFactory()) {
++    if (generation || !devtools_cookie_overrides.empty() ||
++        !cookie_overrides.empty() || factory_builder.RequiresFreshFactory()) {
+       network::mojom::URLLoaderFactoryParamsPtr params =
+           storage_partition->CreateURLLoaderFactoryParams();
+       params->devtools_cookie_setting_overrides =
+           std::move(devtools_cookie_overrides);
+       params->cookie_setting_overrides = std::move(cookie_overrides);
+       return std::move(factory_builder)
+-          .Finish(storage_partition->GetNetworkContext(), std::move(params));
++          .Finish(generation ? generation->GetNetworkContext()
++                             : storage_partition->GetNetworkContext(),
++                  std::move(params));
+     }
+     return std::move(factory_builder)
+         .Finish(storage_partition->GetURLLoaderFactoryForBrowserProcess());
+@@ -2568,7 +2574,8 @@
+     StoragePartitionImpl* partition,
+     std::optional<net::CookieSettingOverrides> devtools_cookie_overrides,
+     std::optional<net::CookieSettingOverrides> cookie_overrides,
+-    const base::UnguessableToken& network_restrictions_id) {
++    const base::UnguessableToken& network_restrictions_id,
++    network::mojom::NetworkContext* generation_context) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ 
+   if (url_loader_factory::GetTestingInterceptor()) {
+@@ -2595,7 +2602,9 @@
+   }
+   return std::move(factory_builder)
+       .Finish<mojo::PendingRemote<network::mojom::URLLoaderFactory>>(
+-          partition->GetNetworkContext(), std::move(params));
++          generation_context ? generation_context
++                             : partition->GetNetworkContext(),
++          std::move(params));
+ }
+ 
+ void NavigationURLLoaderImpl::RecordReceivedResponseUkmForOutermostMainFrame() {
+--- a/content/browser/loader/navigation_url_loader_impl.h
++++ b/content/browser/loader/navigation_url_loader_impl.h
+@@ -109,7 +109,8 @@
+       StoragePartitionImpl* partition,
+       std::optional<net::CookieSettingOverrides> devtools_cookie_overrides,
+       std::optional<net::CookieSettingOverrides> cookie_overrides,
+-      const base::UnguessableToken& network_restrictions_id);
++      const base::UnguessableToken& network_restrictions_id,
++      network::mojom::NetworkContext* generation_context);
+ 
+   // NavigationURLLoader implementation:
+   // Starts the loader by finalizing loader factories initialization and
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -47,10 +47,12 @@
+ #include "base/trace_event/trace_event.h"
+ #include "base/types/optional_util.h"
+ #include "base/types/pass_key.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+ #include "components/viz/host/host_frame_sink_manager.h"
+ #include "content/browser/agent_cluster_key.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_impl.h"
+ #include "content/browser/bad_message.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
+@@ -1655,6 +1657,30 @@
+ // NavigationRequest.
+ int64_t NavigationRequest::unique_id_counter_ = 0;
+ 
++scoped_refptr<AlloyNetworkGeneration>
++NavigationRequest::GetAlloyNetworkGeneration() {
++  const auto* policy = alloy::site_records::RequestContextPolicy::Get(
++      *frame_tree_node_->current_frame_host()->GetBrowserContext());
++  if (!policy ||
++      policy->network_state() != alloy::site_records::NetworkState::kCut) {
++    return nullptr;
++  }
++  if (!alloy_network_generation_) {
++    if (IsSameDocument()) {
++      alloy_network_generation_ = GetAlloyNetworkGenerationForDocument(
++          frame_tree_node_->current_frame_host());
++    } else if (auto* parent = frame_tree_node_->parent()) {
++      alloy_network_generation_ = GetAlloyNetworkGenerationForDocument(parent);
++    } else {
++      alloy_network_generation_ =
++          static_cast<StoragePartitionImpl*>(
++              frame_tree_node_->current_frame_host()->GetStoragePartition())
++              ->CreateAlloyNetworkGeneration();
++    }
++  }
++  return alloy_network_generation_;
++}
++
+ NavigationRequest::NavigationRequest(
+     FrameTreeNode* frame_tree_node,
+     blink::mojom::CommonNavigationParamsPtr common_params,
+@@ -2163,7 +2189,10 @@
+       // Initiator frame's `network_restriction_id` is not passed because the
+       // preconnection has already been checked against the connection-allowlist
+       // by the `IsAllowedByConnectionAllowlist(false)` call above.
+-      storage_partition->GetNetworkContext()->PreconnectSockets(
++      auto generation = GetAlloyNetworkGeneration();
++      auto* context = generation ? generation->GetNetworkContext()
++                                 : storage_partition->GetNetworkContext();
++      context->PreconnectSockets(
+           1, common_params_->url, network::mojom::CredentialsMode::kInclude,
+           GetIsolationInfo().network_anonymization_key(),
+           network::GetNoOpNetworkRestrictionsId(),
+@@ -3513,6 +3542,7 @@
+   // Convert the navigation type to the appropriate cross-document one.
+   common_params_->navigation_type =
+       ConvertToCrossDocumentType(common_params_->navigation_type);
++  alloy_network_generation_.reset();
+ 
+   // Reset navigation handle timings.
+   navigation_handle_timing_ = NavigationHandleTiming();
+@@ -5699,14 +5729,18 @@
+   auto loader_factory = url_loader_factory::CreatePendingRemote(
+       ContentBrowserClient::URLLoaderFactoryType::kEarlyHints,
+       url_loader_factory::TerminalParams::ForNetworkContext(
+-          process->GetStoragePartition()->GetNetworkContext(),
++          GetAlloyNetworkGeneration()
++              ? GetAlloyNetworkGeneration()->GetNetworkContext()
++              : process->GetStoragePartition()->GetNetworkContext(),
+           std::move(url_loader_factory_params)));
+ 
+   did_create_early_hints_manager_params_ = true;
+-  return NavigationEarlyHintsManagerParams(
++  auto params = NavigationEarlyHintsManagerParams(
+       tentative_origin, std::move(isolation_info),
+       mojo::Remote<network::mojom::URLLoaderFactory>(
+           std::move(loader_factory)));
++  params.alloy_network_generation = GetAlloyNetworkGeneration();
++  return params;
+ }
+ 
+ void NavigationRequest::OnRequestFailedInternal(
+@@ -7947,8 +7981,7 @@
+ 
+   RenderFrameHostImpl* initiator_rfh = GetInitiatorDocumentRenderFrameHost();
+   if (initiator_rfh) {
+-    network_context =
+-        initiator_rfh->GetProcess()->GetStoragePartition()->GetNetworkContext();
++    network_context = GetAlloyNetworkContextForDocument(initiator_rfh);
+     network_anonymization_key = initiator_rfh->GetIsolationInfoForSubresources()
+                                     .network_anonymization_key();
+     reporting_source = initiator_rfh->GetReportingSource();
+--- a/content/browser/renderer_host/navigation_request.h
++++ b/content/browser/renderer_host/navigation_request.h
+@@ -28,6 +28,7 @@
+ #include "base/timer/timer.h"
+ #include "base/unguessable_token.h"
+ #include "build/build_config.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/embedder_isolation_info.h"
+ #include "content/browser/fenced_frame/fenced_frame_url_mapping.h"
+ #include "content/browser/loader/keep_alive_url_loader_service.h"
+@@ -1830,6 +1831,8 @@
+       NavigationThrottleEvent event,
+       NavigationThrottle::ThrottleCheckResult result);
+ 
++  scoped_refptr<AlloyNetworkGeneration> GetAlloyNetworkGeneration();
++
+   const base::UnguessableToken& network_restrictions_id() const {
+     return network_restrictions_id_;
+   }
+@@ -3820,6 +3823,7 @@
+   // with this navigation. This is also passed to the network service and
+   // stored in the DocumentAssociatedData at commit. Only used for
+   // cross-document navigations.
++  scoped_refptr<AlloyNetworkGeneration> alloy_network_generation_;
+   base::UnguessableToken network_restrictions_id_ =
+       network::GetNoOpNetworkRestrictionsId();
+ 
+--- a/content/browser/renderer_host/p2p/socket_dispatcher_host.cc
++++ b/content/browser/renderer_host/p2p/socket_dispatcher_host.cc
+@@ -10,9 +10,13 @@
+ 
+ #include "base/containers/heap_array.h"
+ #include "base/functional/bind.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/bad_message.h"
++#include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/renderer_host/render_process_host_impl.h"
+ #include "content/browser/storage_partition_impl.h"
++#include "content/public/browser/browser_context.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/receiver_set.h"
+@@ -85,7 +89,14 @@
+ 
+   mojo::PendingRemote<network::mojom::P2PTrustedSocketManager>
+       pending_trusted_socket_manager;
+-  process.GetStoragePartition()->GetNetworkContext()->CreateP2PSocketManager(
++  auto* frame = RenderFrameHostImpl::FromID(render_frame_host_id);
++  if (!frame && alloy::site_records::RequestContextPolicy::IsStateless(
++                    *process.GetBrowserContext())) {
++    return;
++  }
++  auto* context = frame ? GetAlloyNetworkContextForDocument(frame)
++                        : process.GetStoragePartition()->GetNetworkContext();
++  context->CreateP2PSocketManager(
+       net::MutableNetworkTrafficAnnotationTag(network::alloy::kWebRtcManager),
+       anonymization_key, std::move(trusted_socket_manager_client),
+       pending_trusted_socket_manager.InitWithNewPipeAndPassReceiver(),
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -76,6 +76,7 @@
+ #include "components/webauthn/core/browser/remote_validation.h"
+ #include "content/browser/about_url_loader_factory.h"
+ #include "content/browser/accessibility/render_accessibility_host.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_disable.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_impl.h"
+ #include "content/browser/bad_message.h"
+@@ -2024,6 +2025,8 @@
+   static SubresourceLoaderFactoriesConfig ForLastCommittedNavigation(
+       RenderFrameHostImpl& frame) {
+     SubresourceLoaderFactoriesConfig result;
++    result.alloy_network_generation_ =
++        GetAlloyNetworkGenerationForDocument(&frame);
+     result.origin_ = frame.GetLastCommittedOrigin();
+     result.isolation_info_ = frame.GetIsolationInfoForSubresources();
+     result.client_security_state_ = frame.BuildClientSecurityState();
+@@ -2079,6 +2082,8 @@
+   static SubresourceLoaderFactoriesConfig ForPendingNavigation(
+       NavigationRequest& navigation_request) {
+     SubresourceLoaderFactoriesConfig result;
++    result.alloy_network_generation_ =
++        navigation_request.GetAlloyNetworkGeneration();
+     result.origin_ = navigation_request.GetOriginToCommit().value();
+     result.client_security_state_ =
+         navigation_request.BuildClientSecurityStateForCommittedDocument();
+@@ -2185,6 +2190,11 @@
+   SubresourceLoaderFactoriesConfig& operator=(
+       const SubresourceLoaderFactoriesConfig&) = delete;
+ 
++  network::mojom::NetworkContext* alloy_network_context() const {
++    return alloy_network_generation_
++               ? alloy_network_generation_->GetNetworkContext()
++               : nullptr;
++  }
+   const url::Origin& origin() const { return origin_; }
+   const net::IsolationInfo& isolation_info() const { return isolation_info_; }
+ 
+@@ -2238,6 +2248,7 @@
+   // Private constructor - please go through the static For... methods.
+   SubresourceLoaderFactoriesConfig() = default;
+ 
++  scoped_refptr<AlloyNetworkGeneration> alloy_network_generation_;
+   url::Origin origin_;
+   net::IsolationInfo isolation_info_;
+   network::mojom::ClientSecurityStatePtr client_security_state_;
+@@ -3706,7 +3717,8 @@
+           subresource_loader_factories_config,
+           "RFHI::CreateNetworkServiceDefaultFactory"),
+       subresource_loader_factories_config.ukm_source_id(),
+-      std::move(default_factory_receiver));
++      std::move(default_factory_receiver),
++      subresource_loader_factories_config.alloy_network_context());
+ }
+ 
+ std::unique_ptr<blink::PendingURLLoaderFactoryBundle>
+@@ -3821,7 +3833,8 @@
+     CreateNetworkServiceDefaultFactoryAndObserve(
+         std::move(factory_params),
+         ukm::kInvalidSourceIdObj, /* isolated from page */
+-        factory_remote.InitWithNewPipeAndPassReceiver());
++        factory_remote.InitWithNewPipeAndPassReceiver(),
++        config.alloy_network_context());
+     result[isolated_world_origin] = std::move(factory_remote);
+   }
+   return result;
+@@ -4556,10 +4569,8 @@
+   // expired so that the reporting configuration in the network service can be
+   // removed. This is done here, rather than in the destructor, as it needs the
+   // mojo pipe to the network service.
+-  GetProcess()
+-      ->GetStoragePartition()
+-      ->GetNetworkContext()
+-      ->SendReportsAndRemoveSource(GetReportingSource());
++  GetAlloyNetworkContextForDocument(this)->SendReportsAndRemoveSource(
++      GetReportingSource());
+ 
+   // When a frame's process dies, its RenderFrame no longer exists, which means
+   // that its child frames must be cleaned up as well.
+@@ -8447,7 +8458,8 @@
+             subresource_loader_factories_config,
+             "RFHI::UpdateSubresourceLoaderFactories"),
+         subresource_loader_factories_config.ukm_source_id(),
+-        default_factory_remote.InitWithNewPipeAndPassReceiver());
++        default_factory_remote.InitWithNewPipeAndPassReceiver(),
++        subresource_loader_factories_config.alloy_network_context());
+   }
+ 
+   std::unique_ptr<blink::PendingURLLoaderFactoryBundle>
+@@ -10552,7 +10564,8 @@
+   bypass_redirect_checks = CreateNetworkServiceDefaultFactoryAndObserve(
+       std::move(factory_params),
+       subresource_loader_factories_config.ukm_source_id(),
+-      pending_default_factory.InitWithNewPipeAndPassReceiver());
++      pending_default_factory.InitWithNewPipeAndPassReceiver(),
++      subresource_loader_factories_config.alloy_network_context());
+ 
+   return std::make_unique<blink::PendingURLLoaderFactoryBundle>(
+       std::move(pending_default_factory),
+@@ -12927,7 +12940,8 @@
+                   subresource_loader_factories_config,
+                   "RFHI::CommitNavigation"),
+               subresource_loader_factories_config.ukm_source_id(),
+-              pending_default_factory.InitWithNewPipeAndPassReceiver());
++              pending_default_factory.InitWithNewPipeAndPassReceiver(),
++              subresource_loader_factories_config.alloy_network_context());
+       subresource_loader_factories->set_bypass_redirect_checks(
+           bypass_redirect_checks);
+     }
+@@ -13265,7 +13279,10 @@
+               *navigation_request),
+           "RFHI::FailedNavigation"),
+       ukm::kInvalidSourceIdObj,
+-      default_factory_remote.InitWithNewPipeAndPassReceiver());
++      default_factory_remote.InitWithNewPipeAndPassReceiver(),
++      navigation_request->GetAlloyNetworkGeneration()
++          ? navigation_request->GetAlloyNetworkGeneration()->GetNetworkContext()
++          : nullptr);
+   subresource_loader_factories =
+       std::make_unique<blink::PendingURLLoaderFactoryBundle>(
+           std::move(default_factory_remote),
+@@ -14219,9 +14236,11 @@
+     network::mojom::URLLoaderFactoryParamsPtr params,
+     ukm::SourceIdObj ukm_source_id,
+     mojo::PendingReceiver<network::mojom::URLLoaderFactory>
+-        default_factory_receiver) {
++        default_factory_receiver,
++    network::mojom::NetworkContext* generation_context) {
+   bool bypass_redirect_checks = CreateNetworkServiceDefaultFactoryInternal(
+-      std::move(params), ukm_source_id, std::move(default_factory_receiver));
++      std::move(params), ukm_source_id, std::move(default_factory_receiver),
++      generation_context);
+ 
+   // Add a disconnect handler when Network Service is running
+   // out-of-process.
+@@ -14259,7 +14278,8 @@
+     network::mojom::URLLoaderFactoryParamsPtr params,
+     ukm::SourceIdObj ukm_source_id,
+     mojo::PendingReceiver<network::mojom::URLLoaderFactory>
+-        default_factory_receiver) {
++        default_factory_receiver,
++    network::mojom::NetworkContext* generation_context) {
+   CHECK(params->request_initiator_origin_lock.has_value());
+   const url::Origin request_initiator =
+       params->request_initiator_origin_lock.value();
+@@ -14270,7 +14290,9 @@
+       std::move(default_factory_receiver),
+       ContentBrowserClient::URLLoaderFactoryType::kDocumentSubResource,
+       url_loader_factory::TerminalParams::ForNetworkContext(
+-          GetProcess()->GetStoragePartition()->GetNetworkContext(),
++          generation_context
++              ? generation_context
++              : GetProcess()->GetStoragePartition()->GetNetworkContext(),
+           std::move(params), url_loader_factory::HeaderClientOption::kAllow,
+           url_loader_factory::FactoryOverrideOption::kAllow,
+           url_loader_factory::DisableSecureDnsOption::kAllow),
+@@ -16555,7 +16577,7 @@
+       // document is being loaded into the frame. Inform the network service
+       // of this, so that it can send any queued reports and mark the source
+       // as expired.
+-      GetStoragePartition()->GetNetworkContext()->SendReportsAndRemoveSource(
++      GetAlloyNetworkContextForDocument(this)->SendReportsAndRemoveSource(
+           GetReportingSource());
+ 
+       if (is_main_frame() && frame_tree()->is_primary()) {
+@@ -16590,6 +16612,8 @@
+         navigation_request->devtools_navigation_token());
+     document_associated_data_->SetNetworkRestrictionsId(
+         navigation_request->network_restrictions_id());
++    SetAlloyNetworkGenerationForDocument(
++        this, navigation_request->GetAlloyNetworkGeneration());
+     // Stores fetch keepalive FactoryContext created before committing into
+     // document-associated data, such that it can be referenced later when
+     // DevTools tries to intercepts requests.
+@@ -17052,7 +17076,7 @@
+         endpoints.find(kCrashReportingGroupName) != endpoints.end()) {
+       crash_reporting_group_ = kCrashReportingGroupName;
+     }
+-    GetStoragePartition()->GetNetworkContext()->SetDocumentReportingEndpoints(
++    GetAlloyNetworkContextForDocument(this)->SetDocumentReportingEndpoints(
+         GetReportingSource(), origin, isolation_info_, endpoints);
+   }
+ 
+@@ -17271,7 +17295,7 @@
+   }
+ 
+   // Send the crash report to the Reporting API.
+-  GetProcess()->GetStoragePartition()->GetNetworkContext()->QueueReport(
++  GetAlloyNetworkContextForDocument(this)->QueueReport(
+       /*type=*/"crash", crash_reporting_group_, last_committed_url_,
+       GetReportingSource(), isolation_info_.network_anonymization_key(),
+       std::move(body));
+@@ -19820,7 +19844,7 @@
+ #if BUILDFLAG(ENABLE_MDNS)
+ void RenderFrameHostImpl::CreateMdnsResponder(
+     mojo::PendingReceiver<network::mojom::MdnsResponder> receiver) {
+-  GetStoragePartition()->GetNetworkContext()->CreateMdnsResponder(
++  GetAlloyNetworkContextForDocument(this)->CreateMdnsResponder(
+       std::move(receiver));
+ }
+ #endif  // BUILDFLAG(ENABLE_MDNS)
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -3633,7 +3633,8 @@
+       network::mojom::URLLoaderFactoryParamsPtr params,
+       ukm::SourceIdObj ukm_source_id,
+       mojo::PendingReceiver<network::mojom::URLLoaderFactory>
+-          default_factory_receiver);
++          default_factory_receiver,
++      network::mojom::NetworkContext* generation_context);
+ 
+   // Asks an appropriate `NetworkService` to create a new URLLoaderFactory with
+   // the given `params` and binds the factory to the `default_factory_receiver`.
+@@ -3650,7 +3651,8 @@
+       network::mojom::URLLoaderFactoryParamsPtr params,
+       ukm::SourceIdObj ukm_source_id,
+       mojo::PendingReceiver<network::mojom::URLLoaderFactory>
+-          default_factory_receiver);
++          default_factory_receiver,
++      network::mojom::NetworkContext* generation_context);
+ 
+   // Returns true if the ExecuteJavaScript() API can be used on this host.
+   // The checks do not apply to ExecuteJavaScriptInIsolatedWorld, nor to
+--- a/content/browser/service_worker/service_worker_client.cc
++++ b/content/browser/service_worker/service_worker_client.cc
+@@ -16,6 +16,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/types/optional_util.h"
+ #include "base/uuid.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/loader/navigation_url_loader_impl.h"
+ #include "content/browser/preloading/prefetch/prefetch_features.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
+@@ -1451,7 +1452,12 @@
+           // TODO(crbug.com/390003764): Consider whether/how to apply devtools
+           // cookies setting overrides for a service worker.
+           /*devtools_cookie_overrides=*/std::nullopt,
+-          /*cookie_overrides=*/std::nullopt, network_restrictions_id));
++          /*cookie_overrides=*/std::nullopt, network_restrictions_id,
++          frame_tree_node->navigation_request()->GetAlloyNetworkGeneration()
++              ? frame_tree_node->navigation_request()
++                    ->GetAlloyNetworkGeneration()
++                    ->GetNetworkContext()
++              : nullptr));
+ }
+ 
+ // If a blob URL is used for a SharedWorker script's URL, a controller will be
+--- a/content/browser/service_worker/service_worker_context_wrapper.cc
++++ b/content/browser/service_worker/service_worker_context_wrapper.cc
+@@ -1993,7 +1993,9 @@
+   if (loader_factory_for_test_)
+     return loader_factory_for_test_;
+ 
+-  if (!storage_partition()) {
++  if (!storage_partition() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(
++          *storage_partition_->browser_context())) {
+     return nullptr;
+   }
+ 
+@@ -2041,7 +2043,8 @@
+         /*cookie_overrides=*/std::nullopt,
+         // The network restrictions of the creator (e.g., frame) must be
+         // enforced for service worker script fetches.
+-        creator_network_restrictions_id);
++        creator_network_restrictions_id,
++        /*generation_context=*/nullptr);
+   } else {
+     DCHECK(storage_partition());
+     if (url_loader_factory::GetTestingInterceptor()) {
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -3,7 +3,6 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/storage_partition_impl.h"
+-#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <stdint.h>
+ 
+@@ -41,6 +40,7 @@
+ #include "base/timer/elapsed_timer.h"
+ #include "base/types/optional_util.h"
+ #include "base/unguessable_token.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "components/leveldb_proto/public/proto_database_provider.h"
+ #include "components/services/storage/privileged/cpp/bucket_client_info.h"
+@@ -129,6 +129,7 @@
+ #include "content/public/common/content_features.h"
+ #include "content/public/common/content_switches.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
++#include "mojo/public/cpp/bindings/clone_traits.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+@@ -1263,6 +1264,12 @@
+   CHECK(on_browser_context_will_be_destroyed_called_,
+         base::NotFatalUntil::M159);
+ #endif
++  for (auto& generation : alloy_network_generations_) {
++    if (generation) {
++      generation->Shutdown();
++    }
++  }
++  alloy_network_clients_.Clear();
+   browser_context_ = nullptr;
+ 
+   if (GetFileSystemContext()) {
+@@ -1341,8 +1348,15 @@
+     id_and_patterns->allowlists = pair.second;
+     dest_vector.push_back(std::move(id_and_patterns));
+   }
+-  GetNetworkContext()->RestrictNetworkForIds(std::move(dest_vector),
+-                                             std::move(callback));
++  std::vector<network::mojom::NetworkContext*> contexts;
++  ForEachNetworkContext([&](network::mojom::NetworkContext* context,
++                            cert_verifier::mojom::CertVerifierServiceUpdater*) {
++    contexts.push_back(context);
++  });
++  auto done = base::BarrierClosure(contexts.size(), std::move(callback));
++  for (auto* context : contexts) {
++    context->RestrictNetworkForIds(mojo::Clone(dest_vector), done);
++  }
+ 
+   // Save IDs and allowlisted URLs in `StoragePartitionImpl`. When there is a
+   // crash of `NetworkService`, the network restriction IDs of
+@@ -1364,7 +1378,10 @@
+ 
+ void StoragePartitionImpl::ClearNetworkRestrictionsAfterDelayCallback(
+     const std::vector<base::UnguessableToken>& network_restrictions_ids) {
+-  GetNetworkContext()->ClearNetworkRestrictions(network_restrictions_ids);
++  ForEachNetworkContext([&](network::mojom::NetworkContext* context,
++                            cert_verifier::mojom::CertVerifierServiceUpdater*) {
++    context->ClearNetworkRestrictions(network_restrictions_ids);
++  });
+ 
+   for (const auto& network_restrictions_id : network_restrictions_ids) {
+     network_restrictions_ids_.erase(network_restrictions_id);
+@@ -3275,7 +3292,10 @@
+ 
+ void StoragePartitionImpl::ResetURLLoaderFactories() {
+   CHECK(initialized_);
+-  GetNetworkContext()->ResetURLLoaderFactories();
++  ForEachNetworkContext([](network::mojom::NetworkContext* context,
++                           cert_verifier::mojom::CertVerifierServiceUpdater*) {
++    context->ResetURLLoaderFactories();
++  });
+   shared_url_loader_factory_for_browser_process_->factory()->Reset();
+   shared_url_loader_factory_for_browser_process_->factory_for_io_thread()
+       ->Reset();
+@@ -3495,7 +3515,9 @@
+       storage::GetDefaultDeviceInfoHelper(), std::move(callback));
+ }
+ 
+-void StoragePartitionImpl::InitNetworkContext() {
++network::mojom::NetworkContextParamsPtr
++StoragePartitionImpl::BuildNetworkContextParams(
++    mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater>* verifier) {
+   network::mojom::NetworkContextParamsPtr context_params =
+       network::mojom::NetworkContextParams::New();
+   cert_verifier::mojom::CertVerifierCreationParamsPtr
+@@ -3505,7 +3527,7 @@
+       browser_context_, is_in_memory(), relative_partition_path_,
+       context_params.get(), cert_verifier_creation_params.get())) {
+     // Don't re-initialize the network context during shutdown.
+-    return;
++    return nullptr;
+   }
+   // Should be initialized with existing per-profile CORS access lists.
+   DCHECK(context_params->cors_origin_access_list.empty())
+@@ -3522,10 +3544,10 @@
+          "NetworkContextParams, as they will be replaced with a new pipe to "
+          "the CertVerifierService.";
+ 
+-  cert_verifier_service_updater_.reset();
+-  context_params->cert_verifier_params = GetCertVerifierParamsWithUpdater(
+-      std::move(cert_verifier_creation_params),
+-      cert_verifier_service_updater_.BindNewPipeAndPassReceiver());
++  verifier->reset();
++  context_params->cert_verifier_params =
++      GetCertVerifierParamsWithUpdater(std::move(cert_verifier_creation_params),
++                                       verifier->BindNewPipeAndPassReceiver());
+ 
+   // This mechanisms should be used only for legacy internal headers. You can
+   // find a recommended alternative approach on URLRequest::cors_exempt_headers
+@@ -3575,6 +3597,89 @@
+   }
+ #endif
+ 
++  return context_params;
++}
++
++scoped_refptr<AlloyNetworkGeneration>
++StoragePartitionImpl::CreateAlloyNetworkGeneration() {
++  std::erase_if(alloy_network_generations_,
++                [](const auto& value) { return !value; });
++  auto generation = base::MakeRefCounted<AlloyNetworkGeneration>();
++  InitializeAlloyNetworkGeneration(generation.get());
++  alloy_network_generations_.push_back(generation->GetWeakPtr());
++  return generation;
++}
++
++void StoragePartitionImpl::InitializeAlloyNetworkGeneration(
++    AlloyNetworkGeneration* generation) {
++  mojo::Remote<network::mojom::NetworkContext> context;
++  mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater> verifier;
++  auto params = BuildNetworkContextParams(&verifier);
++  if (!params) {
++    return;
++  }
++  CreateNetworkContextInNetworkService(context.BindNewPipeAndPassReceiver(),
++                                       std::move(params));
++  std::vector<network::mojom::IdAndAllowlistedPatternsPtr> restrictions;
++  for (const auto& [id, allowlists] : network_restrictions_ids_) {
++    restrictions.push_back(
++        network::mojom::IdAndAllowlistedPatterns::New(id, allowlists));
++  }
++  mojo::PendingRemote<network::mojom::NetworkContextClient> client;
++  const auto receiver =
++      alloy_network_clients_.Add(this, client.InitWithNewPipeAndPassReceiver());
++  auto remove_client = base::BindOnce(
++      [](base::WeakPtr<StoragePartitionImpl> partition,
++         mojo::ReceiverId receiver) {
++        if (partition) {
++          partition->alloy_network_clients_.Remove(receiver);
++        }
++      },
++      weak_factory_.GetWeakPtr(), receiver);
++  auto recreate = base::BindRepeating(
++      [](base::WeakPtr<StoragePartitionImpl> partition,
++         base::WeakPtr<AlloyNetworkGeneration> generation) {
++        if (partition && generation) {
++          partition->InitializeAlloyNetworkGeneration(generation.get());
++        }
++      },
++      weak_factory_.GetWeakPtr(), generation->GetWeakPtr());
++  generation->Bind(context.Unbind(), verifier.Unbind(),
++                   std::move(remove_client), std::move(recreate));
++  // Bind the endpoint to its lifetime owner before sending anything with a
++  // response callback. Unbind() cannot transfer outstanding Mojo callbacks.
++  auto* network_context = generation->GetNetworkContext();
++  network_context->RestrictNetworkForIds(std::move(restrictions),
++                                         base::NullCallback());
++  network_context->SetClient(std::move(client));
++}
++
++void StoragePartitionImpl::ForEachNetworkContext(
++    base::FunctionRef<void(network::mojom::NetworkContext*,
++                           cert_verifier::mojom::CertVerifierServiceUpdater*)>
++        callback) {
++  std::erase_if(alloy_network_generations_,
++                [](const auto& value) { return !value; });
++  std::vector<scoped_refptr<AlloyNetworkGeneration>> leases;
++  for (auto& weak : alloy_network_generations_) {
++    if (weak) {
++      leases.emplace_back(weak.get());
++    }
++  }
++  callback(GetNetworkContext(), GetCertVerifierServiceUpdater());
++  for (auto& lease : leases) {
++    if (auto* context = lease->GetNetworkContext()) {
++      callback(context, lease->GetVerifier());
++    }
++  }
++}
++
++void StoragePartitionImpl::InitNetworkContext() {
++  auto context_params =
++      BuildNetworkContextParams(&cert_verifier_service_updater_);
++  if (!context_params) {
++    return;
++  }
+   network_context_owner_->network_context.reset();
+   CreateNetworkContextInNetworkService(
+       network_context_owner_->network_context.BindNewPipeAndPassReceiver(),
+--- a/content/browser/storage_partition_impl.h
++++ b/content/browser/storage_partition_impl.h
+@@ -15,6 +15,7 @@
+ #include "base/containers/flat_map.h"
+ #include "base/dcheck_is_on.h"
+ #include "base/files/file_path.h"
++#include "base/functional/function_ref.h"
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -24,6 +25,7 @@
+ #include "base/unguessable_token.h"
+ #include "components/performance_manager/scenario_api/performance_scenario_observer.h"
+ #include "components/services/storage/public/mojom/storage_service.mojom-forward.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/background_sync/background_sync_context_impl.h"
+ #include "content/browser/content_index/content_index_context_impl.h"
+ #include "content/browser/declarative_performance_observer/declarative_performance_observer_store.h"
+@@ -369,6 +371,11 @@
+ 
+   // Can return nullptr while `this` is being destroyed.
+   BrowserContext* browser_context() const;
++  scoped_refptr<AlloyNetworkGeneration> CreateAlloyNetworkGeneration();
++  void ForEachNetworkContext(
++      base::FunctionRef<void(network::mojom::NetworkContext*,
++                             cert_verifier::mojom::CertVerifierServiceUpdater*)>
++          callback) override;
+ 
+   std::optional<base::FilePath> GetStoragePartitionPath() const;
+ 
+@@ -738,6 +745,9 @@
+   // Called to initialize `network_context_` when `GetNetworkContext()` is
+   // first called or there is an error.
+   void InitNetworkContext();
++  network::mojom::NetworkContextParamsPtr BuildNetworkContextParams(
++      mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater>* verifier);
++  void InitializeAlloyNetworkGeneration(AlloyNetworkGeneration* generation);
+ 
+   bool is_in_memory() const { return config_.in_memory(); }
+ 
+@@ -838,6 +848,9 @@
+   // Owns the NetworkContext used to make requests for the StoragePartition.
+   // Forward declared so we don't need to include network_context.mojom.h here.
+   std::unique_ptr<NetworkContextOwner> network_context_owner_;
++  std::vector<base::WeakPtr<AlloyNetworkGeneration>> alloy_network_generations_;
++  mojo::ReceiverSet<network::mojom::NetworkContextClient>
++      alloy_network_clients_;
+ 
+   mojo::Receiver<network::mojom::NetworkContextClient>
+       network_context_client_receiver_{this};
+--- a/content/browser/websockets/websocket_connector_impl.cc
++++ b/content/browser/websockets/websocket_connector_impl.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/not_fatal_until.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -136,12 +137,16 @@
+   content::ContentBrowserClient::WebSocketOptions options =
+       GetContentClient()->browser()->GetWebSocketOptions(frame);
+ 
+-  content::ContentBrowserClient::WebSocketFactory factory = base::BindOnce(
+-      ConnectCalledByContentBrowserClient, requested_protocols,
+-      storage_access_api_status_, isolation_info_, frame_id_,
+-      devtools_worker_token_, origin_, client_security_state_->Clone(),
+-      options.options, std::move(throttling_profile_id),
+-      network_restrictions_id_, target_address_space, target_network);
++  content::ContentBrowserClient::WebSocketFactory factory =
++      base::BindOnce(ConnectCalledByContentBrowserClient,
++                     frame ? GetAlloyNetworkGenerationForDocument(
++                                 RenderFrameHostImpl::From(frame))
++                           : nullptr,
++                     requested_protocols, storage_access_api_status_,
++                     isolation_info_, frame_id_, devtools_worker_token_,
++                     origin_, client_security_state_->Clone(), options.options,
++                     std::move(throttling_profile_id), network_restrictions_id_,
++                     target_address_space, target_network);
+ 
+   if (GetContentClient()->browser()->WillInterceptWebSocket(frame)) {
+     GetContentClient()->browser()->CreateWebSocketWithFrameId(
+@@ -170,6 +175,7 @@
+ }
+ 
+ void WebSocketConnectorImpl::ConnectCalledByContentBrowserClient(
++    scoped_refptr<AlloyNetworkGeneration> generation,
+     const std::vector<std::string>& requested_protocols,
+     net::StorageAccessApiStatus storage_access_api_status,
+     const net::IsolationInfo& isolation_info,
+@@ -219,18 +225,22 @@
+               : storage_partition->CreateURLLoaderNetworkObserverForFrame(
+                     frame_id);
+ 
+-  storage_partition->GetNetworkContext()->CreateWebSocket(
+-      url, requested_protocols, storage_access_api_status, isolation_info,
+-      std::move(additional_headers), ToOriginatingProcessId(frame_id.child_id),
+-      origin, std::move(client_security_state), options,
+-      net::MutableNetworkTrafficAnnotationTag(kTrafficAnnotation),
+-      std::move(handshake_client),
+-      std::move(url_loader_network_service_observer), std::move(auth_handler),
+-      std::move(trusted_header_client), std::move(throttling_profile_id),
+-      network_restrictions_id, target_address_space,
+-      target_network == net::handles::kInvalidNetworkHandle
+-          ? std::nullopt
+-          : std::make_optional(target_network));
++  (generation ? generation->GetNetworkContext()
++              : storage_partition->GetNetworkContext())
++      ->CreateWebSocket(
++          url, requested_protocols, storage_access_api_status, isolation_info,
++          std::move(additional_headers),
++          ToOriginatingProcessId(frame_id.child_id), origin,
++          std::move(client_security_state), options,
++          net::MutableNetworkTrafficAnnotationTag(kTrafficAnnotation),
++          std::move(handshake_client),
++          std::move(url_loader_network_service_observer),
++          std::move(auth_handler), std::move(trusted_header_client),
++          std::move(throttling_profile_id), network_restrictions_id,
++          target_address_space,
++          target_network == net::handles::kInvalidNetworkHandle
++              ? std::nullopt
++              : std::make_optional(target_network));
+ }
+ 
+ }  // namespace content
+--- a/content/browser/websockets/websocket_connector_impl.h
++++ b/content/browser/websockets/websocket_connector_impl.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "base/unguessable_token.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "content/public/browser/weak_document_ptr.h"
+@@ -60,6 +61,7 @@
+ 
+  private:
+   static void ConnectCalledByContentBrowserClient(
++      scoped_refptr<AlloyNetworkGeneration> generation,
+       const std::vector<std::string>& requested_protocols,
+       net::StorageAccessApiStatus storage_access_api_status,
+       const net::IsolationInfo& isolation_info,
+--- a/content/browser/webtransport/web_transport_connector_impl.cc
++++ b/content/browser/webtransport/web_transport_connector_impl.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/not_fatal_until.h"
+ #include "base/strings/stringprintf.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/webtransport/web_transport_throttle_context.h"
+@@ -177,6 +178,10 @@
+       client_security_state_(std::move(client_security_state)),
+       throttle_context_(GetThrottleContext(process_id_, frame_)),
+       network_restrictions_id_(network_restrictions_id) {
++  if (auto* document = weak_document_.AsRenderFrameHostIfValid()) {
++    alloy_network_generation_ = GetAlloyNetworkGenerationForDocument(
++        RenderFrameHostImpl::From(document));
++  }
+   CHECK(!network_restrictions_id.is_empty(), base::NotFatalUntil::M165);
+ }
+ 
+@@ -343,15 +348,19 @@
+     return;
+   }
+ 
+-  process->GetStoragePartition()->GetNetworkContext()->CreateWebTransport(
+-      net::MutableNetworkTrafficAnnotationTag(network::alloy::kWebTransport),
+-      url, origin_, network_anonymization_key_, std::move(fingerprints),
+-      application_protocols, congestion_control,
+-      anticipated_concurrent_incoming_unidirectional_streams,
+-      anticipated_concurrent_incoming_bidirectional_streams,
+-      std::move(additional_headers), std::move(handshake_client),
+-      std::move(url_loader_network_observer), std::move(client_security_state),
+-      network_restrictions_id_);
++  (alloy_network_generation_
++       ? alloy_network_generation_->GetNetworkContext()
++       : process->GetStoragePartition()->GetNetworkContext())
++      ->CreateWebTransport(
++          net::MutableNetworkTrafficAnnotationTag(
++              network::alloy::kWebTransport),
++          url, origin_, network_anonymization_key_, std::move(fingerprints),
++          application_protocols, congestion_control,
++          anticipated_concurrent_incoming_unidirectional_streams,
++          anticipated_concurrent_incoming_bidirectional_streams,
++          std::move(additional_headers), std::move(handshake_client),
++          std::move(url_loader_network_observer),
++          std::move(client_security_state), network_restrictions_id_);
+ }
+ 
+ }  // namespace content
+--- a/content/browser/webtransport/web_transport_connector_impl.h
++++ b/content/browser/webtransport/web_transport_connector_impl.h
+@@ -8,6 +8,7 @@
+ #include <optional>
+ 
+ #include "base/memory/weak_ptr.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/webtransport/web_transport_throttle_context.h"
+ #include "content/public/browser/weak_document_ptr.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+@@ -94,6 +95,7 @@
+           handshake_client,
+       std::optional<network::mojom::WebTransportErrorPtr> error);
+ 
++  scoped_refptr<AlloyNetworkGeneration> alloy_network_generation_;
+   const int process_id_;
+   const base::WeakPtr<RenderFrameHostImpl> frame_;
+   const WeakDocumentPtr weak_document_;
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -15,6 +15,7 @@
+ #include "base/functional/callback_helpers.h"
+ #include "base/memory/safety_checks.h"
+ #include "build/build_config.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
+ #include "content/browser/broadcast_channel/broadcast_channel_provider.h"
+ #include "content/browser/broadcast_channel/broadcast_channel_service.h"
+@@ -725,7 +726,7 @@
+   return url_loader_factory::CreatePendingRemote(
+       ContentBrowserClient::URLLoaderFactoryType::kWorkerSubResource,
+       url_loader_factory::TerminalParams::ForNetworkContext(
+-          worker_process_host_->GetStoragePartition()->GetNetworkContext(),
++          GetAlloyNetworkContextForDocument(ancestor_render_frame_host),
+           std::move(factory_params),
+           url_loader_factory::HeaderClientOption::kAllow,
+           url_loader_factory::FactoryOverrideOption::kAllow),
+--- a/content/browser/worker_host/worker_script_fetcher.cc
++++ b/content/browser/worker_host/worker_script_fetcher.cc
+@@ -10,6 +10,7 @@
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "content/browser/alloy_network_generation.h"
+ #include "content/browser/connection_allowlist_utils.h"
+ #include "content/browser/data_url_loader_factory.h"
+ #include "content/browser/devtools/devtools_agent_host_impl.h"
+@@ -561,7 +562,7 @@
+             .InitWithNewPipeAndPassReceiver(),
+         ContentBrowserClient::URLLoaderFactoryType::kWorkerMainResource,
+         url_loader_factory::TerminalParams::ForNetworkContext(
+-            factory_process->GetStoragePartition()->GetNetworkContext(),
++            GetAlloyNetworkContextForDocument(&ancestor_render_frame_host),
+             std::move(factory_params),
+             url_loader_factory::HeaderClientOption::kAllow,
+             url_loader_factory::FactoryOverrideOption::kAllow),
+--- a/content/public/browser/storage_partition.h
++++ b/content/public/browser/storage_partition.h
+@@ -10,6 +10,7 @@
+ #include <set>
+ 
+ #include "base/functional/callback_forward.h"
++#include "base/functional/function_ref.h"
+ #include "base/observer_list_types.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+@@ -101,6 +102,13 @@
+   // or restarts, the raw pointer will not be valid or safe to use. Therefore,
+   // caller should not hold onto this pointer beyond the same message loop task.
+   virtual network::mojom::NetworkContext* GetNetworkContext() = 0;
++  // Context-wide configuration applies to every live document generation.
++  virtual void ForEachNetworkContext(
++      base::FunctionRef<void(network::mojom::NetworkContext*,
++                             cert_verifier::mojom::CertVerifierServiceUpdater*)>
++          callback) {
++    callback(GetNetworkContext(), GetCertVerifierServiceUpdater());
++  }
+ 
+   // Returns true if the NetworkContext for this partition has already been
+   // initialized.

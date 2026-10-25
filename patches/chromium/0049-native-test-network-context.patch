@@ -1,0 +1,42 @@
+--- a/chrome/test/base/testing_browser_process.h
++++ b/chrome/test/base/testing_browser_process.h
+@@ -216,6 +216,8 @@
+   // TaskEnvironment::DestructionObserver:
+   void WillDestroyCurrentTaskEnvironment() override;
+ 
++  // Borrowed native process service, owned and retired by the installing test.
++  void SetSystemNetworkContextManager(SystemNetworkContextManager* manager);
+   void SetMetricsService(metrics::MetricsService* metrics_service);
+   void SetProfileManager(std::unique_ptr<ProfileManager> profile_manager);
+   void SetSafeBrowsingService(safe_browsing::SafeBrowsingService* sb_service);
+@@ -290,6 +292,7 @@
+   std::unique_ptr<network::TestNetworkQualityTracker>
+       test_network_quality_tracker_;
+   raw_ptr<metrics::MetricsService> metrics_service_ = nullptr;
++  raw_ptr<SystemNetworkContextManager> system_network_context_manager_ = nullptr;
+   raw_ptr<variations::VariationsService> variations_service_ = nullptr;
+ 
+   // The `ProfileManager` is here as part of the `BrowserProcess` API. It is
+--- a/chrome/test/base/testing_browser_process.cc
++++ b/chrome/test/base/testing_browser_process.cc
+@@ -359,7 +359,7 @@
+ 
+ SystemNetworkContextManager*
+ TestingBrowserProcess::system_network_context_manager() {
+-  return nullptr;
++  return system_network_context_manager_;
+ }
+ 
+ scoped_refptr<network::SharedURLLoaderFactory>
+@@ -380,6 +380,11 @@
+   return profile_manager_.get();
+ }
+ 
++void TestingBrowserProcess::SetSystemNetworkContextManager(
++    SystemNetworkContextManager* manager) {
++  system_network_context_manager_ = manager;
++}
++
+ void TestingBrowserProcess::SetMetricsService(
+     metrics::MetricsService* metrics_service) {
+   metrics_service_ = metrics_service;

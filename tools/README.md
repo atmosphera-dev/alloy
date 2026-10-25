@@ -244,3 +244,67 @@ source verification, not a claim that the shared databases should disappear.
 Similarly, the probe's bounded fixture does not activate every optional service
 or prove that old files cannot reopen; factory/build coverage is verified
 separately. Both product and verification builds use the same removal assertions.
+
+## Native stateless profile probe (NUC only)
+
+After building both configurations on the approved NUC, from
+`/home/builder/work/alloy` with `TMPDIR=/home/builder/work/tmp`:
+
+```sh
+python3 repo/tools/profile_probe.py --out src/out/Release_Alloy --check stateless
+python3 repo/tools/profile_probe.py --out src/out/Verify_Alloy --check stateless
+```
+
+The probe builds `profile_consumer.c` against the generated experimental Alloy
+C API and runs it in a loopback-only network namespace. It needs the existing
+Xvfb, GCC, Node, OpenSSL, GDB, `nm` and NSS `certutil` tools. Each configuration exercises
+KEEP and CUT through native browser callbacks, fresh Back/Forward documents,
+tab close/reopen, storage refusal, cache refetch, connection/TLS positive
+controls and live/post-shutdown filesystem comparisons. CUT is per new
+top-level document; a same-document history change retains its generation.
+
+Media identity uses the native fake-device switch (replacing camera and
+microphone) and an explicit CEF media-permission callback, without automatic
+permission flags. A live fake video track and device enumeration must expose a
+stable ID within one document and a different ID in the next. Tracks are stopped
+before navigation; no physical capture is used by this fixture.
+
+The consumer first creates only its explicitly persistent parent/bootstrap
+browser. `profile_readiness.py`, loaded by GDB, observes returns from native
+startup completion, PreferredApps' first write-completion reply, and blob-limit
+setup. Those callbacks prove the traced parent startup work has completed; no
+sleep or filesystem-quiet interval establishes readiness. The observer neither
+calls inferior functions nor changes application state, and its own home/cache
+and receipts stay outside browser-owned roots. Native parent paths are checked
+after these callbacks as supporting assertions. Only then is `before-paths.json`
+taken, before a native control asks the consumer to create the stateless context.
+The parent browser remains alive throughout the measured interval. After the
+stateless browsers close, their owned C references are released. Native
+destructor-body returns for both request contexts, their browser context and
+the OTR profile establish the teardown barrier, without a timer-based assumption.
+Exact destructor addresses are resolved from the current output's ELF symbols;
+GDB's demangled lookup can otherwise conflate destructor variants. The request-
+context deleting destructor directly invokes D2, bypassing its D1 tail-jump
+wrapper; the observer follows the actual body rather than requiring that wrapper.
+
+Evidence and failed roots are retained under `evidence/profile-stateless-*`.
+The isolated test user's external OS/NSS certificate input is created before
+either page or no-page run and must remain byte-identical. All raw inventories
+include every path. Live and post-shutdown inventories must add **zero** paths
+relative to the same process's pre-context inventory, including type changes;
+there are no path exclusions or filename transformations in either configuration.
+The checked `final-paths.json` is captured after this native stateless destruction
+while the persistent parent remains alive. The parent then closes and CEF shuts
+down normally; `process-final-paths.json` and its full change report retain those
+later parent-lifecycle writes as item-3 evidence. The native inferior's actual
+exit status is checked independently of GDB's status.
+The duration-matched blank run and its complete raw inventories/change report
+remain evidence controls, not the cross-process filesystem pass criterion.
+
+This item-2 check measures what the stateless context writes. Its explicitly
+persistent parent's own startup writes (including PreferredApps/blob_storage)
+precede that measurement; its close/destructor writes (Session Storage,
+Preferences/Secure Preferences, and HttpServerProperties' unconditional
+destructor write to Network Persistent State) are reported after it. Item 3's
+no-disk/bootstrap check is **absolute zero**
+when only stateless/memory contexts exist, not this pre-context baseline.

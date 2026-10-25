@@ -1,0 +1,12 @@
+--- a/browser/themes/brave_theme_service.cc
++++ b/browser/themes/brave_theme_service.cc
+@@ -50,6 +50,9 @@
+ 
+ void BraveThemeService::MigrateBrowserColorSchemeFromBraveDarkModePrefs(
+     Profile* profile) {
++  if (is_stateless()) {
++    return;
++  }
+   if (!g_browser_process) {
+     CHECK_IS_TEST();
+     return;

@@ -1,0 +1,69 @@
+--- a/chrome/browser/optimization_guide/optimization_guide_web_contents_observer.cc
++++ b/chrome/browser/optimization_guide/optimization_guide_web_contents_observer.cc
+@@ -215,6 +215,15 @@
+   page_data.SetNavigationData(std::move(navigation_data));
+ }
+ 
++bool OptimizationGuideWebContentsObserver::HasPendingHintsForTesting() {
++  if (!web_contents()) {
++    return false;
++  }
++  auto* data = PageData::GetForPage(web_contents()->GetPrimaryPage());
++  return data && (!data->GetHintsTargetUrls().empty() ||
++                  data->is_sent_batched_hints_request());
++}
++
+ void OptimizationGuideWebContentsObserver::FlushLastNavigationData() {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   if (!web_contents()) {
+@@ -229,7 +238,7 @@
+     content::WebContents* web_contents) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+ 
+-  if (!this->web_contents())
++  if (!this->web_contents() || !optimization_guide_keyed_service_)
+     return;
+   DCHECK_EQ(this->web_contents(), web_contents);
+ 
+--- a/chrome/browser/optimization_guide/optimization_guide_web_contents_observer.h
++++ b/chrome/browser/optimization_guide/optimization_guide_web_contents_observer.h
+@@ -43,6 +43,7 @@
+ 
+   // Notifies |this| to flush |last_navigation_data| so metrics are recorded.
+   void FlushLastNavigationData();
++  bool HasPendingHintsForTesting();
+ 
+   // Tell the observer that hints for this URL should be fetched once we reach
+   // onload in this |web_contents|. Note that |web_contents| must be the
+--- a/chrome/browser/safe_browsing/chrome_password_reuse_detection_manager_client.cc
++++ b/chrome/browser/safe_browsing/chrome_password_reuse_detection_manager_client.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/memory/ptr_util.h"
+ #include "base/metrics/histogram_functions.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/buildflag.h"
+ #include "chrome/browser/password_manager/chrome_password_manager_client.h"
+ #include "chrome/browser/password_manager/factories/password_reuse_manager_factory.h"
+@@ -236,7 +237,10 @@
+ 
+ bool ChromePasswordReuseDetectionManagerClient::IsHistorySyncAccountEmail(
+     const std::string& username) {
+-  Profile* original_profile = profile_->GetOriginalProfile();
++  Profile* original_profile =
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile_)
++          ? profile_.get()
++          : profile_->GetOriginalProfile();
+   // Password reuse detection is tied to history sync.
+   syncer::SyncService* sync_service =
+       SyncServiceFactory::GetForProfile(original_profile);
+--- a/chrome/browser/safe_browsing/BUILD.gn
++++ b/chrome/browser/safe_browsing/BUILD.gn
+@@ -35,6 +35,7 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//build:branding_buildflags",
+     "//chrome/app:generated_resources",
+     "//chrome/browser:browser_features",

@@ -1,0 +1,2553 @@
+--- a/components/autofill/core/browser/data_manager/addresses/address_data_manager.h
++++ b/components/autofill/core/browser/data_manager/addresses/address_data_manager.h
+@@ -21,6 +21,7 @@
+ #include "base/time/time.h"
+ #include "build/buildflag.h"
+ #include "components/autofill/core/browser/country_type.h"
++#include "components/autofill/core/browser/data_manager/no_capture.h"
+ #include "components/autofill/core/browser/data_model/addresses/autofill_profile.h"
+ #include "components/autofill/core/browser/strike_databases/addresses/address_on_typing_suggestion_strike_database.h"
+ #include "components/autofill/core/browser/strike_databases/addresses/address_suggestion_strike_database.h"
+@@ -73,6 +74,8 @@
+ // incorrectly get rejected by the ADM.
+ class AddressDataManager : public AutofillWebDataServiceObserverOnUISequence {
+  public:
++  explicit AddressDataManager(NoCapture);
++
+   class Observer : public base::CheckedObserver {
+    public:
+     // Triggered after all pending read and write operations have finished.
+@@ -288,6 +291,9 @@
+   const std::string& app_locale() const { return app_locale_; }
+ 
+   void SetSyncServiceForTest(syncer::SyncService* sync_service) {
++    if (no_capture_) {
++      return;
++    }
+     sync_service_ = sync_service;
+   }
+ 
+@@ -484,6 +490,8 @@
+ 
+   const std::string app_locale_;
+ 
++  const bool no_capture_ = false;
++
+   base::WeakPtrFactory<AddressDataManager> weak_ptr_factory_{this};
+ };
+ 
+--- a/components/autofill/core/browser/data_manager/addresses/address_data_manager.cc
++++ b/components/autofill/core/browser/data_manager/addresses/address_data_manager.cc
+@@ -145,6 +145,15 @@
+   return weak_ptr_factory_.GetWeakPtr();
+ }
+ 
++AddressDataManager::AddressDataManager(NoCapture)
++    : variation_country_code_(std::string()),
++      identity_manager_(nullptr),
++      sync_service_(nullptr),
++      app_locale_(),
++      no_capture_(true) {
++  has_initial_load_finished_ = true;
++}
++
+ AddressDataManager::~AddressDataManager() {
+   CancelPendingQuery(pending_profile_query_);
+ }
+@@ -165,6 +174,9 @@
+ }
+ 
+ void AddressDataManager::OnAutofillChangedBySync(syncer::DataType data_type) {
++  if (no_capture_) {
++    return;
++  }
+   if (data_type == syncer::DataType::AUTOFILL_PROFILE ||
+       data_type == syncer::DataType::CONTACT_INFO) {
+     LoadProfiles();
+@@ -174,6 +186,9 @@
+ void AddressDataManager::OnWebDataServiceRequestDone(
+     WebDataServiceBase::Handle handle,
+     std::unique_ptr<WDTypedResult> result) {
++  if (no_capture_) {
++    return;
++  }
+   CHECK_EQ(handle, pending_profile_query_);
+   pending_profile_query_ = 0;
+   if (!result) {
+@@ -209,6 +224,9 @@
+ 
+ std::vector<const AutofillProfile*> AddressDataManager::GetProfiles(
+     ProfileOrder order) const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const AutofillProfile*> profiles =
+       base::ToVector(profiles_, [](const AutofillProfile& p) { return &p; });
+   OrderProfiles(profiles, order);
+@@ -218,12 +236,18 @@
+ std::vector<const AutofillProfile*> AddressDataManager::GetProfilesByRecordType(
+     AutofillProfile::RecordType record_type,
+     ProfileOrder order) const {
++  if (no_capture_) {
++    return {};
++  }
+   return GetProfilesByRecordType(DenseSet({record_type}), order);
+ }
+ 
+ std::vector<const AutofillProfile*> AddressDataManager::GetProfilesByRecordType(
+     DenseSet<AutofillProfile::RecordType> record_types,
+     ProfileOrder order) const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const AutofillProfile*> profiles = GetProfiles(order);
+   std::erase_if(profiles, [&](const AutofillProfile* p) {
+     return !record_types.contains(p->record_type());
+@@ -233,6 +257,9 @@
+ 
+ std::vector<const AutofillProfile*> AddressDataManager::GetProfilesToSuggest()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillProfileEnabled()) {
+     return {};
+   }
+@@ -272,11 +299,17 @@
+ 
+ std::vector<const AutofillProfile*> AddressDataManager::GetProfilesForSettings()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   return GetProfiles(ProfileOrder::kMostRecentlyModifiedDesc);
+ }
+ 
+ const AutofillProfile* AddressDataManager::GetProfileByGUID(
+     const std::string& guid) const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const AutofillProfile*> profiles = GetProfiles();
+   auto it = std::ranges::find(
+       profiles, guid,
+@@ -285,6 +318,10 @@
+ }
+ 
+ void AddressDataManager::AddProfile(const AutofillProfile& profile) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   if (!webdata_service_ || !IsAutofillProfileEnabled()) {
+     return;
+   }
+@@ -303,6 +340,10 @@
+ }
+ 
+ void AddressDataManager::UpdateProfile(const AutofillProfile& profile) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   if (!webdata_service_) {
+     return;
+   }
+@@ -316,11 +357,19 @@
+ void AddressDataManager::RemoveProfile(
+     const std::string& guid,
+     bool non_permanent_account_profile_removal) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   RemoveProfileImpl(guid, non_permanent_account_profile_removal);
+ }
+ 
+ void AddressDataManager::RemoveLocalProfilesModifiedBetween(base::Time begin,
+                                                             base::Time end) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   for (const AutofillProfile* profile :
+        GetProfilesByRecordType(AutofillProfile::RecordType::kLocalOrSyncable)) {
+     if (profile->usage_history().modification_date() >= begin &&
+@@ -331,6 +380,9 @@
+ }
+ 
+ bool AddressDataManager::IsEligibleForAddressAccountStorage() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!sync_service_) {
+     return false;
+   }
+@@ -342,6 +394,10 @@
+ 
+ void AddressDataManager::MigrateProfileToAccount(
+     const AutofillProfile& profile) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   CHECK_EQ(profile.record_type(),
+            AutofillProfile::RecordType::kLocalOrSyncable);
+   AutofillProfile account_profile = profile.ConvertToAccountProfile();
+@@ -352,12 +408,19 @@
+ }
+ 
+ void AddressDataManager::OnAutofillProfilePrefChanged() {
++  if (no_capture_) {
++    return;
++  }
+   LoadProfiles();
+   autofill_metrics::MaybeLogAutofillProfileDisabled(
+       CHECK_DEREF(pref_service_.get()));
+ }
+ 
+ void AddressDataManager::LoadProfiles() {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   if (!webdata_service_) {
+     return;
+   }
+@@ -368,6 +431,10 @@
+ }
+ 
+ void AddressDataManager::RecordUseOf(const AutofillProfile& profile) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   const AutofillProfile* adm_profile = GetProfileByGUID(profile.guid());
+   if (!adm_profile) {
+     return;
+@@ -382,12 +449,18 @@
+ 
+ AddressCountryCode AddressDataManager::GetDefaultCountryCodeForNewAddress()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   return AutofillCountry::GetDefaultCountryCodeForNewAddress(
+       variation_country_code_, app_locale_);
+ }
+ 
+ bool AddressDataManager::IsProfileMigrationBlocked(
+     const std::string& guid) const {
++  if (no_capture_) {
++    return {};
++  }
+   const AutofillProfile* profile = GetProfileByGUID(guid);
+   DCHECK(profile == nullptr || !profile->IsAccountProfile());
+   if (!GetProfileMigrationStrikeDatabase()) {
+@@ -398,6 +471,9 @@
+ 
+ void AddressDataManager::AddStrikeToBlockProfileMigration(
+     const std::string& guid) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetProfileMigrationStrikeDatabase()) {
+     return;
+   }
+@@ -406,6 +482,9 @@
+ 
+ void AddressDataManager::AddMaxStrikesToBlockProfileMigration(
+     const std::string& guid) {
++  if (no_capture_) {
++    return;
++  }
+   if (AutofillProfileMigrationStrikeDatabase* db =
+           GetProfileMigrationStrikeDatabase()) {
+     db->AddStrikes(db->GetMaxStrikesLimit() - db->GetStrikes(guid), guid);
+@@ -414,6 +493,9 @@
+ 
+ void AddressDataManager::RemoveStrikesToBlockProfileMigration(
+     const std::string& guid) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetProfileMigrationStrikeDatabase()) {
+     return;
+   }
+@@ -422,6 +504,9 @@
+ 
+ bool AddressDataManager::IsNewProfileImportBlockedForDomain(
+     const GURL& url) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!GetProfileSaveStrikeDatabase() || !url.is_valid() || !url.has_host()) {
+     return false;
+   }
+@@ -431,6 +516,9 @@
+ 
+ void AddressDataManager::AddStrikeToBlockNewProfileImportForDomain(
+     const GURL& url) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetProfileSaveStrikeDatabase() || !url.is_valid() || !url.has_host()) {
+     return;
+   }
+@@ -439,6 +527,9 @@
+ 
+ void AddressDataManager::RemoveStrikesToBlockNewProfileImportForDomain(
+     const GURL& url) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetProfileSaveStrikeDatabase() || !url.is_valid() || !url.has_host()) {
+     return;
+   }
+@@ -446,6 +537,9 @@
+ }
+ 
+ bool AddressDataManager::IsProfileUpdateBlocked(const std::string& guid) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!GetProfileUpdateStrikeDatabase()) {
+     return false;
+   }
+@@ -454,6 +548,9 @@
+ 
+ void AddressDataManager::AddStrikeToBlockProfileUpdate(
+     const std::string& guid) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetProfileUpdateStrikeDatabase()) {
+     return;
+   }
+@@ -462,6 +559,9 @@
+ 
+ void AddressDataManager::RemoveStrikesToBlockProfileUpdate(
+     const std::string& guid) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetProfileUpdateStrikeDatabase()) {
+     return;
+   }
+@@ -472,6 +572,9 @@
+     FormSignature form_signature,
+     FieldSignature field_signature,
+     const GURL& gurl) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!GetAddressSuggestionStrikeDatabase()) {
+     return false;
+   }
+@@ -484,6 +587,9 @@
+     FormSignature form_signature,
+     FieldSignature field_signature,
+     const GURL& gurl) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetAddressSuggestionStrikeDatabase()) {
+     return;
+   }
+@@ -496,6 +602,9 @@
+     FormSignature form_signature,
+     FieldSignature field_signature,
+     const GURL& gurl) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetAddressSuggestionStrikeDatabase()) {
+     return;
+   }
+@@ -506,6 +615,9 @@
+ 
+ void AddressDataManager::OnHistoryDeletions(
+     const history::DeletionInfo& deletion_info) {
++  if (no_capture_) {
++    return;
++  }
+   if (profile_save_strike_database_) {
+     profile_save_strike_database_->ClearStrikesWithHistory(deletion_info);
+   }
+@@ -515,6 +627,9 @@
+ }
+ 
+ void AddressDataManager::SetPrefService(PrefService* pref_service) {
++  if (no_capture_) {
++    return;
++  }
+   pref_service_ = pref_service;
+   profile_enabled_pref_ = std::make_unique<BooleanPrefMember>();
+   // `pref_service_` can be nullptr in tests. Using base::Unretained(this) is
+@@ -533,6 +648,9 @@
+ 
+ void AddressDataManager::SetStrikeDatabase(
+     strike_database::StrikeDatabaseBase* strike_database) {
++  if (no_capture_) {
++    return;
++  }
+   if (!strike_database) {
+     return;
+   }
+@@ -554,56 +672,86 @@
+ 
+ AddressOnTypingSuggestionStrikeDatabase*
+ AddressDataManager::GetAddressOnTypingSuggestionStrikeDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return const_cast<AddressOnTypingSuggestionStrikeDatabase*>(
+       std::as_const(*this).GetAddressOnTypingSuggestionStrikeDatabase());
+ }
+ 
+ const AddressOnTypingSuggestionStrikeDatabase*
+ AddressDataManager::GetAddressOnTypingSuggestionStrikeDatabase() const {
++  if (no_capture_) {
++    return {};
++  }
+   return address_on_typing_suggestion_strike_database_.get();
+ }
+ 
+ AutofillProfileMigrationStrikeDatabase*
+ AddressDataManager::GetProfileMigrationStrikeDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return const_cast<AutofillProfileMigrationStrikeDatabase*>(
+       std::as_const(*this).GetProfileMigrationStrikeDatabase());
+ }
+ 
+ const AutofillProfileMigrationStrikeDatabase*
+ AddressDataManager::GetProfileMigrationStrikeDatabase() const {
++  if (no_capture_) {
++    return {};
++  }
+   return profile_migration_strike_database_.get();
+ }
+ 
+ AutofillProfileSaveStrikeDatabase*
+ AddressDataManager::GetProfileSaveStrikeDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return const_cast<AutofillProfileSaveStrikeDatabase*>(
+       std::as_const(*this).GetProfileSaveStrikeDatabase());
+ }
+ 
+ const AutofillProfileSaveStrikeDatabase*
+ AddressDataManager::GetProfileSaveStrikeDatabase() const {
++  if (no_capture_) {
++    return {};
++  }
+   return profile_save_strike_database_.get();
+ }
+ 
+ AutofillProfileUpdateStrikeDatabase*
+ AddressDataManager::GetProfileUpdateStrikeDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return const_cast<AutofillProfileUpdateStrikeDatabase*>(
+       std::as_const(*this).GetProfileUpdateStrikeDatabase());
+ }
+ 
+ const AutofillProfileUpdateStrikeDatabase*
+ AddressDataManager::GetProfileUpdateStrikeDatabase() const {
++  if (no_capture_) {
++    return {};
++  }
+   return profile_update_strike_database_.get();
+ }
+ 
+ AddressSuggestionStrikeDatabase*
+ AddressDataManager::GetAddressSuggestionStrikeDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return const_cast<AddressSuggestionStrikeDatabase*>(
+       std::as_const(*this).GetAddressSuggestionStrikeDatabase());
+ }
+ 
+ const AddressSuggestionStrikeDatabase*
+ AddressDataManager::GetAddressSuggestionStrikeDatabase() const {
++  if (no_capture_) {
++    return {};
++  }
+   return address_suggestion_strike_database_.get();
+ }
+ 
+@@ -617,6 +765,9 @@
+ }
+ 
+ bool AddressDataManager::IsAutofillProfileEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!pref_service_) {
+     return false;
+   }
+@@ -626,6 +777,9 @@
+ }
+ 
+ bool AddressDataManager::IsSyncFeatureEnabledForAutofill() const {
++  if (no_capture_) {
++    return {};
++  }
+   // TODO(crbug.com/40066949): Remove this method in favor of
+   // `IsUserSelectableTypeEnabled` once ConsentLevel::kSync and
+   // SyncService::IsSyncFeatureEnabled() are deleted from the codebase.
+@@ -636,6 +790,9 @@
+ 
+ std::optional<CoreAccountInfo> AddressDataManager::GetPrimaryAccountInfo()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (identity_manager_ &&
+       identity_manager_->HasPrimaryAccount(signin::ConsentLevel::kSignin)) {
+     return identity_manager_->GetPrimaryAccountInfo(
+@@ -648,6 +805,9 @@
+ void AddressDataManager::MaybeCreateAccountNameEmailProfile(
+     std::string account_name,
+     std::string email) {
++  if (no_capture_) {
++    return;
++  }
+   if (account_name_email_store_) {
+     account_name_email_store_->MaybeUpdateOrCreateAccountNameEmail(account_name,
+                                                                    email);
+@@ -657,6 +817,9 @@
+ 
+ void AddressDataManager::CancelPendingQuery(
+     WebDataServiceBase::Handle& handle) {
++  if (no_capture_) {
++    return;
++  }
+   if (!webdata_service_ || !handle) {
+     return;
+   }
+@@ -666,6 +829,9 @@
+ 
+ void AddressDataManager::OnAutofillProfileChanged(
+     const AutofillProfileChange& change) {
++  if (no_capture_) {
++    return;
++  }
+   const std::string& guid = change.key();
+   const AutofillProfile& profile = change.data_model();
+   DCHECK(guid == profile.guid());
+@@ -704,6 +870,9 @@
+ }
+ 
+ void AddressDataManager::HandleNextProfileChange() {
++  if (no_capture_) {
++    return;
++  }
+   if (ongoing_profile_changes_.empty()) {
+     return;
+   }
+@@ -778,12 +947,18 @@
+ }
+ 
+ void AddressDataManager::OnProfileChangeDone() {
++  if (no_capture_) {
++    return;
++  }
+   ongoing_profile_changes_.pop_front();
+   NotifyObservers();
+   HandleNextProfileChange();
+ }
+ 
+ void AddressDataManager::LogStoredDataMetrics() const {
++  if (no_capture_) {
++    return;
++  }
+   const std::vector<const AutofillProfile*> profile_pointers = GetProfiles();
+   autofill_metrics::LogStoredProfileMetrics(profile_pointers);
+   autofill_metrics::LogStoredProfileTokenQualityMetrics(profile_pointers);
+@@ -793,6 +968,9 @@
+ void AddressDataManager::RemoveProfileImpl(
+     const std::string& guid,
+     bool non_permanent_account_profile_removal) {
++  if (no_capture_) {
++    return;
++  }
+   if (!webdata_service_) {
+     return;
+   }
+--- a/components/autofill/core/browser/data_manager/payments/payments_data_manager.h
++++ b/components/autofill/core/browser/data_manager/payments/payments_data_manager.h
+@@ -24,6 +24,7 @@
+ #include "base/time/time.h"
+ #include "build/buildflag.h"
+ #include "components/autofill/core/browser/country_type.h"
++#include "components/autofill/core/browser/data_manager/no_capture.h"
+ #include "components/autofill/core/browser/data_model/payments/autofill_offer_data.h"
+ #include "components/autofill/core/browser/data_model/payments/autofill_wallet_usage_data.h"
+ #include "components/autofill/core/browser/data_model/payments/credit_card.h"
+@@ -80,6 +81,8 @@
+                             public syncer::SyncServiceObserver,
+                             public signin::IdentityManager::Observer {
+  public:
++  explicit PaymentsDataManager(NoCapture);
++
+   class Observer : public base::CheckedObserver {
+    public:
+     // Triggered after all pending read and write operations have finished.
+@@ -505,6 +508,9 @@
+ 
+   void SetSyncServiceForTest(syncer::SyncService* sync_service);
+   void SetSyncingForTest(bool is_syncing_for_test) {
++    if (no_capture_) {
++      return;
++    }
+     is_syncing_for_test_ = is_syncing_for_test;
+   }
+ 
+@@ -845,6 +851,8 @@
+ 
+   std::vector<base::OnceClosure> refresh_complete_callbacks_;
+ 
++  const bool no_capture_ = false;
++
+   base::WeakPtrFactory<PaymentsDataManager> weak_ptr_factory_{this};
+ };
+ 
+--- a/components/autofill/core/browser/data_manager/payments/payments_data_manager.cc
++++ b/components/autofill/core/browser/data_manager/payments/payments_data_manager.cc
+@@ -301,6 +301,13 @@
+   }
+ }
+ 
++PaymentsDataManager::PaymentsDataManager(NoCapture)
++    : variations_country_code_(std::string()),
++      app_locale_(),
++      no_capture_(true) {
++  is_payments_data_loaded_ = true;
++}
++
+ PaymentsDataManager::~PaymentsDataManager() {
+   CancelPendingLocalQuery(&pending_creditcards_query_);
+   CancelPendingLocalQuery(&pending_local_ibans_query_);
+@@ -314,6 +321,9 @@
+ }
+ 
+ void PaymentsDataManager::OnAutofillChangedBySync(syncer::DataType data_type) {
++  if (no_capture_) {
++    return;
++  }
+   if (data_type == syncer::AUTOFILL_VALUABLE ||
+       data_type == syncer::AUTOFILL_WALLET_CREDENTIAL ||
+       data_type == syncer::AUTOFILL_WALLET_DATA ||
+@@ -328,6 +338,9 @@
+ void PaymentsDataManager::OnWebDataServiceRequestDone(
+     WebDataServiceBase::Handle h,
+     std::unique_ptr<WDTypedResult> result) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK(HasPendingPaymentQueries());
+ 
+   if (!result) {
+@@ -506,6 +519,9 @@
+ }
+ 
+ bool PaymentsDataManager::ShouldShowBnplSettings() const {
++  if (no_capture_) {
++    return {};
++  }
+   // Check `kAutofillEnableBuyNowPayLater` only if the user has seen a BNPL
+   // suggestion before, or there are already linked issuers present, to avoid
+   // unnecessary feature flag checks. The linked issuer check is due to the fact
+@@ -520,6 +536,9 @@
+ }
+ 
+ CoreAccountInfo PaymentsDataManager::GetAccountInfoForPaymentsServer() const {
++  if (no_capture_) {
++    return {};
++  }
+   // Return the account of the active signed-in user irrespective of whether
+   // they enabled sync or not.
+   return identity_manager_->GetPrimaryAccountInfo(
+@@ -527,12 +546,18 @@
+ }
+ 
+ bool PaymentsDataManager::IsSyncFeatureEnabledForPaymentsServerMetrics() const {
++  if (no_capture_) {
++    return {};
++  }
+   // TODO(crbug.com/40066949): Simplify once ConsentLevel::kSync and
+   // SyncService::IsSyncFeatureEnabled() are deleted from the codebase.
+   return sync_service_ && sync_service_->IsSyncFeatureEnabled();
+ }
+ 
+ void PaymentsDataManager::OnStateChanged(syncer::SyncService* sync_service) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK_EQ(sync_service_, sync_service);
+ 
+   // Use the ephemeral account storage when the user didn't enable the sync
+@@ -546,23 +571,36 @@
+ }
+ 
+ void PaymentsDataManager::OnSyncShutdown(syncer::SyncService*) {
++  if (no_capture_) {
++    return;
++  }
+   // Unreachable, since the service owning this instance is Shutdown() before
+   // the SyncService.
+   NOTREACHED();
+ }
+ 
+ void PaymentsDataManager::OnAccountsCookieDeletedByUserAction() {
++  if (no_capture_) {
++    return;
++  }
+   // Clear all the Sync Transport feature opt-ins.
+   prefs::ClearSyncTransportOptIns(pref_service_);
+ }
+ 
+ void PaymentsDataManager::OnIdentityManagerShutdown(
+     signin::IdentityManager* identity_manager) {
++  if (no_capture_) {
++    return;
++  }
+   CHECK_EQ(identity_manager, identity_manager_);
+   identity_observer_.Reset();
+ }
+ 
+ void PaymentsDataManager::Refresh() {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   LoadCreditCards();
+   LoadCreditCardCloudTokenData();
+   LoadIbans();
+@@ -584,16 +622,25 @@
+ }
+ 
+ void PaymentsDataManager::AddServerIbanForTest(std::unique_ptr<Iban> iban) {
++  if (no_capture_) {
++    return;
++  }
+   server_ibans_.push_back(std::move(iban));
+ }
+ 
+ const Iban* PaymentsDataManager::GetIbanByGUID(const std::string& guid) const {
++  if (no_capture_) {
++    return {};
++  }
+   auto iter = FindElementByGUID(local_ibans_, guid);
+   return iter != local_ibans_.end() ? iter->get() : nullptr;
+ }
+ 
+ const AutofillOfferData* PaymentsDataManager::GetMerchantPromoCodeByOfferId(
+     std::string_view offer_id) const {
++  if (no_capture_) {
++    return {};
++  }
+   auto iter = std::ranges::find_if(
+       autofill_offer_data_,
+       [&offer_id](const std::unique_ptr<AutofillOfferData>& offer_data) {
+@@ -604,6 +651,9 @@
+ 
+ const Iban* PaymentsDataManager::GetIbanByInstrumentId(
+     int64_t instrument_id) const {
++  if (no_capture_) {
++    return {};
++  }
+   for (const Iban* iban : GetServerIbans()) {
+     if (iban->instrument_id() == instrument_id) {
+       return iban;
+@@ -614,6 +664,9 @@
+ 
+ const CreditCard* PaymentsDataManager::GetCreditCardByGUID(
+     const std::string& guid) const {
++  if (no_capture_) {
++    return {};
++  }
+   const std::vector<const CreditCard*>& credit_cards = GetCreditCards();
+   auto iter = FindElementByGUID(credit_cards, guid);
+   return iter != credit_cards.end() ? *iter : nullptr;
+@@ -621,11 +674,17 @@
+ 
+ CreditCard* PaymentsDataManager::GetMutableCreditCardByGUID(
+     const std::string& guid) {
++  if (no_capture_) {
++    return {};
++  }
+   return const_cast<CreditCard*>(GetCreditCardByGUID(guid));
+ }
+ 
+ const CreditCard* PaymentsDataManager::GetCreditCardByNumber(
+     const std::string& number) const {
++  if (no_capture_) {
++    return {};
++  }
+   CreditCard numbered_card;
+   numbered_card.SetNumber(base::ASCIIToUTF16(number));
+   for (const CreditCard* credit_card : GetCreditCards()) {
+@@ -639,6 +698,9 @@
+ 
+ const CreditCard* PaymentsDataManager::GetCreditCardByInstrumentId(
+     int64_t instrument_id) const {
++  if (no_capture_) {
++    return {};
++  }
+   const std::vector<const CreditCard*> credit_cards = GetCreditCards();
+   for (const CreditCard* credit_card : credit_cards) {
+     if (credit_card->instrument_id() == instrument_id) {
+@@ -650,6 +712,9 @@
+ 
+ const CreditCard* PaymentsDataManager::GetCreditCardByServerId(
+     const std::string& server_id) const {
++  if (no_capture_) {
++    return {};
++  }
+   for (const CreditCard* credit_card : GetServerCreditCards()) {
+     if (credit_card->server_id() == server_id) {
+       return credit_card;
+@@ -662,6 +727,9 @@
+ std::optional<T> PaymentsDataManager::GetCreditCardBenefitByInstrumentId(
+     CreditCardBenefitBase::LinkedCardInstrumentId instrument_id,
+     base::FunctionRef<bool(const T&)> filter) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled() || !IsAutofillPaymentMethodsEnabled()) {
+     return std::nullopt;
+   }
+@@ -679,6 +747,9 @@
+ std::optional<CreditCardFlatRateBenefit>
+ PaymentsDataManager::GetFlatRateBenefitByInstrumentId(
+     const CreditCardBenefitBase::LinkedCardInstrumentId instrument_id) const {
++  if (no_capture_) {
++    return {};
++  }
+   return GetCreditCardBenefitByInstrumentId<CreditCardFlatRateBenefit>(
+       instrument_id);
+ }
+@@ -687,6 +758,9 @@
+ PaymentsDataManager::GetCategoryBenefitByInstrumentIdAndCategory(
+     const CreditCardBenefitBase::LinkedCardInstrumentId instrument_id,
+     const CreditCardCategoryBenefit::BenefitCategory benefit_category) const {
++  if (no_capture_) {
++    return {};
++  }
+   return GetCreditCardBenefitByInstrumentId<CreditCardCategoryBenefit>(
+       instrument_id, [&benefit_category](const CreditCardCategoryBenefit& b) {
+         return b.benefit_category() == benefit_category;
+@@ -697,6 +771,9 @@
+ PaymentsDataManager::GetMerchantBenefitByInstrumentIdAndOrigin(
+     const CreditCardBenefitBase::LinkedCardInstrumentId instrument_id,
+     const url::Origin& merchant_origin) const {
++  if (no_capture_) {
++    return {};
++  }
+   return GetCreditCardBenefitByInstrumentId<CreditCardMerchantBenefit>(
+       instrument_id, [&merchant_origin](const CreditCardMerchantBenefit& b) {
+         return b.merchant_domains().contains(merchant_origin);
+@@ -708,6 +785,9 @@
+     const CreditCard& credit_card,
+     const url::Origin& origin,
+     const AutofillOptimizationGuideDecider* optimization_guide) const {
++  if (no_capture_) {
++    return {};
++  }
+   // Ensures that benefit suggestions can be displayed.
+   if (ShouldBlockCardBenefitSuggestionLabels()) {
+     return std::nullopt;
+@@ -787,6 +867,9 @@
+ 
+ std::vector<const CreditCard*> PaymentsDataManager::GetLocalCreditCards()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   return base::ToVector(
+       local_credit_cards_,
+       [](const std::unique_ptr<CreditCard>& card) -> const CreditCard* {
+@@ -796,6 +879,9 @@
+ 
+ std::vector<const CreditCard*> PaymentsDataManager::GetServerCreditCards()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled()) {
+     return {};
+   }
+@@ -807,6 +893,9 @@
+ }
+ 
+ std::vector<const CreditCard*> PaymentsDataManager::GetCreditCards() const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const CreditCard*> result;
+   result.reserve(local_credit_cards_.size() + server_credit_cards_.size());
+   for (const auto& card : local_credit_cards_) {
+@@ -821,6 +910,9 @@
+ }
+ 
+ std::vector<const Iban*> PaymentsDataManager::GetLocalIbans() const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const Iban*> result;
+   result.reserve(local_ibans_.size());
+   for (const auto& iban : local_ibans_) {
+@@ -830,6 +922,9 @@
+ }
+ 
+ std::vector<const Iban*> PaymentsDataManager::GetServerIbans() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled()) {
+     return {};
+   }
+@@ -842,6 +937,9 @@
+ }
+ 
+ std::vector<const Iban*> PaymentsDataManager::GetIbans() const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const Iban*> result;
+   result.reserve(local_ibans_.size() + server_ibans_.size());
+   if (IsAutofillWalletImportEnabled()) {
+@@ -857,6 +955,9 @@
+ }
+ 
+ std::vector<Iban> PaymentsDataManager::GetOrderedIbansToSuggest() const {
++  if (no_capture_) {
++    return {};
++  }
+   std::vector<const Iban*> available_ibans =
+       ShouldSuggestServerPaymentMethods() ? GetIbans() : GetLocalIbans();
+   // Remove any IBAN from the returned list if it's a local IBAN and its
+@@ -884,6 +985,9 @@
+ }
+ 
+ bool PaymentsDataManager::HasMaskedBankAccounts() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillPaymentMethodsEnabled()) {
+     return false;
+   }
+@@ -891,6 +995,9 @@
+ }
+ 
+ base::span<const BnplIssuer> PaymentsDataManager::GetLinkedBnplIssuers() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillPaymentMethodsEnabled() || !IsAutofillBnplPrefEnabled() ||
+       !AreBnplIssuersSupported()) {
+     return {};
+@@ -899,6 +1006,9 @@
+ }
+ 
+ bool PaymentsDataManager::HasEwalletAccounts() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillPaymentMethodsEnabled()) {
+     return false;
+   }
+@@ -907,6 +1017,9 @@
+ 
+ base::span<const BankAccount> PaymentsDataManager::GetMaskedBankAccounts()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!HasMaskedBankAccounts()) {
+     return {};
+   }
+@@ -914,6 +1027,9 @@
+ }
+ 
+ base::span<const Ewallet> PaymentsDataManager::GetEwalletAccounts() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!HasEwalletAccounts()) {
+     return {};
+   }
+@@ -922,6 +1038,9 @@
+ 
+ base::span<const Ewallet> PaymentsDataManager::GetEwalletCreationOptions()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillPaymentMethodsEnabled() ||
+       !AreEwalletCreationOptionsSupported()) {
+     return {};
+@@ -930,11 +1049,17 @@
+ }
+ 
+ PaymentsCustomerData* PaymentsDataManager::GetPaymentsCustomerData() const {
++  if (no_capture_) {
++    return {};
++  }
+   return payments_customer_data_ ? payments_customer_data_.get() : nullptr;
+ }
+ 
+ std::vector<CreditCardCloudTokenData*>
+ PaymentsDataManager::GetCreditCardCloudTokenData() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled()) {
+     return {};
+   }
+@@ -948,6 +1073,9 @@
+ 
+ std::vector<const AutofillOfferData*> PaymentsDataManager::GetAutofillOffers()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled() || !IsAutofillPaymentMethodsEnabled()) {
+     return {};
+   }
+@@ -960,6 +1088,9 @@
+ std::vector<const AutofillOfferData*>
+ PaymentsDataManager::GetActiveAutofillPromoCodeOffersForOrigin(
+     GURL origin) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled() || !IsAutofillPaymentMethodsEnabled()) {
+     return {};
+   }
+@@ -987,6 +1118,9 @@
+   return promo_code_offers_for_origin;
+ }
+ GURL PaymentsDataManager::GetCardArtURL(const CreditCard& credit_card) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (credit_card.card_art_url().is_valid()) {
+     return credit_card.card_art_url();
+   }
+@@ -1004,6 +1138,9 @@
+ 
+ const gfx::Image* PaymentsDataManager::GetCreditCardArtImageForUrl(
+     const GURL& card_art_url) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!card_art_url.is_valid()) {
+     return nullptr;
+   }
+@@ -1025,6 +1162,9 @@
+ 
+ const gfx::Image* PaymentsDataManager::GetCachedCardArtImageForUrl(
+     const GURL& card_art_url) const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled()) {
+     return nullptr;
+   }
+@@ -1040,6 +1180,9 @@
+ 
+ base::span<const BnplIssuer> PaymentsDataManager::GetUnlinkedBnplIssuers()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillPaymentMethodsEnabled() || !IsAutofillBnplPrefEnabled() ||
+       !AreBnplIssuersSupported()) {
+     return {};
+@@ -1048,6 +1191,9 @@
+ }
+ 
+ std::vector<BnplIssuer> PaymentsDataManager::GetBnplIssuers() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillPaymentMethodsEnabled() || !IsAutofillBnplPrefEnabled() ||
+       !AreBnplIssuersSupported()) {
+     return {};
+@@ -1061,6 +1207,9 @@
+ }
+ 
+ void PaymentsDataManager::SetPrefService(PrefService* pref_service) {
++  if (no_capture_) {
++    return;
++  }
+   pref_registrar_.Reset();
+   pref_service_ = pref_service;
+   // `pref_service_` can be nullptr in tests.
+@@ -1083,6 +1232,9 @@
+ }
+ 
+ bool PaymentsDataManager::IsAutofillBnplPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsAutofillBnplEnabled(pref_service_);
+ }
+ 
+@@ -1096,6 +1248,9 @@
+ 
+ bool PaymentsDataManager::IsCardEligibleForBenefits(
+     const CreditCard& card) const {
++  if (no_capture_) {
++    return {};
++  }
+ #if !BUILDFLAG(IS_IOS)
+   const std::string& benefit_source = card.benefit_source();
+   // Benefits sourced from American Express of Bank of Montreal are always
+@@ -1137,21 +1292,33 @@
+ }
+ 
+ bool PaymentsDataManager::ShouldBlockCardBenefitSuggestionLabels() const {
++  if (no_capture_) {
++    return {};
++  }
+   // Benefits are only supported for app locale set to U.S. English or Great
+   // Britain English.
+   return app_locale_ != "en-US" && app_locale_ != "en-GB";
+ }
+ 
+ bool PaymentsDataManager::IsCardBenefitsPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsPaymentCardBenefitsEnabled(pref_service_);
+ }
+ 
+ bool PaymentsDataManager::IsCardBenefitsSyncEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return base::FeatureList::IsEnabled(
+       features::kAutofillEnableCardBenefitsSync);
+ }
+ 
+ bool PaymentsDataManager::IsAutofillPaymentMethodsEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!pref_service_) {
+     return false;
+   }
+@@ -1161,23 +1328,38 @@
+ }
+ 
+ bool PaymentsDataManager::IsAutofillHasSeenIbanPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::HasSeenIban(pref_service_);
+ }
+ 
+ void PaymentsDataManager::SetAutofillHasSeenIban() {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetAutofillHasSeenIban(pref_service_);
+ }
+ 
+ bool PaymentsDataManager::IsAutofillHasSeenBnplPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::HasSeenBnpl(pref_service_);
+ }
+ 
+ void PaymentsDataManager::SetAutofillHasSeenBnpl() {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetAutofillHasSeenBnpl(pref_service_);
+ }
+ 
+ bool PaymentsDataManager::IsAutofillAmountExtractionAiTermsSeenPrefEnabled()
+     const {
++  if (no_capture_) {
++    return {};
++  }
+   // The testing flag acts as a testing override to force the "AI terms not
+   // seen" flow.
+   if (base::FeatureList::IsEnabled(
+@@ -1192,6 +1374,9 @@
+ }
+ 
+ void PaymentsDataManager::SetAutofillAmountExtractionAiTermsSeen() {
++  if (no_capture_) {
++    return;
++  }
+   if (base::FeatureList::IsEnabled(
+           features::kAutofillEnableAiBasedAmountExtraction)) {
+     prefs::SetAutofillAmountExtractionAiTermsSeen(pref_service_);
+@@ -1199,6 +1384,9 @@
+ }
+ 
+ bool PaymentsDataManager::IsAutofillWalletImportEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (is_syncing_for_test_) {
+     return true;
+   }
+@@ -1214,6 +1402,9 @@
+ }
+ 
+ bool PaymentsDataManager::IsPaymentsWalletSyncTransportEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!sync_service_ || !identity_manager_ ||
+       sync_service_->GetAccountInfo().IsEmpty() ||
+       sync_service_->GetTransportState() ==
+@@ -1228,6 +1419,9 @@
+ }
+ 
+ bool PaymentsDataManager::IsPaymentsDownloadActive() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!sync_service_ || !identity_manager_ ||
+       sync_service_->GetAccountInfo().IsEmpty() ||
+       sync_service_->GetTransportState() ==
+@@ -1243,6 +1437,9 @@
+ 
+ AutofillMetrics::PaymentsSigninState
+ PaymentsDataManager::GetPaymentsSigninStateForMetrics() const {
++  if (no_capture_) {
++    return {};
++  }
+   using PaymentsSigninState = AutofillMetrics::PaymentsSigninState;
+ 
+   // Check if the user is signed out.
+@@ -1273,6 +1470,9 @@
+ 
+ bool PaymentsDataManager::IsCardPresentAsBothLocalAndServerCards(
+     const CreditCard& credit_card) {
++  if (no_capture_) {
++    return {};
++  }
+   for (const CreditCard* card_from_list : GetCreditCards()) {
+     if (credit_card.IsLocalOrServerDuplicateOf(*card_from_list)) {
+       return true;
+@@ -1283,6 +1483,9 @@
+ 
+ const CreditCard* PaymentsDataManager::GetServerCardForLocalCard(
+     const CreditCard* local_card) const {
++  if (no_capture_) {
++    return {};
++  }
+   DCHECK(local_card);
+   if (local_card->record_type() != CreditCard::RecordType::kLocalCard) {
+     return nullptr;
+@@ -1298,11 +1501,17 @@
+ 
+ std::string PaymentsDataManager::OnAcceptedLocalCreditCardSave(
+     const CreditCard& imported_card) {
++  if (no_capture_) {
++    return {};
++  }
+   DCHECK(!imported_card.number().empty());
+   return SaveImportedCreditCard(imported_card);
+ }
+ 
+ std::string PaymentsDataManager::OnAcceptedLocalIbanSave(Iban imported_iban) {
++  if (no_capture_) {
++    return {};
++  }
+   DCHECK(!imported_iban.value().empty());
+   // If an existing IBAN is found, call `UpdateIban()`, otherwise,
+   // `AddAsLocalIban()`. `local_ibans_` will be in sync with the local web
+@@ -1321,6 +1530,9 @@
+ }
+ 
+ bool PaymentsDataManager::IsKnownCard(const CreditCard& credit_card) const {
++  if (no_capture_) {
++    return {};
++  }
+   const auto stripped_pan =
+       StripSeparatorsAndNormalizeDigits(credit_card.number());
+   for (const auto& card : local_credit_cards_) {
+@@ -1340,6 +1552,9 @@
+ }
+ 
+ bool PaymentsDataManager::IsServerCard(const CreditCard* credit_card) const {
++  if (no_capture_) {
++    return {};
++  }
+   // Check whether the current card itself is a server card.
+   if (credit_card->record_type() != CreditCard::RecordType::kLocalCard) {
+     return true;
+@@ -1355,6 +1570,9 @@
+ }
+ 
+ void PaymentsDataManager::OnUserAcceptedUpstreamOffer() {
++  if (no_capture_) {
++    return;
++  }
+   // If the user is in sync transport mode for Wallet, record an opt-in.
+   if (IsPaymentsWalletSyncTransportEnabled()) {
+     SetUserOptedInWalletSyncTransport(
+@@ -1365,14 +1583,23 @@
+ 
+ void PaymentsDataManager::SetPaymentMethodsMandatoryReauthEnabled(
+     bool enabled) {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetPaymentMethodsMandatoryReauthEnabled(pref_service_, enabled);
+ }
+ 
+ bool PaymentsDataManager::IsPaymentMethodsMandatoryReauthEnabled() {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsPaymentMethodsMandatoryReauthEnabled(pref_service_);
+ }
+ 
+ bool PaymentsDataManager::ShouldShowPaymentMethodsMandatoryReauthPromo() {
++  if (no_capture_) {
++    return {};
++  }
+ #if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID) || \
+     BUILDFLAG(IS_CHROMEOS)
+   // There is no need to show the promo if the feature is already enabled.
+@@ -1422,15 +1649,24 @@
+ }
+ 
+ bool PaymentsDataManager::IsPaymentCvcStorageEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsPaymentCvcStorageEnabled(pref_service_);
+ }
+ 
+ void PaymentsDataManager::SetPaymentsCvcStorageEnabled(bool enabled) {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetPaymentCvcStorage(pref_service_, enabled);
+ }
+ 
+ base::span<const VirtualCardUsageData>
+ PaymentsDataManager::GetVirtualCardUsageData() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled() || !IsAutofillPaymentMethodsEnabled()) {
+     return {};
+   }
+@@ -1438,6 +1674,9 @@
+ }
+ 
+ std::string PaymentsDataManager::AddAsLocalIban(Iban iban) {
++  if (no_capture_) {
++    return {};
++  }
+   CHECK_EQ(iban.record_type(), Iban::kUnknown);
+   // IBAN shares the same pref with payment methods enablement toggle.
+   if (!IsAutofillPaymentMethodsEnabled()) {
+@@ -1480,6 +1719,9 @@
+ }
+ 
+ std::string PaymentsDataManager::UpdateIban(const Iban& iban) {
++  if (no_capture_) {
++    return {};
++  }
+   if (!GetLocalDatabase()) {
+     return std::string();
+   }
+@@ -1493,6 +1735,10 @@
+ }
+ 
+ void PaymentsDataManager::AddCreditCard(const CreditCard& credit_card) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   if (!IsAutofillPaymentMethodsEnabled()) {
+     return;
+   }
+@@ -1525,6 +1771,10 @@
+ 
+ void PaymentsDataManager::DeleteLocalCreditCards(
+     const std::vector<CreditCard>& cards) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   DCHECK(database_helper_);
+   DCHECK(GetLocalDatabase()) << "Use of local card without local storage.";
+ 
+@@ -1539,6 +1789,10 @@
+ }
+ 
+ void PaymentsDataManager::DeleteAllLocalCreditCards() {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   std::vector<CreditCard> cards_to_delete;
+   cards_to_delete.reserve(local_credit_cards_.size());
+   for (const CreditCard* card : GetLocalCreditCards()) {
+@@ -1548,10 +1802,17 @@
+ }
+ 
+ bool PaymentsDataManager::HasAllLocalCreditCards() const {
++  if (no_capture_) {
++    return {};
++  }
+   return server_credit_cards_.empty();
+ }
+ 
+ void PaymentsDataManager::UpdateCreditCard(const CreditCard& credit_card) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   DCHECK_EQ(CreditCard::RecordType::kLocalCard, credit_card.record_type());
+   CreditCard* existing_credit_card =
+       GetMutableCreditCardByGUID(credit_card.guid());
+@@ -1586,6 +1847,9 @@
+ 
+ void PaymentsDataManager::UpdateLocalCvc(const std::string& guid,
+                                          const std::u16string& cvc) {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetLocalDatabase()) {
+     return;
+   }
+@@ -1601,6 +1865,9 @@
+ 
+ void PaymentsDataManager::UpdateServerCardsMetadata(
+     const std::vector<CreditCard>& credit_cards) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK(GetServerDatabase())
+       << "Updating server card metadata without server storage.";
+ 
+@@ -1614,6 +1881,9 @@
+ 
+ void PaymentsDataManager::AddServerCvc(int64_t instrument_id,
+                                        const std::u16string& cvc) {
++  if (no_capture_) {
++    return;
++  }
+   // We don't check the validity of the instrument_id.
+   // When a user saves a new card along with the CVC, we first save the card and
+   // wait for the instrument id passed back from the UploadResponse. Then this
+@@ -1633,6 +1903,9 @@
+ 
+ void PaymentsDataManager::UpdateServerCvc(int64_t instrument_id,
+                                           const std::u16string& cvc) {
++  if (no_capture_) {
++    return;
++  }
+   CHECK(GetCreditCardByInstrumentId(instrument_id));
+   CHECK(!cvc.empty());
+   CHECK(GetServerDatabase()) << "Updating Server cvc without server storage.";
+@@ -1645,6 +1918,9 @@
+ }
+ 
+ void PaymentsDataManager::RemoveServerCvc(int64_t instrument_id) {
++  if (no_capture_) {
++    return;
++  }
+   // We don't check the validity of the instrument_id.
+   // This is only called in cvc sync bridge's ApplyIncrementalSyncChanges()
+   // call. If the card sync finishes before cvc sync, the card is gone before
+@@ -1659,6 +1935,9 @@
+ }
+ 
+ void PaymentsDataManager::ClearServerCvcs() {
++  if (no_capture_) {
++    return;
++  }
+   CHECK(GetServerDatabase()) << "Removing Server cvc without server storage.";
+ 
+   // Clear the server cvc in the web database.
+@@ -1669,6 +1948,9 @@
+ }
+ 
+ void PaymentsDataManager::ClearLocalCvcs() {
++  if (no_capture_) {
++    return;
++  }
+   CHECK(GetLocalDatabase()) << "Removing Local cvcs without local storage.";
+ 
+   // Clear the local CVCs in the web database.
+@@ -1680,6 +1962,9 @@
+ 
+ #if BUILDFLAG(IS_IOS)
+ void PaymentsDataManager::CleanupForCrbug445879524() {
++  if (no_capture_) {
++    return;
++  }
+   if (!GetLocalDatabase()) {
+     return;
+   }
+@@ -1692,6 +1977,9 @@
+ #endif  // BUILDFLAG(IS_IOS)
+ 
+ void PaymentsDataManager::ClearAllServerDataForTesting() {
++  if (no_capture_) {
++    return;
++  }
+   // This could theoretically be called before we get the data back from the
+   // database on startup, and it could get called when the wallet pref is
+   // off (meaning this class won't even query for the server data) so don't
+@@ -1722,6 +2010,9 @@
+ 
+ bool PaymentsDataManager::SaveCardLocallyIfNew(
+     const CreditCard& imported_card) {
++  if (no_capture_) {
++    return {};
++  }
+   CHECK(!imported_card.number().empty());
+ 
+   for (auto& card : local_credit_cards_) {
+@@ -1739,6 +2030,10 @@
+ }
+ 
+ void PaymentsDataManager::RemoveByGUID(const std::string& guid) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   if (!GetLocalDatabase()) {
+     return;
+   }
+@@ -1756,6 +2051,10 @@
+ 
+ void PaymentsDataManager::RemoveLocalDataModifiedBetween(base::Time begin,
+                                                          base::Time end) {
++  if (no_capture_) {
++    NotifyObservers();
++    return;
++  }
+   if (end.is_null()) {
+     end = base::Time::Max();
+   }
+@@ -1771,6 +2070,9 @@
+ }
+ 
+ void PaymentsDataManager::RecordUseOfCard(const CreditCard& card) {
++  if (no_capture_) {
++    return;
++  }
+   CreditCard* credit_card = GetMutableCreditCardByGUID(card.guid());
+ 
+   // This early return is necessary because this is called at filling time,
+@@ -1798,6 +2100,9 @@
+ }
+ 
+ void PaymentsDataManager::RecordUseOfIban(Iban& iban) {
++  if (no_capture_) {
++    return;
++  }
+   iban.RecordAndLogUse();
+ 
+   if (iban.record_type() == Iban::RecordType::kServerIban) {
+@@ -1818,16 +2123,28 @@
+ // database stores local data as well as server data that is persisted across
+ // restarts, such as Wallet direct offers written by the `ValuableSyncBridge`.
+ scoped_refptr<AutofillWebDataService> PaymentsDataManager::GetLocalDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return database_helper_->GetLocalDatabase();
+ }
+ scoped_refptr<AutofillWebDataService> PaymentsDataManager::GetServerDatabase() {
++  if (no_capture_) {
++    return {};
++  }
+   return database_helper_->GetServerDatabase();
+ }
+ bool PaymentsDataManager::IsUsingAccountStorageForServerDataForTest() {
++  if (no_capture_) {
++    return {};
++  }
+   return database_helper_->IsUsingAccountStorageForServerData();
+ }
+ 
+ void PaymentsDataManager::CancelPendingServerQueries() {
++  if (no_capture_) {
++    return;
++  }
+   CancelPendingServerQuery(&pending_server_creditcards_query_);
+   CancelPendingServerQuery(&pending_customer_data_query_);
+   CancelPendingServerQuery(&pending_server_creditcard_cloud_token_data_query_);
+@@ -1844,6 +2161,9 @@
+ }
+ 
+ bool PaymentsDataManager::ShouldSuggestServerPaymentMethods() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!IsAutofillWalletImportEnabled()) {
+     return false;
+   }
+@@ -1860,6 +2180,10 @@
+ 
+ void PaymentsDataManager::AddCallbackAfterRefreshCompleted(
+     base::OnceClosure callback) {
++  if (no_capture_) {
++    std::move(callback).Run();
++    return;
++  }
+   if (!HasPendingPaymentQueries()) {
+     std::move(callback).Run();
+     return;
+@@ -1873,6 +2197,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadCreditCards() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetLocalDatabase()) {
+     NOTREACHED();
+   }
+@@ -1893,6 +2220,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadCreditCardCloudTokenData() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -1906,6 +2236,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadIbans() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetLocalDatabase()) {
+     NOTREACHED();
+   }
+@@ -1925,6 +2258,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadMaskedBankAccounts() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -1938,6 +2274,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadPaymentInstruments() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -1951,6 +2290,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadAutofillOffers() {
++  if (no_capture_) {
++    return;
++  }
+   // Offers are Wallet direct offers, which are synced through the
+   // `AUTOFILL_VALUABLE` data type. Its `ValuableSyncBridge` is attached to the
+   // profile (local) database in both full sync and transport mode, so the
+@@ -1970,6 +2312,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadVirtualCardUsageData() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -1983,6 +2328,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadCreditCardBenefits() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -1996,6 +2344,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadPaymentInstrumentCreationOptions() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -2011,6 +2362,9 @@
+ 
+ void PaymentsDataManager::CancelPendingLocalQuery(
+     WebDataServiceBase::Handle* handle) {
++  if (no_capture_) {
++    return;
++  }
+   if (*handle) {
+     if (!database_helper_->GetLocalDatabase()) {
+       NOTREACHED();
+@@ -2022,6 +2376,9 @@
+ 
+ void PaymentsDataManager::CancelPendingServerQuery(
+     WebDataServiceBase::Handle* handle) {
++  if (no_capture_) {
++    return;
++  }
+   if (*handle) {
+     if (!database_helper_->GetServerDatabase()) {
+       NOTREACHED();
+@@ -2032,6 +2389,9 @@
+ }
+ 
+ void PaymentsDataManager::LoadPaymentsCustomerData() {
++  if (no_capture_) {
++    return;
++  }
+   if (!database_helper_->GetServerDatabase()) {
+     return;
+   }
+@@ -2045,6 +2405,9 @@
+ }
+ 
+ void PaymentsDataManager::LogStoredPaymentsDataMetrics() const {
++  if (no_capture_) {
++    return;
++  }
+   AutofillMetrics::LogStoredCreditCardMetrics(
+       local_credit_cards_, server_credit_cards_,
+       GetServerCardWithArtImageCount(), kDisusedDataModelTimeDelta);
+@@ -2056,16 +2419,25 @@
+ }
+ 
+ void PaymentsDataManager::LogServerCardLinkClicked() const {
++  if (no_capture_) {
++    return;
++  }
+   AutofillMetrics::LogServerCardLinkClicked(GetPaymentsSigninStateForMetrics());
+ }
+ 
+ void PaymentsDataManager::LogServerIbanLinkClicked() const {
++  if (no_capture_) {
++    return;
++  }
+   autofill_metrics::LogServerIbanLinkClicked(
+       GetPaymentsSigninStateForMetrics());
+ }
+ 
+ const std::string& PaymentsDataManager::GetCountryCodeForExperimentGroup()
+     const {
++  if (no_capture_) {
++    return experiment_country_code_;
++  }
+   // Set to |variations_country_code_| if it exists.
+   if (experiment_country_code_.empty()) {
+     experiment_country_code_ = variations_country_code_.value();
+@@ -2088,6 +2460,9 @@
+ 
+ void PaymentsDataManager::SetSyncServiceForTest(
+     syncer::SyncService* sync_service) {
++  if (no_capture_) {
++    return;
++  }
+   sync_service_ = sync_service;
+   sync_observer_.Reset();
+   if (sync_service_) {
+@@ -2098,33 +2473,54 @@
+ 
+ void PaymentsDataManager::AddMaskedBankAccountForTest(
+     const BankAccount& bank_account) {
++  if (no_capture_) {
++    return;
++  }
+   masked_bank_accounts_.push_back(bank_account);
+ }
+ 
+ void PaymentsDataManager::AddEwalletForTest(const Ewallet& ewallet) {
++  if (no_capture_) {
++    return;
++  }
+   ewallet_accounts_.push_back(ewallet);
+ }
+ 
+ void PaymentsDataManager::AddEwalletCreationOptionForTest(Ewallet ewallet) {
++  if (no_capture_) {
++    return;
++  }
+   ewallet_creation_options_.push_back(std::move(ewallet));
+ }
+ 
+ void PaymentsDataManager::AddServerCreditCardForTest(
+     std::unique_ptr<CreditCard> credit_card) {
++  if (no_capture_) {
++    return;
++  }
+   server_credit_cards_.push_back(std::move(credit_card));
+ }
+ 
+ void PaymentsDataManager::AddCreditCardBenefitForTest(
+     CreditCardBenefit benefit) {
++  if (no_capture_) {
++    return;
++  }
+   credit_card_benefits_.push_back(std::move(benefit));
+ }
+ 
+ bool PaymentsDataManager::IsFacilitatedPaymentsPixUserPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsFacilitatedPaymentsPixEnabled(pref_service_);
+ }
+ 
+ void PaymentsDataManager::SetFacilitatedPaymentsPixAccountLinkingUserPref(
+     bool enabled) {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetFacilitatedPaymentsPixAccountLinking(pref_service_, enabled);
+ }
+ 
+@@ -2134,11 +2530,17 @@
+ }
+ 
+ bool PaymentsDataManager::IsFacilitatedPaymentsEwalletUserPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsFacilitatedPaymentsEwalletEnabled(pref_service_);
+ }
+ 
+ void PaymentsDataManager::SetFacilitatedPaymentsEwalletAccountLinkingUserPref(
+     bool enabled) {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetFacilitatedPaymentsEwalletAccountLinking(pref_service_, enabled);
+ }
+ 
+@@ -2149,14 +2551,23 @@
+ }
+ 
+ bool PaymentsDataManager::IsFacilitatedPaymentsA2AUserPrefEnabled() const {
++  if (no_capture_) {
++    return {};
++  }
+   return prefs::IsFacilitatedPaymentsA2AEnabled(pref_service_);
+ }
+ 
+ void PaymentsDataManager::SetFacilitatedPaymentsA2ATriggeredOnce(bool enabled) {
++  if (no_capture_) {
++    return;
++  }
+   prefs::SetFacilitatedPaymentsA2ATriggeredOnce(pref_service_, enabled);
+ }
+ 
+ bool PaymentsDataManager::HasPendingPaymentQueries() const {
++  if (no_capture_) {
++    return {};
++  }
+   return pending_creditcards_query_ != 0 ||
+          pending_server_creditcards_query_ != 0 ||
+          pending_server_creditcard_cloud_token_data_query_ != 0 ||
+@@ -2172,6 +2583,9 @@
+ }
+ 
+ bool PaymentsDataManager::AreBankAccountsSupported() const {
++  if (no_capture_) {
++    return {};
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   return true;
+ #else
+@@ -2180,6 +2594,9 @@
+ }
+ 
+ bool PaymentsDataManager::AreEwalletAccountsSupported() const {
++  if (no_capture_) {
++    return {};
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   return base::FeatureList::IsEnabled(features::kAutofillSyncEwalletAccounts);
+ #else
+@@ -2188,6 +2605,9 @@
+ }
+ 
+ bool PaymentsDataManager::AreEwalletCreationOptionsSupported() const {
++  if (no_capture_) {
++    return {};
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   return base::FeatureList::IsEnabled(
+       ::payments::facilitated::kEnableEwalletNewAccountLinking);
+@@ -2197,6 +2617,9 @@
+ }
+ 
+ bool PaymentsDataManager::AreBnplIssuersSupported() const {
++  if (no_capture_) {
++    return {};
++  }
+   if (!base::FeatureList::IsEnabled(
+           features::kAutofillEnableBuyNowPayLaterSyncing)) {
+     return false;
+@@ -2216,28 +2639,43 @@
+ }
+ 
+ bool PaymentsDataManager::ArePaymentInstrumentsSupported() const {
++  if (no_capture_) {
++    return {};
++  }
+   // Currently only eWallet accounts and linked BNPL issuers are using generic
+   // payment instrument proto for read from table.
+   return AreEwalletAccountsSupported() || AreBnplIssuersSupported();
+ }
+ 
+ bool PaymentsDataManager::ArePaymentInstrumentCreationOptionsSupported() const {
++  if (no_capture_) {
++    return {};
++  }
+   // Currently only BNPL issuers and eWallet creation options are using the
+   // payment instrument creation option proto for read from table.
+   return AreBnplIssuersSupported() || AreEwalletCreationOptionsSupported();
+ }
+ 
+ void PaymentsDataManager::OnAutofillPaymentsCardBenefitsPrefChange() {
++  if (no_capture_) {
++    return;
++  }
+   prefs::IsPaymentCardBenefitsEnabled(pref_service_)
+       ? LoadCreditCardBenefits()
+       : ClearAllCreditCardBenefits();
+ }
+ 
+ void PaymentsDataManager::ClearAllCreditCardBenefits() {
++  if (no_capture_) {
++    return;
++  }
+   credit_card_benefits_.clear();
+ }
+ 
+ void PaymentsDataManager::OnBnplEnabledPrefChange() {
++  if (no_capture_) {
++    return;
++  }
+   // On pref change to `false`, clearing BNPL issuers is implicitly handled by
+   // `GetBnplIssuers()`, since it returns an empty vector when
+   // `IsAutofillBnplPrefEnabled()` is `false`. We still need to load payment
+@@ -2253,6 +2691,9 @@
+ }
+ 
+ void PaymentsDataManager::ProcessCardArtUrlChanges() {
++  if (no_capture_) {
++    return;
++  }
+   if (!image_fetcher_) {
+     return;
+   }
+@@ -2271,10 +2712,16 @@
+ }
+ 
+ void PaymentsDataManager::OnServerCreditCardsRefreshed() {
++  if (no_capture_) {
++    return;
++  }
+   ProcessCardArtUrlChanges();
+ }
+ 
+ size_t PaymentsDataManager::GetServerCardWithArtImageCount() const {
++  if (no_capture_) {
++    return {};
++  }
+   return std::ranges::count_if(
+       server_credit_cards_.begin(), server_credit_cards_.end(),
+       [](const auto& card) { return card->card_art_url().is_valid(); });
+@@ -2282,6 +2729,9 @@
+ 
+ std::string PaymentsDataManager::SaveImportedCreditCard(
+     const CreditCard& imported_card) {
++  if (no_capture_) {
++    return {};
++  }
+   // Potentially merge the card with an existing card.
+   for (std::unique_ptr<CreditCard>& card : local_credit_cards_) {
+     if (card->UpdateFromImportedCard(imported_card, app_locale_)) {
+@@ -2297,6 +2747,9 @@
+ }
+ 
+ void PaymentsDataManager::OnMaskedBankAccountsRefreshed() {
++  if (no_capture_) {
++    return;
++  }
+   std::vector<GURL> updated_urls;
+   for (const BankAccount& bank_account : masked_bank_accounts_) {
+     const GURL& display_icon_url =
+@@ -2313,6 +2766,9 @@
+ 
+ void PaymentsDataManager::OnPaymentInstrumentsRefreshed(
+     const std::vector<sync_pb::PaymentInstrument>& payment_instruments) {
++  if (no_capture_) {
++    return;
++  }
+   if (!image_fetcher_) {
+     return;
+   }
+@@ -2339,6 +2795,9 @@
+ 
+ void PaymentsDataManager::CacheIfLinkedBnplPaymentInstrument(
+     sync_pb::PaymentInstrument& payment_instrument) {
++  if (no_capture_) {
++    return;
++  }
+   if (!payment_instrument.has_bnpl_issuer_details()) {
+     return;
+   }
+@@ -2420,6 +2879,9 @@
+ 
+ void PaymentsDataManager::CacheIfEwalletPaymentInstrument(
+     sync_pb::PaymentInstrument& payment_instrument) {
++  if (no_capture_) {
++    return;
++  }
+   if (!payment_instrument.has_ewallet_details()) {
+     return;
+   }
+@@ -2442,6 +2904,9 @@
+ void PaymentsDataManager::OnPaymentInstrumentCreationOptionsRefreshed(
+     const std::vector<sync_pb::PaymentInstrumentCreationOption>&
+         payment_instrument_creation_options) {
++  if (no_capture_) {
++    return;
++  }
+   // Clear all payment instrument creation options.
+   unlinked_bnpl_issuers_.clear();
+   ewallet_creation_options_.clear();
+@@ -2462,6 +2927,9 @@
+ void PaymentsDataManager::CacheIfBnplPaymentInstrumentCreationOption(
+     const sync_pb::PaymentInstrumentCreationOption&
+         payment_instrument_creation_option) {
++  if (no_capture_) {
++    return;
++  }
+   if (!payment_instrument_creation_option.has_buy_now_pay_later_option()) {
+     return;
+   }
+@@ -2518,6 +2986,9 @@
+ void PaymentsDataManager::CacheIfEwalletCreationOption(
+     const sync_pb::PaymentInstrumentCreationOption&
+         payment_instrument_creation_option) {
++  if (no_capture_) {
++    return;
++  }
+   if (!payment_instrument_creation_option.has_ewallet_creation_option()) {
+     return;
+   }
+@@ -2553,6 +3024,9 @@
+ bool PaymentsDataManager::HasEligibleCurrencyPriceRangeForBnplIssuer(
+     const std::vector<BnplIssuer::EligiblePriceRange>& eligible_price_ranges,
+     const std::string& currency_code) const {
++  if (no_capture_) {
++    return {};
++  }
+   return std::any_of(
+       eligible_price_ranges.begin(), eligible_price_ranges.end(),
+       [&currency_code](
+--- a/components/autofill/core/browser/data_manager/personal_data_manager.h
++++ b/components/autofill/core/browser/data_manager/personal_data_manager.h
+@@ -14,6 +14,7 @@
+ #include "base/observer_list.h"
+ #include "base/scoped_observation.h"
+ #include "components/autofill/core/browser/data_manager/addresses/address_data_manager.h"
++#include "components/autofill/core/browser/data_manager/no_capture.h"
+ #include "components/autofill/core/browser/data_manager/payments/payments_data_manager.h"
+ #include "components/autofill/core/browser/webdata/autofill_webdata_service.h"
+ #include "components/history/core/browser/history_service_observer.h"
+@@ -74,6 +75,8 @@
+                             public AddressDataManager::Observer,
+                             public PaymentsDataManager::Observer {
+  public:
++  explicit PersonalDataManager(NoCapture);
++
+   // Initializes the `address_data_manager_` and `payments_data_manager_` with
+   // the provided services and triggers asynchronous loading of address and
+   // payments data.
+@@ -107,6 +110,8 @@
+   const PaymentsDataManager& payments_data_manager() const {
+     return *payments_data_manager_;
+   }
++
++  bool IsStoreless() const { return no_capture_; }
+ 
+   // KeyedService:
+   void Shutdown() override;
+@@ -172,6 +177,8 @@
+ 
+   bool has_initial_load_finished_ = false;
+ 
++  const bool no_capture_ = false;
++
+   base::WeakPtrFactory<PersonalDataManager> weak_factory_{this};
+ };
+ 
+--- a/components/autofill/core/browser/data_manager/personal_data_manager.cc
++++ b/components/autofill/core/browser/data_manager/personal_data_manager.cc
+@@ -68,6 +68,14 @@
+   }
+ }
+ 
++PersonalDataManager::PersonalDataManager(NoCapture) : no_capture_(true) {
++  address_data_manager_ = std::make_unique<AddressDataManager>(NoCapture{});
++  payments_data_manager_ = std::make_unique<PaymentsDataManager>(NoCapture{});
++  address_data_manager_observation_.Observe(address_data_manager_.get());
++  payments_data_manager_observation_.Observe(payments_data_manager_.get());
++  has_initial_load_finished_ = true;
++}
++
+ PersonalDataManager::~PersonalDataManager() = default;
+ 
+ void PersonalDataManager::Shutdown() {
+@@ -87,6 +95,9 @@
+ void PersonalDataManager::OnHistoryDeletions(
+     history::HistoryService* /* history_service */,
+     const history::DeletionInfo& deletion_info) {
++  if (no_capture_) {
++    return;
++  }
+   if (!deletion_info.is_from_expiration() && deletion_info.IsAllHistory()) {
+     AutofillCrowdsourcingManager::ClearUploadHistory(pref_service_);
+   }
+@@ -104,6 +115,9 @@
+ 
+ void PersonalDataManager::SetSyncServiceForTest(
+     syncer::SyncService* sync_service) {
++  if (no_capture_) {
++    return;
++  }
+   address_data_manager_->SetSyncServiceForTest(sync_service);   // IN-TEST
+   payments_data_manager_->SetSyncServiceForTest(sync_service);  // IN-TEST
+ }
+@@ -113,6 +127,10 @@
+ }
+ 
+ void PersonalDataManager::Refresh() {
++  if (no_capture_) {
++    NotifyPersonalDataObserver();
++    return;
++  }
+   address_data_manager_->LoadProfiles();
+   payments_data_manager_->Refresh();
+ }
+--- a/components/autofill/core/browser/single_field_fillers/autocomplete/autocomplete_history_manager.h
++++ b/components/autofill/core/browser/single_field_fillers/autocomplete/autocomplete_history_manager.h
+@@ -12,6 +12,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "components/autofill/core/browser/data_manager/no_capture.h"
+ #include "components/autofill/core/browser/data_quality/addresses/profile_token_quality.h"
+ #include "components/autofill/core/browser/single_field_fillers/single_field_fill_router.h"
+ #include "components/autofill/core/browser/suggestions/autocomplete_suggestion_generator.h"
+@@ -33,6 +34,8 @@
+ // through WebDataServiceBase.
+ class AutocompleteHistoryManager : public KeyedService {
+  public:
++  explicit AutocompleteHistoryManager(NoCapture);
++
+   AutocompleteHistoryManager(
+       scoped_refptr<AutofillWebDataService> profile_database,
+       PrefService* pref_service);
+@@ -120,6 +123,8 @@
+   // The PrefService that this instance uses. Must outlive this instance.
+   const raw_ptr<PrefService> pref_service_;
+ 
++  const bool no_capture_ = false;
++
+   base::WeakPtrFactory<AutocompleteHistoryManager> weak_ptr_factory_{this};
+ };
+ 
+--- a/components/autofill/core/browser/single_field_fillers/autocomplete/autocomplete_history_manager.cc
++++ b/components/autofill/core/browser/single_field_fillers/autocomplete/autocomplete_history_manager.cc
+@@ -417,6 +417,9 @@
+   }
+ }
+ 
++AutocompleteHistoryManager::AutocompleteHistoryManager(NoCapture)
++    : profile_database_(nullptr), pref_service_(nullptr), no_capture_(true) {}
++
+ AutocompleteHistoryManager::~AutocompleteHistoryManager() = default;
+ 
+ void AutocompleteHistoryManager::OnGetSingleFieldSuggestions(
+@@ -427,6 +430,10 @@
+     AutofillClient& client,
+     SingleFieldFillRouter::OnSuggestionsReturnedCallback
+         on_suggestions_returned) {
++  if (no_capture_) {
++    std::move(on_suggestions_returned).Run(trigger_field.global_id(), {});
++    return;
++  }
+   // Cancel the pending query if there is one.
+   suggestion_generator_ = nullptr;
+   if (!profile_database_) {
+@@ -453,6 +460,9 @@
+ void AutocompleteHistoryManager::OnWillSubmitFormWithFields(
+     const std::vector<FormFieldData>& fields,
+     const FormStructure* form) {
++  if (no_capture_) {
++    return;
++  }
+   if (!pref_service_ || !prefs::IsAutocompleteEnabled(pref_service_)) {
+     return;
+   }
+@@ -469,6 +479,9 @@
+ }
+ 
+ void AutocompleteHistoryManager::CancelPendingQuery() {
++  if (no_capture_) {
++    return;
++  }
+   if (suggestion_generator_) {
+     suggestion_generator_->CancelPendingQuery();
+   }
+@@ -479,6 +492,9 @@
+     const std::u16string& field_label,
+     const std::u16string& value,
+     SuggestionType type) {
++  if (no_capture_) {
++    return;
++  }
+   if (profile_database_) {
+     profile_database_->RemoveFormValueForElementNameAndLabel(
+         field_name, field_label, value);
+@@ -487,6 +503,9 @@
+ 
+ void AutocompleteHistoryManager::OnSingleFieldSuggestionSelected(
+     const Suggestion& suggestion) {
++  if (no_capture_) {
++    return;
++  }
+   CHECK_EQ(suggestion.type, SuggestionType::kAutocompleteEntry);
+   if (base::FeatureList::IsEnabled(
+           features::kAutofillLabelSensitiveAutocomplete)) {
+@@ -545,6 +564,9 @@
+ void AutocompleteHistoryManager::OnAutofillCleanupReturned(
+     WebDataServiceBase::Handle current_handle,
+     std::unique_ptr<WDTypedResult> result) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK(result);
+   DCHECK_EQ(AUTOFILL_CLEANUP_RESULT, result->GetType());
+   if (!static_cast<const WDResult<bool>*>(result.get())->GetValue()) {
+@@ -560,6 +582,9 @@
+     int new_migration_generation,
+     WebDataServiceBase::Handle current_handle,
+     std::unique_ptr<WDTypedResult> migration_result) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK(migration_result);
+   DCHECK_EQ(BOOL_RESULT, migration_result->GetType());
+   const WDResult<bool>* bool_result =
+--- a/chrome/browser/autofill/personal_data_manager_factory.cc
++++ b/chrome/browser/autofill/personal_data_manager_factory.cc
+@@ -22,19 +22,6 @@
+ 
+ namespace autofill {
+ 
+-namespace {
+-
+-// Return the latest country code from the chrome variation service.
+-// If the variation service is not available, an empty string is returned.
+-const std::string GetCountryCodeFromVariations() {
+-  variations::VariationsService* variation_service =
+-      g_browser_process->variations_service();
+-  return variation_service
+-             ? base::ToUpperASCII(variation_service->GetLatestCountry())
+-             : std::string();
+-}
+-}  // namespace
+-
+ // static
+ PersonalDataManager* PersonalDataManagerFactory::GetForBrowserContext(
+     content::BrowserContext* context) {
+@@ -52,6 +39,7 @@
+     : ProfileKeyedServiceFactory(
+           "PersonalDataManager",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+@@ -59,50 +47,14 @@
+               // TODO(crbug.com/41488885): Check if this service is needed for
+               // Ash Internals.
+               .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+-              .Build()) {
+-  DependsOn(IdentityManagerFactory::GetInstance());
+-  DependsOn(HistoryServiceFactory::GetInstance());
+-  DependsOn(WebDataServiceFactory::GetInstance());
+-  DependsOn(StrikeDatabaseFactory::GetInstance());
+-  DependsOn(AutofillImageFetcherFactory::GetInstance());
+-  DependsOn(SyncServiceFactory::GetInstance());
+-  DependsOn(AutofillOptimizationGuideDeciderFactory::GetInstance());
+-}
++              .Build()) {}
+ 
+ PersonalDataManagerFactory::~PersonalDataManagerFactory() = default;
+ 
+ std::unique_ptr<KeyedService>
+ PersonalDataManagerFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+- Profile* profile = Profile::FromBrowserContext(context);
+-  // WebDataServiceFactory redirects to the original profile.
+-  auto local_storage = WebDataServiceFactory::GetAutofillWebDataForProfile(
+-      profile, ServiceAccessType::EXPLICIT_ACCESS);
+-  auto account_storage = WebDataServiceFactory::GetAutofillWebDataForAccount(
+-      profile, ServiceAccessType::EXPLICIT_ACCESS);
+-
+-  // The HistoryServiceFactory redirects to the original profile.
+-  auto* history_service = HistoryServiceFactory::GetForProfile(
+-      profile, ServiceAccessType::EXPLICIT_ACCESS);
+-
+-  auto* strike_database = StrikeDatabaseFactory::GetForProfile(profile);
+-
+-  // The AutofillImageFetcherFactory redirects to the original profile.
+-  auto* image_fetcher = AutofillImageFetcherFactory::GetForProfile(profile);
+-
+-  auto* identity_manager = IdentityManagerFactory::GetForProfile(profile);
+-
+-  auto* sync_service = SyncServiceFactory::GetForProfile(profile);
+-
+-  auto* autofill_optimization_guide_decider =
+-      AutofillOptimizationGuideDeciderFactory::GetForProfile(profile);
+-
+-  return std::make_unique<PersonalDataManager>(
+-      local_storage, account_storage, profile->GetPrefs(),
+-      g_browser_process->local_state(), identity_manager, history_service,
+-      sync_service, strike_database, image_fetcher,
+-      g_browser_process->GetApplicationLocale(), GetCountryCodeFromVariations(),
+-      autofill_optimization_guide_decider);
++  return std::make_unique<PersonalDataManager>(NoCapture{});
+ }
+ 
+ }  // namespace autofill
+--- a/chrome/browser/autofill/autocomplete_history_manager_factory.cc
++++ b/chrome/browser/autofill/autocomplete_history_manager_factory.cc
+@@ -30,6 +30,7 @@
+     : ProfileKeyedServiceFactory(
+           "AutocompleteHistoryManager",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+@@ -37,9 +38,7 @@
+               // TODO(crbug.com/41488885): Check if this service is needed for
+               // Ash Internals.
+               .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+-              .Build()) {
+-  DependsOn(WebDataServiceFactory::GetInstance());
+-}
++              .Build()) {}
+ 
+ AutocompleteHistoryManagerFactory::~AutocompleteHistoryManagerFactory() =
+     default;
+@@ -47,11 +46,7 @@
+ std::unique_ptr<KeyedService>
+ AutocompleteHistoryManagerFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  Profile* profile = Profile::FromBrowserContext(context);
+-  auto local_storage = WebDataServiceFactory::GetAutofillWebDataForProfile(
+-      profile, ServiceAccessType::EXPLICIT_ACCESS);
+-  return std::make_unique<AutocompleteHistoryManager>(local_storage,
+-                                                      profile->GetPrefs());
++  return std::make_unique<AutocompleteHistoryManager>(NoCapture{});
+ }
+ 
+ }  // namespace autofill
+--- a/chrome/browser/affiliations/affiliation_service_factory.cc
++++ b/chrome/browser/affiliations/affiliation_service_factory.cc
+@@ -75,6 +75,7 @@
+     : ProfileKeyedServiceFactory(
+           "AffiliationService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/41488885): Check if this service is needed for
+               // Ash Internals.
+--- a/chrome/browser/ui/autofill/chrome_autofill_client.cc
++++ b/chrome/browser/ui/autofill/chrome_autofill_client.cc
+@@ -25,6 +25,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/account_settings/account_setting_service_factory.h"
+ #include "chrome/browser/actor/actor_keyed_service.h"
+@@ -659,7 +660,10 @@
+ const signin::IdentityManager* ChromeAutofillClient::GetIdentityManager()
+     const {
+   Profile* profile = GetProfile();
+-  return IdentityManagerFactory::GetForProfile(profile->GetOriginalProfile());
++  return IdentityManagerFactory::GetForProfile(
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++          ? profile
++          : profile->GetOriginalProfile());
+ }
+ 
+ metrics::ProfileMetricsService*
+@@ -675,7 +679,9 @@
+   // to do per-profile feature checks.
+   Profile* profile = GetProfile();
+   return GoogleGroupsManagerFactory::GetForBrowserContext(
+-      profile->GetOriginalProfile());
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++          ? profile
++          : profile->GetOriginalProfile());
+ }
+ 
+ FormDataImporter* ChromeAutofillClient::GetFormDataImporter() {
+@@ -1026,6 +1032,11 @@
+ }
+ 
+ bool ChromeAutofillClient::IsAutofillEnabled() const {
++  const auto* data =
++      PersonalDataManagerFactory::GetForBrowserContext(GetProfile());
++  if (!data || data->IsStoreless()) {
++    return false;
++  }
+   if (IsAutofillProfileEnabled() || AutofillClient::GetPaymentsAutofillClient()
+                                         ->IsAutofillPaymentMethodsEnabled()) {
+     return true;
+@@ -1046,6 +1057,11 @@
+ }
+ 
+ bool ChromeAutofillClient::IsAutofillProfileEnabled() const {
++  const auto* data =
++      PersonalDataManagerFactory::GetForBrowserContext(GetProfile());
++  if (!data || data->IsStoreless()) {
++    return false;
++  }
+   if (!prefs::IsAutofillProfileEnabled(GetPrefs())) {
+     return false;
+   }
+--- a/chrome/browser/ui/autofill/BUILD.gn
++++ b/chrome/browser/ui/autofill/BUILD.gn
+@@ -190,6 +190,7 @@
+   public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     ":autofill",
+     ":autofill_ai_ui_utils_impl",
+     "//chrome/browser:browser_process",
+--- a/chrome/browser/ui/autofill/payments/chrome_payments_autofill_client.cc
++++ b/chrome/browser/ui/autofill/payments/chrome_payments_autofill_client.cc
+@@ -866,6 +866,9 @@
+ }
+ 
+ bool ChromePaymentsAutofillClient::IsAutofillPaymentMethodsEnabled() const {
++  if (client_->GetPersonalDataManager().IsStoreless()) {
++    return false;
++  }
+   if (!autofill_payment_methods_supported_ ||
+       !prefs::IsAutofillPaymentMethodsEnabled(
+           Profile::FromBrowserContext(web_contents()->GetBrowserContext())
+--- a/components/autofill/core/browser/BUILD.gn
++++ b/components/autofill/core/browser/BUILD.gn
+@@ -568,6 +568,7 @@
+     "data_manager/payments/payments_data_manager.cc",
+     "data_manager/payments/payments_data_manager.h",
+     "data_manager/personal_data_manager.cc",
++    "data_manager/no_capture.h",
+     "data_manager/personal_data_manager.h",
+     "data_manager/personal_data_manager_observer.h",
+     "data_manager/valuables/valuables_data_manager.cc",
+--- a/components/autofill/core/browser/data_manager/addresses/address_data_manager_test_api.h
++++ b/components/autofill/core/browser/data_manager/addresses/address_data_manager_test_api.h
+@@ -24,6 +24,17 @@
+     return *adm_->account_name_email_store_;
+   }
+ 
++  size_t CapturedRecordCount() const {
++    return adm_->profiles_.size() + adm_->ongoing_profile_changes_.size();
++  }
++  bool HasBoundDataServices() const {
++    return adm_->webdata_service_ || adm_->pref_service_ ||
++           adm_->identity_manager_ || adm_->sync_service_ ||
++           adm_->alternative_state_name_map_updater_ ||
++           adm_->address_data_cleaner_ || adm_->home_and_work_metadata_ ||
++           adm_->account_name_email_store_;
++  }
++
+  private:
+   raw_ref<AddressDataManager> adm_;
+ };
+--- a/components/autofill/core/browser/data_manager/payments/payments_data_manager_test_api.h
++++ b/components/autofill/core/browser/data_manager/payments/payments_data_manager_test_api.h
+@@ -7,6 +7,9 @@
+ 
+ #include "base/memory/raw_ref.h"
+ #include "components/autofill/core/browser/data_manager/payments/payments_data_manager.h"
++#include "components/autofill/core/browser/data_model/payments/bank_account.h"
++#include "components/autofill/core/browser/data_model/payments/bnpl_issuer.h"
++#include "components/autofill/core/browser/data_model/payments/ewallet.h"
+ 
+ namespace autofill {
+ 
+@@ -58,6 +61,27 @@
+     return payments_data_manager_->AreBnplIssuersSupported();
+   }
+ 
++  size_t CapturedRecordCount() const {
++    const auto& data = payments_data_manager_.get();
++    return data.local_credit_cards_.size() + data.server_credit_cards_.size() +
++           data.local_ibans_.size() + data.server_ibans_.size() +
++           data.masked_bank_accounts_.size() +
++           data.linked_bnpl_issuers_.size() + data.ewallet_accounts_.size() +
++           data.unlinked_bnpl_issuers_.size() +
++           data.ewallet_creation_options_.size() +
++           data.server_credit_card_cloud_token_data_.size() +
++           data.autofill_offer_data_.size() +
++           data.autofill_virtual_card_usage_data_.size() +
++           data.credit_card_benefits_.size() +
++           (data.payments_customer_data_ ? 1 : 0);
++  }
++  bool HasBoundDataServices() const {
++    const auto& data = payments_data_manager_.get();
++    return data.database_helper_ || data.pref_service_ || data.sync_service_ ||
++           data.identity_manager_ || data.image_fetcher_ ||
++           data.autofill_optimization_guide_decider_;
++  }
++
+  private:
+   const raw_ref<PaymentsDataManager> payments_data_manager_;
+ };

@@ -1,0 +1,230 @@
+--- a/chrome/browser/feature_engagement/tracker_factory.cc
++++ b/chrome/browser/feature_engagement/tracker_factory.cc
+@@ -152,6 +152,7 @@
+     : ProfileKeyedServiceFactory(
+           "feature_engagement::Tracker",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+--- a/chrome/browser/safe_browsing/advanced_protection_status_manager_factory.cc
++++ b/chrome/browser/safe_browsing/advanced_protection_status_manager_factory.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/safe_browsing/advanced_protection_status_manager_factory.h"
+ 
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/safe_browsing/advanced_protection_status_manager.h"
+ #include "chrome/browser/signin/identity_manager_factory.h"
+@@ -23,6 +24,13 @@
+       safe_browsing::AdvancedProtectionStatusManagerAndroid>();
+ #else
+   Profile* profile = Profile::FromBrowserContext(context);
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return std::make_unique<
++        safe_browsing::AdvancedProtectionStatusManagerDesktop>(
++        profile->GetPrefs(),
++        safe_browsing::AdvancedProtectionStatusManagerDesktop::
++            NoAccountState{});
++  }
+   return std::make_unique<
+       safe_browsing::AdvancedProtectionStatusManagerDesktop>(
+       profile->GetPrefs(), IdentityManagerFactory::GetForProfile(profile));
+@@ -57,6 +65,7 @@
+     : ProfileKeyedServiceFactory(
+           "AdvancedProtectionStatusManager",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+--- a/chrome/browser/safe_browsing/advanced_protection_status_manager_desktop.h
++++ b/chrome/browser/safe_browsing/advanced_protection_status_manager_desktop.h
+@@ -38,6 +38,13 @@
+   AdvancedProtectionStatusManagerDesktop(
+       PrefService* pref_service,
+       signin::IdentityManager* identity_manager);
++
++  // A private native view of configuration with no account source, refresh
++  // task, learned enrollment or timestamp. Explicit command-line/policy inputs
++  // still have their normal meaning in IsUnderAdvancedProtection().
++  struct NoAccountState {};
++  AdvancedProtectionStatusManagerDesktop(PrefService* pref_service,
++                                         NoAccountState);
+ 
+   AdvancedProtectionStatusManagerDesktop(
+       const AdvancedProtectionStatusManagerDesktop&) = delete;
+@@ -155,6 +162,7 @@
+ 
+   // Is the primary account under advanced protection.
+   bool is_under_advanced_protection_ = false;
++  const bool no_account_state_ = false;
+ 
+   base::OneShotTimer timer_;
+   base::Time last_refreshed_;
+--- a/chrome/browser/safe_browsing/advanced_protection_status_manager_desktop.cc
++++ b/chrome/browser/safe_browsing/advanced_protection_status_manager_desktop.cc
+@@ -54,6 +54,15 @@
+                                              identity_manager,
+                                              kMinimumRefreshDelay) {}
+ 
++AdvancedProtectionStatusManagerDesktop::AdvancedProtectionStatusManagerDesktop(
++    PrefService* pref_service,
++    NoAccountState)
++    : pref_service_(pref_service),
++      no_account_state_(true),
++      minimum_delay_(kMinimumRefreshDelay) {
++  DCHECK(pref_service_);
++}
++
+ void AdvancedProtectionStatusManagerDesktop::Initialize() {
+   SubscribeToSigninEvents();
+ }
+@@ -109,6 +118,9 @@
+ 
+ void AdvancedProtectionStatusManagerDesktop::
+     SetAdvancedProtectionStatusForTesting(bool enrolled) {
++  if (no_account_state_) {
++    return;
++  }
+   is_under_advanced_protection_ = enrolled;
+   NotifyObserversStatusChanged();
+ }
+@@ -118,7 +130,9 @@
+ }
+ 
+ void AdvancedProtectionStatusManagerDesktop::UnsubscribeFromSigninEvents() {
+-  identity_manager_->RemoveObserver(this);
++  if (identity_manager_) {
++    identity_manager_->RemoveObserver(this);
++  }
+ }
+ 
+ bool AdvancedProtectionStatusManagerDesktop::IsRefreshScheduled() {
+--- a/chrome/browser/safe_browsing/BUILD.gn
++++ b/chrome/browser/safe_browsing/BUILD.gn
+@@ -718,6 +718,7 @@
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/browser:browser_process",
+     "//chrome/browser/profiles",
+     "//chrome/browser/profiles:profile",
+--- a/chrome/browser/extensions/api/web_authentication_proxy/web_authentication_proxy_service.cc
++++ b/chrome/browser/extensions/api/web_authentication_proxy/web_authentication_proxy_service.cc
+@@ -264,8 +264,12 @@
+ WebAuthenticationProxyService::GetIfProxyAttached(
+     content::BrowserContext* browser_context) {
+   auto* profile = Profile::FromBrowserContext(browser_context);
+-  switch (WebAuthenticationProxyRegistrarFactory::GetForBrowserContext(profile)
+-              ->ProxyActiveForProfile(profile)) {
++  auto* registrar =
++      WebAuthenticationProxyRegistrarFactory::GetForBrowserContext(profile);
++  if (!registrar) {
++    return nullptr;
++  }
++  switch (registrar->ProxyActiveForProfile(profile)) {
+     case WebAuthenticationProxyRegistrar::ProxyStatus::kActive:
+       return WebAuthenticationProxyServiceFactory::GetForBrowserContext(
+           profile);
+--- a/chrome/browser/extensions/api/web_authentication_proxy/web_authentication_proxy_api.cc
++++ b/chrome/browser/extensions/api/web_authentication_proxy/web_authentication_proxy_api.cc
+@@ -70,11 +70,15 @@
+ ExtensionFunction::ResponseAction WebAuthenticationProxyAttachFunction::Run() {
+   DCHECK(extension());
+ 
+-  const bool success =
++  auto* registrar =
+       WebAuthenticationProxyRegistrarFactory::GetForBrowserContext(
+-          browser_context())
+-          ->SetRequestProxy(Profile::FromBrowserContext(browser_context()),
+-                            extension());
++          browser_context());
++  if (!registrar) {
++    return RespondNow(
++        Error("Web authentication proxy is unavailable in this context"));
++  }
++  const bool success = registrar->SetRequestProxy(
++      Profile::FromBrowserContext(browser_context()), extension());
+   return RespondNow(success ? NoArguments()
+                             : Error("Another extension is already attached"));
+ }
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -201,10 +201,12 @@
+                            ui::AXMode::kLabelImages)) {
+     return;
+   }
+-  AccessibilityLabelsServiceFactory::GetForProfile(
++  auto* service = AccessibilityLabelsServiceFactory::GetForProfile(
+       Profile::FromBrowserContext(
+-          frame_host->GetProcess()->GetBrowserContext()))
+-      ->BindImageAnnotator(std::move(receiver));
++          frame_host->GetProcess()->GetBrowserContext()));
++  if (service) {
++    service->BindImageAnnotator(std::move(receiver));
++  }
+ }
+ 
+ void BindDistillabilityService(
+--- a/chrome/browser/renderer_context_menu/accessibility_labels_menu_observer.cc
++++ b/chrome/browser/renderer_context_menu/accessibility_labels_menu_observer.cc
+@@ -73,6 +73,9 @@
+ 
+ void AccessibilityLabelsMenuObserver::ExecuteCommand(int command_id) {
+   DCHECK(IsCommandIdSupported(command_id));
++  if (!ShouldShowLabelsItem()) {
++    return;
++  }
+   Profile* profile = Profile::FromBrowserContext(proxy_->GetBrowserContext());
+   if (command_id == IDC_CONTENT_CONTEXT_ACCESSIBILITY_LABELS_TOGGLE) {
+     // When a user enables the accessibility labeling item, we
+@@ -111,7 +114,8 @@
+     return false;
+   }
+ 
+-  return ui::AXPlatform::GetInstance().IsScreenReaderActive();
++  return ui::AXPlatform::GetInstance().IsScreenReaderActive() &&
++         AccessibilityLabelsServiceFactory::GetForProfile(profile);
+ }
+ 
+ void AccessibilityLabelsMenuObserver::ShowConfirmBubble(Profile* profile,
+--- a/chrome/browser/ui/webui/family_link_user_internals/family_link_user_internals_ui.h
++++ b/chrome/browser/ui/webui/family_link_user_internals/family_link_user_internals_ui.h
+@@ -5,7 +5,9 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_FAMILY_LINK_USER_INTERNALS_FAMILY_LINK_USER_INTERNALS_UI_H_
+ #define CHROME_BROWSER_UI_WEBUI_FAMILY_LINK_USER_INTERNALS_FAMILY_LINK_USER_INTERNALS_UI_H_
+ 
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/common/webui_url_constants.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/internal_webui_config.h"
+ #include "content/public/browser/web_ui_controller.h"
+ #include "content/public/common/url_constants.h"
+@@ -18,6 +20,13 @@
+   FamilyLinkUserInternalsUIConfig()
+       : DefaultInternalWebUIConfig(
+             chrome::kChromeUIFamilyLinkUserInternalsHost) {}
++
++  bool IsWebUIEnabled(content::BrowserContext* browser_context) override {
++    return !alloy::site_records::RequestContextPolicy::IsStateless(
++               *browser_context) &&
++           content::DefaultInternalWebUIConfig<
++               FamilyLinkUserInternalsUI>::IsWebUIEnabled(browser_context);
++  }
+ };
+ 
+ // The implementation for the chrome://family-link-user-internals page.
+--- a/chrome/browser/ui/webui/family_link_user_internals/BUILD.gn
++++ b/chrome/browser/ui/webui/family_link_user_internals/BUILD.gn
+@@ -10,6 +10,7 @@
+     "family_link_user_internals_ui.h",
+   ]
+   public_deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/common",
+     "//content/public/browser",
+   ]

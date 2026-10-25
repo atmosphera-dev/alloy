@@ -1,0 +1,152 @@
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -26,6 +26,7 @@
+ #include "components/permissions/features.h"
+ #include "components/supervised_user/core/browser/family_link_settings_service.h"
+ #include "components/supervised_user/core/browser/supervised_user_content_settings_provider.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/document_user_data.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -102,9 +103,16 @@
+ HostContentSettingsMap* HostContentSettingsMapFactory::GetForFrame(
+     content::RenderFrameHost* frame) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!frame) {
++    return nullptr;
++  }
+   if (!alloy::site_records::RequestContextPolicy::IsStateless(
+           *frame->GetBrowserContext())) {
+     return GetForProfile(frame->GetBrowserContext());
++  }
++  if (!content::AlloyDocumentStateAdmitted(frame) ||
++      frame->GetBrowserContext()->ShutdownStarted()) {
++    return nullptr;
+   }
+   return &AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)
+               ->settings.settings();
+@@ -116,6 +124,10 @@
+     base::OnceCallback<std::unique_ptr<KeyedService>(HostContentSettingsMap*)>
+         factory) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!content::AlloyDocumentStateAdmitted(frame) ||
++      frame->GetBrowserContext()->ShutdownStarted()) {
++    return nullptr;
++  }
+   CHECK(alloy::site_records::RequestContextPolicy::IsStateless(
+       *frame->GetBrowserContext()));
+   return AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)
+--- a/chrome/browser/permissions/chrome_permissions_client.cc
++++ b/chrome/browser/permissions/chrome_permissions_client.cc
+@@ -362,10 +362,11 @@
+   document_constraints.set_session_model(
+       content_settings::mojom::SessionModel::DURABLE);
+   document_constraints.set_track_last_visit_for_autoexpiration(false);
+-  HostContentSettingsMapFactory::GetForFrame(frame)
+-      ->SetPermissionSettingDefaultScope(request.requesting_origin,
+-                                         request.embedding_origin, type,
+-                                         setting, document_constraints);
++  if (auto* map = GetSettingsMapForDocument(browser_context, frame)) {
++    map->SetPermissionSettingDefaultScope(request.requesting_origin,
++                                          request.embedding_origin, type,
++                                          setting, document_constraints);
++  }
+ }
+ 
+ scoped_refptr<content_settings::CookieSettings>
+--- a/components/permissions/permissions_client.cc
++++ b/components/permissions/permissions_client.cc
+@@ -78,19 +78,22 @@
+ content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
+     content::BrowserContext* context,
+     const PermissionRequestData& request) {
+-  return RequiresDocumentPermissionContext(context)
+-             ? request.alloy_document.AsRenderFrameHostIfValid()
+-             : content::RenderFrameHost::FromID(
+-                   request.id.global_render_frame_host_id());
++  if (RequiresDocumentPermissionContext(context)) {
++    auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
++    return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
++  }
++  return content::RenderFrameHost::FromID(
++      request.id.global_render_frame_host_id());
+ }
+ 
+ content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
+     content::BrowserContext* context,
+     const PermissionRequest& request) {
+-  return RequiresDocumentPermissionContext(context)
+-             ? request.alloy_document().AsRenderFrameHostIfValid()
+-             : content::RenderFrameHost::FromID(
+-                   request.get_requesting_frame_id());
++  if (RequiresDocumentPermissionContext(context)) {
++    auto* frame = request.alloy_document().AsRenderFrameHostIfValid();
++    return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
++  }
++  return content::RenderFrameHost::FromID(request.get_requesting_frame_id());
+ }
+ 
+ PermissionActionsHistory*
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -402,6 +402,7 @@
+   ]
+ 
+   sources = [
++    "alloy_document_state.cc",
+     "$target_gen_dir/devtools/protocol/audits.cc",
+     "$target_gen_dir/devtools/protocol/audits.h",
+     "$target_gen_dir/devtools/protocol/background_service.cc",
+--- a/content/browser/renderer_host/document_associated_data.cc
++++ b/content/browser/renderer_host/document_associated_data.cc
+@@ -64,6 +64,7 @@
+ }
+ 
+ DocumentAssociatedData::~DocumentAssociatedData() {
++  alloy_state_admission_open_ = false;
+   TRACE_EVENT0("navigation", "DocumentAssociatedData::~DocumentAssociatedData");
+   base::ScopedUmaHistogramTimer histogram_timer(
+       "Navigation.DocumentAssociatedDataDestructor");
+--- a/content/browser/renderer_host/document_associated_data.h
++++ b/content/browser/renderer_host/document_associated_data.h
+@@ -62,6 +62,9 @@
+   // speculative RenderFrameHost that has not yet committed, the renderer side
+   // will not have a document with a matching token!
+   const blink::DocumentToken& token() const { return token_; }
++  // Native weak/safe references remain valid for teardown. New Alloy state
++  // must stop being admitted before any service/user-data destructor runs.
++  bool IsAlloyStateAdmissionOpen() const { return alloy_state_admission_open_; }
+ 
+   // The Page object associated with the main document. It is nullptr for
+   // subframes.
+@@ -244,6 +247,7 @@
+ 
+  private:
+   const blink::DocumentToken token_;
++  bool alloy_state_admission_open_ = true;
+   std::unique_ptr<PageImpl> owned_page_;
+   bool dom_content_loaded_ = false;
+   bool is_discarded_ = false;
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -2585,6 +2585,10 @@
+   const DocumentAssociatedData& document_associated_data() const {
+     return *document_associated_data_;
+   }
++  bool IsAlloyStateAdmissionOpen() const {
++    return document_associated_data_ &&
++           document_associated_data_->IsAlloyStateAdmissionOpen();
++  }
+ 
+   DocumentAssociatedData& document_associated_data() {
+     return *document_associated_data_;
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -32,6 +32,7 @@
+     "active_url_message_filter.h",
+     "allow_service_worker_result.cc",
+     "allow_service_worker_result.h",
++    "alloy_document_state.h",
+     "alloy_document_identity.h",
+     "anchor_element_preconnect_delegate.h",
+     "attribution_data_model.cc",

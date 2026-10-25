@@ -1,0 +1,199 @@
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -258,6 +258,8 @@
+   if (enable_bound_session_credentials) {
+     deps += [ "//components/unexportable_keys/mojom:mojo_service" ]
+   }
++  deps += [ "//brave/alloy/site_records:capabilities" ]
++
+ }
+ 
+ if (!is_chromeos) {
+@@ -436,6 +438,8 @@
+   if (is_android) {
+     deps += [ "//chrome/browser/profiles/android:jni_headers" ]
+   }
++  public_deps += [ "//brave/alloy/site_records:mode_types" ]
++
+ }
+ 
+ source_set("profile_manager") {
+--- a/chrome/browser/profiles/off_the_record_profile_impl.cc
++++ b/chrome/browser/profiles/off_the_record_profile_impl.cc
+@@ -8,6 +8,10 @@
+ #include <utility>
+ 
+ #include "base/command_line.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/policy/chrome_browser_policy_connector.h"
++#include "chrome/browser/prefs/chrome_command_line_pref_store.h"
+ #include "base/compiler_specific.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+@@ -174,7 +178,16 @@
+         profile_, ProfileKeepAliveOrigin::kOffTheRecordProfile);
+   }
+ 
+-  if (otr_profile_id.IsDevTools()) {
++  if (auto network_state = otr_profile_id.GetAlloyStatelessNetworkState()) {
++    alloy::site_records::RequestContextPolicy::AttachStateless(
++        *this, *network_state);
++    prefs_ = PrefServiceSyncableFromProfile(profile_)
++                 ->CreateIndependentPrefService(
++                     g_browser_process->policy_service(),
++                     g_browser_process->browser_policy_connector(),
++                     base::MakeRefCounted<ChromeCommandLinePrefStore>(
++                         base::CommandLine::ForCurrentProcess()));
++  } else if (otr_profile_id.IsDevTools()) {
+     prefs_ =
+         CreateAutomationPrefService(PrefServiceSyncableFromProfile(profile_),
+                                     CreateExtensionPrefStore(profile_, true));
+@@ -200,7 +213,9 @@
+       this);
+ 
+   const IncognitoModePrefs::IncognitoModeType incognito_type =
+-      IncognitoModePrefs::GetIncognitoModeType(profile_);
++      alloy::site_records::RequestContextPolicy::Get(*this)
++          ? IncognitoModePrefs::IncognitoModeType::kStandard
++          : IncognitoModePrefs::GetIncognitoModeType(profile_);
+   // Always crash when incognito is not available.
+   CHECK(!IsIncognitoProfile() ||
+         incognito_type == IncognitoModePrefs::IncognitoModeType::kStandard);
+@@ -208,7 +223,9 @@
+   CHECK(!IsEnterpriseIsolatedModeProfile() ||
+         incognito_type == IncognitoModePrefs::IncognitoModeType::kEnterprise);
+ 
+-  TrackZoomLevelsFromParent();
++  if (!alloy::site_records::RequestContextPolicy::Get(*this)) {
++    TrackZoomLevelsFromParent();
++  }
+ 
+ #if BUILDFLAG(ENABLE_PLUGINS)
+   ChromePluginServiceFilter::GetInstance()->RegisterProfile(this);
+@@ -259,6 +276,9 @@
+ }
+ 
+ OffTheRecordProfileImpl::~OffTheRecordProfileImpl() {
++  if (auto* policy = alloy::site_records::RequestContextPolicy::Get(*this)) {
++    policy->Revoke();
++  }
+   MaybeSendDestroyedNotification();
+ 
+ #if BUILDFLAG(ENABLE_PLUGINS)
+--- a/chrome/browser/profiles/profile.cc
++++ b/chrome/browser/profiles/profile.cc
+@@ -173,6 +173,14 @@
+   return CreateUnique(kCEFOTRProfileIDPrefix);
+ }
+ 
++// static
++Profile::OTRProfileID Profile::OTRProfileID::CreateUniqueForAlloyStateless(
++    alloy::site_records::NetworkState network_state) {
++  auto id = CreateUniqueForCEF();
++  id.alloy_network_state_ = network_state;
++  return id;
++}
++
+ bool Profile::OTRProfileID::IsUniqueForCEF() const {
+   return base::StartsWith(profile_id_, kCEFOTRProfileIDPrefix,
+                           base::CompareCase::SENSITIVE);
+--- a/chrome/browser/profiles/profile.h
++++ b/chrome/browser/profiles/profile.h
+@@ -9,6 +9,8 @@
+ 
+ #include <memory>
+ #include <optional>
++
++#include "brave/alloy/site_records/storage_mode.h"
+ #include <string>
+ #include <vector>
+ 
+@@ -96,6 +98,12 @@
+ 
+     // Creates a unique OTR profile id to be used for CEF browser contexts.
+     static OTRProfileID CreateUniqueForCEF();
++    // Carries immutable engine policy into construction, before pref stores
++    // or keyed services can observe a parent profile. Identity remains CEF OTR.
++    static OTRProfileID CreateUniqueForAlloyStateless(
++        alloy::site_records::NetworkState network_state);
++    std::optional<alloy::site_records::NetworkState>
++    GetAlloyStatelessNetworkState() const { return alloy_network_state_; }
+     bool IsUniqueForCEF() const;
+ 
+     // Creates a unique OTR profile id to be used for DevTools browser contexts.
+@@ -168,6 +176,7 @@
+     const std::string& ToString() const;
+ 
+     const std::string profile_id_;
++    std::optional<alloy::site_records::NetworkState> alloy_network_state_;
+   };
+ 
+   class Delegate {
+--- a/components/sync_preferences/pref_service_syncable.cc
++++ b/components/sync_preferences/pref_service_syncable.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "components/sync_preferences/pref_service_syncable.h"
++
++#include "base/check_op.h"
++#include "components/sync_preferences/pref_service_syncable_factory.h"
+ 
+ #include <utility>
+ 
+@@ -196,6 +199,23 @@
+       pref_sync_associator_.client(), read_error_callback_, false);
+ }
+ 
++std::unique_ptr<PrefServiceSyncable>
++PrefServiceSyncable::CreateIndependentPrefService(
++    policy::PolicyService* policies, policy::BrowserPolicyConnector* connector,
++    scoped_refptr<PrefStore> command_line_prefs) {
++  CHECK_EQ(policies == nullptr, connector == nullptr);
++  pref_service_forked_ = true;
++  PrefServiceSyncableFactory factory;
++  factory.set_user_prefs(base::MakeRefCounted<InMemoryPrefStore>());
++  factory.SetAccountPrefStore(base::MakeRefCounted<InMemoryPrefStore>());
++  factory.set_command_line_prefs(std::move(command_line_prefs));
++  if (policies) {
++    factory.SetManagedPolicies(policies, connector);
++    factory.SetRecommendedPolicies(policies, connector);
++  }
++  return factory.CreateSyncable(pref_registry_->ForkForIncognito());
++}
++
+ bool PrefServiceSyncable::IsSyncing() {
+   return pref_sync_associator_.models_associated();
+ }
+--- a/components/sync_preferences/pref_service_syncable.h
++++ b/components/sync_preferences/pref_service_syncable.h
+@@ -20,6 +20,11 @@
+ #include "components/sync_preferences/pref_model_associator.h"
+ 
+ class PrefValueStore;
++
++namespace policy {
++class PolicyService;
++class BrowserPolicyConnector;
++}
+ 
+ namespace syncer {
+ class SyncableService;
+@@ -81,6 +86,16 @@
+   std::unique_ptr<PrefServiceSyncable> CreateIncognitoPrefService(
+       scoped_refptr<PrefStore> incognito_extension_pref_store,
+       const std::vector<const char*>& persistent_pref_names);
++
++  // Fresh memory stores, sharing only immutable registered defaults. Unlike
++  // an incognito overlay, never reads or writes any of this service's mutable
++  // stores (user, account, extension, managed, recommended or command line).
++  // Optional inputs are independently constructed read-only external policy,
++  // not inherited stores from a parent profile.
++  std::unique_ptr<PrefServiceSyncable> CreateIndependentPrefService(
++      policy::PolicyService* policies = nullptr,
++      policy::BrowserPolicyConnector* connector = nullptr,
++      scoped_refptr<PrefStore> command_line_prefs = nullptr);
+ 
+   // Returns true if preferences state has synchronized with the remote
+   // preferences. If true is returned it can be assumed the local preferences

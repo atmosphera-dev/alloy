@@ -1,0 +1,20 @@
+--- a/chrome/browser/extensions/tab_helper.cc
++++ b/chrome/browser/extensions/tab_helper.cc
+@@ -9,6 +9,7 @@
+ #include "base/check_op.h"
+ #include "base/notreached.h"
+ #include "base/types/pass_key.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/extensions/activity_log/activity_log.h"
+ #include "chrome/browser/extensions/extension_action_runner.h"
+@@ -193,7 +194,8 @@
+             rules_registry_service->content_rules_registry()) {
+       func(content_rules_registry);
+     }
+-    if (profile_->IsOffTheRecord()) {
++    if (profile_->IsOffTheRecord() &&
++        !alloy::site_records::RequestContextPolicy::IsStateless(*profile_)) {
+       // The original profile's content rules registry handles rules for
+       // spanning extensions in incognito profiles, so invoke it also.
+       RulesRegistryService* original_profile_rules_registry_service =

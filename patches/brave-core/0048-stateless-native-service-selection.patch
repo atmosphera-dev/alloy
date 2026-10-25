@@ -1,0 +1,30 @@
+--- a/browser/brave_shields/ad_block_pref_service_factory.cc
++++ b/browser/brave_shields/ad_block_pref_service_factory.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/no_destructor.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "brave/browser/brave_browser_process.h"
+ #include "brave/components/brave_shields/content/browser/ad_block_pref_service.h"
+ #include "chrome/browser/browser_process.h"
+@@ -69,6 +70,9 @@
+ 
+ content::BrowserContext* AdBlockPrefServiceFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
+   return GetBrowserContextRedirectedInIncognito(context);
+ }
+ 
+--- a/browser/brave_shields/BUILD.gn
++++ b/browser/brave_shields/BUILD.gn
+@@ -47,6 +47,7 @@
+   public_deps = [ ":brave_shields" ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//base:i18n",
+     "//brave/browser:browser_process",
+     "//brave/components/brave_perf_predictor/browser",

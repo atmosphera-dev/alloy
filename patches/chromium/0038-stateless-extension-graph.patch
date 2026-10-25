@@ -1,0 +1,413 @@
+--- a/chrome/browser/extensions/BUILD.gn
++++ b/chrome/browser/extensions/BUILD.gn
+@@ -490,6 +490,7 @@
+     "//chrome/browser/ui/toolbar",
+   ]
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//base",
+     "//chrome/app:command_ids",
+     "//chrome/app/theme:chrome_unscaled_resources",
+@@ -1810,6 +1811,7 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/browser:browser_process",
+     "//chrome/browser/app_mode",
+     "//chrome/browser/content_settings:content_settings_factory",
+--- a/chrome/browser/extensions/blocklist_factory.cc
++++ b/chrome/browser/extensions/blocklist_factory.cc
+@@ -33,6 +33,7 @@
+           "Blocklist",
+           // Redirected in incognito.
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Audit whether these should be
+               // redirected or should have their own instance.
+--- a/chrome/browser/extensions/chrome_extension_system.cc
++++ b/chrome/browser/extensions/chrome_extension_system.cc
+@@ -15,6 +15,7 @@
+ #include "base/strings/string_tokenizer.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
+ #include "chrome/browser/browser_process.h"
+@@ -121,8 +122,10 @@
+ ChromeExtensionSystem::Shared::~Shared() = default;
+ 
+ void ChromeExtensionSystem::Shared::InitPrefs() {
++  const bool stateless =
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile_);
+   store_factory_ = base::MakeRefCounted<value_store::ValueStoreFactoryImpl>(
+-      profile_->GetPath());
++      stateless ? base::FilePath() : profile_->GetPath(), stateless);
+ 
+   // Three state stores. Two stores, which contain declarative rules and dynamic
+   // user scripts respectively, must be loaded immediately so that the
+@@ -213,6 +216,10 @@
+ }
+ 
+ void ChromeExtensionSystem::Shared::Init(bool extensions_enabled) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile_)) {
++    extensions_enabled = false;
++  }
++
+   TRACE_EVENT0("browser,startup", "ChromeExtensionSystem::Shared::Init");
+   const base::CommandLine* command_line =
+       base::CommandLine::ForCurrentProcess();
+@@ -229,7 +236,8 @@
+   user_script_manager_ = std::make_unique<UserScriptManager>(profile_);
+ 
+   bool autoupdate_enabled =
+-      !profile_->IsGuestSession() && !profile_->IsSystemProfile();
++      !profile_->IsGuestSession() && !profile_->IsSystemProfile() &&
++      !alloy::site_records::RequestContextPolicy::IsStateless(*profile_);
+ #if BUILDFLAG(IS_CHROMEOS)
+   if (!extensions_enabled) {
+     autoupdate_enabled = false;
+@@ -385,7 +393,8 @@
+     : profile_(profile) {
+   shared_ = ChromeExtensionSystemSharedFactory::GetForBrowserContext(profile);
+ 
+-  if (!profile->IsOffTheRecord()) {
++  if (!profile->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
+     shared_->InitPrefs();
+   }
+ }
+--- a/chrome/browser/extensions/chrome_extension_system_factory.cc
++++ b/chrome/browser/extensions/chrome_extension_system_factory.cc
+@@ -51,6 +51,7 @@
+     : ProfileKeyedServiceFactory(
+           "ExtensionSystemShared",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Audit whether these should be
+               // redirected or should have their own instance.
+--- a/chrome/browser/extensions/chrome_extensions_browser_client.cc
++++ b/chrome/browser/extensions/chrome_extensions_browser_client.cc
+@@ -18,6 +18,7 @@
+ #include "base/time/time.h"
+ #include "base/values.h"
+ #include "base/version.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/android_buildflags.h"
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
+@@ -314,6 +315,11 @@
+ bool ChromeExtensionsBrowserClient::IsSameContext(
+     content::BrowserContext* first,
+     content::BrowserContext* second) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*first) ||
++      alloy::site_records::RequestContextPolicy::IsStateless(*second)) {
++    return first == second;
++  }
++
+   Profile* first_profile = Profile::FromBrowserContext(first);
+   Profile* second_profile = Profile::FromBrowserContext(second);
+   return first_profile->IsSameOrParent(second_profile);
+@@ -321,17 +327,31 @@
+ 
+ bool ChromeExtensionsBrowserClient::HasOffTheRecordContext(
+     content::BrowserContext* context) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return true;
++  }
++
+   return static_cast<Profile*>(context)->HasPrimaryOTRProfile();
+ }
+ 
+ content::BrowserContext* ChromeExtensionsBrowserClient::GetOffTheRecordContext(
+     content::BrowserContext* context) {
++  // The stateless runtime's native namespace is this context, never its parent.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
++
+   return static_cast<Profile*>(context)->GetPrimaryOTRProfile(
+       /*create_if_needed=*/true);
+ }
+ 
+ content::BrowserContext* ChromeExtensionsBrowserClient::GetOriginalContext(
+     content::BrowserContext* context) {
++  // The stateless runtime's native namespace is this context, never its parent.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
++
+   DCHECK(context);
+   return static_cast<Profile*>(context)->GetOriginalProfile();
+ }
+@@ -339,6 +359,11 @@
+ content::BrowserContext*
+ ChromeExtensionsBrowserClient::GetContextRedirectedToOriginal(
+     content::BrowserContext* context) {
++  // The stateless runtime's native namespace is this context, never its parent.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
++
+   return ProfileSelections::Builder()
+       .WithRegular(ProfileSelection::kRedirectedToOriginal)
+       .WithGuest(ProfileSelection::kRedirectedToOriginal)
+@@ -352,6 +377,11 @@
+ content::BrowserContext* ChromeExtensionsBrowserClient::
+     GetContextRedirectedToOriginalWithoutAshInternals(
+         content::BrowserContext* context) {
++  // The stateless runtime's native namespace is this context, never its parent.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
++
+   return ProfileSelections::Builder()
+       .WithRegular(ProfileSelection::kRedirectedToOriginal)
+       .WithGuest(ProfileSelection::kRedirectedToOriginal)
+@@ -374,6 +404,11 @@
+ content::BrowserContext*
+ ChromeExtensionsBrowserClient::GetContextForOriginalOnly(
+     content::BrowserContext* context) {
++  // The stateless runtime's native namespace is this context, never its parent.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
++
+   return ProfileSelections::Builder()
+       .WithGuest(ProfileSelection::kOriginalOnly)
+       // TODO(crbug.com/41488885): Check if this service is needed for Ash
+--- a/chrome/browser/extensions/extension_management.cc
++++ b/chrome/browser/extensions/extension_management.cc
+@@ -1139,6 +1139,7 @@
+     : ProfileKeyedServiceFactory(
+           "ExtensionManagement",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Audit whether these should be
+               // redirected or should have their own instance.
+--- a/chrome/browser/extensions/forced_extensions/install_stage_tracker_factory.cc
++++ b/chrome/browser/extensions/forced_extensions/install_stage_tracker_factory.cc
+@@ -29,6 +29,7 @@
+     : ProfileKeyedServiceFactory(
+           "InstallStageTracker",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kOriginalOnly)
+               .WithGuest(ProfileSelection::kOriginalOnly)
+               // TODO(crbug.com/41488885): Check if this service is needed for
+--- a/chrome/browser/extensions/install_tracker_factory.cc
++++ b/chrome/browser/extensions/install_tracker_factory.cc
+@@ -32,6 +32,7 @@
+           // The installs themselves are routed to the non-incognito profile and
+           // so should the install progress.
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Audit whether these should be
+               // redirected or should have their own instance.
+--- a/chrome/browser/extensions/install_verifier_factory.cc
++++ b/chrome/browser/extensions/install_verifier_factory.cc
+@@ -35,6 +35,7 @@
+     : ProfileKeyedServiceFactory(
+           "InstallVerifier",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Audit whether these should be
+               // redirected or should have their own instance.
+--- a/chrome/browser/profiles/profile_selections.cc
++++ b/chrome/browser/profiles/profile_selections.cc
+@@ -45,6 +45,14 @@
+ ProfileSelections::Builder& ProfileSelections::Builder::WithSystem(
+     ProfileSelection selection) {
+   selections_->SetProfileSelectionForSystem(selection);
++  return *this;
++}
++
++ProfileSelections::Builder& ProfileSelections::Builder::WithAlloyStateless(
++    ProfileSelection selection) {
++  CHECK(selection == ProfileSelection::kNone ||
++        selection == ProfileSelection::kOwnInstance);
++  selections_->alloy_stateless_profile_selection_ = selection;
+   return *this;
+ }
+ 
+@@ -142,6 +150,11 @@
+ 
+ ProfileSelection ProfileSelections::GetProfileSelection(
+     Profile* profile) const {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile) &&
++      alloy_stateless_profile_selection_) {
++    return *alloy_stateless_profile_selection_;
++  }
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   // This check has to be performed before the check on
+   // `profile->IsRegularProfile()` because profiles that are internal ASH
+--- a/chrome/browser/profiles/profile_selections.h
++++ b/chrome/browser/profiles/profile_selections.h
+@@ -65,6 +65,10 @@
+     // same configuration as other OTR profiles.
+     // The original profile of the Isolated Mode profile is the regular profile.
+     Builder& WithIsolatedMode(ProfileSelection selection);
++
++    // Configuration/runtime factories may opt into a private native instance.
++    // Retained stores keep their normal stateless rejection. Never redirects.
++    Builder& WithAlloyStateless(ProfileSelection selection);
+ 
+     // In Ash there are internal profiles that are not user profiles, such as a
+     // the signin or the lockscreen profile.
+@@ -157,6 +161,8 @@
+   ProfileSelection guest_profile_selection_ = ProfileSelection::kNone;
+   ProfileSelection system_profile_selection_ = ProfileSelection::kNone;
+   ProfileSelection ash_internals_profile_selection_ = ProfileSelection::kNone;
++  std::optional<ProfileSelection> alloy_stateless_profile_selection_ =
++      std::nullopt;
+   std::optional<ProfileSelection> isolated_mode_profile_selection_ =
+       std::nullopt;
+ };
+--- a/chrome/browser/ui/global_error/global_error_service_factory.cc
++++ b/chrome/browser/ui/global_error/global_error_service_factory.cc
+@@ -23,6 +23,7 @@
+     : ProfileKeyedServiceFactory(
+           "GlobalErrorService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+--- a/components/value_store/value_store_factory_impl.cc
++++ b/components/value_store/value_store_factory_impl.cc
+@@ -58,8 +58,9 @@
+ };
+ }  // namespace
+ 
+-ValueStoreFactoryImpl::ValueStoreFactoryImpl(const base::FilePath& profile_path)
+-    : profile_path_(profile_path) {}
++ValueStoreFactoryImpl::ValueStoreFactoryImpl(const base::FilePath& profile_path,
++                                             bool no_storage)
++    : profile_path_(profile_path), no_storage_(no_storage) {}
+ 
+ ValueStoreFactoryImpl::~ValueStoreFactoryImpl() = default;
+ 
+@@ -72,7 +73,7 @@
+ std::unique_ptr<ValueStore> ValueStoreFactoryImpl::CreateValueStore(
+     const base::FilePath& directory,
+     const std::string& uma_client_name) {
+-  if (IsRemovedExtensionStore(directory)) {
++  if (no_storage_ || IsRemovedExtensionStore(directory)) {
+     return std::make_unique<NoStoreExtensionValues>();
+   }
+   return std::make_unique<LeveldbValueStore>(uma_client_name,
+@@ -80,14 +81,14 @@
+ }
+ 
+ void ValueStoreFactoryImpl::DeleteValueStore(const base::FilePath& directory) {
+-  if (IsRemovedExtensionStore(directory)) {
++  if (no_storage_ || IsRemovedExtensionStore(directory)) {
+     return;
+   }
+   base::DeletePathRecursively(GetDBPath(directory));
+ }
+ 
+ bool ValueStoreFactoryImpl::HasValueStore(const base::FilePath& directory) {
+-  if (IsRemovedExtensionStore(directory)) {
++  if (no_storage_ || IsRemovedExtensionStore(directory)) {
+     return false;
+   }
+   return base::DirectoryExists(GetDBPath(directory));
+--- a/components/value_store/value_store_factory_impl.h
++++ b/components/value_store/value_store_factory_impl.h
+@@ -17,7 +17,8 @@
+ // A factory to create ValueStore instances.
+ class ValueStoreFactoryImpl : public ValueStoreFactory {
+  public:
+-  explicit ValueStoreFactoryImpl(const base::FilePath& profile_path);
++  explicit ValueStoreFactoryImpl(const base::FilePath& profile_path,
++                                 bool no_storage = false);
+   ValueStoreFactoryImpl(const ValueStoreFactoryImpl&) = delete;
+   ValueStoreFactoryImpl& operator=(const ValueStoreFactoryImpl&) = delete;
+ 
+@@ -34,6 +35,7 @@
+   base::FilePath GetDBPath(const base::FilePath& directory) const;
+ 
+   const base::FilePath profile_path_;
++  const bool no_storage_;
+ };
+ 
+ }  // namespace value_store
+--- a/extensions/browser/BUILD.gn
++++ b/extensions/browser/BUILD.gn
+@@ -613,6 +613,7 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     ":cws_item_service_proto",
+     "//base",
+     "//base:i18n",
+--- a/extensions/browser/extension_registrar.cc
++++ b/extensions/browser/extension_registrar.cc
+@@ -16,6 +16,7 @@
+ #include "base/notreached.h"
+ #include "base/stl_util.h"
+ #include "base/version_info/version_info.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/chromeos_buildflags.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -1395,6 +1396,12 @@
+ }
+ 
+ bool ExtensionRegistrar::CanAddExtension(const Extension* extension) const {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_) &&
++      !Manifest::IsComponentLocation(extension->location())) {
++    return false;
++  }
++
+   // TODO(jstritar): We may be able to get rid of this branch by overriding the
+   // default extension state to DISABLED when the --disable-extensions flag
+   // is set (http://crbug.com/29067).
+--- a/extensions/browser/unpacked_installer.cc
++++ b/extensions/browser/unpacked_installer.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/threading/thread_restrictions.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "components/crx_file/id_util.h"
+@@ -136,6 +137,14 @@
+ }
+ 
+ void UnpackedInstaller::Load(const base::FilePath& path_in) {
++  if (browser_context_ &&
++      alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_)) {
++    ReportExtensionLoadError(
++        u"Extension installation is unavailable in stateless contexts");
++    return;
++  }
++
+   DCHECK(extension_path_.empty());
+   extension_path_ = path_in;
+   if (!browser_context_) {
+@@ -149,6 +158,12 @@
+ bool UnpackedInstaller::LoadFromCommandLine(const base::FilePath& path_in,
+                                             std::string* extension_id,
+                                             bool only_allow_apps) {
++  if (browser_context_ &&
++      alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_)) {
++    return false;
++  }
++
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(extension_path_.empty());
+ 

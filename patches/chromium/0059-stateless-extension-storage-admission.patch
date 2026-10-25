@@ -1,0 +1,247 @@
+--- a/extensions/browser/api/storage/storage_utils.h
++++ b/extensions/browser/api/storage/storage_utils.h
+@@ -17,6 +17,12 @@
+ }  // namespace content
+ 
+ namespace extensions::storage_utils {
++
++// Shared admission for values, session storage, renderer access and
++// access-level metadata. Check before looking up or creating any storage owner.
++bool IsStorageAllowed(const content::BrowserContext& browser_context);
++inline constexpr char kStorageUnavailableError[] =
++    "Storage is unavailable in stateless contexts.";
+ 
+ // Returns the session storage access level for `extension_id`.
+ api::storage::AccessLevel GetAccessLevelForArea(
+--- a/extensions/browser/api/storage/storage_utils.cc
++++ b/extensions/browser/api/storage/storage_utils.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "base/values.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "content/public/common/child_process_id.h"
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_util.h"
+@@ -51,21 +52,28 @@
+ }
+ }  // namespace
+ 
++bool IsStorageAllowed(const content::BrowserContext& browser_context) {
++  return !alloy::site_records::RequestContextPolicy::IsStateless(
++      browser_context);
++}
++
+ api::storage::AccessLevel GetAccessLevelForArea(
+     const ExtensionId& extension_id,
+     content::BrowserContext& browser_context,
+     StorageAreaNamespace storage_area) {
+-  ExtensionPrefs* prefs = ExtensionPrefs::Get(&browser_context);
+-  const PrefMap* pref_map = GetPrefMapForStorageArea(storage_area);
++  if (IsStorageAllowed(browser_context)) {
++    ExtensionPrefs* prefs = ExtensionPrefs::Get(&browser_context);
++    const PrefMap* pref_map = GetPrefMapForStorageArea(storage_area);
+ 
+-  int stored_access_level_int = 0;
+-  if (pref_map && prefs->ReadPrefAsInteger(extension_id, *pref_map,
+-                                           &stored_access_level_int)) {
+-    // Return access level iff it's a valid value.
+-    if (stored_access_level_int > 0 &&
+-        stored_access_level_int <=
+-            std::to_underlying(api::storage::AccessLevel::kMaxValue)) {
+-      return static_cast<api::storage::AccessLevel>(stored_access_level_int);
++    int stored_access_level_int = 0;
++    if (pref_map && prefs->ReadPrefAsInteger(extension_id, *pref_map,
++                                             &stored_access_level_int)) {
++      // Return access level iff it's a valid value.
++      if (stored_access_level_int > 0 &&
++          stored_access_level_int <=
++              std::to_underlying(api::storage::AccessLevel::kMaxValue)) {
++        return static_cast<api::storage::AccessLevel>(stored_access_level_int);
++      }
+     }
+   }
+ 
+@@ -86,6 +94,9 @@
+                            content::BrowserContext& browser_context,
+                            StorageAreaNamespace storage_area,
+                            api::storage::AccessLevel access_level) {
++  if (!IsStorageAllowed(browser_context)) {
++    return;
++  }
+   ExtensionPrefs* prefs = ExtensionPrefs::Get(&browser_context);
+   const PrefMap* pref_map = GetPrefMapForStorageArea(storage_area);
+   prefs->SetIntegerPref(extension_id, *pref_map,
+@@ -116,6 +127,9 @@
+     std::optional<StorageAreaNamespace> storage_area,
+     content::RenderFrameHost* render_frame_host,
+     content::RenderProcessHost& render_process_host) {
++  if (!IsStorageAllowed(browser_context)) {
++    return false;
++  }
+   if (!extension.permissions_data()->HasAPIPermission(
+           mojom::APIPermissionID::kStorage)) {
+     return false;
+--- a/extensions/browser/api/storage/session_storage_manager.cc
++++ b/extensions/browser/api/storage/session_storage_manager.cc
+@@ -8,6 +8,7 @@
+ #include "base/trace_event/memory_usage_estimator.h"
+ #include "components/keyed_service/content/browser_context_dependency_manager.h"
+ #include "components/keyed_service/content/browser_context_keyed_service_factory.h"
++#include "extensions/browser/api/storage/storage_utils.h"
+ #include "extensions/browser/extension_registry_factory.h"
+ #include "extensions/browser/extensions_browser_client.h"
+ #include "extensions/common/api/storage.h"
+@@ -52,6 +53,9 @@
+ 
+ content::BrowserContext* SessionStorageManagerFactory::GetBrowserContextToUse(
+     content::BrowserContext* browser_context) const {
++  if (!storage_utils::IsStorageAllowed(*browser_context)) {
++    return nullptr;
++  }
+   // Share storage between incognito and on-the-record profiles by using the
+   // original context of an incognito window.
+   return ExtensionsBrowserClient::Get()->GetContextRedirectedToOriginal(
+--- a/extensions/browser/api/storage/storage_api.cc
++++ b/extensions/browser/api/storage/storage_api.cc
+@@ -108,6 +108,11 @@
+   EXTENSION_FUNCTION_PRERUN_VALIDATE(args().size() >= 1);
+   EXTENSION_FUNCTION_PRERUN_VALIDATE(args()[0].is_string());
+ 
++  if (!storage_utils::IsStorageAllowed(*browser_context())) {
++    *error = storage_utils::kStorageUnavailableError;
++    return false;
++  }
++
+   base::ListValue& mutable_args = GetMutableArgs();
+ 
+   // Not a ref since we remove the underlying value after.
+--- a/extensions/browser/api/storage/storage_frontend.cc
++++ b/extensions/browser/api/storage/storage_frontend.cc
+@@ -201,6 +201,17 @@
+       new StorageFrontend(std::move(storage_factory), context));
+ }
+ 
++namespace {
++
++StorageFrontend::ResultStatus UnavailableStorageStatus() {
++  StorageFrontend::ResultStatus status;
++  status.success = false;
++  status.error = storage_utils::kStorageUnavailableError;
++  return status;
++}
++
++}  // namespace
++
+ // Implementation of ResultStatus.
+ 
+ StorageFrontend::ResultStatus::ResultStatus() = default;
+@@ -332,6 +343,13 @@
+                                 std::optional<std::vector<std::string>> keys,
+                                 base::OnceCallback<void(GetResult)> callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    GetResult result;
++    result.status = UnavailableStorageStatus();
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++    return;
++  }
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+     SessionStorageManager* storage_manager =
+@@ -373,6 +391,13 @@
+     StorageAreaNamespace storage_area,
+     base::OnceCallback<void(GetKeysResult)> callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    GetKeysResult result;
++    result.status = UnavailableStorageStatus();
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++    return;
++  }
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+     SessionStorageManager* storage_manager =
+@@ -415,6 +440,12 @@
+     std::optional<std::vector<std::string>> keys,
+     base::OnceCallback<void(size_t)> callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    size_t result = 0;
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++    return;
++  }
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+     SessionStorageManager* storage_manager =
+@@ -447,6 +478,12 @@
+                           base::DictValue values,
+                           base::OnceCallback<void(ResultStatus)> callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    auto result = UnavailableStorageStatus();
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++    return;
++  }
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+     SessionStorageManager* storage_manager =
+@@ -498,6 +535,12 @@
+                              const std::vector<std::string>& keys,
+                              base::OnceCallback<void(ResultStatus)> callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    auto result = UnavailableStorageStatus();
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++    return;
++  }
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+     SessionStorageManager* storage_manager =
+@@ -539,6 +582,12 @@
+     StorageAreaNamespace storage_area,
+     base::OnceCallback<void(StorageFrontend::ResultStatus)> callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    auto result = UnavailableStorageStatus();
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++    return;
++  }
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+     SessionStorageManager* storage_manager =
+@@ -587,7 +636,8 @@
+ 
+ bool StorageFrontend::IsStorageEnabled(
+     settings_namespace::Namespace settings_namespace) const {
+-  return caches_.contains(settings_namespace);
++  return storage_utils::IsStorageAllowed(*browser_context_) &&
++         caches_.contains(settings_namespace);
+ }
+ 
+ void StorageFrontend::RunWithStorage(
+@@ -596,6 +646,7 @@
+     ValueStoreCache::StorageCallback callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   CHECK(extension.get());
++  CHECK(storage_utils::IsStorageAllowed(*browser_context_));
+ 
+   ValueStoreCache* cache = caches_[settings_namespace];
+   CHECK(cache);
+@@ -653,6 +704,10 @@
+     std::optional<api::storage::AccessLevel> access_level,
+     base::Value changes) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!storage_utils::IsStorageAllowed(*browser_context_)) {
++    return;
++  }
++
+   TRACE_EVENT1("browser", "StorageFrontend::OnSettingsChanged", "extension_id",
+                extension_id);
+ 

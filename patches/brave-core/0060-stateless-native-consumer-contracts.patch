@@ -1,0 +1,33 @@
+--- a/browser/url_sanitizer/url_sanitizer_service_factory.cc
++++ b/browser/url_sanitizer/url_sanitizer_service_factory.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/feature_list.h"
+ #include "base/no_destructor.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "brave/browser/brave_browser_process.h"
+ #include "brave/components/url_sanitizer/core/browser/url_sanitizer_component_installer.h"
+ #include "brave/components/url_sanitizer/core/browser/url_sanitizer_service.h"
+@@ -75,6 +76,9 @@
+ 
+ content::BrowserContext* URLSanitizerServiceFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return context;
++  }
+   return GetBrowserContextRedirectedInIncognito(context);
+ }
+ 
+--- a/components/request_otr/browser/request_otr_navigation_throttle.cc
++++ b/components/request_otr/browser/request_otr_navigation_throttle.cc
+@@ -41,6 +41,10 @@
+     PrefService* pref_service,
+     const std::string& locale) {
+   DCHECK(pref_service);
++  // Irregular contexts can deny either optional owner before construction.
++  if (!request_otr_service || !ephemeral_storage_service) {
++    return;
++  }
+ 
+   // If 'request off-the-record' feature is disabled or ephemeral storage
+   // is disabled, don't bother creating throttle.

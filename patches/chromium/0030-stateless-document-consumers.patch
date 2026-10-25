@@ -1,0 +1,302 @@
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+@@ -3338,6 +3338,9 @@
+ void ChromeFileSystemAccessPermissionContext::NavigatedAwayFromOrigin(
+     const url::Origin& origin) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (RequiresDocumentContext()) {
++    return;
++  }
+   if (!base::FeatureList::IsEnabled(
+           features::kFileSystemAccessPersistentPermissions)) {
+     auto it = active_permissions_map_.find(origin);
+--- a/chrome/browser/file_system_access/file_system_access_permission_context_factory.cc
++++ b/chrome/browser/file_system_access/file_system_access_permission_context_factory.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/file_system_access/chrome_file_system_access_permission_context.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/render_frame_host.h"
+ 
+ // static
+ ChromeFileSystemAccessPermissionContext*
+@@ -23,6 +24,27 @@
+     content::BrowserContext* profile) {
+   return static_cast<ChromeFileSystemAccessPermissionContext*>(
+       GetInstance()->GetServiceForBrowserContext(profile, false));
++}
++
++// static
++ChromeFileSystemAccessPermissionContext*
++FileSystemAccessPermissionContextFactory::GetForFrame(
++    content::RenderFrameHost* frame) {
++  return frame ? GetForDocument(frame->GetWeakDocumentPtr()) : nullptr;
++}
++
++// static
++ChromeFileSystemAccessPermissionContext*
++FileSystemAccessPermissionContextFactory::GetForDocument(
++    const content::WeakDocumentPtr& document) {
++  auto* frame = document.AsRenderFrameHostIfValid();
++  if (!frame) {
++    return nullptr;
++  }
++  auto* root = GetForProfileIfExists(frame->GetBrowserContext());
++  return root ? static_cast<ChromeFileSystemAccessPermissionContext*>(
++                    root->ForDocument(document))
++              : nullptr;
+ }
+ 
+ // static
+--- a/chrome/browser/file_system_access/file_system_access_permission_context_factory.h
++++ b/chrome/browser/file_system_access/file_system_access_permission_context_factory.h
+@@ -7,6 +7,11 @@
+ 
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++namespace content {
++class RenderFrameHost;
++class WeakDocumentPtr;
++}  // namespace content
+ 
+ class ChromeFileSystemAccessPermissionContext;
+ 
+@@ -19,6 +24,12 @@
+       content::BrowserContext* profile);
+   static ChromeFileSystemAccessPermissionContext* GetForProfileIfExists(
+       content::BrowserContext* profile);
++  // Browser-owned live-document queries. A captured document is required for
++  // callbacks; do not resolve a replacement document from a reused frame ID.
++  static ChromeFileSystemAccessPermissionContext* GetForFrame(
++      content::RenderFrameHost* frame);
++  static ChromeFileSystemAccessPermissionContext* GetForDocument(
++      const content::WeakDocumentPtr& document);
+   static FileSystemAccessPermissionContextFactory* GetInstance();
+ 
+   FileSystemAccessPermissionContextFactory(
+--- a/chrome/browser/ui/page_info/BUILD.gn
++++ b/chrome/browser/ui/page_info/BUILD.gn
+@@ -42,6 +42,7 @@
+     "chrome_page_info_ui_delegate.cc",
+   ]
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/browser/bluetooth",
+     "//chrome/browser/page_info",
+     "//chrome/browser/privacy_sandbox:headers",
+--- a/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/page_info/chrome_page_info_delegate.h"
+ 
+ #include "base/metrics/histogram_functions.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+ #include "chrome/browser/bluetooth/bluetooth_chooser_context_factory.h"
+@@ -140,7 +141,8 @@
+     content::WebContents* web_contents,
+     GetBrowserCallback get_browser_callback)
+     : get_browser_callback_(std::move(get_browser_callback)),
+-      web_contents_(web_contents) {
++      web_contents_(web_contents),
++      document_(web_contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()) {
+   CHECK(get_browser_callback_);
+ #if !BUILDFLAG(IS_ANDROID)
+   sentiment_service_ =
+@@ -163,19 +165,31 @@
+ 
+ permissions::ObjectPermissionContextBase*
+ ChromePageInfoDelegate::GetChooserContext(ContentSettingsType type) {
++  const bool stateless =
++      alloy::site_records::RequestContextPolicy::IsStateless(*GetProfile());
++  auto* frame = document_.AsRenderFrameHostIfValid();
++  if (stateless && !frame) {
++    return nullptr;
++  }
+   switch (type) {
+     case ContentSettingsType::USB_CHOOSER_DATA:
+-      return UsbChooserContextFactory::GetForProfile(GetProfile());
++      return stateless ? UsbChooserContextFactory::GetForFrame(frame)
++                       : UsbChooserContextFactory::GetForProfile(GetProfile());
+     case ContentSettingsType::BLUETOOTH_CHOOSER_DATA:
+       if (base::FeatureList::IsEnabled(
+               features::kWebBluetoothNewPermissionsBackend)) {
+-        return BluetoothChooserContextFactory::GetForProfile(GetProfile());
++        return stateless ? BluetoothChooserContextFactory::GetForFrame(frame)
++                         : BluetoothChooserContextFactory::GetForProfile(
++                               GetProfile());
+       }
+       return nullptr;
+     case ContentSettingsType::SERIAL_CHOOSER_DATA:
+-      return SerialChooserContextFactory::GetForProfile(GetProfile());
++      return stateless
++                 ? SerialChooserContextFactory::GetForFrame(frame)
++                 : SerialChooserContextFactory::GetForProfile(GetProfile());
+     case ContentSettingsType::HID_CHOOSER_DATA:
+-      return HidChooserContextFactory::GetForProfile(GetProfile());
++      return stateless ? HidChooserContextFactory::GetForFrame(frame)
++                       : HidChooserContextFactory::GetForProfile(GetProfile());
+     case ContentSettingsType::SMART_CARD_DATA:
+ #if BUILDFLAG(IS_CHROMEOS)
+       if (base::FeatureList::IsEnabled(blink::features::kSmartCard)) {
+--- a/chrome/browser/ui/page_info/chrome_page_info_delegate.h
++++ b/chrome/browser/ui/page_info/chrome_page_info_delegate.h
+@@ -9,6 +9,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "build/build_config.h"
+ #include "components/page_info/page_info_delegate.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ #include "url/gurl.h"
+@@ -163,6 +164,7 @@
+   // browser tabs (e.g. payment handler dialogs or modal web dialogs).
+   GetBrowserCallback get_browser_callback_;
+   raw_ptr<content::WebContents, AcrossTasksDanglingUntriaged> web_contents_;
++  const content::WeakDocumentPtr document_;
+   security_state::SecurityLevel security_level_for_tests_;
+   security_state::VisibleSecurityState visible_security_state_for_tests_;
+   bool security_state_for_tests_set_ = false;
+--- a/chrome/browser/ui/views/file_system_access/file_system_access_bubble_controller.cc
++++ b/chrome/browser/ui/views/file_system_access/file_system_access_bubble_controller.cc
+@@ -30,9 +30,8 @@
+   url::Origin origin =
+       web_contents->GetPrimaryMainFrame()->GetLastCommittedOrigin();
+ 
+-  auto* context =
+-      FileSystemAccessPermissionContextFactory::GetForProfileIfExists(
+-          web_contents->GetBrowserContext());
++  auto* context = FileSystemAccessPermissionContextFactory::GetForFrame(
++      web_contents->GetPrimaryMainFrame());
+   if (!context) {
+     // If there is no context, there can't be any usage either, so just return.
+     return;
+--- a/chrome/browser/ui/views/file_system_access/file_system_access_page_action_controller.cc
++++ b/chrome/browser/ui/views/file_system_access/file_system_access_page_action_controller.cc
+@@ -31,9 +31,8 @@
+   content::WebContents* contents = tab().GetContents();
+   url::Origin origin =
+       contents->GetPrimaryMainFrame()->GetLastCommittedOrigin();
+-  auto* context =
+-      FileSystemAccessPermissionContextFactory::GetForProfileIfExists(
+-          contents->GetBrowserContext());
++  auto* context = FileSystemAccessPermissionContextFactory::GetForFrame(
++      contents->GetPrimaryMainFrame());
+   if (context) {
+     has_write_access = context->OriginHasWriteAccess(origin);
+     show_read_indicator = context->OriginHasReadAccess(origin);
+--- a/chrome/browser/ui/views/file_system_access/file_system_access_usage_bubble_view.cc
++++ b/chrome/browser/ui/views/file_system_access/file_system_access_usage_bubble_view.cc
+@@ -505,6 +505,7 @@
+     : LocationBarBubbleDelegateView(anchor,
+                                     web_contents,
+                                     /*autosize=*/true),
++      document_(web_contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()),
+       origin_(origin),
+       usage_(std::move(usage)),
+       readable_paths_model_(std::move(usage_.readable_files),
+@@ -628,9 +629,8 @@
+     return;
+   }
+ 
+-  content::BrowserContext* profile = web_contents()->GetBrowserContext();
+   auto* context =
+-      FileSystemAccessPermissionContextFactory::GetForProfileIfExists(profile);
++      FileSystemAccessPermissionContextFactory::GetForDocument(document_);
+   if (!context) {
+     return;
+   }
+--- a/chrome/browser/ui/views/file_system_access/file_system_access_usage_bubble_view.h
++++ b/chrome/browser/ui/views/file_system_access/file_system_access_usage_bubble_view.h
+@@ -10,6 +10,7 @@
+ #include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_bubble_delegate_view.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/models/table_model.h"
+ #include "url/origin.h"
+@@ -98,6 +99,7 @@
+ 
+   raw_ptr<views::View> readable_collapsible_list_view_;
+   raw_ptr<views::View> writable_collapsible_list_view_;
++  const content::WeakDocumentPtr document_;
+   const url::Origin origin_;
+   const Usage usage_;
+   FilePathListModel readable_paths_model_;
+--- a/chrome/browser/ui/views/page_info/page_info_permission_content_view.cc
++++ b/chrome/browser/ui/views/page_info/page_info_permission_content_view.cc
+@@ -62,6 +62,7 @@
+     : presenter_(presenter), type_(type), ui_delegate_(ui_delegate) {
+   CHECK(web_contents);
+   web_contents_ = web_contents->GetWeakPtr();
++  document_ = web_contents->GetPrimaryMainFrame()->GetWeakDocumentPtr();
+ 
+   ChromeLayoutProvider* layout_provider = ChromeLayoutProvider::Get();
+   const int bottom_margin =
+@@ -121,8 +122,7 @@
+           features::kFileSystemAccessPersistentPermissions)) {
+     std::vector<base::FilePath> granted_file_paths;
+     auto* context =
+-        FileSystemAccessPermissionContextFactory::GetForProfileIfExists(
+-            web_contents->GetBrowserContext());
++        FileSystemAccessPermissionContextFactory::GetForDocument(document_);
+     if (context) {
+       granted_file_paths =
+           context->GetGrantedPaths(url::Origin::Create(presenter_->site_url()));
+@@ -271,9 +271,9 @@
+         permission_.setting.value_or(CONTENT_SETTING_DEFAULT));
+     if (web_contents_.MaybeValid()) {
+       auto* context =
+-          FileSystemAccessPermissionContextFactory::GetForProfileIfExists(
+-              web_contents_->GetBrowserContext());
++          FileSystemAccessPermissionContextFactory::GetForDocument(document_);
+       remember_setting_->SetVisible(context &&
++                                    !context->RequiresDocumentContext() &&
+                                     setting != CONTENT_SETTING_BLOCK);
+       remember_setting_->SetChecked(
+           context && context->OriginHasExtendedPermission(
+@@ -369,9 +369,8 @@
+     return;
+   }
+   auto* context =
+-      FileSystemAccessPermissionContextFactory::GetForProfileIfExists(
+-          web_contents_->GetBrowserContext());
+-  if (!context) {
++      FileSystemAccessPermissionContextFactory::GetForDocument(document_);
++  if (!context || context->RequiresDocumentContext()) {
+     return;
+   }
+   bool checkbox_enabled = remember_setting_->GetChecked();
+--- a/chrome/browser/ui/views/page_info/page_info_permission_content_view.h
++++ b/chrome/browser/ui/views/page_info/page_info_permission_content_view.h
+@@ -8,6 +8,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "components/page_info/page_info_ui.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/view.h"
+ 
+@@ -114,6 +115,7 @@
+   ContentSettingsType type_;
+   raw_ptr<ChromePageInfoUiDelegate> ui_delegate_ = nullptr;
+   base::WeakPtr<content::WebContents> web_contents_;
++  content::WeakDocumentPtr document_;
+   PageInfo::PermissionInfo permission_;
+ 
+   raw_ptr<NonAccessibleImageView> icon_ = nullptr;
+--- a/components/page_info/page_info.cc
++++ b/components/page_info/page_info.cc
+@@ -822,6 +822,9 @@
+                                          const base::Value& object) {
+   permissions::ObjectPermissionContextBase* context =
+       delegate_->GetChooserContext(ui_info.content_settings_type);
++  if (!context) {
++    return;
++  }
+   const auto origin = url::Origin::Create(site_url_);
+   context->RevokeObjectPermission(origin, object.GetDict());
+   show_info_bar_ = true;

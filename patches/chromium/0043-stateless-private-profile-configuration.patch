@@ -1,0 +1,40 @@
+--- a/chrome/browser/metrics/profile_metrics_service_factory.cc
++++ b/chrome/browser/metrics/profile_metrics_service_factory.cc
+@@ -8,6 +8,7 @@
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_constants.h"
+@@ -31,6 +32,7 @@
+     : ProfileKeyedServiceFactory(
+           "ProfileMetricsService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               .WithGuest(ProfileSelection::kRedirectedToOriginal)
+               .WithSystem(ProfileSelection::kOwnInstance)
+@@ -42,6 +44,11 @@
+ std::unique_ptr<KeyedService>
+ ProfileMetricsServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
++  // Brave's private identity graph requires this native configuration object.
++  // Stateless contexts have no profile label and never consult a parent/path.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return std::make_unique<metrics::ProfileMetricsService>();
++  }
+   if (!base::FeatureList::IsEnabled(metrics::features::kPerProfileMetrics)) {
+     return std::make_unique<metrics::ProfileMetricsService>();
+   }
+--- a/chrome/browser/metrics/BUILD.gn
++++ b/chrome/browser/metrics/BUILD.gn
+@@ -272,6 +272,7 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//build/config/compiler:compiler_buildflags",
+     "//chrome/browser:browser_process_platform_part",
+     "//chrome/browser:chrome_browser_main",

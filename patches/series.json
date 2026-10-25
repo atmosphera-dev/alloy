@@ -182,6 +182,246 @@
       "patch": "brave-core/0019-test-double-compatibility.patch",
       "root": "brave",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0019-stateless-contexts.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0019-stateless-contexts.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0020-stateless-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0020-stateless-admission.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0020-stateless-admission.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0021-stateless-renderer-caches.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0022-stateless-network-generations.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0023-stateless-history.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0024-stateless-document-identities.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0024-stateless-document-identities.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0025-stateless-document-permissions.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0026-stateless-document-grants.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0027-stateless-document-zoom.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0028-stateless-document-files.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0029-stateless-profile-routing.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0030-stateless-document-consumers.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0031-stateless-page-settings.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0032-stateless-permission-services.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0033-stateless-document-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0034-stateless-state-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0036-stateless-ssl-working-state.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0037-stateless-instant-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0038-stateless-extension-graph.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0039-stateless-native-test-profile.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0040-stateless-configuration-observers.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0041-stateless-working-permission-contracts.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0042-stateless-settings-notification-lifetime.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0043-stateless-private-profile-configuration.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0044-stateless-extension-storage-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0045-stateless-native-profile-owners.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0046-stateless-spelling-owner.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0047-native-service-context-fence.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0048-stateless-native-service-selection.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0048-stateless-native-service-selection.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0049-native-test-network-context.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0050-stateless-native-configuration.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0051-no-capture-saved-data-facades.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0052-stateless-native-language-configuration.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0053-stateless-native-pref-configuration.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0053-stateless-native-pref-configuration.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0054-stateless-native-favicon-owner.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0055-stateless-native-rule-owner.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0056-no-capture-translation-ranker.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0057-denied-native-consumer-contracts.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0058-canonical-network-observer-owner.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0059-stateless-extension-storage-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0060-stateless-native-consumer-contracts.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0060-stateless-native-consumer-contracts.patch",
+      "root": "brave",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

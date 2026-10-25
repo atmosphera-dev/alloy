@@ -1,0 +1,151 @@
+--- a/chrome/browser/profiles/incognito_helpers.cc
++++ b/chrome/browser/profiles/incognito_helpers.cc
+@@ -4,15 +4,22 @@
+ 
+ #include "chrome/browser/profiles/incognito_helpers.h"
+ 
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/profiles/profile.h"
+ 
+ content::BrowserContext* GetBrowserContextRedirectedInIncognito(
+     content::BrowserContext* context) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return nullptr;
++  }
+   return Profile::FromBrowserContext(context)->GetOriginalProfile();
+ }
+ 
+ const content::BrowserContext* GetBrowserContextRedirectedInIncognito(
+     const content::BrowserContext* context) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return nullptr;
++  }
+   const Profile* profile = Profile::FromBrowserContext(
+       const_cast<content::BrowserContext*>(context));
+   return profile->GetOriginalProfile();
+--- a/chrome/browser/regional_capabilities/regional_capabilities_service_factory.cc
++++ b/chrome/browser/regional_capabilities/regional_capabilities_service_factory.cc
+@@ -78,6 +78,7 @@
+     : ProfileKeyedServiceFactory(
+           "RegionalCapabilitiesService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               // Scope rationale: Service needed where we have some features
+               // or checks that could be dependent on the country or some other
+               // profile or device state. OTR profiles should defer to the
+--- a/chrome/browser/plugins/plugin_prefs_factory.cc
++++ b/chrome/browser/plugins/plugin_prefs_factory.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/files/file_path.h"
+ #include "base/path_service.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/plugins/plugin_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_paths.h"
+@@ -38,6 +39,7 @@
+     : RefcountedProfileKeyedServiceFactory(
+           "PluginPrefs",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+@@ -54,7 +56,10 @@
+     content::BrowserContext* context) const {
+   Profile* profile = static_cast<Profile*>(context);
+   scoped_refptr<PluginPrefs> plugin_prefs(new PluginPrefs());
+-  plugin_prefs->set_profile(profile->GetOriginalProfile());
++  plugin_prefs->set_profile(
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++          ? profile
++          : profile->GetOriginalProfile());
+   plugin_prefs->SetPrefs(profile->GetPrefs());
+   return plugin_prefs;
+ }
+--- a/chrome/browser/plugins/BUILD.gn
++++ b/chrome/browser/plugins/BUILD.gn
+@@ -66,6 +66,7 @@
+   public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     ":plugins",
+     "//components/pdf/common:constants",
+     "//components/pdf/common:util",
+--- a/chrome/browser/supervised_user/family_link_settings_service_factory.cc
++++ b/chrome/browser/supervised_user/family_link_settings_service_factory.cc
+@@ -39,6 +39,9 @@
+ SimpleFactoryKey* FamilyLinkSettingsServiceFactory::GetKeyToUse(
+     SimpleFactoryKey* key) const {
+   ProfileKey* profile_key = ProfileKey::FromSimpleFactoryKey(key);
++  if (profile_key->IsAlloyStateless()) {
++    return nullptr;
++  }
+   return profile_key->GetOriginalKey();
+ }
+ }  // namespace supervised_user
+--- a/chrome/browser/offline_items_collection/offline_content_aggregator_factory.cc
++++ b/chrome/browser/offline_items_collection/offline_content_aggregator_factory.cc
+@@ -41,5 +41,8 @@
+ SimpleFactoryKey* OfflineContentAggregatorFactory::GetKeyToUse(
+     SimpleFactoryKey* key) const {
+   ProfileKey* profile_key = ProfileKey::FromSimpleFactoryKey(key);
++  if (profile_key->IsAlloyStateless()) {
++    return nullptr;
++  }
+   return profile_key->GetOriginalKey();
+ }
+--- a/chrome/browser/download/download_offline_content_provider_factory.cc
++++ b/chrome/browser/download/download_offline_content_provider_factory.cc
+@@ -63,5 +63,8 @@
+ 
+ SimpleFactoryKey* DownloadOfflineContentProviderFactory::GetKeyToUse(
+     SimpleFactoryKey* key) const {
++  if (ProfileKey::FromSimpleFactoryKey(key)->IsAlloyStateless()) {
++    return nullptr;
++  }
+   return key;
+ }
+--- a/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
++++ b/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
+@@ -61,5 +61,8 @@
+     SimpleFactoryKey* key) const {
+   // Separate incognito instance that does nothing.
+   ProfileKey* profile_key = ProfileKey::FromSimpleFactoryKey(key);
++  if (profile_key->IsAlloyStateless()) {
++    return key;
++  }
+   return profile_key->GetOriginalKey();
+ }
+--- a/chrome/browser/performance_manager/persistence/site_data/site_data_cache_facade_factory.cc
++++ b/chrome/browser/performance_manager/persistence/site_data/site_data_cache_facade_factory.cc
+@@ -54,6 +54,7 @@
+     : ProfileKeyedServiceFactory(
+           "SiteDataCacheFacadeFactory",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kNone)
+               .WithRegular(ProfileSelection::kOwnInstance)
+               .WithGuest(ProfileSelection::kOwnInstance)
+               // TODO(crbug.com/41488885): Check if this service is needed for
+--- a/extensions/browser/extension_action_manager.cc
++++ b/extensions/browser/extension_action_manager.cc
+@@ -5,6 +5,7 @@
+ #include "extensions/browser/extension_action_manager.h"
+ 
+ #include "base/no_destructor.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "components/keyed_service/content/browser_context_dependency_manager.h"
+ #include "components/keyed_service/content/browser_context_keyed_service_factory.h"
+ #include "content/public/browser/browser_context.h"
+@@ -61,7 +62,9 @@
+ ExtensionActionManager::ExtensionActionManager(
+     content::BrowserContext* browser_context)
+     : browser_context_(browser_context) {
+-  CHECK(!browser_context_->IsOffTheRecord())
++  CHECK(
++      !browser_context_->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(*browser_context_))
+       << "Don't instantiate this with an off-the-record context.";
+   extension_registry_observation_.Observe(
+       ExtensionRegistry::Get(browser_context_));

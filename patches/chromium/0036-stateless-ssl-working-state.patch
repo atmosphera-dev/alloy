@@ -1,0 +1,1552 @@
+--- a/chrome/browser/ssl/BUILD.gn
++++ b/chrome/browser/ssl/BUILD.gn
+@@ -120,6 +120,8 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:document_settings",
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/browser:browser_process",
+     "//chrome/browser:browser_process_platform_part",
+     "//chrome/browser/content_settings:content_settings_factory",
+--- a/chrome/browser/ssl/ask_before_http_dialog_controller.cc
++++ b/chrome/browser/ssl/ask_before_http_dialog_controller.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ssl/https_only_mode_tab_helper.h"
+@@ -18,8 +19,10 @@
+ #include "components/security_interstitials/core/https_only_mode_metrics.h"
+ #include "components/security_interstitials/core/metrics_helper.h"
+ #include "components/strings/grit/components_strings.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/class_property.h"
+ #include "ui/base/interaction/element_identifier.h"
+@@ -185,6 +188,11 @@
+     const GURL& request_url,
+     ukm::SourceId navigation_source_id,
+     security_interstitials::https_only_mode::FallbackReason fallback_reason) {
++  if (web_contents) {
++    alloy_warning_owner_ =
++        content::AlloyDocumentStateOwner(web_contents->GetPrimaryMainFrame());
++  }
++
+   if (!web_contents) {
+     return;
+   }
+@@ -558,6 +566,10 @@
+   }
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents_ptr->GetBrowserContext());
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile) &&
++      !content::AlloyStateOwnerForContext(alloy_warning_owner_, profile)) {
++    return;
++  }
+   StatefulSSLHostStateDelegate* state =
+       static_cast<StatefulSSLHostStateDelegate*>(
+           profile->GetSSLHostStateDelegate());
+@@ -571,6 +583,8 @@
+         request_url.GetHost(),
+         web_contents_ptr->GetPrimaryMainFrame()->GetStoragePartition());
+   }
++  StatefulSSLHostStateDelegateFactory::PrepareHttpReload(
++      profile, web_contents_ptr, request_url);
+   auto* tab_helper = HttpsOnlyModeTabHelper::FromWebContents(web_contents_ptr);
+   tab_helper->set_is_navigation_upgraded(false);
+   tab_helper->set_is_navigation_fallback(false);
+--- a/chrome/browser/ssl/ask_before_http_dialog_controller.h
++++ b/chrome/browser/ssl/ask_before_http_dialog_controller.h
+@@ -10,6 +10,7 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "build/build_config.h"
+ #include "components/security_interstitials/core/https_only_mode_metrics.h"
+ #include "components/security_interstitials/core/metrics_helper.h"
+@@ -110,6 +111,7 @@
+   ui::ScopedUnownedUserData<AskBeforeHttpDialogController>
+       scoped_unowned_user_data_;
+ 
++  base::WeakPtr<base::SupportsUserData> alloy_warning_owner_;
+   base::WeakPtrFactory<AskBeforeHttpDialogController> weak_ptr_factory_{this};
+ };
+ 
+--- a/chrome/browser/ssl/https_defaulted_callbacks.cc
++++ b/chrome/browser/ssl/https_defaulted_callbacks.cc
+@@ -6,9 +6,11 @@
+ 
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ssl/https_only_mode_tab_helper.h"
++#include "chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h"
+ #include "chrome/browser/ssl/typed_navigation_upgrade_throttle.h"
+ #include "components/omnibox/common/omnibox_features.h"
+ #include "components/security_interstitials/content/stateful_ssl_host_state_delegate.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+@@ -43,8 +45,8 @@
+     return false;
+   }
+   StatefulSSLHostStateDelegate* state =
+-      static_cast<StatefulSSLHostStateDelegate*>(
+-          profile->GetSSLHostStateDelegate());
++      StatefulSSLHostStateDelegateFactory::GetForOwner(
++          profile, content::AlloyNavigationStateOwner(handle));
+   bool is_allowlisted =
+       state && state->IsHttpAllowedForHost(handle->GetURL().GetHost(),
+                                            handle->GetWebContents()
+--- a/chrome/browser/ssl/https_only_mode_controller_client.cc
++++ b/chrome/browser/ssl/https_only_mode_controller_client.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ssl/https_only_mode_controller_client.h"
+ 
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/interstitials/chrome_settings_page_helper.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -13,7 +14,9 @@
+ #include "components/security_interstitials/content/settings_page_helper.h"
+ #include "components/security_interstitials/content/stateful_ssl_host_state_delegate.h"
+ #include "components/security_interstitials/core/metrics_helper.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ // static
+@@ -39,7 +42,14 @@
+           chrome::ChromeUINewTabURLAsGURL(),
+           std::move(settings_page_helper)),
+       web_contents_(web_contents),
+-      request_url_(request_url) {}
++      request_url_(request_url),
++      alloy_warning_owner_([&] {
++        auto pending = content::AlloyPendingNavigationStateOwner(
++            web_contents->GetPrimaryMainFrame()->GetFrameTreeNodeId());
++        return pending ? pending
++                       : content::AlloyDocumentStateOwner(
++                             web_contents->GetPrimaryMainFrame());
++      }()) {}
+ 
+ HttpsOnlyModeControllerClient::~HttpsOnlyModeControllerClient() = default;
+ 
+@@ -51,6 +61,10 @@
+   // LINT.IfChange(HttpsFirstModeProceedLogic)
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents_->GetBrowserContext());
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile) &&
++      !content::AlloyStateOwnerForContext(alloy_warning_owner_, profile)) {
++    return;
++  }
+   StatefulSSLHostStateDelegate* state =
+       static_cast<StatefulSSLHostStateDelegate*>(
+           profile->GetSSLHostStateDelegate());
+@@ -64,6 +78,8 @@
+         request_url_.GetHost(),
+         web_contents_->GetPrimaryMainFrame()->GetStoragePartition());
+   }
++  StatefulSSLHostStateDelegateFactory::PrepareHttpReload(profile, web_contents_,
++                                                         request_url_);
+   auto* tab_helper = HttpsOnlyModeTabHelper::FromWebContents(web_contents_);
+   tab_helper->set_is_navigation_upgraded(false);
+   tab_helper->set_is_navigation_fallback(false);
+--- a/chrome/browser/ssl/https_only_mode_controller_client.h
++++ b/chrome/browser/ssl/https_only_mode_controller_client.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_SSL_HTTPS_ONLY_MODE_CONTROLLER_CLIENT_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "components/security_interstitials/content/security_interstitial_controller_client.h"
+ 
+ namespace content {
+@@ -40,6 +42,7 @@
+  private:
+   raw_ptr<content::WebContents> web_contents_;
+   const GURL request_url_;
++  const base::WeakPtr<base::SupportsUserData> alloy_warning_owner_;
+ };
+ 
+ #endif  // CHROME_BROWSER_SSL_HTTPS_ONLY_MODE_CONTROLLER_CLIENT_H_
+--- a/chrome/browser/ssl/https_only_mode_tab_helper.cc
++++ b/chrome/browser/ssl/https_only_mode_tab_helper.cc
+@@ -5,19 +5,100 @@
+ #include "chrome/browser/ssl/https_only_mode_tab_helper.h"
+ 
+ #include "base/feature_list.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/ssl/ask_before_http_dialog_controller.h"
+ #include "components/security_interstitials/core/features.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/reload_type.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+ 
+ HttpsOnlyModeTabHelper::~HttpsOnlyModeTabHelper() = default;
+ 
++HttpsOnlyModeTabHelper::NativeNavigationState*
++HttpsOnlyModeTabHelper::GetState() const {
++  if (!alloy_document_scoped_) {
++    return ordinary_state_.get();
++  }
++  if (!web_contents()) {
++    return nullptr;
++  }
++  auto* owner = content::AlloyStateOwnerForContext(
++      alloy_owner_, web_contents()->GetBrowserContext());
++  if (!owner) {
++    return nullptr;
++  }
++  auto* state =
++      static_cast<NativeNavigationState*>(owner->GetUserData(&kAlloyStateKey));
++  if (!state) {
++    auto created = std::make_unique<NativeNavigationState>();
++    state = created.get();
++    owner->SetUserData(&kAlloyStateKey, std::move(created));
++  }
++  return state;
++}
++
++void HttpsOnlyModeTabHelper::PrepareAlloyReload(
++    const GURL& url,
++    ReloadContinuation continuation) {
++  if (!alloy_document_scoped_) {
++    return;
++  }
++  alloy_owner_ =
++      content::AlloyDocumentStateOwner(web_contents()->GetPrimaryMainFrame());
++  if (auto* state = GetState()) {
++    state->approved_reload_url = url;
++    state->approved_reload_document =
++        web_contents()->GetPrimaryMainFrame()->GetWeakDocumentPtr();
++    state->approved_reload = std::move(continuation);
++  }
++}
++
+ void HttpsOnlyModeTabHelper::DidStartNavigation(
+     content::NavigationHandle* navigation_handle) {
++  if (alloy_document_scoped_) {
++    if (!navigation_handle->IsInPrimaryMainFrame() ||
++        navigation_handle->IsSameDocument()) {
++      return;
++    }
++    auto* previous_owner = content::AlloyStateOwnerForContext(
++        alloy_owner_, web_contents()->GetBrowserContext());
++    auto* previous = GetState();
++    const bool reload =
++        navigation_handle->GetReloadType() != content::ReloadType::NONE;
++    const bool maintain = previous && previous->is_exempt_error_ && reload;
++    ReloadContinuation approved;
++    if (previous && reload &&
++        previous->approved_reload_url == navigation_handle->GetURL() &&
++        previous->approved_reload_document.AsRenderFrameHostIfValid() ==
++            web_contents()->GetPrimaryMainFrame()) {
++      approved = std::move(previous->approved_reload);
++    }
++    if (previous) {
++      previous->approved_reload.Reset();
++      previous->approved_reload_url = GURL();
++      previous->approved_reload_document = {};
++    }
++    auto next = content::AlloyNavigationStateOwner(navigation_handle);
++    auto* next_owner = content::AlloyStateOwnerForContext(
++        next, web_contents()->GetBrowserContext());
++    if (maintain && previous_owner && next_owner &&
++        previous_owner != next_owner &&
++        !next_owner->GetUserData(&kAlloyStateKey)) {
++      next_owner->SetUserData(&kAlloyStateKey,
++                              previous_owner->TakeUserData(&kAlloyStateKey));
++    }
++    alloy_owner_ = next;
++    if (approved) {
++      std::move(approved).Run(next);
++    }
++  }
++
+   if (base::FeatureList::IsEnabled(
+           security_interstitials::features::kHttpsFirstDialogUi)) {
+     // Close the Ask-before-HTTP dialog if a new navigation begins in the
+@@ -71,7 +151,7 @@
+   // dialog UI.
+   if (base::FeatureList::IsEnabled(
+           security_interstitials::features::kHttpsFirstDialogUi) &&
+-      is_navigation_fallback_ &&
++      is_navigation_fallback() &&
+       !navigation_handle->GetURL().SchemeIsCryptographic()) {
+     auto* tab = tabs::TabInterface::MaybeGetFromContents(
+         navigation_handle->GetWebContents());
+@@ -98,6 +178,20 @@
+ HttpsOnlyModeTabHelper::HttpsOnlyModeTabHelper(
+     content::WebContents* web_contents)
+     : WebContentsObserver(web_contents),
+-      content::WebContentsUserData<HttpsOnlyModeTabHelper>(*web_contents) {}
++      content::WebContentsUserData<HttpsOnlyModeTabHelper>(*web_contents),
++      alloy_document_scoped_(
++          alloy::site_records::RequestContextPolicy::IsStateless(
++              *web_contents->GetBrowserContext())),
++      ordinary_state_(alloy_document_scoped_
++                          ? nullptr
++                          : std::make_unique<NativeNavigationState>()) {
++  if (alloy_document_scoped_) {
++    auto pending = content::AlloyPendingNavigationStateOwner(
++        web_contents->GetPrimaryMainFrame()->GetFrameTreeNodeId());
++    alloy_owner_ = pending ? pending
++                           : content::AlloyDocumentStateOwner(
++                                 web_contents->GetPrimaryMainFrame());
++  }
++}
+ 
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(HttpsOnlyModeTabHelper);
+--- a/chrome/browser/ssl/https_only_mode_tab_helper.h
++++ b/chrome/browser/ssl/https_only_mode_tab_helper.h
+@@ -6,8 +6,13 @@
+ #define CHROME_BROWSER_SSL_HTTPS_ONLY_MODE_TAB_HELPER_H_
+ 
+ #include <map>
++#include <memory>
+ 
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "components/security_interstitials/core/https_only_mode_metrics.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ 
+@@ -32,34 +37,60 @@
+   void DidFinishNavigation(
+       content::NavigationHandle* navigation_handle) override;
+ 
++  using ReloadContinuation =
++      base::OnceCallback<void(const base::WeakPtr<base::SupportsUserData>&)>;
++  void PrepareAlloyReload(const GURL& url, ReloadContinuation continuation);
++
+   // HTTPS-Only Mode metadata getters and setters:
+   void set_is_navigation_upgraded(bool upgraded) {
+-    is_navigation_upgraded_ = upgraded;
++    if (auto* state = GetState()) {
++      state->is_navigation_upgraded_ = upgraded;
++    }
+   }
+-  bool is_navigation_upgraded() const { return is_navigation_upgraded_; }
++  bool is_navigation_upgraded() const {
++    auto* state = GetState();
++    return state ? state->is_navigation_upgraded_ : false;
++  }
+ 
+   void set_is_navigation_fallback(bool fallback) {
+-    is_navigation_fallback_ = fallback;
++    if (auto* state = GetState()) {
++      state->is_navigation_fallback_ = fallback;
++    }
+   }
+-  bool is_navigation_fallback() const { return is_navigation_fallback_; }
++  bool is_navigation_fallback() const {
++    auto* state = GetState();
++    return state ? state->is_navigation_fallback_ : false;
++  }
+ 
+   void set_fallback_url(const GURL& fallback_url) {
+-    fallback_url_ = fallback_url;
++    if (auto* state = GetState()) {
++      state->fallback_url_ = fallback_url;
++    }
+   }
+-  GURL fallback_url() const { return fallback_url_; }
++  GURL fallback_url() const {
++    auto* state = GetState();
++    return state ? state->fallback_url_ : GURL();
++  }
+ 
+   bool has_failed_upgrade(const GURL& url) const {
+-    return failed_upgrade_urls_.contains(url);
++    auto* state = GetState();
++    return state && state->failed_upgrade_urls_.contains(url);
+   }
+   void add_failed_upgrade(
+       const GURL& url,
+       security_interstitials::https_only_mode::FallbackReason reason) {
+-    failed_upgrade_urls_[url] = reason;
++    if (auto* state = GetState()) {
++      state->failed_upgrade_urls_[url] = reason;
++    }
+   }
+   security_interstitials::https_only_mode::FallbackReason
+   get_failed_upgrade_reason(const GURL& url) const {
+-    auto it = failed_upgrade_urls_.find(url);
+-    if (it != failed_upgrade_urls_.end()) {
++    auto* state = GetState();
++    if (!state) {
++      return security_interstitials::https_only_mode::FallbackReason::kNone;
++    }
++    auto it = state->failed_upgrade_urls_.find(url);
++    if (it != state->failed_upgrade_urls_.end()) {
+       return it->second;
+     }
+     return security_interstitials::https_only_mode::FallbackReason::kNone;
+@@ -67,69 +98,94 @@
+ 
+   void set_fallback_reason(
+       security_interstitials::https_only_mode::FallbackReason reason) {
+-    fallback_reason_ = reason;
++    if (auto* state = GetState()) {
++      state->fallback_reason_ = reason;
++    }
+   }
+   security_interstitials::https_only_mode::FallbackReason fallback_reason()
+       const {
+-    return fallback_reason_;
++    auto* state = GetState();
++    return state
++               ? state->fallback_reason_
++               : security_interstitials::https_only_mode::FallbackReason::kNone;
+   }
+ 
+   void set_is_exempt_error(bool is_exempt_error) {
+-    is_exempt_error_ = is_exempt_error;
++    if (auto* state = GetState()) {
++      state->is_exempt_error_ = is_exempt_error;
++    }
+   }
+-  bool is_exempt_error() const { return is_exempt_error_; }
++  bool is_exempt_error() const {
++    auto* state = GetState();
++    return state ? state->is_exempt_error_ : false;
++  }
+ 
+   void set_is_typed_schemeless_upgrade(bool is_typed_schemeless_upgrade) {
+-    is_typed_schemeless_upgrade_ = is_typed_schemeless_upgrade;
++    if (auto* state = GetState()) {
++      state->is_typed_schemeless_upgrade_ = is_typed_schemeless_upgrade;
++    }
+   }
+   bool is_typed_schemeless_upgrade() const {
+-    return is_typed_schemeless_upgrade_;
++    auto* state = GetState();
++    return state ? state->is_typed_schemeless_upgrade_ : false;
+   }
+ 
+  private:
+   explicit HttpsOnlyModeTabHelper(content::WebContents* web_contents);
+   friend class content::WebContentsUserData<HttpsOnlyModeTabHelper>;
+ 
+-  // TODO(crbug.com/40771668): Track upgrade status per-navigation rather than
+-  // per-WebContents, in case multiple navigations occur in the WebContents and
+-  // the metadata is not cleared. This may be tricky however as the Interceptor
+-  // and the Throttle have slightly different views of the navigation -- the
+-  // Throttle has a NavigationHandle (and thus the Navigation ID) but the
+-  // Interceptor has the NavigationEntry's ID which does not match.
+-  bool is_navigation_upgraded_ = false;
++  struct NativeNavigationState final : public base::SupportsUserData::Data {
++    // TODO(crbug.com/40771668): Track upgrade status per-navigation rather than
++    // per-WebContents, in case multiple navigations occur in the WebContents
++    // and the metadata is not cleared. This may be tricky however as the
++    // Interceptor and the Throttle have slightly different views of the
++    // navigation -- the Throttle has a NavigationHandle (and thus the
++    // Navigation ID) but the Interceptor has the NavigationEntry's ID which
++    // does not match.
++    bool is_navigation_upgraded_ = false;
+ 
+-  // Set to true if the current navigation is a fallback to HTTP.
+-  bool is_navigation_fallback_ = false;
++    // Set to true if the current navigation is a fallback to HTTP.
++    bool is_navigation_fallback_ = false;
+ 
+-  // HTTP URL that the current navigation should fall back to on failure.
+-  GURL fallback_url_;
++    // HTTP URL that the current navigation should fall back to on failure.
++    GURL fallback_url_;
+ 
+-  // Holds the set of URLs that have failed to be upgraded to HTTPS in this
+-  // WebContents. This is used to immediately show the HTTP interstitial without
+-  // re-trying to upgrade the navigation -- currently this is only applied to
+-  // back/forward navigations as they interact badly with interceptors, and this
+-  // acts as the browser "remembering" the navigation state. This includes the
+-  // fallback reason so we can record the correct UKM metrics when the user
+-  // finally makes a decision on the warning.
+-  //
+-  // In the case of HTTPS Upgrades, without HTTPS-First Mode enabled, these
+-  // hostnames will also be on the HTTP allowlist, bypassing upgrade attempts.
+-  std::map<GURL, security_interstitials::https_only_mode::FallbackReason>
+-      failed_upgrade_urls_;
++    // Holds the set of URLs that have failed to be upgraded to HTTPS in this
++    // WebContents. This is used to immediately show the HTTP interstitial
++    // without re-trying to upgrade the navigation -- currently this is only
++    // applied to back/forward navigations as they interact badly with
++    // interceptors, and this acts as the browser "remembering" the navigation
++    // state. This includes the fallback reason so we can record the correct UKM
++    // metrics when the user finally makes a decision on the warning.
++    //
++    // In the case of HTTPS Upgrades, without HTTPS-First Mode enabled, these
++    // hostnames will also be on the HTTP allowlist, bypassing upgrade attempts.
++    std::map<GURL, security_interstitials::https_only_mode::FallbackReason>
++        failed_upgrade_urls_;
+ 
+-  security_interstitials::https_only_mode::FallbackReason fallback_reason_ =
+-      security_interstitials::https_only_mode::FallbackReason::kNone;
++    security_interstitials::https_only_mode::FallbackReason fallback_reason_ =
++        security_interstitials::https_only_mode::FallbackReason::kNone;
+ 
+-  // Set to true if the current navigation resulted in a net error that is
+-  // indicative of potentially-transient network conditions (such as a hostname
+-  // resolution failure, the network being disconnected, or an address being
+-  // unreachable) which don't signal that the server doesn't support HTTPS. This
+-  // is used to track whether to maintain upgrade state across reloads (such as
+-  // the automatic net error reload) and continue the upgrade attempt
+-  // post-reload.
+-  bool is_exempt_error_ = false;
++    // Set to true if the current navigation resulted in a net error that is
++    // indicative of potentially-transient network conditions (such as a
++    // hostname resolution failure, the network being disconnected, or an
++    // address being unreachable) which don't signal that the server doesn't
++    // support HTTPS. This is used to track whether to maintain upgrade state
++    // across reloads (such as the automatic net error reload) and continue the
++    // upgrade attempt post-reload.
++    bool is_exempt_error_ = false;
+ 
+-  bool is_typed_schemeless_upgrade_ = false;
++    bool is_typed_schemeless_upgrade_ = false;
++
++    GURL approved_reload_url;
++    content::WeakDocumentPtr approved_reload_document;
++    ReloadContinuation approved_reload;
++  };
++  NativeNavigationState* GetState() const;
++  inline static const int kAlloyStateKey = 0;
++  const bool alloy_document_scoped_;
++  const std::unique_ptr<NativeNavigationState> ordinary_state_;
++  base::WeakPtr<base::SupportsUserData> alloy_owner_;
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+--- a/chrome/browser/ssl/https_upgrades_interceptor.cc
++++ b/chrome/browser/ssl/https_upgrades_interceptor.cc
+@@ -8,6 +8,7 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+ #include "chrome/browser/browser_process.h"
+@@ -18,6 +19,7 @@
+ #include "chrome/browser/ssl/https_first_mode_settings_tracker.h"
+ #include "chrome/browser/ssl/https_only_mode_tab_helper.h"
+ #include "chrome/browser/ssl/https_upgrades_util.h"
++#include "chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/captive_portal/core/buildflags.h"
+@@ -25,6 +27,7 @@
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/security_interstitials/content/stateful_ssl_host_state_delegate.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/storage_partition.h"
+@@ -209,6 +212,8 @@
+     content::FrameTreeNodeId frame_tree_node_id,
+     content::NavigationUIData* navigation_ui_data)
+     : frame_tree_node_id_(frame_tree_node_id),
++      alloy_owner_(
++          content::AlloyPendingNavigationStateOwner(frame_tree_node_id)),
+       navigation_ui_data_(navigation_ui_data) {}
+ 
+ HttpsUpgradesInterceptor::~HttpsUpgradesInterceptor() = default;
+@@ -245,6 +250,13 @@
+     const network::ResourceRequest& tentative_resource_request,
+     content::BrowserContext* browser_context,
+     content::URLLoaderRequestInterceptor::LoaderCallback callback) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context) &&
++      !content::AlloyStateOwnerForContext(alloy_owner_, browser_context)) {
++    std::move(callback).Run({});
++    return;
++  }
++
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+   // Note: Redirects cause a restarted request with a new call to
+@@ -282,8 +294,7 @@
+   }
+ 
+   StatefulSSLHostStateDelegate* state =
+-      static_cast<StatefulSSLHostStateDelegate*>(
+-          profile->GetSSLHostStateDelegate());
++      StatefulSSLHostStateDelegateFactory::GetForOwner(profile, alloy_owner_);
+   auto* storage_partition =
+       web_contents->GetPrimaryMainFrame()->GetStoragePartition();
+ 
+@@ -392,7 +403,13 @@
+       tentative_resource_request.method,
+       tentative_resource_request.transition_type, std::move(callback));
+   network::mojom::NetworkContext* network_context =
+-      profile->GetDefaultStoragePartition()->GetNetworkContext();
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++          ? content::AlloyNetworkContextForStateOwner(alloy_owner_, profile)
++          : profile->GetDefaultStoragePartition()->GetNetworkContext();
++  if (!network_context) {
++    std::move(query_complete_callback).Run(false);
++    return;
++  }
+ 
+   CHECK(tentative_resource_request.trusted_params);
+   network_context->IsHSTSActiveForHost(
+@@ -411,6 +428,17 @@
+     int transition_type,
+     content::URLLoaderRequestInterceptor::LoaderCallback callback,
+     bool is_hsts_active_for_host) {
++  auto* original_contents =
++      content::WebContents::FromFrameTreeNodeId(frame_tree_node_id_);
++  if (original_contents &&
++      alloy::site_records::RequestContextPolicy::IsStateless(
++          *original_contents->GetBrowserContext()) &&
++      !content::AlloyStateOwnerForContext(
++          alloy_owner_, original_contents->GetBrowserContext())) {
++    std::move(callback).Run({});
++    return;
++  }
++
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+   // Reconstruct objects here instead of binding them as parameters to this
+@@ -527,8 +555,7 @@
+   // TODO(crbug.com/40248833): Move this to a helper function `IsAllowlisted()`,
+   // especially once this gets more complicated for HFM vs. Upgrades.
+   StatefulSSLHostStateDelegate* state =
+-      static_cast<StatefulSSLHostStateDelegate*>(
+-          profile->GetSSLHostStateDelegate());
++      StatefulSSLHostStateDelegateFactory::GetForOwner(profile, alloy_owner_);
+   // StatefulSSLHostStateDelegate can be null during tests.
+   auto* storage_partition =
+       web_contents->GetPrimaryMainFrame()->GetStoragePartition();
+@@ -698,6 +725,16 @@
+     mojo::ScopedDataPipeConsumerHandle* response_body,
+     mojo::PendingReceiver<network::mojom::URLLoaderClient>* client_receiver,
+     blink::ThrottlingURLLoader* url_loader) {
++  auto* original_contents =
++      content::WebContents::FromFrameTreeNodeId(frame_tree_node_id_);
++  if (original_contents &&
++      alloy::site_records::RequestContextPolicy::IsStateless(
++          *original_contents->GetBrowserContext()) &&
++      !content::AlloyStateOwnerForContext(
++          alloy_owner_, original_contents->GetBrowserContext())) {
++    return false;
++  }
++
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   // When an upgraded navigation fails, this method creates a loader to trigger
+   // the fallback to HTTP.
+@@ -770,8 +807,7 @@
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents->GetBrowserContext());
+   StatefulSSLHostStateDelegate* state =
+-      static_cast<StatefulSSLHostStateDelegate*>(
+-          profile->GetSSLHostStateDelegate());
++      StatefulSSLHostStateDelegateFactory::GetForOwner(profile, alloy_owner_);
+ 
+   // Record failure type metrics for upgraded navigations.
+   RecordHttpsFirstModeNavigation(Event::kUpgradeFailed, *interstitial_state_);
+--- a/chrome/browser/ssl/https_upgrades_interceptor.h
++++ b/chrome/browser/ssl/https_upgrades_interceptor.h
+@@ -11,6 +11,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/sequence_checker.h"
++#include "base/supports_user_data.h"
+ #include "chrome/browser/ssl/https_only_mode_tab_helper.h"
+ #include "components/security_interstitials/core/https_only_mode_metrics.h"
+ #include "content/public/browser/url_loader_request_interceptor.h"
+@@ -115,6 +116,7 @@
+ 
+   // Used to access the WebContents for the navigation.
+   content::FrameTreeNodeId frame_tree_node_id_;
++  base::WeakPtr<base::SupportsUserData> alloy_owner_;
+ 
+   // Parameters about whether the throttle should trigger the interstitial
+   // warning before navigating to the HTTP fallback URL. Can be null if the
+--- a/chrome/browser/ssl/https_upgrades_util.cc
++++ b/chrome/browser/ssl/https_upgrades_util.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/ssl/chrome_security_blocking_page_factory.h"
+ #include "chrome/browser/ssl/https_first_mode_settings_tracker.h"
+ #include "chrome/browser/ssl/https_upgrades_interceptor.h"
++#include "chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/content_settings/core/common/content_settings_pattern.h"
+@@ -19,6 +20,8 @@
+ #include "components/safe_browsing/core/common/safe_browsing_prefs.h"
+ #include "components/security_interstitials/content/stateful_ssl_host_state_delegate.h"
+ #include "components/security_interstitials/core/https_only_mode_metrics.h"
++#include "content/public/browser/alloy_document_state.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "net/base/url_util.h"
+ #include "url/gurl.h"
+@@ -88,8 +91,13 @@
+   }
+ 
+   StatefulSSLHostStateDelegate* state =
+-      static_cast<StatefulSSLHostStateDelegate*>(
+-          profile->GetSSLHostStateDelegate());
++      StatefulSSLHostStateDelegateFactory::GetForOwner(profile, [&] {
++        auto owner = content::AlloyPendingNavigationStateOwner(
++            web_contents->GetPrimaryMainFrame()->GetFrameTreeNodeId());
++        return owner ? owner
++                     : content::AlloyDocumentStateOwner(
++                           web_contents->GetPrimaryMainFrame());
++      }());
+ 
+   if (IsBalancedModeEnabled(prefs) && state &&
+       !state->HttpsFirstBalancedModeSuppressedForTesting()) {
+--- a/chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.cc
++++ b/chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.cc
+@@ -6,17 +6,62 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/callback_helpers.h"
++#include "brave/alloy/site_records/document_settings.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ssl/https_only_mode_tab_helper.h"
+ #include "components/security_interstitials/content/stateful_ssl_host_state_delegate.h"
++#include "content/public/browser/alloy_document_state.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
+ 
+ namespace {
++const int kAlloySSLStateKey = 0;
++class NativeSSLWorkingState final : public base::SupportsUserData::Data {
++ public:
++  NativeSSLWorkingState(Profile* profile,
++                        base::WeakPtr<base::SupportsUserData> owner)
++      : profile_(profile),
++        owner_(owner),
++        settings_(profile->GetPrefs(), base::DoNothing()),
++        state_(profile,
++               &settings_.settings(),
++               true,
++               {},
++               base::BindRepeating(&NativeSSLWorkingState::NetworkContext,
++                                   base::Unretained(this))) {}
++  ~NativeSSLWorkingState() override { state_.Shutdown(); }
++  network::mojom::NetworkContext* NetworkContext() {
++    return content::AlloyNetworkContextForStateOwner(owner_, profile_);
++  }
++  void TransferTo(base::WeakPtr<base::SupportsUserData> owner) {
++    owner_ = owner;
++  }
++  StatefulSSLHostStateDelegate* state() { return &state_; }
++
++ private:
++  raw_ptr<Profile> profile_;
++  base::WeakPtr<base::SupportsUserData> owner_;
++  alloy::site_records::DocumentSettings settings_;
++  StatefulSSLHostStateDelegate state_;
++};
+ 
+ std::unique_ptr<KeyedService> BuildStatefulSSLHostStateDelegate(
+     content::BrowserContext* context) {
+   Profile* profile = Profile::FromBrowserContext(context);
+   return std::make_unique<StatefulSSLHostStateDelegate>(
+-      profile, HostContentSettingsMapFactory::GetForProfile(profile));
++      profile, HostContentSettingsMapFactory::GetForProfile(profile),
++      !alloy::site_records::RequestContextPolicy::IsStateless(*profile),
++      base::BindRepeating(
++          [](Profile* profile,
++             const base::WeakPtr<base::SupportsUserData>& owner)
++              -> content::SSLHostStateDelegate* {
++            return StatefulSSLHostStateDelegateFactory::GetForOwner(profile,
++                                                                    owner);
++          },
++          profile));
+ }
+ 
+ }  // namespace
+@@ -26,6 +71,67 @@
+ StatefulSSLHostStateDelegateFactory::GetForProfile(Profile* profile) {
+   return static_cast<StatefulSSLHostStateDelegate*>(
+       GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++StatefulSSLHostStateDelegate* StatefulSSLHostStateDelegateFactory::GetForOwner(
++    Profile* profile,
++    const base::WeakPtr<base::SupportsUserData>& owner) {
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return GetForProfile(profile);
++  }
++  auto* admitted = content::AlloyStateOwnerForContext(owner, profile);
++  if (!admitted) {
++    return nullptr;
++  }
++  auto* data = static_cast<NativeSSLWorkingState*>(
++      admitted->GetUserData(&kAlloySSLStateKey));
++  if (!data) {
++    auto created = std::make_unique<NativeSSLWorkingState>(profile, owner);
++    data = created.get();
++    admitted->SetUserData(&kAlloySSLStateKey, std::move(created));
++    GetForProfile(profile)->RegisterDocumentInstance(data->state());
++  }
++  return data->state();
++}
++
++// Only this explicit user decision enters the requested native reload. Other
++// current-document exceptions are not copied into a new document.
++void StatefulSSLHostStateDelegateFactory::PrepareHttpReload(
++    Profile* profile,
++    content::WebContents* contents,
++    const GURL& url) {
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return;
++  }
++  auto owner =
++      content::AlloyDocumentStateOwner(contents->GetPrimaryMainFrame());
++  if (!content::AlloyStateOwnerForContext(owner, profile)) {
++    return;
++  }
++  auto approved = std::make_unique<NativeSSLWorkingState>(
++      profile, base::WeakPtr<base::SupportsUserData>());
++  approved->state()->AllowHttpForHost(
++      url.GetHost(), contents->GetPrimaryMainFrame()->GetStoragePartition());
++  auto* helper = HttpsOnlyModeTabHelper::FromWebContents(contents);
++  if (!helper) {
++    return;
++  }
++  helper->PrepareAlloyReload(
++      url,
++      base::BindOnce(
++          [](Profile* profile, std::unique_ptr<NativeSSLWorkingState> state,
++             const base::WeakPtr<base::SupportsUserData>& next) {
++            auto* new_owner = content::AlloyStateOwnerForContext(next, profile);
++            if (!new_owner || new_owner->GetUserData(&kAlloySSLStateKey)) {
++              return;
++            }
++            state->TransferTo(next);
++            auto* instance = state->state();
++            new_owner->SetUserData(&kAlloySSLStateKey, std::move(state));
++            GetForProfile(profile)->RegisterDocumentInstance(instance);
++          },
++          profile, std::move(approved)));
+ }
+ 
+ // static
+--- a/chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h
++++ b/chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h
+@@ -5,11 +5,17 @@
+ #ifndef CHROME_BROWSER_SSL_STATEFUL_SSL_HOST_STATE_DELEGATE_FACTORY_H_
+ #define CHROME_BROWSER_SSL_STATEFUL_SSL_HOST_STATE_DELEGATE_FACTORY_H_
+ 
++#include "base/memory/weak_ptr.h"
+ #include "base/no_destructor.h"
++#include "base/supports_user_data.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ #include "components/prefs/pref_service.h"
+ 
+ class StatefulSSLHostStateDelegate;
++class GURL;
++namespace content {
++class WebContents;
++}
+ class Profile;
+ 
+ // Singleton that associates all StatefulSSLHostStateDelegates with
+@@ -17,6 +23,12 @@
+ class StatefulSSLHostStateDelegateFactory : public ProfileKeyedServiceFactory {
+  public:
+   static StatefulSSLHostStateDelegate* GetForProfile(Profile* profile);
++  static StatefulSSLHostStateDelegate* GetForOwner(
++      Profile* profile,
++      const base::WeakPtr<base::SupportsUserData>& owner);
++  static void PrepareHttpReload(Profile* profile,
++                                content::WebContents* contents,
++                                const GURL& url);
+ 
+   static StatefulSSLHostStateDelegateFactory* GetInstance();
+ 
+--- a/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
+@@ -619,6 +619,14 @@
+ 
+ StatefulSSLHostStateDelegate*
+ ChromePageInfoDelegate::GetStatefulSSLHostStateDelegate() {
++  if (document_scoped_) {
++    auto* frame = document_.AsRenderFrameHostIfValid();
++    return frame ? StatefulSSLHostStateDelegateFactory::GetForOwner(
++                       Profile::FromBrowserContext(frame->GetBrowserContext()),
++                       content::AlloyDocumentStateOwner(frame))
++                 : nullptr;
++  }
++
+   return StatefulSSLHostStateDelegateFactory::GetForProfile(GetProfile());
+ }
+ 
+--- a/components/security_interstitials/content/stateful_ssl_host_state_delegate.cc
++++ b/components/security_interstitials/content/stateful_ssl_host_state_delegate.cc
+@@ -86,7 +86,10 @@
+ 
+ StatefulSSLHostStateDelegate::StatefulSSLHostStateDelegate(
+     content::BrowserContext* browser_context,
+-    HostContentSettingsMap* host_content_settings_map)
++    HostContentSettingsMap* host_content_settings_map,
++    bool user_state_admitted,
++    OwnerResolver resolver,
++    NetworkContextGetter network_context)
+     : clock_(new base::DefaultClock()),
+       browser_context_(browser_context),
+       host_content_settings_map_(host_content_settings_map),
+@@ -95,7 +98,28 @@
+           clock_.get(),
+           base::Seconds(kHTTPSFirstModeBypassExpirationInSeconds)),
+       https_only_mode_enforcelist_(host_content_settings_map_, clock_.get()),
+-      https_first_balanced_mode_suppressed_for_testing(false) {}
++      https_first_balanced_mode_suppressed_for_testing(false),
++      user_state_admitted_(user_state_admitted),
++      owner_resolver_(std::move(resolver)),
++      network_context_(std::move(network_context)) {}
++
++content::SSLHostStateDelegate* StatefulSSLHostStateDelegate::ForAlloyStateOwner(
++    const base::WeakPtr<base::SupportsUserData>& owner) {
++  return user_state_admitted_ ? this
++         : owner_resolver_    ? owner_resolver_.Run(owner)
++                              : nullptr;
++}
++
++void StatefulSSLHostStateDelegate::RegisterDocumentInstance(
++    StatefulSSLHostStateDelegate* instance) {
++  std::erase_if(document_instances_, [](const auto& value) { return !value; });
++  for (const auto& value : document_instances_) {
++    if (value.get() == instance) {
++      return;
++    }
++  }
++  document_instances_.push_back(instance->weak_factory_.GetWeakPtr());
++}
+ 
+ StatefulSSLHostStateDelegate::~StatefulSSLHostStateDelegate() = default;
+ 
+@@ -104,6 +128,10 @@
+     const net::X509Certificate& cert,
+     net::Error error,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return;
++  }
++
+   if (!storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition()) {
+     // Decisions for non-default storage partitions are stored in memory only;
+@@ -143,6 +171,16 @@
+ 
+ void StatefulSSLHostStateDelegate::Clear(
+     base::RepeatingCallback<bool(const std::string&)> host_filter) {
++  if (!user_state_admitted_) {
++    auto instances = document_instances_;
++    for (auto& instance : instances) {
++      if (instance) {
++        instance->Clear(host_filter);
++      }
++    }
++    return;
++  }
++
+   // Convert host matching to content settings pattern matching. Content
+   // settings deletion is done synchronously on the UI thread, so we can use
+   // |host_filter| by reference.
+@@ -172,6 +210,10 @@
+     const net::X509Certificate& cert,
+     net::Error error,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return DENIED;
++  }
++
+   if (!storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition()) {
+     if (allowed_certs_for_non_default_storage_partitions_.find(host) ==
+@@ -217,6 +259,10 @@
+ void StatefulSSLHostStateDelegate::HostRanInsecureContent(
+     const std::string& host,
+     InsecureContentType content_type) {
++  if (!user_state_admitted_) {
++    return;
++  }
++
+   switch (content_type) {
+     case MIXED_CONTENT:
+       ran_mixed_content_hosts_.insert(host);
+@@ -230,6 +276,10 @@
+ bool StatefulSSLHostStateDelegate::DidHostRunInsecureContent(
+     const std::string& host,
+     InsecureContentType content_type) {
++  if (!user_state_admitted_) {
++    return false;
++  }
++
+   switch (content_type) {
+     case MIXED_CONTENT:
+       return ran_mixed_content_hosts_.contains(host);
+@@ -242,6 +292,10 @@
+ void StatefulSSLHostStateDelegate::AllowHttpForHost(
+     const std::string& host,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return;
++  }
++
+   bool is_nondefault_storage =
+       !storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition();
+@@ -251,6 +305,10 @@
+ bool StatefulSSLHostStateDelegate::IsHttpAllowedForHost(
+     const std::string& host,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return false;
++  }
++
+   bool is_nondefault_storage =
+       !storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition();
+@@ -262,6 +320,10 @@
+     const std::string& host,
+     bool enforced,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return;
++  }
++
+   bool is_nondefault_storage =
+       !storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition();
+@@ -275,6 +337,10 @@
+ bool StatefulSSLHostStateDelegate::IsHttpsEnforcedForUrl(
+     const GURL& url,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return false;
++  }
++
+   bool is_nondefault_storage =
+       !storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition();
+@@ -284,6 +350,10 @@
+ 
+ std::set<GURL> StatefulSSLHostStateDelegate::GetHttpsEnforcedHosts(
+     content::StoragePartition* storage_partition) const {
++  if (!user_state_admitted_) {
++    return {};
++  }
++
+   bool is_nondefault_storage =
+       !storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition();
+@@ -291,16 +361,46 @@
+ }
+ 
+ void StatefulSSLHostStateDelegate::ClearHttpsOnlyModeAllowlist() {
++  if (!user_state_admitted_) {
++    auto instances = document_instances_;
++    for (auto& instance : instances) {
++      if (instance) {
++        instance->ClearHttpsOnlyModeAllowlist();
++      }
++    }
++    return;
++  }
++
+   https_only_mode_allowlist_.ClearAllowlist(base::Time(), base::Time::Max());
+ }
+ 
+ void StatefulSSLHostStateDelegate::ClearHttpsEnforcelist() {
++  if (!user_state_admitted_) {
++    auto instances = document_instances_;
++    for (auto& instance : instances) {
++      if (instance) {
++        instance->ClearHttpsEnforcelist();
++      }
++    }
++    return;
++  }
++
+   https_only_mode_enforcelist_.ClearEnforcements(base::Time(),
+                                                  base::Time::Max());
+ }
+ 
+ void StatefulSSLHostStateDelegate::RevokeUserAllowExceptions(
+     const std::string& host) {
++  if (!user_state_admitted_) {
++    auto instances = document_instances_;
++    for (auto& instance : instances) {
++      if (instance) {
++        instance->RevokeUserAllowExceptions(host);
++      }
++    }
++    return;
++  }
++
+   GURL url = GetSecureGURLForHost(host);
+   host_content_settings_map_->SetWebsiteSettingDefaultScope(
+       url, GURL(), ContentSettingsType::SSL_CERT_DECISIONS, base::Value());
+@@ -321,6 +421,10 @@
+ 
+ bool StatefulSSLHostStateDelegate::HasAllowExceptionForAnyHost(
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return false;
++  }
++
+   return HasCertAllowExceptionForAnyHost(storage_partition) ||
+          IsHttpAllowedForAnyHost(storage_partition);
+ }
+@@ -366,10 +470,24 @@
+ // extreme caution as it can have a big, negative impact on network performance.
+ void StatefulSSLHostStateDelegate::RevokeUserAllowExceptionsHard(
+     const std::string& host) {
++  if (!user_state_admitted_) {
++    auto instances = document_instances_;
++    for (auto& instance : instances) {
++      if (instance) {
++        instance->RevokeUserAllowExceptionsHard(host);
++      }
++    }
++    return;
++  }
++
+   RevokeUserAllowExceptions(host);
+   auto* network_context =
+-      browser_context_->GetDefaultStoragePartition()->GetNetworkContext();
+-  network_context->CloseIdleConnections(base::NullCallback());
++      network_context_
++          ? network_context_.Run()
++          : browser_context_->GetDefaultStoragePartition()->GetNetworkContext();
++  if (network_context) {
++    network_context->CloseIdleConnections(base::NullCallback());
++  }
+ }
+ 
+ bool StatefulSSLHostStateDelegate::
+@@ -397,6 +515,10 @@
+ bool StatefulSSLHostStateDelegate::HasCertAllowException(
+     const std::string& host,
+     content::StoragePartition* storage_partition) {
++  if (!user_state_admitted_) {
++    return false;
++  }
++
+   if (!storage_partition ||
+       storage_partition != browser_context_->GetDefaultStoragePartition()) {
+     return allowed_certs_for_non_default_storage_partitions_.contains(host);
+--- a/components/security_interstitials/content/stateful_ssl_host_state_delegate.h
++++ b/components/security_interstitials/content/stateful_ssl_host_state_delegate.h
+@@ -8,8 +8,11 @@
+ #include <memory>
+ #include <set>
+ #include <string>
+-
++#include <vector>
++
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/security_interstitials/core/https_only_mode_allowlist.h"
+ #include "components/security_interstitials/core/https_only_mode_enforcelist.h"
+@@ -26,6 +29,10 @@
+ class FilePath;
+ }  //  namespace base
+ 
++namespace network::mojom {
++class NetworkContext;
++}
++
+ namespace content {
+ class BrowserContext;
+ class StoragePartition;
+@@ -37,9 +44,19 @@
+ class StatefulSSLHostStateDelegate : public content::SSLHostStateDelegate,
+                                      public KeyedService {
+  public:
++  using OwnerResolver = base::RepeatingCallback<content::SSLHostStateDelegate*(
++      const base::WeakPtr<base::SupportsUserData>&)>;
++  using NetworkContextGetter =
++      base::RepeatingCallback<network::mojom::NetworkContext*()>;
+   StatefulSSLHostStateDelegate(
+       content::BrowserContext* browser_context,
+-      HostContentSettingsMap* host_content_settings_map);
++      HostContentSettingsMap* host_content_settings_map,
++      bool user_state_admitted = true,
++      OwnerResolver resolver = {},
++      NetworkContextGetter network_context = {});
++  content::SSLHostStateDelegate* ForAlloyStateOwner(
++      const base::WeakPtr<base::SupportsUserData>& owner) override;
++  void RegisterDocumentInstance(StatefulSSLHostStateDelegate* instance);
+ 
+   StatefulSSLHostStateDelegate(const StatefulSSLHostStateDelegate&) = delete;
+   StatefulSSLHostStateDelegate& operator=(const StatefulSSLHostStateDelegate&) =
+@@ -180,6 +197,11 @@
+   security_interstitials::HttpsOnlyModeEnforcelist https_only_mode_enforcelist_;
+ 
+   bool https_first_balanced_mode_suppressed_for_testing;
++  const bool user_state_admitted_;
++  const OwnerResolver owner_resolver_;
++  const NetworkContextGetter network_context_;
++  std::vector<base::WeakPtr<StatefulSSLHostStateDelegate>> document_instances_;
++  base::WeakPtrFactory<StatefulSSLHostStateDelegate> weak_factory_{this};
+ };
+ 
+ #endif  // COMPONENTS_SECURITY_INTERSTITIALS_CONTENT_STATEFUL_SSL_HOST_STATE_DELEGATE_H_
+--- a/content/browser/ssl/ssl_error_handler.cc
++++ b/content/browser/ssl/ssl_error_handler.cc
+@@ -5,7 +5,14 @@
+ #include "content/browser/ssl/ssl_error_handler.h"
+ 
+ #include "base/memory/weak_ptr.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "content/browser/navigation_or_document_handle.h"
++#include "content/browser/renderer_host/navigation_request.h"
++#include "content/public/browser/alloy_document_state.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/ssl_host_state_delegate.h"
++#include "content/public/browser/web_contents.h"
+ #include "net/base/net_errors.h"
+ 
+ using net::SSLInfo;
+@@ -18,8 +25,13 @@
+                                  const GURL& url,
+                                  net::Error net_error,
+                                  const net::SSLInfo& ssl_info,
+-                                 bool fatal)
++                                 bool fatal,
++                                 NavigationOrDocumentHandle* owner)
+     : delegate_(delegate),
++      owner_(owner),
++      alloy_scoped_(web_contents &&
++                    alloy::site_records::RequestContextPolicy::IsStateless(
++                        *web_contents->GetBrowserContext())),
+       request_url_(url),
+       is_primary_main_frame_request_(is_primary_main_frame_request),
+       ssl_info_(ssl_info),
+@@ -30,6 +42,22 @@
+ }
+ 
+ SSLErrorHandler::~SSLErrorHandler() {}
++
++SSLHostStateDelegate* SSLErrorHandler::GetScopedStateDelegate() const {
++  if (!owner_) {
++    return nullptr;
++  }
++  auto* context = owner_->GetAlloyStateBrowserContext();
++  if (!context) {
++    return nullptr;
++  }
++  auto state_owner =
++      owner_->GetDocument()
++          ? AlloyDocumentStateOwner(owner_->GetDocument())
++          : AlloyNavigationStateOwner(owner_->GetNavigationRequest());
++  auto* root = context->GetSSLHostStateDelegate();
++  return root ? root->ForAlloyStateOwner(state_owner) : nullptr;
++}
+ 
+ void SSLErrorHandler::CancelRequest() {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+--- a/content/browser/ssl/ssl_error_handler.h
++++ b/content/browser/ssl/ssl_error_handler.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_BROWSER_SSL_SSL_ERROR_HANDLER_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/global_request_id.h"
+@@ -20,6 +21,8 @@
+ namespace content {
+ 
+ class WebContents;
++class NavigationOrDocumentHandle;
++class SSLHostStateDelegate;
+ 
+ // SSLErrorHandler is the UI-thread class for handling SSL certificate
+ // errors. Users of this class can call CancelRequest(),
+@@ -48,7 +51,8 @@
+                   const GURL& url,
+                   net::Error net_error,
+                   const net::SSLInfo& ssl_info,
+-                  bool fatal);
++                  bool fatal,
++                  NavigationOrDocumentHandle* owner = nullptr);
+ 
+   SSLErrorHandler(const SSLErrorHandler&) = delete;
+   SSLErrorHandler& operator=(const SSLErrorHandler&) = delete;
+@@ -68,6 +72,8 @@
+   net::Error cert_error() const { return cert_error_; }
+ 
+   bool fatal() const { return fatal_; }
++  bool alloy_scoped() const { return alloy_scoped_; }
++  SSLHostStateDelegate* GetScopedStateDelegate() const;
+ 
+   // Cancels the associated net::URLRequest.
+   void CancelRequest();
+@@ -85,6 +91,8 @@
+ 
+  private:
+   base::WeakPtr<Delegate> delegate_;
++  const scoped_refptr<NavigationOrDocumentHandle> owner_;
++  const bool alloy_scoped_;
+ 
+   // The URL for the request that generated the error.
+   const GURL request_url_;
+--- a/content/browser/ssl/ssl_manager.cc
++++ b/content/browser/ssl/ssl_manager.cc
+@@ -13,6 +13,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/supports_user_data.h"
+ #include "base/trace_event/optional_trace_event.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/navigation_or_document_handle.h"
+ #include "content/browser/navigation_subresource_loader_params.h"
+@@ -20,6 +21,7 @@
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/ssl/ssl_error_handler.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -43,6 +45,14 @@
+ 
+ const char kSSLManagerKeyName[] = "content_ssl_manager";
+ 
++SSLHostStateDelegate* SSLStateForDocument(SSLHostStateDelegate* root,
++                                          RenderFrameHost* frame) {
++  return root && alloy::site_records::RequestContextPolicy::IsStateless(
++                     *frame->GetBrowserContext())
++             ? root->ForAlloyStateOwner(AlloyDocumentStateOwner(frame))
++             : root;
++}
++
+ // Used to log type of mixed content displayed/ran, matches histogram enum
+ // (MixedContentType). DO NOT REORDER.
+ enum class MixedContentType {
+@@ -60,6 +70,13 @@
+                         bool record_decision,
+                         CertificateRequestResultType decision) {
+   CHECK(handler->ssl_info().is_valid(), base::NotFatalUntil::M160);
++  if (handler->alloy_scoped()) {
++    state_delegate = handler->GetScopedStateDelegate();
++    if (!state_delegate) {
++      handler->DenyRequest();
++      return;
++    }
++  }
+   switch (decision) {
+     case CERTIFICATE_REQUEST_RESULT_TYPE_CONTINUE:
+       // Note that we should not call SetMaxSecurityStyle here, because
+@@ -127,9 +144,9 @@
+     frame_tree_node = navigation_or_document->GetFrameTreeNode();
+   }
+ 
+-  std::unique_ptr<SSLErrorHandler> handler(
+-      new SSLErrorHandler(web_contents, delegate, is_primary_main_frame_request,
+-                          url, net_error, ssl_info, fatal));
++  std::unique_ptr<SSLErrorHandler> handler(new SSLErrorHandler(
++      web_contents, delegate, is_primary_main_frame_request, url, net_error,
++      ssl_info, fatal, navigation_or_document));
+ 
+   if (!web_contents || !frame_tree_node) {
+     // Check if the DevTools Browser target is set to ignore certificate errors.
+@@ -253,13 +270,16 @@
+ }
+ 
+ void SSLManager::DidRunMixedContent(const GURL& security_origin) {
++  auto* state_delegate = SSLStateForDocument(
++      ssl_host_state_delegate_, controller_->frame_tree().GetMainFrame());
++
+   NavigationEntryImpl* entry = controller_->GetLastCommittedEntry();
+   if (!entry)
+     return;
+ 
+-  if (ssl_host_state_delegate_) {
+-    ssl_host_state_delegate_->HostRanInsecureContent(
+-        security_origin.GetHost(), SSLHostStateDelegate::MIXED_CONTENT);
++  if (state_delegate) {
++    state_delegate->HostRanInsecureContent(security_origin.GetHost(),
++                                           SSLHostStateDelegate::MIXED_CONTENT);
+   }
+   // TODO(crbug.com/40223471): Ensure proper notify_changes is passed to
+   // UpdateEntry.
+@@ -268,12 +288,15 @@
+ }
+ 
+ void SSLManager::DidRunContentWithCertErrors(const GURL& security_origin) {
++  auto* state_delegate = SSLStateForDocument(
++      ssl_host_state_delegate_, controller_->frame_tree().GetMainFrame());
++
+   NavigationEntryImpl* entry = controller_->GetLastCommittedEntry();
+   if (!entry)
+     return;
+ 
+-  if (ssl_host_state_delegate_) {
+-    ssl_host_state_delegate_->HostRanInsecureContent(
++  if (state_delegate) {
++    state_delegate->HostRanInsecureContent(
+         security_origin.GetHost(), SSLHostStateDelegate::CERT_ERRORS_CONTENT);
+   }
+   // TODO(crbug.com/40223471): Ensure proper notify_changes is passed to
+@@ -283,6 +306,14 @@
+ }
+ 
+ void SSLManager::OnCertError(std::unique_ptr<SSLErrorHandler> handler) {
++  auto* state_delegate = handler->alloy_scoped()
++                             ? handler->GetScopedStateDelegate()
++                             : ssl_host_state_delegate_.get();
++  if (handler->alloy_scoped() && !state_delegate) {
++    handler->DenyRequest();
++    return;
++  }
++
+   // First we check if we know the policy for this error.
+   CHECK(handler->ssl_info().is_valid(), base::NotFatalUntil::M160);
+ 
+@@ -294,8 +325,8 @@
+     // through even if there are certificate errors. Errors on localhost
+     // are unlikely to indicate actual security problems.
+     judgment = SSLHostStateDelegate::ALLOWED;
+-  } else if (ssl_host_state_delegate_) {
+-    judgment = ssl_host_state_delegate_->QueryPolicy(
++  } else if (state_delegate) {
++    judgment = state_delegate->QueryPolicy(
+         handler->request_url().GetHost(), *handler->ssl_info().cert.get(),
+         handler->cert_error(),
+         controller_->frame_tree().GetMainFrame()->GetStoragePartition());
+@@ -314,16 +345,22 @@
+ }
+ 
+ bool SSLManager::HasAllowExceptionForAnyHost() {
+-  if (!ssl_host_state_delegate_) {
++  auto* state_delegate = SSLStateForDocument(
++      ssl_host_state_delegate_, controller_->frame_tree().GetMainFrame());
++
++  if (!state_delegate) {
+     return false;
+   }
+-  return ssl_host_state_delegate_->HasAllowExceptionForAnyHost(
++  return state_delegate->HasAllowExceptionForAnyHost(
+       controller_->frame_tree().GetMainFrame()->GetStoragePartition());
+ }
+ 
+ void SSLManager::DidStartResourceResponse(
+     const url::SchemeHostPort& final_response_url,
+     bool has_certificate_errors) {
++  auto* state_delegate = SSLStateForDocument(
++      ssl_host_state_delegate_, controller_->frame_tree().GetMainFrame());
++
+   const std::string& scheme = final_response_url.scheme();
+   const std::string& host = final_response_url.host();
+ 
+@@ -332,8 +369,8 @@
+   }
+   // If the scheme is https: or wss and the cert did not have any errors, revoke
+   // any previous decisions that have occurred.
+-  if (!ssl_host_state_delegate_ ||
+-      !ssl_host_state_delegate_->HasAllowException(
++  if (!state_delegate ||
++      !state_delegate->HasAllowException(
+           host,
+           controller_->frame_tree().GetMainFrame()->GetStoragePartition())) {
+     return;
+@@ -343,7 +380,7 @@
+   // clear out any exceptions that were made by the user for bad
+   // certificates. This intentionally does not apply to cached resources
+   // (see https://crbug.com/634553 for an explanation).
+-  ssl_host_state_delegate_->RevokeUserAllowExceptions(host);
++  state_delegate->RevokeUserAllowExceptions(host);
+ }
+ 
+ void SSLManager::OnCertErrorInternal(std::unique_ptr<SSLErrorHandler> handler) {
+@@ -376,6 +413,9 @@
+                              int add_content_status_flags,
+                              int remove_content_status_flags,
+                              bool notify_changes) {
++  auto* state_delegate = SSLStateForDocument(
++      ssl_host_state_delegate_, controller_->frame_tree().GetMainFrame());
++
+   // We don't always have a navigation entry to update, for example in the
+   // case of the Web Inspector.
+   if (!entry)
+@@ -386,7 +426,7 @@
+   entry->GetSSL().content_status &= ~remove_content_status_flags;
+   entry->GetSSL().content_status |= add_content_status_flags;
+ 
+-  if (ssl_host_state_delegate_) {
++  if (state_delegate) {
+     const std::optional<url::Origin>& entry_origin =
+         entry->root_node()->frame_entry->committed_origin();
+     // In some cases (e.g., unreachable URLs), navigation entries might not have
+@@ -394,7 +434,7 @@
+     // those cases.
+     if (entry_origin.has_value()) {
+       const std::string& host = entry_origin->host();
+-      if (ssl_host_state_delegate_->DidHostRunInsecureContent(
++      if (state_delegate->DidHostRunInsecureContent(
+               host, SSLHostStateDelegate::MIXED_CONTENT)) {
+         entry->GetSSL().content_status |= SSLStatus::RAN_INSECURE_CONTENT;
+       }
+@@ -403,7 +443,7 @@
+       // main page is HTTPS with a certificate.
+       if (entry->GetURL().SchemeIsCryptographic() &&
+           entry->GetSSL().certificate &&
+-          ssl_host_state_delegate_->DidHostRunInsecureContent(
++          state_delegate->DidHostRunInsecureContent(
+               host, SSLHostStateDelegate::CERT_ERRORS_CONTENT)) {
+         entry->GetSSL().content_status |=
+             SSLStatus::RAN_CONTENT_WITH_CERT_ERRORS;
+--- a/content/public/browser/ssl_host_state_delegate.h
++++ b/content/public/browser/ssl_host_state_delegate.h
+@@ -9,6 +9,8 @@
+ #include <string>
+ 
+ #include "base/functional/callback_forward.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "net/base/net_errors.h"
+ #include "net/cert/x509_certificate.h"
+ 
+@@ -43,6 +45,13 @@
+     // errors on an HTTPS page.
+     CERT_ERRORS_CONTENT,
+   };
++
++  // Ordinary embedders retain their native context-wide delegate. Stateless
++  // delegates resolve the engine's admitted navigation/document owner instead.
++  virtual SSLHostStateDelegate* ForAlloyStateOwner(
++      const base::WeakPtr<base::SupportsUserData>&) {
++    return this;
++  }
+ 
+   // Records that |cert| is permitted to be used for |host| in the future, for
+   // a specified |error| type.

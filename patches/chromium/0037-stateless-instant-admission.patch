@@ -1,0 +1,40 @@
+--- a/chrome/browser/search/instant_service_factory.cc
++++ b/chrome/browser/search/instant_service_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/search/instant_service_factory.h"
+ 
+ #include "base/trace_event/trace_event.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search/instant_service.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+@@ -12,6 +13,9 @@
+ 
+ // static
+ InstantService* InstantServiceFactory::GetForProfile(Profile* profile) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return nullptr;
++  }
+   DCHECK(search::IsInstantExtendedAPIEnabled());
+   TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("loading"),
+               "InstantServiceFactory::GetForProfile");
+@@ -45,6 +49,9 @@
+ std::unique_ptr<KeyedService>
+ InstantServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++    return nullptr;
++  }
+   DCHECK(search::IsInstantExtendedAPIEnabled());
+   return std::make_unique<InstantService>(Profile::FromBrowserContext(context));
+ }
+--- a/chrome/browser/search/BUILD.gn
++++ b/chrome/browser/search/BUILD.gn
+@@ -15,6 +15,7 @@
+   ]
+   public_deps = []
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//base",
+     "//chrome/browser:browser_public_dependencies",
+     "//chrome/browser/ntp_tiles",

@@ -1,0 +1,227 @@
+--- a/content/browser/back_forward_cache/back_forward_cache_impl.cc
++++ b/content/browser/back_forward_cache/back_forward_cache_impl.cc
+@@ -26,6 +26,7 @@
+ #include "base/time/time.h"
+ #include "base/trace_event/typed_macros.h"
+ #include "base/types/expected.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_can_store_document_result.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_metrics.h"
+@@ -2111,6 +2112,11 @@
+ }
+ 
+ bool BackForwardCacheImpl::IsAllowed(const GURL& current_url) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *web_contents_->GetBrowserContext())) {
++    return false;
++  }
++
+   return IsHostPathAllowed(current_url) && IsQueryAllowed(current_url);
+ }
+ 
+--- a/content/browser/preloading/prefetch/prefetch_service.cc
++++ b/content/browser/preloading/prefetch/prefetch_service.cc
+@@ -17,6 +17,7 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/synchronization/waitable_event.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "components/embedder_support/user_agent_utils.h"
+ #include "components/variations/net/variations_http_headers.h"
+ #include "content/browser/browser_context_impl.h"
+@@ -830,6 +831,11 @@
+ PrefetchService::CheckEligibilityResult
+ PrefetchService::CheckInitialEligibilityOfPrefetch(
+     CheckEligibilityParams params) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_)) {
++    return std::move(params).Finish(PreloadingEligibility::kPreloadingDisabled);
++  }
++
+   auto prefetch_container = params.prefetch_container_internal;
+   if (delegate_) {
+     const auto eligibility_from_delegate = delegate_->IsSomePreloadingEnabled(
+--- a/content/browser/preloading/prerender/prerender_host_registry.cc
++++ b/content/browser/preloading/prerender/prerender_host_registry.cc
+@@ -23,6 +23,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/devtools/render_frame_devtools_agent_host.h"
+@@ -40,6 +41,7 @@
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/common/frame.mojom.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/preloading.h"
+ #include "content/public/browser/preloading_data.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -539,6 +541,11 @@
+ PrerenderHostId PrerenderHostRegistry::CreateAndStartHost(
+     const PrerenderAttributes& attributes,
+     PreloadingAttempt* attempt) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *web_contents()->GetBrowserContext())) {
++    return PrerenderHostId();
++  }
++
+   std::string recorded_url =
+       attributes.initiator_origin.has_value()
+           ? attributes.initiator_origin.value().GetURL().spec()
+--- a/content/browser/renderer_host/frame_navigation_entry.h
++++ b/content/browser/renderer_host/frame_navigation_entry.h
+@@ -175,6 +175,13 @@
+   const std::vector<GURL>& redirect_chain() const { return redirect_chain_; }
+ 
+   void SetPageState(const blink::PageState& page_state);
++  // Unlike restore-time SetPageState, this does not change live frame routing
++  // sequence numbers. Nothing beyond the URL remains in the serialized state.
++  void DiscardRestorePayload() {
++    page_state_ = blink::PageState::CreateFromURL(url_);
++    method_ = "GET";
++    post_id_ = -1;
++  }
+   const blink::PageState& page_state() const { return page_state_; }
+ 
+   // Remember the set of bindings granted to this FrameNavigationEntry at the
+--- a/content/browser/renderer_host/navigation_controller_impl.cc
++++ b/content/browser/renderer_host/navigation_controller_impl.cc
+@@ -56,6 +56,7 @@
+ #include "base/trace_event/optional_trace_event.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/types/optional_util.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "cc/base/switches.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_impl.h"
+@@ -2069,6 +2070,10 @@
+         // We don't send a notification about auto-subframe PageState during
+         // UpdateStateForFrame, since it looks like nothing has changed.  Send
+         // it here at commit time instead.
++        if (alloy::site_records::RequestContextPolicy::IsStateless(
++                *browser_context_)) {
++          GetLastCommittedEntry()->DiscardRestorePayload();
++        }
+         NotifyEntryChanged(GetLastCommittedEntry());
+         return false;
+       }
+@@ -2082,8 +2087,11 @@
+   //
+   // TODO(akalin): Use "sane time" as described in
+   // https://www.chromium.org/developers/design-documents/sane-time .
+-  base::Time timestamp =
+-      time_smoother_.GetSmoothedTime(get_timestamp_callback_.Run());
++  base::Time timestamp;
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_)) {
++    timestamp = time_smoother_.GetSmoothedTime(get_timestamp_callback_.Run());
++  }
+   DVLOG(1) << "Navigation finished at (smoothed) timestamp "
+            << timestamp.ToDeltaSinceWindowsEpoch().InMicroseconds();
+ 
+@@ -2184,6 +2192,23 @@
+ 
+   active_entry->SetIsOverridingUserAgent(
+       navigation_request->is_overriding_user_agent());
++
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_)) {
++    // Keep only the active document's working entry and any still-in-flight
++    // navigation. All retired entries have URL + anonymous routing ID only.
++    for (auto& entry : entries_) {
++      if (entry.get() != active_entry && entry.get() != pending_entry_) {
++        entry = entry->CloneUrlOnly();
++      }
++    }
++    if (entry_replaced_by_post_commit_error_) {
++      entry_replaced_by_post_commit_error_ =
++          entry_replaced_by_post_commit_error_->CloneUrlOnly();
++    }
++    // The original POST has already committed. Never save it for a reload.
++    active_entry->DiscardRestorePayload();
++  }
+ 
+   NotifyNavigationEntryCommitted(details, &deferred_notifier);
+ 
+@@ -5484,6 +5509,11 @@
+ void NavigationControllerImpl::UpdateStateForFrame(
+     RenderFrameHostImpl* rfhi,
+     const blink::PageState& page_state) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context_)) {
++    return;
++  }
++
+   OPTIONAL_TRACE_EVENT1("content",
+                         "NavigationControllerImpl::UpdateStateForFrame",
+                         "render_frame_host", rfhi);
+--- a/content/browser/renderer_host/navigation_entry_impl.cc
++++ b/content/browser/renderer_host/navigation_entry_impl.cc
+@@ -428,6 +428,31 @@
+ std::unique_ptr<NavigationEntryImpl> NavigationEntryImpl::FromNavigationEntry(
+     std::unique_ptr<NavigationEntry> entry) {
+   return base::WrapUnique(FromNavigationEntry(entry.release()));
++}
++
++std::unique_ptr<NavigationEntryImpl> NavigationEntryImpl::CloneUrlOnly() const {
++  auto entry = std::make_unique<NavigationEntryImpl>();
++  entry->SetURL(GetVirtualURL());
++  entry->set_unique_id(GetUniqueID());
++  // No SiteInstance or document survives. The native restore classification
++  // materializes this URL afresh on traversal, without any restore payload.
++  entry->set_restore_type(RestoreType::kRestored);
++  entry->frame_tree_->frame_entry->SetPageState(
++      blink::PageState::CreateFromURL(GetVirtualURL()));
++  return entry;
++}
++
++void NavigationEntryImpl::DiscardRestorePayload() {
++  std::vector<TreeNode*> nodes{frame_tree_.get()};
++  while (!nodes.empty()) {
++    auto* node = nodes.back();
++    nodes.pop_back();
++    node->frame_entry->DiscardRestorePayload();
++    for (auto& child : node->children) {
++      nodes.push_back(child.get());
++    }
++  }
++  post_data_.reset();
+ }
+ 
+ NavigationEntryImpl::NavigationEntryImpl()
+--- a/content/browser/renderer_host/navigation_entry_impl.h
++++ b/content/browser/renderer_host/navigation_entry_impl.h
+@@ -124,6 +124,10 @@
+   NavigationEntryImpl& operator=(const NavigationEntryImpl&) = delete;
+ 
+   ~NavigationEntryImpl() override;
++  // A fresh history projection containing only the URL and anonymous ID.
++  std::unique_ptr<NavigationEntryImpl> CloneUrlOnly() const;
++  // Keep live routing identities but no serialized form, scroll or POST data.
++  void DiscardRestorePayload();
+ 
+   // NavigationEntry implementation:
+   bool IsInitialEntry() const override;
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -1781,6 +1781,16 @@
+       initiator_navigation_state_(initiator_navigation_state),
+       should_ignore_initiator_policies_for_inheritance_(
+           should_ignore_initiator_policies_for_inheritance) {
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *frame_tree_node_->current_frame_host()->GetBrowserContext())) {
++    auto page_state =
++        blink::PageState::CreateFromEncodedData(commit_params_->page_state);
++    if (page_state.IsValid()) {
++      commit_params_->page_state =
++          blink::PageState::CreateFromURL(common_params_->url).ToEncodedData();
++    }
++  }
++
+   TRACE_EVENT("navigation", "NavigationRequest::NavigationRequest",
+               perfetto::Flow::FromPointer(this),
+               perfetto::protos::pbzero::ChromeTrackEvent::kNavigation, this);

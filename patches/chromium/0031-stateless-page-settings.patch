@@ -1,0 +1,838 @@
+--- a/chrome/browser/content_settings/cookie_settings_factory.cc
++++ b/chrome/browser/content_settings/cookie_settings_factory.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/check_op.h"
+ #include "base/metrics/histogram_functions.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profiles_state.h"
+@@ -62,6 +63,8 @@
+ CookieSettingsFactory::BuildServiceInstanceFor(
+     content::BrowserContext* context) const {
+   Profile* profile = Profile::FromBrowserContext(context);
++  const bool stateless =
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile);
+   PrefService* prefs = profile->GetPrefs();
+ 
+   if (profiles::IsRegularUserProfile(profile)) {
+@@ -104,5 +107,8 @@
+   return new content_settings::CookieSettings(
+       host_content_settings_map, prefs,
+       profile->IsPrimaryOTRProfileWithRegularParent(),
+-      compute_fedcm_sharing_permissions, extension_scheme);
++      stateless ? content_settings::CookieSettings::
++                      NoFedCmSharingPermissionsCallback()
++                : compute_fedcm_sharing_permissions,
++      extension_scheme, stateless);
+ }
+--- a/chrome/browser/ui/page_info/BUILD.gn
++++ b/chrome/browser/ui/page_info/BUILD.gn
+@@ -38,6 +38,7 @@
+ 
+ source_set("impl") {
+   sources = [
++    "alloy_document_permission_query.h",
+     "chrome_page_info_delegate.cc",
+     "chrome_page_info_ui_delegate.cc",
+   ]
+--- a/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ssl/https_upgrades_util.h"
+ #include "chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h"
+ #include "chrome/browser/subresource_filter/subresource_filter_profile_context_factory.h"
++#include "chrome/browser/ui/page_info/alloy_document_permission_query.h"
+ #include "chrome/browser/ui/url_identity.h"
+ #include "chrome/browser/usb/usb_chooser_context.h"
+ #include "chrome/browser/usb/usb_chooser_context_factory.h"
+@@ -142,7 +143,9 @@
+     GetBrowserCallback get_browser_callback)
+     : get_browser_callback_(std::move(get_browser_callback)),
+       web_contents_(web_contents),
+-      document_(web_contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()) {
++      document_(web_contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()),
++      document_scoped_(alloy::site_records::RequestContextPolicy::IsStateless(
++          *Profile::FromBrowserContext(web_contents->GetBrowserContext()))) {
+   CHECK(get_browser_callback_);
+ #if !BUILDFLAG(IS_ANDROID)
+   sentiment_service_ =
+@@ -165,8 +168,7 @@
+ 
+ permissions::ObjectPermissionContextBase*
+ ChromePageInfoDelegate::GetChooserContext(ContentSettingsType type) {
+-  const bool stateless =
+-      alloy::site_records::RequestContextPolicy::IsStateless(*GetProfile());
++  const bool stateless = document_scoped_;
+   auto* frame = document_.AsRenderFrameHostIfValid();
+   if (stateless && !frame) {
+     return nullptr;
+@@ -246,6 +248,10 @@
+     blink::PermissionType permission,
+     const url::Origin& origin,
+     const std::optional<url::Origin>& requesting_origin) {
++  if (document_scoped_) {
++    return alloy::site_records::PageInfoDocumentPermissionResult(
++        document_, permission, origin, requesting_origin);
++  }
+   auto* controller = GetProfile()->GetPermissionController();
+   auto descriptor = content::PermissionDescriptorUtil::
+       CreatePermissionDescriptorForPermissionType(permission);
+@@ -325,14 +331,37 @@
+ 
+ std::unique_ptr<content_settings::CookieControlsController>
+ ChromePageInfoDelegate::CreateCookieControlsController() {
++  if (document_scoped_ && !document_.AsRenderFrameHostIfValid()) {
++    return nullptr;
++  }
++
+   Profile* profile = GetProfile();
+-  return std::make_unique<content_settings::CookieControlsController>(
+-      CookieSettingsFactory::GetForProfile(profile),
+-      profile->IsOffTheRecord()
+-          ? CookieSettingsFactory::GetForProfile(profile->GetOriginalProfile())
+-          : nullptr,
+-      HostContentSettingsMapFactory::GetForProfile(profile),
+-      profile->IsPrimaryOTRProfileWithRegularParent());
++  const bool stateless = document_scoped_;
++  auto* settings = GetContentSettings();
++  if (!settings) {
++    return nullptr;
++  }
++  auto controller =
++      std::make_unique<content_settings::CookieControlsController>(
++          CookieSettingsFactory::GetForProfile(profile),
++          !stateless && profile->IsOffTheRecord()
++              ? CookieSettingsFactory::GetForProfile(
++                    profile->GetOriginalProfile())
++              : nullptr,
++          stateless ? nullptr : settings,
++          profile->IsPrimaryOTRProfileWithRegularParent(),
++          stateless
++              ? base::BindRepeating(
++                    [](content::WeakDocumentPtr document)
++                        -> HostContentSettingsMap* {
++                      auto* frame = document.AsRenderFrameHostIfValid();
++                      return frame ? HostContentSettingsMapFactory::GetForFrame(
++                                         frame)
++                                   : nullptr;
++                    },
++                    document_)
++              : base::RepeatingCallback<HostContentSettingsMap*()>());
++  return controller;
+ }
+ 
+ bool ChromePageInfoDelegate::IsIsolatedWebApp() {
+@@ -584,6 +613,10 @@
+ }
+ 
+ HostContentSettingsMap* ChromePageInfoDelegate::GetContentSettings() {
++  if (document_scoped_) {
++    auto* frame = document_.AsRenderFrameHostIfValid();
++    return frame ? HostContentSettingsMapFactory::GetForFrame(frame) : nullptr;
++  }
+   return HostContentSettingsMapFactory::GetForProfile(GetProfile());
+ }
+ 
+@@ -631,6 +664,10 @@
+ }
+ 
+ void ChromePageInfoDelegate::OnCookiesPageOpened() {
++  if (document_scoped_) {
++    return;
++  }
++
+   auto* profile = GetProfile();
+   auto cookie_settings = CookieSettingsFactory::GetForProfile(profile);
+   // Don't record the preference if 3PC are allowed by default. Since then
+--- a/chrome/browser/ui/page_info/chrome_page_info_delegate.h
++++ b/chrome/browser/ui/page_info/chrome_page_info_delegate.h
+@@ -165,6 +165,7 @@
+   GetBrowserCallback get_browser_callback_;
+   raw_ptr<content::WebContents, AcrossTasksDanglingUntriaged> web_contents_;
+   const content::WeakDocumentPtr document_;
++  const bool document_scoped_;
+   security_state::SecurityLevel security_level_for_tests_;
+   security_state::VisibleSecurityState visible_security_state_for_tests_;
+   bool security_state_for_tests_set_ = false;
+--- a/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/feature_list.h"
+ #include "base/notreached.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/page_info/about_this_site_tab_helper.h"
+ #include "chrome/browser/page_info/merchant_trust_service_factory.h"
+@@ -16,6 +17,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/page_info/alloy_document_permission_query.h"
+ #include "chrome/browser/ui/page_info/merchant_trust_side_panel.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/common/chrome_features.h"
+@@ -60,7 +62,11 @@
+ ChromePageInfoUiDelegate::ChromePageInfoUiDelegate(
+     content::WebContents* web_contents,
+     const GURL& site_url)
+-    : web_contents_(web_contents), site_url_(site_url) {}
++    : web_contents_(web_contents),
++      site_url_(site_url),
++      document_(web_contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()),
++      document_scoped_(alloy::site_records::RequestContextPolicy::IsStateless(
++          *Profile::FromBrowserContext(web_contents->GetBrowserContext()))) {}
+ 
+ bool ChromePageInfoUiDelegate::ShouldShowAllow(ContentSettingsType type) {
+   switch (type) {
+@@ -311,6 +317,11 @@
+ 
+ content::PermissionResult ChromePageInfoUiDelegate::GetPermissionResult(
+     blink::PermissionType permission) {
++  if (document_scoped_) {
++    return alloy::site_records::PageInfoDocumentPermissionResult(
++        document_, permission, url::Origin::Create(site_url_));
++  }
++
+   return GetProfile()
+       ->GetPermissionController()
+       ->GetPermissionResultForOriginWithoutContext(
+--- a/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.h
++++ b/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.h
+@@ -10,6 +10,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "build/build_config.h"
+ #include "components/page_info/page_info_ui_delegate.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "url/gurl.h"
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -99,6 +100,8 @@
+ 
+   raw_ptr<content::WebContents, AcrossTasksDanglingUntriaged> web_contents_;
+   GURL site_url_;
++  const content::WeakDocumentPtr document_;
++  const bool document_scoped_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_PAGE_INFO_CHROME_PAGE_INFO_UI_DELEGATE_H_
+--- a/components/content_settings/browser/ui/cookie_controls_controller.cc
++++ b/components/content_settings/browser/ui/cookie_controls_controller.cc
+@@ -98,10 +98,12 @@
+     scoped_refptr<CookieSettings> cookie_settings,
+     scoped_refptr<CookieSettings> original_cookie_settings,
+     HostContentSettingsMap* settings_map,
+-    bool is_incognito_profile)
++    bool is_incognito_profile,
++    base::RepeatingCallback<HostContentSettingsMap*()> settings_source)
+     : cookie_settings_(cookie_settings),
+       original_cookie_settings_(original_cookie_settings),
+-      settings_map_(settings_map) {
++      settings_source_(std::move(settings_source)),
++      settings_map_(settings_source_ ? nullptr : settings_map) {
+   CHECK(cookie_settings_);
+   cookie_observation_.Observe(cookie_settings_.get());
+ }
+@@ -111,11 +113,13 @@
+     scoped_refptr<CookieSettings> cookie_settings,
+     scoped_refptr<CookieSettings> original_cookie_settings,
+     HostContentSettingsMap* settings_map,
+-    bool is_incognito_profile)
++    bool is_incognito_profile,
++    base::RepeatingCallback<HostContentSettingsMap*()> settings_source)
+     : CookieControlsController(cookie_settings,
+                                original_cookie_settings,
+                                settings_map,
+-                               is_incognito_profile) {
++                               is_incognito_profile,
++                               std::move(settings_source)) {
+   scoped_unowned_user_data_.emplace(host, *this);
+ }
+ 
+@@ -130,6 +134,11 @@
+ CookieControlsController::~CookieControlsController() = default;
+ 
+ void CookieControlsController::OnUiClosing() {
++  if (!HasDocumentAuthority()) {
++    should_reload_ = false;
++    return;
++  }
++
+   auto* web_contents = GetWebContents();
+   if (should_reload_ && web_contents && !web_contents->IsBeingDestroyed()) {
+     web_contents->GetController().Reload(content::ReloadType::NORMAL, true);
+@@ -144,6 +153,9 @@
+ 
+ void CookieControlsController::Update(content::WebContents* web_contents,
+                                       const GURL& site_url) {
++  if (!HasDocumentAuthority()) {
++    return;
++  }
+   DCHECK(web_contents);
+   site_url_ = site_url;
+   if (!tab_observer_ || GetWebContents() != web_contents) {
+@@ -165,6 +177,11 @@
+ }
+ 
+ CookieControlsController::Status CookieControlsController::GetStatus() {
++  if (cookie_settings_->IsStateless()) {
++    return {CookieControlsState::kBlocked3pc,
++            CookieControlsEnforcement::kEnforcedByCookieSetting, base::Time()};
++  }
++
+   if (!cookie_settings_->ShouldBlockThirdPartyCookies()) {
+     return {CookieControlsState::kHidden,
+             CookieControlsEnforcement::kNoEnforcement, base::Time()};
+@@ -247,6 +264,10 @@
+ 
+ void CookieControlsController::OnCookieBlockingEnabledForSite(
+     bool block_third_party_cookies) {
++  if (!HasDocumentAuthority() || cookie_settings_->IsStateless()) {
++    return;
++  }
++
+   const GURL url = site_url_;
+   should_reload_ = true;
+   if (block_third_party_cookies) {
+@@ -260,9 +281,9 @@
+   base::RecordAction(UserMetricsAction("CookieControls.Bubble.TurnOff"));
+   cookie_settings_->SetCookieSettingForUserBypass(url);
+   Update(GetWebContents(), url);
+-  base::DictValue metadata = GetMetadata(settings_map_, url);
++  base::DictValue metadata = GetMetadata(GetSettingsMap(), url);
+   metadata.Set(kActivationsCountKey, GetActivationCount(metadata) + 1);
+-  ApplyMetadataChanges(settings_map_, url, std::move(metadata));
++  ApplyMetadataChanges(GetSettingsMap(), url, std::move(metadata));
+ 
+   RecordActivationMetrics();
+ }
+@@ -272,11 +293,19 @@
+ }
+ 
+ void CookieControlsController::SetStateChangedViaBypass(bool changed) {
++  if (!HasDocumentAuthority()) {
++    return;
++  }
++
+   // Avoid a toggle back and forth being marked as "changed".
+   user_changed_ub_state_ = changed && !user_changed_ub_state_;
+ }
+ 
+ int CookieControlsController::GetAllowedThirdPartyCookiesSitesCount() const {
++  if (!HasDocumentAuthority()) {
++    return 0;
++  }
++
+   auto* pscs = content_settings::PageSpecificContentSettings::GetForPage(
+       GetWebContents()->GetPrimaryPage());
+   if (!pscs) {
+@@ -288,6 +317,10 @@
+ }
+ 
+ int CookieControlsController::GetBlockedThirdPartyCookiesSitesCount() const {
++  if (!HasDocumentAuthority()) {
++    return 0;
++  }
++
+   auto* pscs = content_settings::PageSpecificContentSettings::GetForPage(
+       GetWebContents()->GetPrimaryPage());
+   if (!pscs) {
+@@ -299,6 +332,10 @@
+ }
+ 
+ int CookieControlsController::GetStatefulBounceCount() const {
++  if (!HasDocumentAuthority()) {
++    return 0;
++  }
++
+   auto* pscs = content_settings::PageSpecificContentSettings::GetForPage(
+       GetWebContents()->GetPrimaryPage());
+   if (pscs) {
+@@ -309,6 +346,10 @@
+ }
+ 
+ void CookieControlsController::UpdateCookieControlsIcon() {
++  if (!HasDocumentAuthority()) {
++    return;
++  }
++
+   if (observers_.empty()) {
+     return;
+   }
+@@ -322,6 +363,10 @@
+ 
+ void CookieControlsController::UpdatePageReloadStatus(
+     int recent_reloads_count) {
++  if (!HasDocumentAuthority()) {
++    return;
++  }
++
+   if (StateChangedViaBypass() && recent_reloads_count > 0) {
+     waiting_for_page_load_finish_ = true;
+     show_icon_as_confirmation_ = true;
+@@ -339,6 +384,10 @@
+ }
+ 
+ void CookieControlsController::OnPageFinishedLoading() {
++  if (!HasDocumentAuthority()) {
++    return;
++  }
++
+   if (!waiting_for_page_load_finish_) {
+     return;
+   }
+@@ -375,6 +424,10 @@
+ }
+ 
+ void CookieControlsController::RecordActivationMetrics() {
++  if (!HasDocumentAuthority()) {
++    return;
++  }
++
+   const GURL& url = site_url_;
+ 
+   auto site_data_access_type =
+@@ -390,7 +443,7 @@
+           cookie_settings_->HasAnyFrameRequestedStorageAccess(url))
+       .SetPageRefreshCount(std::clamp(recent_reloads_count_, 0, 10))
+       .SetRepeatedActivation(
+-          GetActivationCount(GetMetadata(settings_map_, url)) > 1)
++          GetActivationCount(GetMetadata(GetSettingsMap(), url)) > 1)
+       .SetSiteEngagementLevel(static_cast<uint64_t>(
+           SiteEngagementService::Get(GetWebContents()->GetBrowserContext())
+               ->GetEngagementLevel(url)))
+@@ -444,6 +497,10 @@
+ 
+ void CookieControlsController::TabObserver::OnSiteDataAccessed(
+     const AccessDetails& access_details) {
++  if (!cookie_controls_->HasDocumentAuthority()) {
++    return;
++  }
++
+   if (access_details.site_data_type != SiteDataType::kCookies) {
+     cookie_controls_->UpdateCookieControlsIcon();
+     return;
+@@ -478,6 +535,13 @@
+ 
+ void CookieControlsController::TabObserver::PrimaryPageChanged(
+     content::Page& page) {
++  if (!cookie_controls_->HasDocumentAuthority()) {
++    timer_.Stop();
++    cookie_accessed_set_.Clear();
++    last_visited_url_ = GURL();
++    return;
++  }
++
+   const GURL& current_url =
+       content::WebContentsObserver::web_contents()->GetVisibleURL();
+   cookie_accessed_set_.Clear();
+--- a/components/content_settings/browser/ui/cookie_controls_controller.h
++++ b/components/content_settings/browser/ui/cookie_controls_controller.h
+@@ -9,6 +9,7 @@
+ #include <set>
+ 
+ #include "base/containers/lru_cache.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -41,7 +42,8 @@
+       scoped_refptr<content_settings::CookieSettings> cookie_settings,
+       scoped_refptr<content_settings::CookieSettings> original_cookie_settings,
+       HostContentSettingsMap* settings_map,
+-      bool is_incognito_profile);
++      bool is_incognito_profile,
++      base::RepeatingCallback<HostContentSettingsMap*()> settings_source = {});
+   // Constructs a controller registered on `host`, so that owners which have an
+   // UnownedUserDataHost - such as a browser window - can expose it through
+   // Get() rather than through an accessor of their own.
+@@ -50,7 +52,8 @@
+       scoped_refptr<content_settings::CookieSettings> cookie_settings,
+       scoped_refptr<content_settings::CookieSettings> original_cookie_settings,
+       HostContentSettingsMap* settings_map,
+-      bool is_incognito_profile);
++      bool is_incognito_profile,
++      base::RepeatingCallback<HostContentSettingsMap*()> settings_source = {});
+   CookieControlsController(const CookieControlsController& other) = delete;
+   CookieControlsController& operator=(const CookieControlsController& other) =
+       delete;
+@@ -93,6 +96,11 @@
+   }
+ 
+  private:
++  HostContentSettingsMap* GetSettingsMap() const {
++    return settings_source_ ? settings_source_.Run() : settings_map_.get();
++  }
++  bool HasDocumentAuthority() const { return GetSettingsMap() != nullptr; }
++
+   struct Status {
+     Status(CookieControlsState controls_state,
+            CookieControlsEnforcement enforcement,
+@@ -190,6 +198,7 @@
+   // corresponds to the regular profile when |cookie_settings_| is incognito.
+   // This may be null.
+   scoped_refptr<content_settings::CookieSettings> original_cookie_settings_;
++  const base::RepeatingCallback<HostContentSettingsMap*()> settings_source_;
+   raw_ptr<HostContentSettingsMap> settings_map_;
+ 
+   // The URL the controller is currently anchored to. Set in `Update()` and
+--- a/components/content_settings/core/browser/cookie_settings.cc
++++ b/components/content_settings/core/browser/cookie_settings.cc
+@@ -45,9 +45,11 @@
+     PrefService* prefs,
+     bool is_incognito,
+     ComputeFedCmSharingPermissionsCallback compute_fedcm_sharing_permissions,
+-    const char* extension_scheme)
++    const char* extension_scheme,
++    bool stateless)
+     : host_content_settings_map_(host_content_settings_map),
+       is_incognito_(is_incognito),
++      stateless_(stateless),
+       extension_scheme_(extension_scheme),
+       block_third_party_cookies_(
+           net::cookie_util::IsForceThirdPartyCookieBlockingEnabled()),
+@@ -65,11 +67,22 @@
+ 
+ ContentSetting CookieSettings::GetDefaultCookieSetting(
+     content_settings::ProviderType* provider_id) const {
++  if (stateless_) {
++    if (provider_id) {
++      *provider_id = ProviderType::kDefaultProvider;
++    }
++    return CONTENT_SETTING_BLOCK;
++  }
++
+   return host_content_settings_map_->GetDefaultContentSetting(
+       ContentSettingsType::COOKIES, provider_id);
+ }
+ 
+ ContentSettingsForOneType CookieSettings::GetCookieSettings() const {
++  if (stateless_) {
++    return {};
++  }
++
+   return host_content_settings_map_->GetSettingsForOneType(
+       ContentSettingsType::COOKIES);
+ }
+@@ -83,6 +96,10 @@
+ }
+ 
+ void CookieSettings::SetDefaultCookieSetting(ContentSetting setting) {
++  if (stateless_) {
++    return;
++  }
++
+   DCHECK(IsValidSetting(setting));
+   host_content_settings_map_->SetDefaultContentSetting(
+       ContentSettingsType::COOKIES, setting);
+@@ -90,6 +107,10 @@
+ 
+ void CookieSettings::SetCookieSetting(const GURL& primary_url,
+                                       ContentSetting setting) {
++  if (stateless_) {
++    return;
++  }
++
+   DCHECK(IsValidSetting(setting));
+   host_content_settings_map_->SetContentSettingDefaultScope(
+       primary_url, GURL(), ContentSettingsType::COOKIES, setting);
+@@ -97,6 +118,10 @@
+ 
+ void CookieSettings::SetCookieSettingForUserBypass(
+     const GURL& first_party_url) {
++  if (stateless_) {
++    return;
++  }
++
+   ContentSettingConstraints constraints;
+   constraints.set_session_model(mojom::SessionModel::DURABLE);
+   host_content_settings_map_->SetContentSettingCustomScope(
+@@ -107,6 +132,10 @@
+ }
+ 
+ void CookieSettings::ResetCookieSetting(const GURL& primary_url) {
++  if (stateless_) {
++    return;
++  }
++
+   host_content_settings_map_->SetNarrowestContentSetting(
+       primary_url, GURL(), ContentSettingsType::COOKIES,
+       CONTENT_SETTING_DEFAULT);
+@@ -125,6 +154,10 @@
+ 
+ void CookieSettings::SetThirdPartyCookieSetting(const GURL& first_party_url,
+                                                 ContentSetting setting) {
++  if (stateless_) {
++    return;
++  }
++
+   DCHECK(IsValidSetting(setting));
+   host_content_settings_map_->SetContentSettingCustomScope(
+       ContentSettingsPattern::Wildcard(),
+@@ -133,6 +166,10 @@
+ }
+ 
+ void CookieSettings::ResetThirdPartyCookieSetting(const GURL& first_party_url) {
++  if (stateless_) {
++    return;
++  }
++
+   // Standard third party cookie settings are, with the introduction of User
+   // Bypass, site scoped. There also may be an origin scoped exception either
+   // created manually, or through the previous UI. Resetting should support
+@@ -153,6 +190,10 @@
+ }
+ 
+ bool CookieSettings::IsStoragePersistent(const GURL& origin) const {
++  if (stateless_) {
++    return false;
++  }
++
+   // TODO(dgrogan): Don't use host_content_settings_map_ directly.
+   // https://crbug.com/539538
+   ContentSetting setting = host_content_settings_map_->GetContentSetting(
+@@ -163,6 +204,10 @@
+ 
+ bool CookieSettings::HasAnyFrameRequestedStorageAccess(
+     const GURL& first_party_url) const {
++  if (stateless_) {
++    return false;
++  }
++
+   ContentSettingsForOneType settings =
+       host_content_settings_map_->GetSettingsForOneType(
+           ContentSettingsType::STORAGE_ACCESS);
+@@ -189,6 +234,10 @@
+     const GURL& url,
+     const net::SiteForCookies& site_for_cookies,
+     const url::Origin& top_level_origin) const {
++  if (stateless_) {
++    return false;
++  }
++
+   return !site_for_cookies.IsNull() &&
+          top_level_origin.scheme() == kChromeUIScheme &&
+          url.SchemeIsCryptographic();
+@@ -210,6 +259,10 @@
+ bool CookieSettings::ShouldAlwaysAllowCookies(
+     const GURL& url,
+     const GURL& first_party_url) const {
++  if (stateless_) {
++    return false;
++  }
++
+   if (first_party_url.SchemeIs(kChromeUIScheme) &&
+       url.SchemeIsCryptographic()) {
+     return true;
+@@ -233,6 +286,15 @@
+     const GURL& secondary_url,
+     ContentSettingsType content_type,
+     content_settings::SettingInfo* info) const {
++  if (stateless_) {
++    if (info) {
++      *info = SettingInfo();
++      info->primary_pattern = ContentSettingsPattern::Wildcard();
++      info->secondary_pattern = ContentSettingsPattern::Wildcard();
++    }
++    return CONTENT_SETTING_BLOCK;
++  }
++
+   if (content_type == ContentSettingsType::FEDERATED_IDENTITY_SHARING) {
+     return HasFedCmSharingPermission(primary_url, secondary_url)
+                ? ContentSetting::CONTENT_SETTING_ALLOW
+@@ -245,6 +307,10 @@
+ 
+ bool CookieSettings::IsThirdPartyCookiesAllowedScheme(
+     std::string_view scheme) const {
++  if (stateless_) {
++    return false;
++  }
++
+   return std::ranges::contains(
+       ContentSettingsRegistry::GetInstance()
+           ->Get(ContentSettingsType::COOKIES)
+@@ -318,6 +384,9 @@
+ bool CookieSettings::ShouldBlockThirdPartyCookies(
+     base::optional_ref<const url::Origin> top_frame_origin,
+     net::CookieSettingOverrides overrides) const {
++  if (stateless_) {
++    return true;
++  }
+   if (std::optional<bool> modifier_decision =
+           MaybeBlockThirdPartyCookiesPerModifiers(top_frame_origin,
+                                                   overrides)) {
+@@ -329,6 +398,10 @@
+ }
+ 
+ void CookieSettings::UpdateFedCmSharingPermissions() {
++  if (stateless_) {
++    return;
++  }
++
+   base::AutoLock lock(fedcm_sharing_permissions_lock_);
+   ContentSettingsForOneType settings = compute_fedcm_sharing_permissions_.Run();
+   if (settings.empty()) {
+--- a/components/content_settings/core/browser/cookie_settings.h
++++ b/components/content_settings/core/browser/cookie_settings.h
+@@ -78,10 +78,13 @@
+       PrefService* prefs,
+       bool is_incognito,
+       ComputeFedCmSharingPermissionsCallback compute_fedcm_sharing_permissions,
+-      const char* extension_scheme = kDummyExtensionScheme);
++      const char* extension_scheme = kDummyExtensionScheme,
++      bool stateless = false);
+ 
+   CookieSettings(const CookieSettings&) = delete;
+   CookieSettings& operator=(const CookieSettings&) = delete;
++
++  bool IsStateless() const { return stateless_; }
+ 
+   // Returns the default content setting (CONTENT_SETTING_ALLOW,
+   // CONTENT_SETTING_BLOCK, or CONTENT_SETTING_SESSION_ONLY) for cookies. If
+@@ -219,6 +222,7 @@
+   std::unique_ptr<PrefChangeRegistrar> pref_change_registrar_;
+   [[maybe_unused]] const bool is_incognito_;
+ 
++  const bool stateless_;
+   const char* extension_scheme_;  // Weak.
+ 
+   mutable base::Lock lock_;
+--- a/components/page_info/page_info.cc
++++ b/components/page_info/page_info.cc
+@@ -359,11 +359,13 @@
+ #if !BUILDFLAG(IS_ANDROID)
+   if (web_contents) {
+     cookie_controller_ = delegate_->CreateCookieControlsController();
+-    cookie_observation_.Observe(cookie_controller_.get());
+-
+-    // TODO(crbug.com/40901748): SetCookieInfo is called twice, once from here
+-    // and once from InitializeUiState. This should be cleaned up.
+-    cookie_controller_->Update(web_contents, site_url_);
++    if (cookie_controller_) {
++      cookie_observation_.Observe(cookie_controller_.get());
++
++      // TODO(crbug.com/40901748): SetCookieInfo is called twice, once from here
++      // and once from InitializeUiState. This should be cleaned up.
++      cookie_controller_->Update(web_contents, site_url_);
++    }
+ 
+     auto* pscs = GetPageSpecificContentSettings();
+     if (pscs) {
+@@ -437,6 +439,10 @@
+ }
+ 
+ void PageInfo::OnThirdPartyToggleClicked(bool block_third_party_cookies) {
++  if (!GetContentSettings() || !cookie_controller_) {
++    return;
++  }
++
+   RecordPageInfoAction(block_third_party_cookies
+                            ? page_info::PAGE_INFO_COOKIES_BLOCKED_FOR_SITE
+                            : page_info::PAGE_INFO_COOKIES_ALLOWED_FOR_SITE);
+@@ -622,6 +628,12 @@
+     std::optional<PermissionSetting> setting,
+     std::optional<url::Origin> requesting_origin,
+     bool is_one_time) {
++  scoped_refptr<HostContentSettingsMap> map_owner = GetContentSettings();
++  auto* map = map_owner.get();
++  if (!map) {
++    return;
++  }
++
+   // Check that we are passing nullopt instead of CONTENT_SETTING_DEFAULT.
+   CHECK_NE(setting, PermissionSetting{CONTENT_SETTING_DEFAULT});
+   ContentSettingChangedViaPageInfo(type);
+@@ -645,7 +657,6 @@
+   // This is technically redundant given the histogram above, but putting the
+   // total count of permission changes in another histogram makes it easier to
+   // compare it against other kinds of actions in Page Info.
+-  HostContentSettingsMap* map = GetContentSettings();
+   RecordPageInfoAction(page_info::PAGE_INFO_CHANGED_PERMISSION);
+   if (type == ContentSettingsType::SOUND) {
+     ContentSetting default_setting =
+@@ -755,6 +766,9 @@
+                 kUserManuallyChangedSiteSetting);
+   }
+ 
++  if (GetContentSettings() != map) {
++    return;
++  }
+   map->SetNarrowestContentSetting(primary_url, site_url_, type, setting,
+                                   constraints);
+ 
+@@ -841,7 +855,8 @@
+   if (reload_prompt) {
+     *reload_prompt = false;
+   }
+-  if (show_info_bar_ && web_contents_ && !web_contents_->IsBeingDestroyed()) {
++  if (GetContentSettings() && show_info_bar_ && web_contents_ &&
++      !web_contents_->IsBeingDestroyed()) {
+     if (delegate_->CreateInfoBarDelegate() && reload_prompt) {
+       *reload_prompt = true;
+     }
+@@ -851,6 +866,10 @@
+ }
+ 
+ void PageInfo::OnRevokeSSLErrorBypassButtonPressed() {
++  if (!GetContentSettings()) {
++    return;
++  }
++
+   auto* stateful_ssl_host_state_delegate =
+       delegate_->GetStatefulSSLHostStateDelegate();
+   DCHECK(stateful_ssl_host_state_delegate);
+@@ -1551,6 +1570,11 @@
+   ChosenObjectInfoList chosen_object_info_list;
+ 
+   HostContentSettingsMap* content_settings = GetContentSettings();
++  if (!content_settings) {
++    ui_->SetPermissionInfo(permission_info_list,
++                           std::move(chosen_object_info_list));
++    return;
++  }
+   DCHECK(web_contents_);
+   for (const ContentSettingsType type : kPermissionType) {
+     PermissionInfo permission_info;
+@@ -1617,6 +1641,11 @@
+ 
+ std::set<net::SchemefulSite> PageInfo::GetTwoSitePermissionRequesters(
+     ContentSettingsType type) {
++  auto* map = GetContentSettings();
++  if (!map) {
++    return {};
++  }
++
+   if (type == ContentSettingsType::STORAGE_ACCESS) {
+     return {};
+   }
+@@ -1629,7 +1658,6 @@
+     }
+   }
+   // Collect sites that were previously granted a permission
+-  auto* map = GetContentSettings();
+   for (auto& setting : map->GetSettingsForOneType(type)) {
+     if (setting.primary_pattern == ContentSettingsPattern::Wildcard() &&
+         setting.secondary_pattern == ContentSettingsPattern::Wildcard()) {
+@@ -1837,6 +1865,10 @@
+ 
+ content_settings::PageSpecificContentSettings*
+ PageInfo::GetPageSpecificContentSettings() const {
++  if (!GetContentSettings()) {
++    return nullptr;
++  }
++
+   // TODO(https://crbug.com/1103176, https://crbug.com/1233122): PageInfo should
+   // be per page. Why is it a WebContentsObserver if it is not observing
+   // anything?
+--- a/components/page_info/page_info_delegate.h
++++ b/components/page_info/page_info_delegate.h
+@@ -116,6 +116,7 @@
+ 
+   // The |HostContentSettingsMap| is the service that provides and manages
+   // content settings (aka. site permissions).
++  // May return null when the original document's authority has ended.
+   virtual HostContentSettingsMap* GetContentSettings() = 0;
+ 
+   // The subresource filter service determines whether ads should be blocked on

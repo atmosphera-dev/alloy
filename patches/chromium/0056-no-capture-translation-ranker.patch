@@ -1,0 +1,164 @@
+--- a/components/translate/core/browser/translate_ranker_impl.h
++++ b/components/translate/core/browser/translate_ranker_impl.h
+@@ -82,6 +82,11 @@
+ // whether the user should be given a translation prompt or not.
+ class TranslateRankerImpl : public TranslateRanker {
+  public:
++  // Same ready, no-model interface for every Alloy context. No data or loader
++  // services are bound, and event/model intake is unavailable in this form.
++  struct NoCapture {};
++  explicit TranslateRankerImpl(NoCapture);
++
+   TranslateRankerImpl(const base::FilePath& model_path,
+                       const GURL& model_url,
+                       ukm::UkmRecorder* ukm_recorder);
+@@ -121,6 +126,7 @@
+   // Check if the ModelLoader has been initialized. Used to test ModelLoader
+   // logic.
+   bool CheckModelLoaderForTesting();
++  bool HasCapturedDataForTesting() const;
+ 
+  private:
+   void SendEventToUKM(const metrics::TranslateEventProto& translate_event,
+@@ -155,6 +161,8 @@
+   // Saved cache of translate event protos.
+   std::vector<metrics::TranslateEventProto> event_cache_;
+ 
++  const bool no_capture_ = false;
++
+   base::WeakPtrFactory<TranslateRankerImpl> weak_ptr_factory_{this};
+ };
+ 
+--- a/components/translate/core/browser/translate_ranker_impl.cc
++++ b/components/translate/core/browser/translate_ranker_impl.cc
+@@ -160,6 +160,13 @@
+   }
+ }
+ 
++TranslateRankerImpl::TranslateRankerImpl(NoCapture)
++    : ukm_recorder_(nullptr),
++      is_uma_logging_enabled_(false),
++      is_query_enabled_(false),
++      is_enforcement_enabled_(false),
++      no_capture_(true) {}
++
+ TranslateRankerImpl::~TranslateRankerImpl() = default;
+ 
+ // static
+@@ -199,6 +206,9 @@
+ }
+ 
+ void TranslateRankerImpl::EnableLogging(bool value) {
++  if (no_capture_) {
++    return;
++  }
+   if (value != is_uma_logging_enabled_) {
+     DVLOG(3) << "Cleared translate events cache.";
+     event_cache_.clear();
+@@ -207,12 +217,18 @@
+ }
+ 
+ uint32_t TranslateRankerImpl::GetModelVersion() const {
++  if (no_capture_) {
++    return 0;
++  }
+   return model_ ? model_->proto().translate().version() : 0;
+ }
+ 
+ bool TranslateRankerImpl::ShouldOfferTranslation(
+     TranslateEventProto* translate_event,
+     TranslateMetricsLogger* translate_metrics_logger) {
++  if (no_capture_) {
++    return true;
++  }
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   // The ranker is a gate in the "show a translation prompt" flow. To retain
+   // the pre-existing functionality, it defaults to returning true in the
+@@ -262,6 +278,9 @@
+ 
+ bool TranslateRankerImpl::GetModelDecision(
+     const TranslateEventProto& translate_event) {
++  if (no_capture_) {
++    return true;
++  }
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(model_ != nullptr);
+ 
+@@ -299,6 +318,10 @@
+ 
+ void TranslateRankerImpl::FlushTranslateEvents(
+     std::vector<TranslateEventProto>* events) {
++  if (no_capture_) {
++    events->clear();
++    return;
++  }
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DVLOG(3) << "Flushing translate ranker events.";
+   events->swap(event_cache_);
+@@ -307,6 +330,9 @@
+ 
+ void TranslateRankerImpl::SendEventToUKM(const TranslateEventProto& event,
+                                          ukm::SourceId ukm_source_id) {
++  if (no_capture_) {
++    return;
++  }
+   if (!ukm_recorder_) {
+     DVLOG(3) << "No UKM service.";
+     return;
+@@ -327,6 +353,9 @@
+ 
+ void TranslateRankerImpl::AddTranslateEvent(const TranslateEventProto& event,
+                                             ukm::SourceId ukm_source_id) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if (ukm_source_id != ukm::kInvalidSourceId) {
+     SendEventToUKM(event, ukm_source_id);
+@@ -338,8 +367,16 @@
+ }
+ 
+ void TranslateRankerImpl::OnModelAvailable(std::unique_ptr<RankerModel> model) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   model_ = std::move(model);
++}
++
++bool TranslateRankerImpl::HasCapturedDataForTesting() const {
++  return ukm_recorder_ || model_loader_ || model_ || !event_cache_.empty() ||
++         is_uma_logging_enabled_;
+ }
+ 
+ bool TranslateRankerImpl::CheckModelLoaderForTesting() {
+@@ -350,6 +387,9 @@
+     int event_type,
+     ukm::SourceId ukm_source_id,
+     TranslateEventProto* translate_event) {
++  if (no_capture_) {
++    return;
++  }
+   DCHECK(TranslateEventProto::EventType_IsValid(event_type));
+   translate_event->set_event_type(
+       static_cast<TranslateEventProto::EventType>(event_type));
+--- a/chrome/browser/translate/translate_ranker_factory.cc
++++ b/chrome/browser/translate/translate_ranker_factory.cc
+@@ -29,6 +29,7 @@
+     : ProfileKeyedServiceFactory(
+           "TranslateRanker",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // Translate is enabled in guest profiles.
+               .WithGuest(ProfileSelection::kRedirectedToOriginal)
+@@ -42,8 +43,7 @@
+ TranslateRankerFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* browser_context) const {
+   return std::make_unique<TranslateRankerImpl>(
+-      TranslateRankerImpl::GetModelPath(browser_context->GetPath()),
+-      TranslateRankerImpl::GetModelURL(), ukm::UkmRecorder::Get());
++      TranslateRankerImpl::NoCapture{});
+ }
+ 
+ }  // namespace translate

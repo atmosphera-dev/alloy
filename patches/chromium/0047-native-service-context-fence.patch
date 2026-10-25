@@ -1,0 +1,105 @@
+--- a/components/keyed_service/core/keyed_service_base_factory.h
++++ b/components/keyed_service/core/keyed_service_base_factory.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_KEYED_SERVICE_CORE_KEYED_SERVICE_BASE_FACTORY_H_
+ #define COMPONENTS_KEYED_SERVICE_CORE_KEYED_SERVICE_BASE_FACTORY_H_
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/sequence_checker.h"
+ #include "components/keyed_service/core/dependency_node.h"
+@@ -35,6 +36,27 @@
+   // TODO(crbug.com/40619682): Remove once there are no dependencies between
+   // factories with different type of context, or dependencies are safe to have.
+   enum Type { BROWSER_CONTEXT, BROWSER_STATE, SIMPLE };
++
++  // Scoped native test observation before a service mapping is read or created.
++  // Contexts are opaque so the same fence covers browser and SimpleKey
++  // factories. The production path has no observer and retains no
++  // service-access history.
++  using ContextAccessCallbackForTesting =
++      base::RepeatingCallback<void(const char*, const void*, const void*)>;
++  class KEYED_SERVICE_EXPORT ScopedContextAccessObserverForTesting {
++   public:
++    explicit ScopedContextAccessObserverForTesting(
++        ContextAccessCallbackForTesting callback);
++    ScopedContextAccessObserverForTesting(
++        const ScopedContextAccessObserverForTesting&) = delete;
++    ScopedContextAccessObserverForTesting& operator=(
++        const ScopedContextAccessObserverForTesting&) = delete;
++    ~ScopedContextAccessObserverForTesting();
++
++   private:
++    const ContextAccessCallbackForTesting callback_;
++    const raw_ptr<const ContextAccessCallbackForTesting> previous_;
++  };
+ 
+   KeyedServiceBaseFactory(const KeyedServiceBaseFactory&) = delete;
+   KeyedServiceBaseFactory& operator=(const KeyedServiceBaseFactory&) = delete;
+@@ -73,6 +95,9 @@
+   // might be created, be destroyed, and then a new object might be created at
+   // 0xWhatever).
+   void MarkContextLive(void* context);
++
++  void NotifyContextAccessForTesting(const void* requested,
++                                     const void* selected) const;
+ 
+   // Finds which context (if any) to use.
+   virtual void* GetContextToUse(void* context) const = 0;
+--- a/components/keyed_service/core/keyed_service_base_factory.cc
++++ b/components/keyed_service/core/keyed_service_base_factory.cc
+@@ -5,12 +5,42 @@
+ #include "components/keyed_service/core/keyed_service_base_factory.h"
+ 
+ #include <type_traits>
++#include <utility>
+ 
++#include "base/check_op.h"
+ #include "base/supports_user_data.h"
+ #include "base/trace_event/trace_event.h"
+ #include "components/keyed_service/core/dependency_manager.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_service.h"
++
++namespace {
++thread_local const KeyedServiceBaseFactory::ContextAccessCallbackForTesting*
++    g_context_access_observer_for_testing = nullptr;
++}  // namespace
++
++KeyedServiceBaseFactory::ScopedContextAccessObserverForTesting::
++    ScopedContextAccessObserverForTesting(
++        ContextAccessCallbackForTesting callback)
++    : callback_(std::move(callback)),
++      previous_(
++          std::exchange(g_context_access_observer_for_testing, &callback_)) {}
++
++KeyedServiceBaseFactory::ScopedContextAccessObserverForTesting::
++    ~ScopedContextAccessObserverForTesting() {
++  CHECK_EQ(g_context_access_observer_for_testing, &callback_);
++  g_context_access_observer_for_testing = previous_.get();
++}
++
++void KeyedServiceBaseFactory::NotifyContextAccessForTesting(
++    const void* requested,
++    const void* selected) const {
++  if (g_context_access_observer_for_testing) {
++    // A test callback can nest scopes. Keep its binding alive through the call.
++    auto callback = *g_context_access_observer_for_testing;
++    callback.Run(name(), requested, selected);
++  }
++}
+ 
+ KeyedServiceBaseFactory::KeyedServiceBaseFactory(const char* service_name,
+                                                  DependencyManager* manager,
+--- a/components/keyed_service/core/keyed_service_templated_factory.cc
++++ b/components/keyed_service/core/keyed_service_templated_factory.cc
+@@ -110,7 +110,9 @@
+                 ctx.event()->set_chrome_keyed_service()->set_name(name());
+               });
+   AssertContextWasntDestroyed(context);
++  const void* requested = context;
+   context = GetContextToUse(context);
++  NotifyContextAccessForTesting(requested, context);
+   if (!context) {
+     return nullptr;
+   }

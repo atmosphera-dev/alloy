@@ -1,0 +1,102 @@
+--- a/components/content_settings/core/browser/content_settings_pref_provider.cc
++++ b/components/content_settings/core/browser/content_settings_pref_provider.cc
+@@ -209,6 +209,24 @@
+   });
+ }
+ 
++void PrefProvider::EnableDocumentPermissionState() {
++  CHECK(off_the_record_);
++  if (document_permission_state_) {
++    return;
++  }
++  document_permission_state_ = true;
++  for (auto type : {ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA,
++                    ContentSettingsType::PERMISSION_ACTIONS_HISTORY}) {
++    const auto* info = WebsiteSettingsRegistry::GetInstance()->Get(type);
++    content_settings_prefs_.emplace(
++        type, std::make_unique<ContentSettingsPref>(
++                  type, prefs_, &pref_change_registrar_, info->pref_name(),
++                  true, false,
++                  base::BindRepeating(&PrefProvider::Notify,
++                                      base::Unretained(this))));
++  }
++}
++
+ PrefProvider::~PrefProvider() {
+   DCHECK(!prefs_);
+ }
+@@ -244,7 +262,10 @@
+   DCHECK(CalledOnValidThread());
+   DCHECK(prefs_);
+ 
+-  if (IsRemovedActivityStore(content_type)) {
++  if (IsRemovedActivityStore(content_type) &&
++      !(document_permission_state_ &&
++        (content_type == ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA ||
++         content_type == ContentSettingsType::PERMISSION_ACTIONS_HISTORY))) {
+     return true;
+   }
+   if (!supports_type(content_type)) {
+--- a/components/content_settings/core/browser/content_settings_pref_provider.h
++++ b/components/content_settings/core/browser/content_settings_pref_provider.h
+@@ -44,6 +44,9 @@
+   PrefProvider& operator=(const PrefProvider&) = delete;
+ 
+   ~PrefProvider() override;
++  // Full native functional embargo/temporary-grant state, only in an OTR
++  // document map. Profile-wide activity types remain unadmitted.
++  void EnableDocumentPermissionState();
+ 
+   // UserModifiableProvider implementations.
+   std::unique_ptr<RuleIterator> GetRuleIterator(
+@@ -129,6 +132,7 @@
+   raw_ptr<PrefService> prefs_;
+ 
+   const bool off_the_record_;
++  bool document_permission_state_ = false;
+ 
+   bool store_last_modified_;
+ 
+--- a/components/content_settings/core/browser/host_content_settings_map.cc
++++ b/components/content_settings/core/browser/host_content_settings_map.cc
+@@ -334,6 +334,11 @@
+   DeleteStorageAccessRwsGrantsIfFeatureDisabled();
+ }
+ 
++void HostContentSettingsMap::EnableDocumentPermissionState() {
++  CHECK(is_off_the_record_);
++  pref_provider_->EnableDocumentPermissionState();
++}
++
+ // static
+ void HostContentSettingsMap::RegisterProfilePrefs(
+     user_prefs::PrefRegistrySyncable* registry) {
+--- a/components/content_settings/core/browser/host_content_settings_map.h
++++ b/components/content_settings/core/browser/host_content_settings_map.h
+@@ -91,6 +91,7 @@
+   HostContentSettingsMap& operator=(const HostContentSettingsMap&) = delete;
+ 
+   static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++  void EnableDocumentPermissionState();
+ 
+   // Adds a new provider for |type|. This should be used instead of
+   // |RegisterProvider|, not in addition.
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -79,3 +79,4 @@
+ #include "content/browser/alloy_network_generation.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_disable.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_impl.h"
+@@ -16613,6 +16614,11 @@
+         navigation_request->devtools_navigation_token());
+     document_associated_data_->SetNetworkRestrictionsId(
+         navigation_request->network_restrictions_id());
++    if (alloy::site_records::RequestContextPolicy::IsStateless(
++            *GetBrowserContext())) {
++      document_associated_data_->set_navigation_or_document_handle(
++          navigation_request->navigation_or_document_handle());
++    }
+     SetAlloyNetworkGenerationForDocument(
+         this, navigation_request->GetAlloyNetworkGeneration());
+     AlloyCommitDocumentNoiseIdentity(this, navigation_request.get());

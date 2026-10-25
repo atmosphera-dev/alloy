@@ -1,0 +1,64 @@
+--- a/chrome/browser/favicon/BUILD.gn
++++ b/chrome/browser/favicon/BUILD.gn
+@@ -32,6 +32,7 @@
+   ]
+   public_deps = [ ":favicon" ]
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/app/resources:platform_locale_settings",
+     "//chrome/browser:browser_features",
+     "//chrome/browser/history",
+--- a/chrome/browser/favicon/favicon_service_factory.cc
++++ b/chrome/browser/favicon/favicon_service_factory.cc
+@@ -9,6 +9,7 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/favicon/chrome_favicon_client.h"
+ #include "chrome/browser/history/history_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -40,6 +41,10 @@
+ favicon::FaviconService* FaviconServiceFactory::GetForProfile(
+     Profile* profile,
+     ServiceAccessType sat) {
++  // This getter manually selects the parent, before native factory selection.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return nullptr;
++  }
+   if (!profile->IsOffTheRecord()) {
+     return static_cast<favicon::FaviconService*>(
+         GetInstance()->GetServiceForBrowserContext(profile, true));
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -438,6 +438,7 @@
+   if (is_android) {
+     deps += [ "//chrome/browser/profiles/android:jni_headers" ]
+   }
++  deps += [ "//brave/alloy/site_records:capabilities" ]
+   public_deps += [ "//brave/alloy/site_records:mode_types" ]
+ 
+ }
+--- a/chrome/browser/profiles/profile_selections.cc
++++ b/chrome/browser/profiles/profile_selections.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/profiles/profile_selections.h"
+ 
+ #include "base/memory/ptr_util.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/profile_metrics/browser_profile_type.h"
+ 
+@@ -127,6 +128,12 @@
+     case ProfileSelection::kOwnInstance:
+       return profile;
+     case ProfileSelection::kRedirectedToOriginal:
++      // Shared by ordinary and refcounted keyed-service factories. Reject
++      // before either constructing or retrieving any service owned by the
++      // parent.
++      if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++        return nullptr;
++      }
+       return profile->GetOriginalProfile();
+     case ProfileSelection::kOffTheRecordOnly:
+       return profile->IsOffTheRecord() ? profile : nullptr;

@@ -1,0 +1,406 @@
+--- a/components/content_settings/browser/BUILD.gn
++++ b/components/content_settings/browser/BUILD.gn
+@@ -25,6 +25,8 @@
+     "//content/public/browser",
+     "//content/public/common",
+   ]
++  deps += [ "//brave/alloy/site_records:capabilities" ]
++
+ }
+ 
+ source_set("test_support") {
+--- a/components/content_settings/browser/content_settings_manager_impl.cc
++++ b/components/content_settings/browser/content_settings_manager_impl.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/content_settings/browser/content_settings_manager_impl.h"
++#include "content/public/browser/browser_context.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "base/feature_list.h"
+ #include "base/memory/ptr_util.h"
+@@ -127,6 +129,12 @@
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   const content::ChildProcessId render_process_id =
+       render_process_host->GetID();
++  const auto* policy = alloy::site_records::RequestContextPolicy::Get(
++      *render_process_host->GetBrowserContext());
++  const auto storage_mode = policy
++      ? std::make_optional(policy->StorageCapability(
++            alloy::site_records::StorePurpose::kDomStorage).mode())
++      : std::nullopt;
+   auto cookie_settings =
+       delegate->GetCookieSettings(render_process_host->GetBrowserContext());
+   base::ThreadPool::CreateSingleThreadTaskRunner(
+@@ -135,7 +143,7 @@
+           FROM_HERE,
+           base::BindOnce(&ContentSettingsManagerImpl::CreateOnThread,
+                          render_process_id, std::move(receiver),
+-                         std::move(cookie_settings), std::move(delegate)));
++                         std::move(cookie_settings), std::move(delegate), storage_mode));
+ }
+ 
+ void ContentSettingsManagerImpl::Clone(
+@@ -152,6 +160,10 @@
+     const net::SiteForCookies& site_for_cookies,
+     const url::Origin& top_frame_origin) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++
++  if (storage_mode_ == alloy::site_records::StorageMode::kStateless) {
++    return false;
++  }
+   GURL url = origin.GetURL();
+ 
+   // TODO(crbug.com/40247160): Consider whether the following check should
+@@ -187,6 +199,12 @@
+     const net::SiteForCookies& site_for_cookies,
+     const url::Origin& top_frame_origin,
+     base::OnceCallback<void(bool)> callback) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (storage_mode_ == alloy::site_records::StorageMode::kStateless) {
++    std::move(callback).Run(false);
++    return;
++  }
++
+   bool allowed = EvaluateStorageAccessPermission(origin, site_for_cookies,
+                                                  top_frame_origin);
+   GURL url = origin.GetURL();
+@@ -221,10 +239,12 @@
+ ContentSettingsManagerImpl::ContentSettingsManagerImpl(
+     content::ChildProcessId render_process_id,
+     std::unique_ptr<Delegate> delegate,
+-    scoped_refptr<CookieSettings> cookie_settings)
++    scoped_refptr<CookieSettings> cookie_settings,
++    std::optional<alloy::site_records::StorageMode> storage_mode)
+     : delegate_(std::move(delegate)),
+       render_process_id_(render_process_id),
+-      cookie_settings_(std::move(cookie_settings)) {
++      cookie_settings_(std::move(cookie_settings)),
++      storage_mode_(storage_mode) {
+   CHECK(cookie_settings_);
+ }
+ 
+@@ -232,7 +252,8 @@
+     const ContentSettingsManagerImpl& other)
+     : delegate_(other.delegate_->Clone()),
+       render_process_id_(other.render_process_id_),
+-      cookie_settings_(other.cookie_settings_) {}
++      cookie_settings_(other.cookie_settings_),
++      storage_mode_(other.storage_mode_) {}
+ 
+ // static
+ void ContentSettingsManagerImpl::CreateOnThread(
+@@ -240,10 +261,11 @@
+     mojo::PendingReceiver<content_settings::mojom::ContentSettingsManager>
+         receiver,
+     scoped_refptr<CookieSettings> cookie_settings,
+-    std::unique_ptr<Delegate> delegate) {
++    std::unique_ptr<Delegate> delegate,
++    std::optional<alloy::site_records::StorageMode> storage_mode) {
+   mojo::MakeSelfOwnedReceiver(
+       base::WrapUnique(new ContentSettingsManagerImpl(
+-          render_process_id, std::move(delegate), std::move(cookie_settings))),
++          render_process_id, std::move(delegate), std::move(cookie_settings), storage_mode)),
+       std::move(receiver));
+ }
+ 
+--- a/components/content_settings/browser/content_settings_manager_impl.h
++++ b/components/content_settings/browser/content_settings_manager_impl.h
+@@ -6,6 +6,8 @@
+ #define COMPONENTS_CONTENT_SETTINGS_BROWSER_CONTENT_SETTINGS_MANAGER_IMPL_H_
+ 
+ #include <memory>
++#include <optional>
++#include "brave/alloy/site_records/storage_mode.h"
+ 
+ #include "base/functional/callback_forward.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -88,7 +90,8 @@
+  private:
+   ContentSettingsManagerImpl(content::ChildProcessId render_process_id,
+                              std::unique_ptr<Delegate> delegate,
+-                             scoped_refptr<CookieSettings> cookie_settings);
++                             scoped_refptr<CookieSettings> cookie_settings,
++                             std::optional<alloy::site_records::StorageMode> storage_mode);
+   ContentSettingsManagerImpl(const ContentSettingsManagerImpl& other);
+   bool EvaluateStorageAccessPermission(
+       const url::Origin& origin,
+@@ -100,7 +103,8 @@
+       mojo::PendingReceiver<content_settings::mojom::ContentSettingsManager>
+           receiver,
+       scoped_refptr<CookieSettings> cookie_settings,
+-      std::unique_ptr<Delegate> delegate);
++      std::unique_ptr<Delegate> delegate,
++      std::optional<alloy::site_records::StorageMode> storage_mode);
+ 
+   const std::unique_ptr<Delegate> delegate_;
+ 
+@@ -111,6 +115,9 @@
+   // Used to look up storage permissions.
+   const scoped_refptr<CookieSettings> cookie_settings_;
+ 
++  // Captured from browser ownership before crossing the sequence boundary.
++  const std::optional<alloy::site_records::StorageMode> storage_mode_;
++
+   SEQUENCE_CHECKER(sequence_checker_);
+ };
+ 
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3633,6 +3633,8 @@
+     deps += [ "//components/vrp_flags" ]
+     public_deps += [ "//components/vrp_flags:mojom" ]
+   }
++  deps += [ "//brave/alloy/site_records:capabilities" ]
++
+ }
+ 
+ if (is_android) {
+--- a/content/browser/dom_storage/dom_storage_context_wrapper.cc
++++ b/content/browser/dom_storage/dom_storage_context_wrapper.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/dom_storage/dom_storage_context_wrapper.h"
++#include "content/public/browser/browser_context.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <algorithm>
+ #include <string>
+@@ -267,6 +269,15 @@
+     const std::string& namespace_id,
+     mojo::ReportBadMessageCallback bad_message_callback,
+     mojo::PendingReceiver<blink::mojom::SessionStorageNamespace> receiver) {
++  if (partition_) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*partition_->browser_context());
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kDomStorage)
++                     .Allows(alloy::site_records::StorePurpose::kDomStorage,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return;
++  }
++  }
++
+   CHECK(session_storage_control_, base::NotFatalUntil::M158);
+   session_storage_control_->BindNamespace(namespace_id, std::move(receiver));
+ }
+@@ -294,6 +305,15 @@
+     std::optional<blink::LocalFrameToken> local_frame_token,
+     ChildProcessSecurityPolicyImpl::Handle security_policy_handle,
+     mojo::ReportBadMessageCallback bad_message_callback) {
++  if (partition_) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*partition_->browser_context());
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kDomStorage)
++                     .Allows(alloy::site_records::StorePurpose::kDomStorage,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return false;
++  }
++  }
++
+   bool host_storage_key_matched_or_missing = true;
+   if (local_frame_token) {
+     RenderFrameHostImpl* host = RenderFrameHostImpl::FromFrameToken(
+--- a/content/browser/file_system_access/file_system_access_manager_impl.cc
++++ b/content/browser/file_system_access/file_system_access_manager_impl.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/file_system_access/file_system_access_manager_impl.h"
++#include "content/public/browser/render_process_host.h"
++#include "content/public/browser/browser_context.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <algorithm>
+ #include <iterator>
+@@ -612,6 +615,17 @@
+     GetSandboxedFileSystemCallback callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (auto* process = RenderProcessHost::FromID(binding_context.process_id())) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*process->GetBrowserContext());
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kFileSystem)
++                     .Allows(alloy::site_records::StorePurpose::kFileSystem,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    std::move(callback).Run(file_system_access_error::FromFileError(
++        base::File::FILE_ERROR_SECURITY), mojo::NullRemote());
++    return;
++  }
++  }
++
+   if (!ChildProcessSecurityPolicy::GetInstance()->CanAccessDataForOrigin(
+           binding_context.process_id(), binding_context.storage_key.origin())) {
+     std::move(callback).Run(file_system_access_error::FromFileError(
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -6,6 +6,7 @@
+ // channel. There will be one RenderProcessHost per renderer process.
+ 
+ #include "content/browser/renderer_host/render_process_host_impl.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -2340,6 +2341,13 @@
+     mojo::PendingReceiver<blink::mojom::CacheStorage> receiver) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M152);
+ 
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*GetBrowserContext());
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kCacheStorage)
++                     .Allows(alloy::site_records::StorePurpose::kCacheStorage,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return;
++  }
++
+   storage_partition_impl_->GetCacheStorageControl()->AddReceiver(
+       cross_origin_embedder_policy, std::move(coep_reporter_remote),
+       document_isolation_policy, std::move(dip_reporter_remote), bucket_locator,
+@@ -2380,6 +2388,13 @@
+     base::WeakPtr<BucketContext> bucket_context,
+     mojo::PendingReceiver<blink::mojom::BucketManagerHost> receiver) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M152);
++
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*GetBrowserContext());
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kQuota)
++                     .Allows(alloy::site_records::StorePurpose::kQuota,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return;
++  }
+   storage_partition_impl_->GetBucketManager()->BindReceiver(
+       std::move(bucket_context), std::move(receiver),
+       mojo::GetBadMessageCallback());
+@@ -2394,6 +2409,13 @@
+     const blink::StorageKey& storage_key,
+     mojo::PendingReceiver<blink::mojom::FileSystemManager> receiver) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M152);
++
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*GetBrowserContext());
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kFileSystem)
++                     .Allows(alloy::site_records::StorePurpose::kFileSystem,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return;
++  }
+   // Note, the base::Unretained() is safe because the target object has an IO
+   // thread deleter and the callback is also targeting the IO thread.
+   GetIOThreadTaskRunner({})->PostTask(
+--- a/content/browser/service_worker/service_worker_context_wrapper.cc
++++ b/content/browser/service_worker/service_worker_context_wrapper.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/service_worker/service_worker_context_wrapper.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <map>
+ #include <memory>
+@@ -631,6 +632,18 @@
+     GlobalRenderFrameHostId requesting_frame_id,
+     StatusCodeCallback callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++
++  if (browser_context_) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*browser_context_);
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kServiceWorkers)
++                     .Allows(alloy::site_records::StorePurpose::kServiceWorkers,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback),
++                                 blink::ServiceWorkerStatusCode::kErrorDisallowed));
++    return;
++  }
++  }
+   if (!context_core_) {
+     GetUIThreadTaskRunner({})->PostTask(
+         FROM_HERE, base::BindOnce(std::move(callback),
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/storage_partition_impl.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <stdint.h>
+ 
+@@ -3374,6 +3375,13 @@
+     const storage::BucketLocator& bucket_locator,
+     const storage::BucketClientInfo& client_info,
+     mojo::PendingReceiver<blink::mojom::IDBFactory> receiver) {
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*browser_context_);
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kIndexedDb)
++                     .Allows(alloy::site_records::StorePurpose::kIndexedDb,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return;
++  }
++
+   indexed_db_control_wrapper_->BindIndexedDB(bucket_locator, client_info,
+                                              std::move(receiver));
+ }
+@@ -3383,6 +3391,13 @@
+     const base::UnguessableToken& token,
+     mojo::PendingReceiver<blink::mojom::LockManager> receiver) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
++
++  if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*browser_context_);
++      policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kQuota)
++                     .Allows(alloy::site_records::StorePurpose::kQuota,
++                             alloy::site_records::StorageAccess::kWriteMemory)) {
++    return;
++  }
+ 
+   GetQuotaManagerProxy()->UpdateOrCreateBucket(
+       storage::BucketInitParams::ForDefaultBucket(storage_key),
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -731,6 +731,7 @@
+       http_auth_merged_preferences_(network_service),
+       ohttp_handler_(this),
+       prefetch_enabled_(
++          !params_->alloy_stateless &&
+           base::FeatureList::IsEnabled(features::kNetworkContextPrefetch) &&
+           (params_->bound_network == net::handles::kInvalidNetworkHandle)),
+       cors_non_wildcard_request_headers_support_(base::FeatureList::IsEnabled(
+@@ -738,6 +739,14 @@
+       prefetch_cache_(prefetch_enabled_ ? std::make_unique<PrefetchCache>()
+                                         : nullptr),
+       variations_headers_(std::move(params_->initial_variations_headers)) {
++  if (params_->alloy_stateless) {
++    params_->file_paths.reset();
++    params_->http_cache_enabled = false;
++    params_->shared_dictionary_enabled = false;
++    params_->device_bound_sessions_enabled = false;
++    params_->cookieable_schemes = std::vector<std::string>();
++  }
++
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+@@ -3251,7 +3260,8 @@
+   builder.set_hsts_policy_bypass_list(params_->hsts_policy_bypass_list);
+ 
+ #if BUILDFLAG(ENABLE_REPORTING)
+-  bool reporting_enabled = base::FeatureList::IsEnabled(features::kReporting);
++  bool reporting_enabled = !params_->alloy_stateless &&
++      base::FeatureList::IsEnabled(features::kReporting);
+   if (reporting_enabled) {
+     auto reporting_policy = net::ReportingPolicy::Create();
+     if (params_->reporting_delivery_interval) {
+@@ -3265,7 +3275,7 @@
+     builder.set_reporting_policy(nullptr);
+   }
+ 
+-  bool nel_enabled =
++  bool nel_enabled = !params_->alloy_stateless &&
+       base::FeatureList::IsEnabled(features::kNetworkErrorLogging);
+   builder.set_network_error_logging_enabled(nel_enabled);
+ 
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -352,6 +352,8 @@
+ 
+ // Parameters for constructing a network context.
+ struct NetworkContextParams {
++  // Engine-owned stateless storage admission. Never selected by a renderer.
++  bool alloy_stateless = false;
+   mojo_base.mojom.File? alloy_guard_log;
+   mojo_base.mojom.FilePath alloy_guard_log_path;
+   bool alloy_favicons_enabled = true;

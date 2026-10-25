@@ -1,0 +1,135 @@
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -52,6 +52,7 @@
+ #include "base/types/expected.h"
+ #include "base/types/expected_macros.h"
+ #include "base/values.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/android_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+@@ -7983,6 +7984,14 @@
+   url::Origin top_frame_origin = rfh->GetMainFrame()->GetLastCommittedOrigin();
+   content::BrowserContext* browser_context = rfh->GetBrowserContext();
+ 
++  // Stateless IDs use the native frame salt, regenerated at document commit.
++  // Do not consult a parent settings provider or open a per-origin salt store.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *browser_context)) {
++    std::move(callback).Run(false, browser_context->UniqueId());
++    return;
++  }
++
+   // Persistent MediaDevice IDs are allowed iff cookies are allowed.
+   scoped_refptr<content_settings::CookieSettings> cookie_settings =
+       CookieSettingsFactory::GetForProfile(
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "base/feature_list.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+ #include "chrome/browser/content_settings/one_time_permission_provider.h"
+@@ -111,14 +112,18 @@
+ 
+   Profile* profile = static_cast<Profile*>(context);
+   // extensions::ContentSettingsService::Get() needs the original profile.
+-  Profile* original_profile = profile->GetOriginalProfile();
++  const bool stateless =
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile);
++  Profile* original_profile =
++      stateless ? profile : profile->GetOriginalProfile();
+ 
+   // In OffTheRecord mode, retrieve the host content settings map of the parent
+   // profile in order to ensure the preferences have been migrated.
+   // This is not required for guest sessions, since the parent profile of a
+   // guest OTR profile is empty.
+-  if (profile->IsOffTheRecord() && !profile->IsGuestSession())
++  if (!stateless && profile->IsOffTheRecord() && !profile->IsGuestSession()) {
+     GetForProfile(original_profile);
++  }
+ 
+   bool should_record_metrics = profiles::IsRegularUserProfile(profile);
+   scoped_refptr<HostContentSettingsMap> settings_map(new HostContentSettingsMap(
+@@ -144,21 +149,24 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   // These must be registered before before the HostSettings are passed over to
+   // the IOThread.  Simplest to do this on construction.
+-  settings_map->RegisterProvider(
+-      ProviderType::kCustomExtensionProvider,
+-      std::make_unique<content_settings::CustomExtensionProvider>(
+-          extensions::ContentSettingsService::Get(original_profile)
+-              ->content_settings_store(),
+-          // TODO(crbug.com/40199565): This is the only call site, so can we
+-          // remove this constructor parameter, or should this actually reflect
+-          // the case where profile->IsOffTheRecord() is true? And what is the
+-          // interaction with profile->IsGuestSession()?
+-          false));
+-
+-  settings_map->RegisterProvider(
+-      ProviderType::kExtensionInstallTimePermissionProvider,
+-      std::make_unique<extensions::ExtensionInstallTimePermissionProvider>(
+-          context, extensions::ExtensionRegistry::Get(context)));
++  if (!stateless) {
++    settings_map->RegisterProvider(
++        ProviderType::kCustomExtensionProvider,
++        std::make_unique<content_settings::CustomExtensionProvider>(
++            extensions::ContentSettingsService::Get(original_profile)
++                ->content_settings_store(),
++            // TODO(crbug.com/40199565): This is the only call site, so can we
++            // remove this constructor parameter, or should this actually
++            // reflect the case where profile->IsOffTheRecord() is true? And
++            // what is the interaction with profile->IsGuestSession()?
++            false));
++
++    settings_map->RegisterProvider(
++        ProviderType::kExtensionInstallTimePermissionProvider,
++        std::make_unique<extensions::ExtensionInstallTimePermissionProvider>(
++            context, extensions::ExtensionRegistry::Get(context)));
++  }
++
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ 
+   supervised_user::FamilyLinkSettingsService* family_link_settings_service =
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3637,6 +3637,8 @@
+ 
+   sources += [ "alloy_network_generation.cc", "alloy_network_generation.h" ]
+ 
++  sources += [ "alloy_document_identity.cc" ]
++
+ }
+ 
+ if (is_android) {
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -205,6 +205,7 @@
+ #include "content/common/navigation_client.mojom.h"
+ #include "content/common/navigation_params_utils.h"
+ #include "content/public/browser/active_url_message_filter.h"
++#include "content/public/browser/alloy_document_identity.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/clipboard_types.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -16614,6 +16615,7 @@
+         navigation_request->network_restrictions_id());
+     SetAlloyNetworkGenerationForDocument(
+         this, navigation_request->GetAlloyNetworkGeneration());
++    AlloyCommitDocumentNoiseIdentity(this, navigation_request.get());
+     // Stores fetch keepalive FactoryContext created before committing into
+     // document-associated data, such that it can be referenced later when
+     // DevTools tries to intercepts requests.
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -32,6 +32,7 @@
+     "active_url_message_filter.h",
+     "allow_service_worker_result.cc",
+     "allow_service_worker_result.h",
++    "alloy_document_identity.h",
+     "anchor_element_preconnect_delegate.h",
+     "attribution_data_model.cc",
+     "attribution_data_model.h",

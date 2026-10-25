@@ -1,0 +1,254 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1159,6 +1159,8 @@
+       "libcef/common/cdm_host_file_path.h",
+     ]
+   }
++  deps += [ "//brave/alloy/site_records:capabilities" ]
++
+ }
+ 
+ 
+--- a/include/internal/cef_types.h
++++ b/include/internal/cef_types.h
+@@ -4252,6 +4252,16 @@
+   int is_gpu_memory_inflated;
+ } cef_task_info_t;
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++///
++/// EXPERIMENTAL: Managed working network-state lifetime for stateless contexts.
++///
++typedef enum {
++  ALLOY_NETWORK_STATE_KEEP = 0,
++  ALLOY_NETWORK_STATE_CUT = 1,
++} alloy_network_state_t;
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/libcef/browser/chrome/chrome_browser_context.cc
++++ b/libcef/browser/chrome/chrome_browser_context.cc
+@@ -5,6 +5,7 @@
+ #include "cef/libcef/browser/chrome/chrome_browser_context.h"
+ 
+ #include <memory>
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "base/threading/thread_restrictions.h"
+ #include "cef/libcef/browser/net_service/proxy_url_loader_factory.h"
+@@ -33,8 +34,11 @@
+ }  // namespace
+ 
+ ChromeBrowserContext::ChromeBrowserContext(
+-    const CefRequestContextSettings& settings)
+-    : CefBrowserContext(settings), weak_ptr_factory_(this) {}
++    const CefRequestContextSettings& settings,
++    std::optional<alloy::site_records::NetworkState> stateless_network_state)
++    : CefBrowserContext(settings),
++      stateless_network_state_(stateless_network_state),
++      weak_ptr_factory_(this) {}
+ 
+ ChromeBrowserContext::~ChromeBrowserContext() = default;
+ 
+@@ -123,6 +127,11 @@
+ }
+ 
+ void ChromeBrowserContext::Shutdown() {
++  if (profile_) {
++    if (auto* policy = alloy::site_records::RequestContextPolicy::Get(*profile_)) {
++      policy->Revoke();
++    }
++  }
+   CefBrowserContext::Shutdown();
+ 
+   // Allow potential deletion of the Profile at some future point (controlled
+@@ -158,7 +167,9 @@
+ 
+     // Creation of a disk-based profile failed for some reason. Create a
+     // new/unique OffTheRecord profile instead.
+-    const auto& profile_id = Profile::OTRProfileID::CreateUniqueForCEF();
++    const auto profile_id = stateless_network_state_
++        ? Profile::OTRProfileID::CreateUniqueForAlloyStateless(*stateless_network_state_)
++        : Profile::OTRProfileID::CreateUniqueForCEF();
+     parent_profile = GetPrimaryUserProfile();
+     profile_ = parent_profile->GetOffTheRecordProfile(
+         profile_id, /*create_if_needed=*/true);
+--- a/libcef/browser/chrome/chrome_browser_context.h
++++ b/libcef/browser/chrome/chrome_browser_context.h
+@@ -6,6 +6,7 @@
+ #define CEF_LIBCEF_BROWSER_CHROME_CHROME_BROWSER_CONTEXT_H_
+ #pragma once
+ 
++#include "brave/alloy/site_records/storage_mode.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "cef/libcef/browser/browser_context.h"
+@@ -18,7 +19,10 @@
+ // unless otherwise indicated.
+ class ChromeBrowserContext : public CefBrowserContext, public ProfileObserver {
+  public:
+-  explicit ChromeBrowserContext(const CefRequestContextSettings& settings);
++  explicit ChromeBrowserContext(
++      const CefRequestContextSettings& settings,
++      std::optional<alloy::site_records::NetworkState> stateless_network_state =
++          std::nullopt);
+ 
+   ChromeBrowserContext(const ChromeBrowserContext&) = delete;
+   ChromeBrowserContext& operator=(const ChromeBrowserContext&) = delete;
+@@ -52,6 +56,7 @@
+ 
+   void ProfileCreated(CreateStatus status, Profile* profile);
+ 
++  const std::optional<alloy::site_records::NetworkState> stateless_network_state_;
+   base::OnceClosure initialized_cb_;
+   raw_ptr<Profile> profile_ = nullptr;
+   bool should_destroy_ = false;
+--- a/libcef/browser/request_context_impl.cc
++++ b/libcef/browser/request_context_impl.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "cef/libcef/browser/request_context_impl.h"
+ 
++#include "cef/include/alloy/alloy_request_context.h"
+ #include "base/atomic_sequence_num.h"
+ #include "base/logging.h"
+ #include "base/strings/stringprintf.h"
+@@ -167,7 +168,37 @@
+   return CefRequestContextImpl::GetOrCreateRequestContext(std::move(config));
+ }
+ 
++CefRefPtr<CefRequestContext> AlloyCreateStatelessRequestContext(
++    alloy_network_state_t network_state,
++    CefRefPtr<CefRequestContextHandler> handler) {
++  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
++  switch (network_state) {
++    case ALLOY_NETWORK_STATE_KEEP:
++      return CefRequestContextImpl::CreateStateless(
++          alloy::site_records::NetworkState::kKeep, handler);
++    case ALLOY_NETWORK_STATE_CUT:
++      return CefRequestContextImpl::CreateStateless(
++          alloy::site_records::NetworkState::kCut, handler);
++  }
++  return nullptr;
++}
++
+ // CefRequestContextImpl
++
++// static
++CefRefPtr<CefRequestContext> CefRequestContextImpl::CreateStateless(
++    alloy::site_records::NetworkState network_state,
++    CefRefPtr<CefRequestContextHandler> handler) {
++  if (!CONTEXT_STATE_VALID()) {
++    return nullptr;
++  }
++  Config config;
++  config.stateless_network_state = network_state;
++  config.settings.cookieable_schemes_exclude_defaults = true;
++  config.handler = handler;
++  config.unique_id = g_next_id.GetNext();
++  return GetOrCreateRequestContext(std::move(config));
++}
+ 
+ CefRequestContextImpl::~CefRequestContextImpl() {
+   CEF_REQUIRE_UIT();
+@@ -805,7 +836,8 @@
+     // CefBrowserContext for that path. Otherwise, this new instance will
+     // be a completely isolated "incognito mode" context.
+     browser_context_ = CefAppManager::Get()->CreateNewBrowserContext(
+-        config_.settings, std::move(initialized_cb));
++        config_.settings, std::move(initialized_cb),
++        config_.stateless_network_state);
+   } else {
+     // Share the same settings as the existing context.
+     config_.settings = browser_context_->settings();
+--- a/libcef/browser/request_context_impl.h
++++ b/libcef/browser/request_context_impl.h
+@@ -6,6 +6,7 @@
+ #define CEF_LIBCEF_BROWSER_REQUEST_CONTEXT_IMPL_H_
+ #pragma once
+ 
++#include "brave/alloy/site_records/storage_mode.h"
+ #include "base/memory/raw_ptr.h"
+ #include "cef/include/cef_request_context.h"
+ #include "cef/libcef/browser/browser_context.h"
+@@ -35,6 +36,10 @@
+   CefRequestContextImpl& operator=(const CefRequestContextImpl&) = delete;
+ 
+   ~CefRequestContextImpl() override;
++
++  static CefRefPtr<CefRequestContext> CreateStateless(
++      alloy::site_records::NetworkState network_state,
++      CefRefPtr<CefRequestContextHandler> handler);
+ 
+   // Creates the singleton global RequestContext. Called from
+   // AlloyBrowserMainParts::PreMainMessageLoopRun and
+@@ -174,6 +179,7 @@
+     // |settings| or |other| will be set when creating a new CefRequestContext
+     // via the API.
+     CefRequestContextSettings settings;
++    std::optional<alloy::site_records::NetworkState> stateless_network_state;
+     CefRefPtr<CefRequestContextImpl> other;
+ 
+     // Optionally use this handler.
+--- a/libcef/common/app_manager.h
++++ b/libcef/common/app_manager.h
+@@ -7,6 +7,9 @@
+ #pragma once
+ 
+ #include <list>
++#include <optional>
++
++#include "brave/alloy/site_records/storage_mode.h"
+ 
+ #include "base/functional/callback.h"
+ #include "build/build_config.h"
+@@ -55,7 +58,9 @@
+   virtual CefRefPtr<CefRequestContext> GetGlobalRequestContext() = 0;
+   virtual CefBrowserContext* CreateNewBrowserContext(
+       const CefRequestContextSettings& settings,
+-      base::OnceClosure initialized_cb) = 0;
++      base::OnceClosure initialized_cb,
++      std::optional<alloy::site_records::NetworkState> stateless_network_state =
++          std::nullopt) = 0;
+ 
+ #if BUILDFLAG(IS_WIN)
+   // Returns the module name (usually libcef.dll).
+--- a/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -598,8 +598,9 @@
+ 
+ CefBrowserContext* ChromeMainDelegateCef::CreateNewBrowserContext(
+     const CefRequestContextSettings& settings,
+-    base::OnceClosure initialized_cb) {
+-  auto context = new ChromeBrowserContext(settings);
++    base::OnceClosure initialized_cb,
++    std::optional<alloy::site_records::NetworkState> stateless_network_state) {
++  auto context = new ChromeBrowserContext(settings, stateless_network_state);
+   context->InitializeAsync(std::move(initialized_cb));
+   return context;
+ }
+--- a/libcef/common/chrome/chrome_main_delegate_cef.h
++++ b/libcef/common/chrome/chrome_main_delegate_cef.h
+@@ -64,7 +64,9 @@
+   CefRefPtr<CefRequestContext> GetGlobalRequestContext() override;
+   CefBrowserContext* CreateNewBrowserContext(
+       const CefRequestContextSettings& settings,
+-      base::OnceClosure initialized_cb) override;
++      base::OnceClosure initialized_cb,
++      std::optional<alloy::site_records::NetworkState> stateless_network_state)
++      override;
+ 
+   // CefTaskRunnerManager overrides.
+   scoped_refptr<base::SingleThreadTaskRunner> GetBackgroundTaskRunner()
+--- a/tools/translator.py
++++ b/tools/translator.py
+@@ -161,6 +161,7 @@
+   header.add_directory(cpp_header_dir, excluded_files)
+   header.add_directory(cpp_header_test_dir)
+   header.add_directory(cpp_header_views_dir)
++  header.add_directory(os.path.join(cpp_header_dir, 'alloy'))
+ 
+   # Track the number of files that were written.
+   writect = 0

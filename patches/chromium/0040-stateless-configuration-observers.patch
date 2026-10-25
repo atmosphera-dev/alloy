@@ -1,0 +1,10 @@
+--- a/chrome/browser/font_pref_change_notifier_factory.cc
++++ b/chrome/browser/font_pref_change_notifier_factory.cc
+@@ -11,6 +11,7 @@
+     : ProfileKeyedServiceFactory(
+           "FontPrefChangeNotifier",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.

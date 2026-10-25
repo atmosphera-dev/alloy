@@ -1,0 +1,38 @@
+--- a/chrome/browser/favicon/favicon_utils.cc
++++ b/chrome/browser/favicon/favicon_utils.cc
+@@ -70,13 +70,16 @@
+   if (ContentFaviconDriver::FromWebContents(web_contents))
+     return;
+ 
+-  Profile* original_profile =
+-      Profile::FromBrowserContext(web_contents->GetBrowserContext())
+-          ->GetOriginalProfile();
++  // Preserve the requesting context through admission. Ordinary OTR favicon
++  // display still uses the parent's service through the existing
++  // explicit-access factory contract; stateless contexts never select that
++  // parent.
++  Profile* profile =
++      Profile::FromBrowserContext(web_contents->GetBrowserContext());
+   return ContentFaviconDriver::CreateForWebContents(
+       web_contents,
+-      FaviconServiceFactory::GetForProfile(original_profile,
+-                                           ServiceAccessType::IMPLICIT_ACCESS),
++      FaviconServiceFactory::GetForProfile(profile,
++                                           ServiceAccessType::EXPLICIT_ACCESS),
+       base::BindRepeating(
+           [](PrefService* prefs) {
+             return prefs->GetBoolean(alloy::kFaviconsEnabled);
+@@ -143,11 +146,9 @@
+   if (!entry)
+     return;
+ 
+-  Profile* original_profile =
+-      Profile::FromBrowserContext(contents->GetBrowserContext())
+-          ->GetOriginalProfile();
++  Profile* profile = Profile::FromBrowserContext(contents->GetBrowserContext());
+   favicon::FaviconService* favicon_service =
+-      FaviconServiceFactory::GetForProfile(original_profile,
++      FaviconServiceFactory::GetForProfile(profile,
+                                            ServiceAccessType::EXPLICIT_ACCESS);
+   if (!favicon_service)
+     return;

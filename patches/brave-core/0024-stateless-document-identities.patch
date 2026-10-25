@@ -1,0 +1,94 @@
+--- a/browser/brave_shields/brave_shields_web_contents_observer.cc
++++ b/browser/brave_shields/brave_shields_web_contents_observer.cc
+@@ -13,6 +13,7 @@
+ #include "base/check.h"
+ #include "base/feature_list.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "brave/browser/brave_shields/brave_shields_settings_service_factory.h"
+ #include "brave/components/brave_perf_predictor/browser/perf_predictor_tab_helper.h"
+ #include "brave/components/brave_shields/core/browser/brave_shields_settings_service.h"
+@@ -31,6 +32,7 @@
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/user_prefs/user_prefs.h"
++#include "content/public/browser/alloy_document_identity.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -345,8 +347,12 @@
+   const base::Token farbling_token =
+       farbling_level != brave_shields::mojom::FarblingLevel::OFF &&
+               shields_settings_service
+-          ? shields_settings_service->GetFarblingToken(
+-                primary_url, base::as_byte_span(additional_entropy))
++          ? (alloy::site_records::RequestContextPolicy::IsStateless(
++                 *rfh->GetBrowserContext())
++                 ? content::AlloyDocumentNoiseIdentityForNavigation(
++                       navigation_handle)
++                 : shields_settings_service->GetFarblingToken(
++                       primary_url, base::as_byte_span(additional_entropy)))
+           : base::Token();
+   PrefService* pref_service =
+       user_prefs::UserPrefs::Get(rfh->GetBrowserContext());
+--- a/chromium_src/chrome/browser/content_settings/content_settings_manager_delegate.cc
++++ b/chromium_src/chrome/browser/content_settings/content_settings_manager_delegate.cc
+@@ -6,6 +6,7 @@
+ #include <string>
+ #include <string_view>
+ 
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "brave/browser/brave_shields/brave_shields_settings_service_factory.h"
+ #include "brave/components/brave_shields/core/browser/brave_shields_settings_service.h"
+ #include "brave/components/brave_shields/core/browser/brave_shields_utils.h"
+@@ -14,6 +15,7 @@
+ #include "brave/components/containers/buildflags/buildflags.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "components/user_prefs/user_prefs.h"
++#include "content/public/browser/alloy_document_identity.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ #if BUILDFLAG(ENABLE_CONTAINERS)
+@@ -73,8 +75,11 @@
+   const base::Token farbling_token =
+       farbling_level != brave_shields::mojom::FarblingLevel::OFF &&
+               shields_settings_service
+-          ? shields_settings_service->GetFarblingToken(
+-                top_frame_url, base::as_byte_span(additional_entropy))
++          ? (alloy::site_records::RequestContextPolicy::IsStateless(
++                 *browser_context)
++                 ? content::AlloyDocumentNoiseIdentity(top_frame_rfh)
++                 : shields_settings_service->GetFarblingToken(
++                       top_frame_url, base::as_byte_span(additional_entropy)))
+           : base::Token();
+   PrefService* pref_service = user_prefs::UserPrefs::Get(browser_context);
+ 
+--- a/chromium_src/chrome/renderer/worker_content_settings_client.cc
++++ b/chromium_src/chrome/renderer/worker_content_settings_client.cc
+@@ -16,6 +16,7 @@
+ #include "components/content_settings/renderer/content_settings_agent_impl.h"
+ #include "net/base/features.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++#include "third_party/blink/public/platform/platform.h"
+ 
+ #define WorkerContentSettingsClient WorkerContentSettingsClient_ChromiumImpl
+ 
+@@ -25,7 +26,17 @@
+ 
+ WorkerContentSettingsClient_BraveImpl::WorkerContentSettingsClient_BraveImpl(
+     content::RenderFrame* render_frame)
+-    : WorkerContentSettingsClient_ChromiumImpl(render_frame) {}
++    : WorkerContentSettingsClient_ChromiumImpl(render_frame) {
++  if (blink::Platform::Current()->IsAlloyStateless()) {
++    auto* agent = content_settings::ContentSettingsAgentImpl::Get(render_frame);
++    CHECK(agent);
++    // Capture the creator document's immutable snapshot on the main thread.
++    // A worker must not later re-resolve a frame serving another document.
++    shields_settings_ = static_cast<blink::WebContentSettingsClient*>(agent)
++                            ->GetBraveShieldsSettings(
++                                ContentSettingsType::BRAVE_WEBCOMPAT_NONE);
++  }
++}
+ 
+ WorkerContentSettingsClient_BraveImpl::
+     ~WorkerContentSettingsClient_BraveImpl() = default;

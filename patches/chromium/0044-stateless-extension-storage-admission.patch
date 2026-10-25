@@ -1,0 +1,32 @@
+--- a/extensions/browser/api/storage/storage_frontend.cc
++++ b/extensions/browser/api/storage/storage_frontend.cc
+@@ -20,6 +20,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/trace_event/trace_event.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "components/value_store/value_store_factory.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -242,6 +243,11 @@
+   TRACE_EVENT0("browser,startup", "StorageFrontend::Init");
+ 
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  // Keep the complete native frontend, but admit no stateless storage cache.
++  // SettingsFunction reports disabled namespaces before attempting an operation.
++  if (alloy::site_records::RequestContextPolicy::IsStateless(*browser_context_)) {
++    return;
++  }
+   DCHECK(!browser_context_->IsOffTheRecord());
+ 
+   caches_[settings_namespace::LOCAL] = new LocalValueStoreCache(factory);
+--- a/extensions/browser/api/storage/BUILD.gn
++++ b/extensions/browser/api/storage/BUILD.gn
+@@ -57,6 +57,7 @@
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+ 
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     ":settings_namespace",
+     ":settings_observer",
+     "//base",

@@ -1,0 +1,1497 @@
+--- a/chrome/browser/permissions/chrome_permissions_client.cc
++++ b/chrome/browser/permissions/chrome_permissions_client.cc
+@@ -296,8 +296,49 @@
+ HostContentSettingsMap* ChromePermissionsClient::GetSettingsMapForDocument(
+     content::BrowserContext* browser_context,
+     content::RenderFrameHost* frame) {
+-  return frame ? HostContentSettingsMapFactory::GetForFrame(frame)
+-               : GetSettingsMap(browser_context);
++  if (RequiresDocumentPermissionContext(browser_context)) {
++    if (!frame || frame->GetBrowserContext() != browser_context ||
++        browser_context->ShutdownStarted()) {
++      return nullptr;
++    }
++    return HostContentSettingsMapFactory::GetForFrame(frame);
++  }
++  return GetSettingsMap(browser_context);
++}
++
++bool ChromePermissionsClient::RequiresDocumentPermissionContext(
++    content::BrowserContext* context) {
++  return alloy::site_records::RequestContextPolicy::IsStateless(*context);
++}
++
++permissions::PermissionActionsHistory*
++ChromePermissionsClient::GetPermissionActionsHistoryForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost* frame) {
++  if (!RequiresDocumentPermissionContext(context)) {
++    return PermissionActionsHistoryFactory::GetForProfile(
++        Profile::FromBrowserContext(context));
++  }
++  if (!frame || frame->GetBrowserContext() != context ||
++      context->ShutdownStarted()) {
++    return nullptr;
++  }
++  return PermissionActionsHistoryFactory::GetForFrame(frame);
++}
++
++permissions::PermissionDecisionAutoBlocker*
++ChromePermissionsClient::GetPermissionDecisionAutoBlockerForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost* frame) {
++  if (!RequiresDocumentPermissionContext(context)) {
++    return PermissionDecisionAutoBlockerFactory::GetForProfile(
++        Profile::FromBrowserContext(context));
++  }
++  if (!frame || frame->GetBrowserContext() != context ||
++      context->ShutdownStarted()) {
++    return nullptr;
++  }
++  return PermissionDecisionAutoBlockerFactory::GetForFrame(frame);
+ }
+ 
+ void ChromePermissionsClient::SetPermissionSettingForDocument(
+--- a/chrome/browser/permissions/chrome_permissions_client.h
++++ b/chrome/browser/permissions/chrome_permissions_client.h
+@@ -31,6 +31,14 @@
+   static ChromePermissionsClient* GetInstance();
+ 
+   // PermissionsClient:
++  bool RequiresDocumentPermissionContext(content::BrowserContext*) override;
++  permissions::PermissionActionsHistory* GetPermissionActionsHistoryForDocument(
++      content::BrowserContext*,
++      content::RenderFrameHost*) override;
++  permissions::PermissionDecisionAutoBlocker*
++  GetPermissionDecisionAutoBlockerForDocument(
++      content::BrowserContext*,
++      content::RenderFrameHost*) override;
+   HostContentSettingsMap* GetSettingsMap(
+       content::BrowserContext* browser_context) override;
+   HostContentSettingsMap* GetSettingsMapForDocument(
+--- a/chrome/browser/permissions/permission_actions_history_factory.cc
++++ b/chrome/browser/permissions/permission_actions_history_factory.cc
+@@ -4,15 +4,42 @@
+ 
+ #include "chrome/browser/permissions/permission_actions_history_factory.h"
+ 
++#include "base/functional/bind.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/permissions/permission_actions_history.h"
++#include "content/public/browser/render_frame_host.h"
+ 
+ // static
+ permissions::PermissionActionsHistory*
+ PermissionActionsHistoryFactory::GetForProfile(Profile* profile) {
+   return static_cast<permissions::PermissionActionsHistory*>(
+       GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++permissions::PermissionActionsHistory*
++PermissionActionsHistoryFactory::GetForFrame(content::RenderFrameHost* frame) {
++  if (!frame || frame->GetBrowserContext()->ShutdownStarted()) {
++    return nullptr;
++  }
++  auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return GetForProfile(profile);
++  }
++  static const int type_key = 0;
++  return static_cast<permissions::PermissionActionsHistory*>(
++      HostContentSettingsMapFactory::GetStatelessDocumentService(
++          frame, &type_key,
++          base::BindOnce(
++              [](Profile* profile,
++                 HostContentSettingsMap* map) -> std::unique_ptr<KeyedService> {
++                return std::make_unique<permissions::PermissionActionsHistory>(
++                    profile->GetPrefs(), map, false,
++                    GetForProfile(profile)->GetDocumentNotificationCallback());
++              },
++              profile)));
+ }
+ 
+ // static
+@@ -46,5 +73,6 @@
+   HostContentSettingsMap* const host_content_settings_map =
+       HostContentSettingsMapFactory::GetForProfile(profile);
+   return std::make_unique<permissions::PermissionActionsHistory>(
+-      profile->GetPrefs(), host_content_settings_map);
++      profile->GetPrefs(), host_content_settings_map,
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile));
+ }
+--- a/chrome/browser/permissions/permission_actions_history_factory.h
++++ b/chrome/browser/permissions/permission_actions_history_factory.h
+@@ -7,6 +7,9 @@
+ 
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
++namespace content {
++class RenderFrameHost;
++}
+ 
+ class Profile;
+ 
+@@ -22,6 +25,8 @@
+       const PermissionActionsHistoryFactory&) = delete;
+   static permissions::PermissionActionsHistory* GetForProfile(Profile* profile);
+   static PermissionActionsHistoryFactory* GetInstance();
++  static permissions::PermissionActionsHistory* GetForFrame(
++      content::RenderFrameHost* frame);
+ 
+  private:
+   friend base::NoDestructor<PermissionActionsHistoryFactory>;
+--- a/chrome/browser/permissions/permission_decision_auto_blocker_factory.cc
++++ b/chrome/browser/permissions/permission_decision_auto_blocker_factory.cc
+@@ -4,15 +4,44 @@
+ 
+ #include "chrome/browser/permissions/permission_decision_auto_blocker_factory.h"
+ 
++#include "base/functional/bind.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/permissions/permission_decision_auto_blocker.h"
++#include "content/public/browser/render_frame_host.h"
+ 
+ // static
+ permissions::PermissionDecisionAutoBlocker*
+ PermissionDecisionAutoBlockerFactory::GetForProfile(Profile* profile) {
+   return static_cast<permissions::PermissionDecisionAutoBlocker*>(
+       GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++permissions::PermissionDecisionAutoBlocker*
++PermissionDecisionAutoBlockerFactory::GetForFrame(
++    content::RenderFrameHost* frame) {
++  if (!frame || frame->GetBrowserContext()->ShutdownStarted()) {
++    return nullptr;
++  }
++  auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return GetForProfile(profile);
++  }
++  static const int type_key = 0;
++  return static_cast<permissions::PermissionDecisionAutoBlocker*>(
++      HostContentSettingsMapFactory::GetStatelessDocumentService(
++          frame, &type_key,
++          base::BindOnce(
++              [](Profile* profile,
++                 HostContentSettingsMap* map) -> std::unique_ptr<KeyedService> {
++                return std::make_unique<
++                    permissions::PermissionDecisionAutoBlocker>(
++                    map, false,
++                    GetForProfile(profile)->GetDocumentNotificationCallback());
++              },
++              profile)));
+ }
+ 
+ // static
+@@ -45,5 +74,6 @@
+     content::BrowserContext* context) const {
+   Profile* profile = Profile::FromBrowserContext(context);
+   return std::make_unique<permissions::PermissionDecisionAutoBlocker>(
+-      HostContentSettingsMapFactory::GetForProfile(profile));
++      HostContentSettingsMapFactory::GetForProfile(profile),
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile));
+ }
+--- a/chrome/browser/permissions/permission_decision_auto_blocker_factory.h
++++ b/chrome/browser/permissions/permission_decision_auto_blocker_factory.h
+@@ -7,6 +7,9 @@
+ 
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
++namespace content {
++class RenderFrameHost;
++}
+ 
+ class Profile;
+ 
+@@ -19,6 +22,8 @@
+   static permissions::PermissionDecisionAutoBlocker* GetForProfile(
+       Profile* profile);
+   static PermissionDecisionAutoBlockerFactory* GetInstance();
++  static permissions::PermissionDecisionAutoBlocker* GetForFrame(
++      content::RenderFrameHost* frame);
+ 
+   PermissionDecisionAutoBlockerFactory(
+       const PermissionDecisionAutoBlockerFactory&) = delete;
+--- a/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_delegate.cc
+@@ -599,11 +599,21 @@
+ 
+ permissions::PermissionDecisionAutoBlocker*
+ ChromePageInfoDelegate::GetPermissionDecisionAutoblocker() {
++  if (document_scoped_) {
++    return PermissionDecisionAutoBlockerFactory::GetForFrame(
++        document_.AsRenderFrameHostIfValid());
++  }
++
+   return PermissionDecisionAutoBlockerFactory::GetForProfile(GetProfile());
+ }
+ 
+ permissions::PermissionActionsHistory*
+ ChromePageInfoDelegate::GetPermissionActionsHistory() {
++  if (document_scoped_) {
++    return PermissionActionsHistoryFactory::GetForFrame(
++        document_.AsRenderFrameHostIfValid());
++  }
++
+   return PermissionActionsHistoryFactory::GetForProfile(GetProfile());
+ }
+ 
+--- a/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
+@@ -11,6 +11,7 @@
+ #include "chrome/browser/page_info/about_this_site_tab_helper.h"
+ #include "chrome/browser/page_info/merchant_trust_service_factory.h"
+ #include "chrome/browser/page_info/page_info_features.h"
++#include "chrome/browser/permissions/permission_decision_auto_blocker_factory.h"
+ #include "chrome/browser/permissions/permission_manager_factory.h"
+ #include "chrome/browser/permissions/system/system_permission_settings.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -332,6 +333,19 @@
+ 
+ std::optional<content::PermissionResult>
+ ChromePageInfoUiDelegate::GetEmbargoResult(ContentSettingsType type) {
++  if (document_scoped_) {
++    auto* frame = document_.AsRenderFrameHostIfValid();
++    if (!frame ||
++        frame->GetLastCommittedOrigin() != url::Origin::Create(site_url_)) {
++      return content::PermissionResult(blink::mojom::PermissionStatus::DENIED);
++    }
++    auto* blocker = PermissionDecisionAutoBlockerFactory::GetForFrame(frame);
++    return blocker ? blocker->GetEmbargoResult(site_url_, type)
++                   : std::optional<content::PermissionResult>(
++                         content::PermissionResult(
++                             blink::mojom::PermissionStatus::DENIED));
++  }
++
+   return permissions::PermissionsClient::Get()
+       ->GetPermissionDecisionAutoBlocker(GetProfile())
+       ->GetEmbargoResult(site_url_, type);
+--- a/components/page_info/page_info.cc
++++ b/components/page_info/page_info.cc
+@@ -713,8 +713,9 @@
+   // was changed away from BLOCK (or reset to default), clear embargo status if
+   // it exists.
+   if (!setting || !info->delegate().IsBlocked(*setting)) {
+-    delegate_->GetPermissionDecisionAutoblocker()->RemoveEmbargoAndResetCounts(
+-        site_url_, type);
++    if (auto* blocker = delegate_->GetPermissionDecisionAutoblocker()) {
++      blocker->RemoveEmbargoAndResetCounts(site_url_, type);
++    }
+   }
+ 
+   // Also clear heuristic grant data if user removes the granted state.
+@@ -723,8 +724,9 @@
+       setting &&
+       (info->delegate().IsBlocked(*setting) ||
+        info->delegate().IsUndecided(*setting))) {
+-    delegate_->GetPermissionActionsHistory()->ResetHeuristicData(site_url_,
+-                                                                 type);
++    if (auto* history = delegate_->GetPermissionActionsHistory()) {
++      history->ResetHeuristicData(site_url_, type);
++    }
+   }
+ 
+   using Constraints = content_settings::ContentSettingConstraints;
+@@ -1350,8 +1352,8 @@
+   if (permissions::PermissionDecisionAutoBlocker::IsEnabledForContentSetting(
+           permission_info.type) &&
+       permission_info.source == content_settings::SettingSource::kUser) {
+-    if (delegate_->GetPermissionDecisionAutoblocker()->IsEmbargoed(
+-            site_url_, permission_info.type)) {
++    if (auto* blocker = delegate_->GetPermissionDecisionAutoblocker();
++        blocker && blocker->IsEmbargoed(site_url_, permission_info.type)) {
+       permission_info.setting = setting_info->delegate().ApplyPermissionEmbargo(
+           permission_info.setting.value_or(permission_info.default_setting));
+     }
+--- a/components/permissions/content_setting_permission_context_base.cc
++++ b/components/permissions/content_setting_permission_context_base.cc
+@@ -40,10 +40,11 @@
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
+-  return PermissionsClient::Get()
+-      ->GetSettingsMapForDocument(browser_context(), render_frame_host)
+-      ->GetContentSetting(requesting_origin, embedding_origin,
+-                          content_settings_type());
++  auto* map = PermissionsClient::Get()->GetSettingsMapForDocument(
++      browser_context(), render_frame_host);
++  return map ? map->GetContentSetting(requesting_origin, embedding_origin,
++                                      content_settings_type())
++             : CONTENT_SETTING_BLOCK;
+ }
+ 
+ PermissionSetting
+--- a/components/permissions/contexts/local_network_access_compat_permission_context.cc
++++ b/components/permissions/contexts/local_network_access_compat_permission_context.cc
+@@ -32,6 +32,11 @@
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
++  if (!PermissionsClient::Get()->GetSettingsMapForDocument(browser_context(),
++                                                           render_frame_host)) {
++    return CONTENT_SETTING_BLOCK;
++  }
++
+   ContentSetting local_network_setting =
+       PermissionsClient::Get()
+           ->GetSettingsMapForDocument(browser_context(), render_frame_host)
+--- a/components/permissions/origin_keyed_permission_action_service.cc
++++ b/components/permissions/origin_keyed_permission_action_service.cc
+@@ -18,29 +18,18 @@
+ OriginKeyedPermissionActionService::GetLastActionEntry(
+     const GURL& origin,
+     ContentSettingsType type) {
+-  auto origin_it = map_.find(origin);
+-  if (origin_it != map_.end()) {
+-    auto content_settings_it = origin_it->second.find(type);
+-    if (content_settings_it != origin_it->second.end()) {
+-      return content_settings_it->second;
+-    }
+-  }
+   return std::nullopt;
+ }
+ 
+ void OriginKeyedPermissionActionService::RecordAction(
+     const GURL& origin,
+     ContentSettingsType type,
+-    permissions::PermissionAction action) {
+-  map_[origin][type] = std::make_pair(action, base::TimeTicks::Now());
+-}
++    permissions::PermissionAction action) {}
+ 
+ void OriginKeyedPermissionActionService::RecordActionWithTimeForTesting(
+     const GURL& origin,
+     ContentSettingsType type,
+     permissions::PermissionAction action,
+-    base::TimeTicks time) {
+-  map_[origin][type] = std::make_pair(action, time);
+-}
++    base::TimeTicks time) {}
+ 
+ }  // namespace permissions
+--- a/components/permissions/origin_keyed_permission_action_service.h
++++ b/components/permissions/origin_keyed_permission_action_service.h
+@@ -5,8 +5,9 @@
+ #ifndef COMPONENTS_PERMISSIONS_ORIGIN_KEYED_PERMISSION_ACTION_SERVICE_H_
+ #define COMPONENTS_PERMISSIONS_ORIGIN_KEYED_PERMISSION_ACTION_SERVICE_H_
+ 
+-#include <map>
++#include <optional>
+ #include <utility>
++
+ #include "base/time/time.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+ #include "components/keyed_service/core/keyed_service.h"
+@@ -20,9 +21,8 @@
+ 
+ typedef std::pair<PermissionAction, base::TimeTicks> PermissionActionTime;
+ 
+-// Service that keeps track of the last permission action per content setting,
+-// keyed on origins. The data is kept in-memory only and is not persisted across
+-// browser sessions. This service is used for metrics evaluation.
++// Compatibility facade for removed metrics-only permission activity.
++// No origin-indexed action or timestamp is admitted.
+ class OriginKeyedPermissionActionService : public KeyedService {
+  public:
+   OriginKeyedPermissionActionService();
+@@ -45,9 +45,6 @@
+                                       ContentSettingsType type,
+                                       PermissionAction action,
+                                       base::TimeTicks time);
+-
+- private:
+-  std::map<GURL, std::map<ContentSettingsType, PermissionActionTime>> map_;
+ };
+ 
+ }  // namespace permissions
+--- a/components/permissions/permission_actions_history.cc
++++ b/components/permissions/permission_actions_history.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/containers/adapters.h"
+ #include "base/feature_list.h"
++#include "base/functional/bind.h"
+ #include "base/json/values_util.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/values.h"
+@@ -62,7 +63,6 @@
+ // Keys for storing data in website settings.
+ constexpr char kTemporaryGrantCountKey[] = "temporary_grant_count";
+ constexpr char kTemporaryGrantTimeStampKey[] = "temporary_grant_time_days";
+-constexpr char kOneTimeGrantCountKey[] = "one_time_grant_count";
+ 
+ base::DictValue GetOriginActionHistoryData(HostContentSettingsMap* settings,
+                                            const GURL& origin_url) {
+@@ -103,10 +103,31 @@
+ 
+ PermissionActionsHistory::PermissionActionsHistory(
+     PrefService* pref_service,
+-    HostContentSettingsMap* settings_map)
+-    : pref_service_(pref_service), settings_map_(settings_map) {}
++    HostContentSettingsMap* settings_map,
++    bool notification_only,
++    Changed document_changed)
++    : pref_service_(pref_service),
++      settings_map_(settings_map),
++      notification_only_(notification_only),
++      document_changed_(std::move(document_changed)) {}
+ 
+ PermissionActionsHistory::~PermissionActionsHistory() = default;
++
++PermissionActionsHistory::Changed
++PermissionActionsHistory::GetDocumentNotificationCallback() {
++  if (shutting_down_) {
++    return {};
++  }
++  return base::BindRepeating(
++      &PermissionActionsHistory::NotifyAutoGrantedHeuristically,
++      weak_factory_.GetWeakPtr());
++}
++
++void PermissionActionsHistory::Shutdown() {
++  shutting_down_ = true;
++  weak_factory_.InvalidateWeakPtrs();
++  document_changed_.Reset();
++}
+ 
+ std::vector<PermissionActionsHistory::Entry>
+ PermissionActionsHistory::GetHistory(const base::Time& begin,
+@@ -132,7 +153,13 @@
+ bool PermissionActionsHistory::RecordTemporaryGrant(
+     const GURL& url,
+     ContentSettingsType permission) {
+-  base::DictValue dict = GetOriginActionHistoryData(settings_map_, url);
++  if (notification_only_ || shutting_down_) {
++    return false;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
++  base::DictValue dict = GetOriginActionHistoryData(settings_owner.get(), url);
+   base::DictValue* permission_dict = EnsurePermissionDict(dict, permission);
+ 
+   std::optional<int> value = permission_dict->FindInt(kTemporaryGrantCountKey);
+@@ -142,9 +169,12 @@
+   permission_dict->Set(kTemporaryGrantTimeStampKey,
+                        base::TimeToValue(base::Time::Now()));
+ 
+-  settings_map_->SetWebsiteSettingDefaultScope(
++  settings_owner.get()->SetWebsiteSettingDefaultScope(
+       url, GURL(), ContentSettingsType::PERMISSION_ACTIONS_HISTORY,
+       base::Value(std::move(dict)));
++  if (!alive) {
++    return false;
++  }
+ 
+   bool auto_granted = current_count >= kHeuristicGrantThreshold;
+   if (auto_granted) {
+@@ -156,27 +186,48 @@
+ void PermissionActionsHistory::ResetHeuristicData(
+     const GURL& url,
+     ContentSettingsType permission) {
+-  base::DictValue dict = GetOriginActionHistoryData(settings_map_, url);
++  if (notification_only_ || shutting_down_) {
++    return;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
++  base::DictValue dict = GetOriginActionHistoryData(settings_owner.get(), url);
+   if (dict.empty()) {
+     return;
+   }
+ 
+   dict.Remove(PermissionUtil::GetPermissionString(permission));
+-  settings_map_->SetWebsiteSettingDefaultScope(
++  settings_owner.get()->SetWebsiteSettingDefaultScope(
+       url, GURL(), ContentSettingsType::PERMISSION_ACTIONS_HISTORY,
+       base::Value(std::move(dict)));
++  if (!alive) {
++    return;
++  }
+ }
+ 
+ void PermissionActionsHistory::ResetHeuristicData(
+     base::RepeatingCallback<bool(const GURL& url)> filter) {
+-  for (const auto& site : settings_map_->GetSettingsForOneType(
++  if (notification_only_ || shutting_down_) {
++    return;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
++  for (const auto& site : settings_owner.get()->GetSettingsForOneType(
+            ContentSettingsType::PERMISSION_ACTIONS_HISTORY)) {
+     GURL origin(site.primary_pattern.ToString());
+ 
+     if (origin.is_valid() && filter.Run(origin)) {
+-      settings_map_->SetWebsiteSettingDefaultScope(
++      if (!alive) {
++        return;
++      }
++      settings_owner.get()->SetWebsiteSettingDefaultScope(
+           origin, GURL(), ContentSettingsType::PERMISSION_ACTIONS_HISTORY,
+           base::Value());
++      if (!alive) {
++        return;
++      }
+     }
+   }
+ }
+@@ -185,8 +236,14 @@
+     const GURL& request_origin,
+     ContentSettingsType permission,
+     bool needs_update) {
++  if (notification_only_ || shutting_down_) {
++    return false;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
+   base::DictValue dict =
+-      GetOriginActionHistoryData(settings_map_, request_origin);
++      GetOriginActionHistoryData(settings_owner.get(), request_origin);
+   base::DictValue* permission_dict = EnsurePermissionDict(dict, permission);
+ 
+   std::optional<base::Time> last_grant_time =
+@@ -205,10 +262,14 @@
+                            kHeuristicGrantThreshold - 1);
+       permission_dict->Set(kTemporaryGrantTimeStampKey,
+                            base::TimeToValue(base::Time::Now()));
+-      settings_map_->SetWebsiteSettingDefaultScope(
++      settings_owner.get()->SetWebsiteSettingDefaultScope(
+           request_origin, GURL(),
+           ContentSettingsType::PERMISSION_ACTIONS_HISTORY,
+           base::Value(std::move(dict)));
++      if (!alive) {
++        return false;
++      }
++
+     } else {
+       ResetHeuristicData(request_origin, permission);
+     }
+@@ -219,10 +280,13 @@
+     if (needs_update) {
+       permission_dict->Set(kTemporaryGrantTimeStampKey,
+                            base::TimeToValue(base::Time::Now()));
+-      settings_map_->SetWebsiteSettingDefaultScope(
++      settings_owner.get()->SetWebsiteSettingDefaultScope(
+           request_origin, GURL(),
+           ContentSettingsType::PERMISSION_ACTIONS_HISTORY,
+           base::Value(std::move(dict)));
++      if (!alive) {
++        return false;
++      }
+     }
+     return true;
+   }
+@@ -242,6 +306,10 @@
+ int PermissionActionsHistory::GetTemporaryGrantCountForTesting(
+     const GURL& request_origin,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return 0;
++  }
++
+   return GetTemporaryGrantCount(request_origin, permission, settings_map_);
+ }
+ 
+@@ -255,8 +323,19 @@
+ void PermissionActionsHistory::NotifyAutoGrantedHeuristically(
+     const GURL& origin,
+     ContentSettingsType content_setting) {
++  // A local observer may retire the owner, including this service. Capture
++  // everything needed before entering external code and do not forward a
++  // retired document's event into the profile's notification-only hub.
++  auto alive = weak_factory_.GetWeakPtr();
++  auto changed = document_changed_;
+   for (Observer& obs : observers_) {
+     obs.OnAutoGrantedHeuristically(origin, content_setting);
++    if (!alive) {
++      return;
++    }
++  }
++  if (changed) {
++    changed.Run(origin, content_setting);
+   }
+ }
+ 
+@@ -292,32 +371,7 @@
+ 
+ void PermissionActionsHistory::RecordOneTimeGrant(
+     const GURL& origin,
+-    ContentSettingsType permission_type) {
+-  if (permission_type != ContentSettingsType::GEOLOCATION &&
+-      permission_type != ContentSettingsType::GEOLOCATION_WITH_OPTIONS &&
+-      permission_type != ContentSettingsType::MEDIASTREAM_MIC &&
+-      permission_type != ContentSettingsType::MEDIASTREAM_CAMERA) {
+-    return;
+-  }
+-  base::Value setting = settings_map_->GetWebsiteSetting(
+-      origin, origin, ContentSettingsType::PERMISSION_ACTIONS_HISTORY, nullptr);
+-  base::DictValue dict = !setting.is_none() && setting.is_dict()
+-                             ? setting.GetDict().Clone()
+-                             : base::DictValue();
+-  const std::string permission_str =
+-      PermissionUtil::GetPermissionString(permission_type);
+-  base::DictValue* permission_dict = dict.EnsureDict(permission_str);
+-  int current_count =
+-      permission_dict->FindInt(kOneTimeGrantCountKey).value_or(0);
+-  current_count++;
+-  permission_dict->Set(kOneTimeGrantCountKey, current_count);
+-  settings_map_->SetWebsiteSettingDefaultScope(
+-      origin, origin, ContentSettingsType::PERMISSION_ACTIONS_HISTORY,
+-      base::Value(std::move(dict)));
+-  base::UmaHistogramCounts100(
+-      "Permissions.OneTimePermission." + permission_str + ".OneTimeGrant",
+-      current_count);
+-}
++    ContentSettingsType permission_type) {}
+ 
+ void PermissionActionsHistory::RecordOTPCountForAction(
+     ContentSettingsType permission,
+@@ -353,23 +407,6 @@
+ int PermissionActionsHistory::GetOneTimeGrantCount(
+     const GURL& origin,
+     ContentSettingsType permission) {
+-  if (permission != ContentSettingsType::GEOLOCATION &&
+-      permission != ContentSettingsType::GEOLOCATION_WITH_OPTIONS &&
+-      permission != ContentSettingsType::MEDIASTREAM_MIC &&
+-      permission != ContentSettingsType::MEDIASTREAM_CAMERA) {
+-    return 0;
+-  }
+-  base::Value setting = settings_map_->GetWebsiteSetting(
+-      origin, origin, ContentSettingsType::PERMISSION_ACTIONS_HISTORY, nullptr);
+-  if (!setting.is_none() && setting.is_dict()) {
+-    const base::DictValue& dict = setting.GetDict();
+-    const std::string permission_str =
+-        PermissionUtil::GetPermissionString(permission);
+-    const base::DictValue* permission_dict = dict.FindDict(permission_str);
+-    if (permission_dict) {
+-      return permission_dict->FindInt(kOneTimeGrantCountKey).value_or(0);
+-    }
+-  }
+   return 0;
+ }
+ 
+--- a/components/permissions/permission_actions_history.h
++++ b/components/permissions/permission_actions_history.h
+@@ -5,7 +5,9 @@
+ #ifndef COMPONENTS_PERMISSIONS_PERMISSION_ACTIONS_HISTORY_H_
+ #define COMPONENTS_PERMISSIONS_PERMISSION_ACTIONS_HISTORY_H_
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/notreached.h"
+ #include "base/observer_list.h"
+ #include "base/time/time.h"
+@@ -54,11 +56,18 @@
+         ContentSettingsType content_setting) = 0;
+   };
+ 
++  using Changed =
++      base::RepeatingCallback<void(const GURL&, ContentSettingsType)>;
+   explicit PermissionActionsHistory(PrefService* pref_service,
+-                                    HostContentSettingsMap* settings_map);
++                                    HostContentSettingsMap* settings_map,
++                                    bool notification_only = false,
++                                    Changed document_changed = {});
+ 
+   PermissionActionsHistory(const PermissionActionsHistory&) = delete;
+   PermissionActionsHistory& operator=(const PermissionActionsHistory&) = delete;
++
++  Changed GetDocumentNotificationCallback();
++  void Shutdown() override;
+ 
+   ~PermissionActionsHistory() override;
+ 
+@@ -146,8 +155,12 @@
+   raw_ptr<PrefService> pref_service_;
+ 
+   raw_ptr<HostContentSettingsMap> settings_map_;
++  const bool notification_only_;
++  Changed document_changed_;
++  bool shutting_down_ = false;
+ 
+   base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<PermissionActionsHistory> weak_factory_{this};
+ };
+ 
+ }  // namespace permissions
+--- a/components/permissions/permission_context_base.cc
++++ b/components/permissions/permission_context_base.cc
+@@ -327,12 +327,32 @@
+ content::PermissionResult PermissionContextBase_ChromiumImpl::GetPermissionStatus(
+     const PermissionRequestData& request_data,
+     content::RenderFrameHost* render_frame_host) const {
+-  if (base::FeatureList::IsEnabled(blink::features::kGeolocationElement) &&
+-      request_data.IsEligibleForHeuristicAutoGrant() &&
+-      PermissionsClient::Get()
+-          ->GetPermissionActionsHistory(browser_context_)
+-          ->CheckHeuristicallyAutoGranted(request_data.requesting_origin,
+-                                          content_settings_type_)) {
++  auto* client = PermissionsClient::Get();
++  if (client->RequiresDocumentPermissionContext(browser_context_)) {
++    render_frame_host =
++        client->GetPermissionRequestDocument(browser_context_, request_data);
++    if (!render_frame_host) {
++      return content::PermissionResult(PermissionStatus::DENIED);
++    }
++  }
++
++  std::unique_ptr<PermissionResolver> resolver =
++      CreatePermissionResolver(request_data.permission_descriptor);
++  auto native_result = GetPermissionStatus(*resolver, render_frame_host,
++                                           request_data.requesting_origin,
++                                           request_data.embedding_origin);
++  if (native_result.status != PermissionStatus::ASK) {
++    return native_result;
++  }
++
++  if (auto* history =
++          base::FeatureList::IsEnabled(blink::features::kGeolocationElement) &&
++                  request_data.IsEligibleForHeuristicAutoGrant()
++              ? client->GetPermissionActionsHistoryForDocument(
++                    browser_context_, render_frame_host)
++              : nullptr;
++      history && history->CheckHeuristicallyAutoGranted(
++                     request_data.requesting_origin, content_settings_type_)) {
+     return content::PermissionResult(
+         PermissionStatus::GRANTED,
+         content::PermissionStatusSource::HEURISTIC_GRANT,
+@@ -341,11 +361,7 @@
+             ->delegate()
+             .ToPermissionSetting(CONTENT_SETTING_ALLOW));
+   }
+-  std::unique_ptr<PermissionResolver> resolver =
+-      CreatePermissionResolver(request_data.permission_descriptor);
+-  return GetPermissionStatus(*resolver, render_frame_host,
+-                             request_data.requesting_origin,
+-                             request_data.embedding_origin);
++  return native_result;
+ }
+ 
+ content::PermissionResult PermissionContextBase_ChromiumImpl::GetPermissionStatus(
+@@ -353,6 +369,12 @@
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
++  if (PermissionsClient::Get()->RequiresDocumentPermissionContext(
++          browser_context_) &&
++      !render_frame_host) {
++    return content::PermissionResult(PermissionStatus::DENIED);
++  }
++
+   // If the permission has been disabled through Finch, block all requests.
+   if (IsPermissionKillSwitchOn()) {
+     return content::PermissionResult(
+@@ -477,10 +499,13 @@
+   }
+ 
+   if (UsesAutomaticEmbargo()) {
++    auto* blocker =
++        PermissionsClient::Get()->GetPermissionDecisionAutoBlockerForDocument(
++            browser_context_, render_frame_host);
+     std::optional<content::PermissionResult> result =
+-        PermissionsClient::Get()
+-            ->GetPermissionDecisionAutoBlocker(browser_context_)
+-            ->GetEmbargoResult(requesting_origin, content_settings_type_);
++        blocker ? blocker->GetEmbargoResult(requesting_origin,
++                                            content_settings_type_)
++                : std::nullopt;
+     if (result) {
+       result->retrieved_permission_setting = retrieved_permission_data;
+       return std::move(result).value();
+@@ -600,10 +625,14 @@
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
+-  return PermissionsClient::Get()
+-      ->GetSettingsMapForDocument(browser_context(), render_frame_host)
+-      ->GetPermissionSetting(requesting_origin, embedding_origin,
+-                             content_settings_type());
++  auto* map = PermissionsClient::Get()->GetSettingsMapForDocument(
++      browser_context(), render_frame_host);
++  return map ? map->GetPermissionSetting(requesting_origin, embedding_origin,
++                                         content_settings_type())
++             : content_settings::PermissionSettingsRegistry::GetInstance()
++                   ->Get(content_settings_type())
++                   ->delegate()
++                   .ToPermissionSetting(CONTENT_SETTING_BLOCK);
+ }
+ 
+ void PermissionContextBase_ChromiumImpl::DecidePermission(
+@@ -620,8 +649,14 @@
+          request_data->requesting_origin == request_data->embedding_origin ||
+          content_settings_type_ == ContentSettingsType::STORAGE_ACCESS);
+ 
+-  content::RenderFrameHost* rfh = content::RenderFrameHost::FromID(
+-      request_data->id.global_render_frame_host_id());
++  auto* client = PermissionsClient::Get();
++  auto* rfh =
++      client->GetPermissionRequestDocument(browser_context_, *request_data);
++  if (client->RequiresDocumentPermissionContext(browser_context_) && !rfh) {
++    std::move(callback).Run(
++        content::PermissionResult(PermissionStatus::DENIED));
++    return;
++  }
+   DCHECK(rfh);
+ 
+   content::WebContents* web_contents =
+@@ -662,21 +697,28 @@
+ void PermissionContextBase_ChromiumImpl::PermissionDecided(
+     const permissions::PermissionPromptDecision& decision,
+     const PermissionRequestData& request_data) {
+-  UserMadePermissionDecision(request_data.id, request_data.requesting_origin,
+-                             request_data.embedding_origin,
+-                             decision.overall_decision);
+-  //  If a permission request originates from an embedded element, its
+-  //  cancellation would be a result of a "system permission changed event."
+-  //  In this case, we will dispatch `OnPermissionChanged` early here.
+-  if (request_data.IsEmbeddedPermissionElementInitiated() &&
+-      decision.overall_decision == PermissionDecision::kNone) {
+-    content::RenderFrameHost* rfh = content::RenderFrameHost::FromID(
+-        request_data.id.global_render_frame_host_id());
+-    MaybeUpdateCachedHasDevicePermission(
+-        content::WebContents::FromRenderFrameHost(rfh));
+-  }
+-
+-  bool persist = decision.overall_decision != PermissionDecision::kNone;
++  const bool has_authority =
++      !PermissionsClient::Get()->RequiresDocumentPermissionContext(
++          browser_context_) ||
++      PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
++                                                             request_data);
++  if (has_authority) {
++    UserMadePermissionDecision(request_data.id, request_data.requesting_origin,
++                               request_data.embedding_origin,
++                               decision.overall_decision);
++    //  If a permission request originates from an embedded element, its
++    //  cancellation would be a result of a "system permission changed event."
++    //  In this case, we will dispatch `OnPermissionChanged` early here.
++    if (request_data.IsEmbeddedPermissionElementInitiated() &&
++        decision.overall_decision == PermissionDecision::kNone) {
++      auto* rfh = PermissionsClient::Get()->GetPermissionRequestDocument(
++          browser_context_, request_data);
++      MaybeUpdateCachedHasDevicePermission(
++          content::WebContents::FromRenderFrameHost(rfh));
++    }
++  }
++  bool persist =
++      has_authority && decision.overall_decision != PermissionDecision::kNone;
+ 
+   auto request = pending_requests_.find(request_data.id.ToString());
+   CHECK(request != pending_requests_.end());
+@@ -768,7 +810,8 @@
+     const PermissionRequestData& request_data,
+     const permissions::PermissionPromptDecision& decision) {
+   // Note that rfh may be null, see crbug.com/426909787.
+-  auto* rfh = request_data.alloy_document.AsRenderFrameHostIfValid();
++  auto* rfh = PermissionsClient::Get()->GetPermissionRequestDocument(
++      browser_context_, request_data);
+ 
+   PermissionSetting previous_value = GetPermissionStatusInternal(
+       rfh, request_data.requesting_origin, request_data.embedding_origin);
+@@ -787,6 +830,15 @@
+     bool persist,
+     const content::PermissionResult* permission_result,
+     const permissions::PermissionPromptDecision& decision) {
++  if (PermissionsClient::Get()->RequiresDocumentPermissionContext(
++          browser_context_) &&
++      !PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
++                                                              request_data)) {
++    std::move(callback).Run(
++        content::PermissionResult(PermissionStatus::DENIED));
++    return;
++  }
++
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   content::PermissionResult new_permission_result =
+       permission_result ? *permission_result
+@@ -801,7 +853,8 @@
+   }
+ 
+   // Note that rfh may be null, see crbug.com/426909787.
+-  auto* rfh = request_data.alloy_document.AsRenderFrameHostIfValid();
++  auto* rfh = PermissionsClient::Get()->GetPermissionRequestDocument(
++      browser_context_, request_data);
+ 
+   if (decision.is_final && rfh) {
+     UpdateTabContext(request_data, new_permission_result.status ==
+--- a/components/permissions/permission_decision_auto_blocker.cc
++++ b/components/permissions/permission_decision_auto_blocker.cc
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/feature_list.h"
++#include "base/functional/bind.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/values.h"
+@@ -314,6 +315,9 @@
+ PermissionDecisionAutoBlocker::GetEmbargoResult(
+     const GURL& request_origin,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return std::nullopt;
++  }
+   return GetEmbargoResult(settings_map_, request_origin, permission,
+                           clock_->Now());
+ }
+@@ -321,6 +325,10 @@
+ base::Time PermissionDecisionAutoBlocker::GetEmbargoStartTime(
+     const GURL& request_origin,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return {};
++  }
++
+   DCHECK(settings_map_);
+   base::DictValue dict =
+       GetOriginAutoBlockerData(settings_map_, request_origin);
+@@ -341,11 +349,19 @@
+ 
+ std::set<GURL> PermissionDecisionAutoBlocker::GetEmbargoedOrigins(
+     ContentSettingsType content_type) {
++  if (notification_only_ || shutting_down_) {
++    return {};
++  }
++
+   return GetEmbargoedOrigins(std::vector<ContentSettingsType>{content_type});
+ }
+ 
+ std::set<GURL> PermissionDecisionAutoBlocker::GetEmbargoedOrigins(
+     std::vector<ContentSettingsType> content_types) {
++  if (notification_only_ || shutting_down_) {
++    return {};
++  }
++
+   DCHECK(settings_map_);
+ 
+   std::vector<ContentSettingsType> filtered_content_types;
+@@ -375,12 +391,20 @@
+ int PermissionDecisionAutoBlocker::GetDismissCount(
+     const GURL& url,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return 0;
++  }
++
+   return GetActionCount(url, permission, kPromptDismissCountKey, settings_map_);
+ }
+ 
+ int PermissionDecisionAutoBlocker::GetIgnoreCount(
+     const GURL& url,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return 0;
++  }
++
+   return GetActionCount(url, permission, kPromptIgnoreCountKey, settings_map_);
+ }
+ 
+@@ -388,15 +412,27 @@
+     const GURL& url,
+     ContentSettingsType permission,
+     bool dismissed_prompt_was_quiet) {
++  if (notification_only_ || shutting_down_) {
++    return false;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
+   int current_dismissal_count = RecordActionInWebsiteSettings(
+-      url, permission, kPromptDismissCountKey, settings_map_);
++      url, permission, kPromptDismissCountKey, settings_owner.get());
++  if (!alive) {
++    return false;
++  }
+ 
+   int current_dismissal_count_with_quiet_ui =
+       dismissed_prompt_was_quiet
+           ? RecordActionInWebsiteSettings(url, permission,
+                                           kPromptDismissCountWithQuietUiKey,
+-                                          settings_map_)
++                                          settings_owner.get())
+           : -1;
++  if (!alive) {
++    return false;
++  }
+ 
+   // TODO(dominickn): ideally we would have a method
+   // ContentSettingPermissionContextBase::ShouldEmbargoAfterRepeatedDismissals()
+@@ -427,23 +463,36 @@
+     const GURL& url,
+     ContentSettingsType permission,
+     bool ignored_prompt_was_quiet) {
++  if (notification_only_ || shutting_down_) {
++    return false;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
+   int current_ignore_count = RecordActionInWebsiteSettings(
+-      url, permission, kPromptIgnoreCountKey, settings_map_);
++      url, permission, kPromptIgnoreCountKey, settings_owner.get());
++  if (!alive) {
++    return false;
++  }
+ 
+   int current_ignore_count_with_quiet_ui =
+       ignored_prompt_was_quiet
+           ? RecordActionInWebsiteSettings(url, permission,
+                                           kPromptIgnoreCountWithQuietUiKey,
+-                                          settings_map_)
++                                          settings_owner.get())
+           : -1;
++  if (!alive) {
++    return false;
++  }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   if (base::FeatureList::IsEnabled(
+           permissions::kPermissionsAndroidClapperLoud) &&
+       permission == ContentSettingsType::NOTIFICATIONS &&
+       !ignored_prompt_was_quiet) {
+-    int quiet_ignore_count = GetActionCount(
+-        url, permission, kPromptIgnoreCountWithQuietUiKey, settings_map_);
++    int quiet_ignore_count =
++        GetActionCount(url, permission, kPromptIgnoreCountWithQuietUiKey,
++                       settings_owner.get());
+     int current_loud_ignore_count = current_ignore_count - quiet_ignore_count;
+     if (current_loud_ignore_count >= kClapperIgnoresBeforeBlock) {
+       PlaceUnderEmbargo(url, permission, kPermissionIgnoreEmbargoKey);
+@@ -471,6 +520,10 @@
+ bool PermissionDecisionAutoBlocker::RecordDisplayAndEmbargo(
+     const GURL& url,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return false;
++  }
++
+   DCHECK_EQ(permission,
+             ContentSettingsType::FEDERATED_IDENTITY_AUTO_REAUTHN_PERMISSION);
+   PlaceUnderEmbargo(url, permission, kPermissionDisplayEmbargoKey);
+@@ -480,29 +533,50 @@
+ void PermissionDecisionAutoBlocker::RemoveEmbargoAndResetCounts(
+     const GURL& url,
+     ContentSettingsType permission) {
++  if (notification_only_ || shutting_down_) {
++    return;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
+   if (!IsEnabledForContentSetting(permission)) {
+     return;
+   }
+ 
+-  base::DictValue dict = GetOriginAutoBlockerData(settings_map_, url);
++  base::DictValue dict = GetOriginAutoBlockerData(settings_owner.get(), url);
+ 
+   dict.Remove(GetStringForContentType(permission));
+ 
+-  settings_map_->SetWebsiteSettingDefaultScope(
++  settings_owner.get()->SetWebsiteSettingDefaultScope(
+       url, GURL(), ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA,
+       base::Value(std::move(dict)));
++  if (!alive) {
++    return;
++  }
+ }
+ 
+ void PermissionDecisionAutoBlocker::RemoveEmbargoAndResetCounts(
+     base::RepeatingCallback<bool(const GURL& url)> filter) {
+-  for (const auto& site : settings_map_->GetSettingsForOneType(
++  if (notification_only_ || shutting_down_) {
++    return;
++  }
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
++  for (const auto& site : settings_owner.get()->GetSettingsForOneType(
+            ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA)) {
+     GURL origin(site.primary_pattern.ToString());
+ 
+     if (origin.is_valid() && filter.Run(origin)) {
+-      settings_map_->SetWebsiteSettingDefaultScope(
++      if (!alive) {
++        return;
++      }
++      settings_owner.get()->SetWebsiteSettingDefaultScope(
+           origin, GURL(), ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA,
+           base::Value());
++      if (!alive) {
++        return;
++      }
+     }
+   }
+ }
+@@ -522,32 +596,71 @@
+ }
+ 
+ PermissionDecisionAutoBlocker::PermissionDecisionAutoBlocker(
+-    HostContentSettingsMap* settings_map)
+-    : settings_map_(settings_map), clock_(base::DefaultClock::GetInstance()) {}
++    HostContentSettingsMap* settings_map,
++    bool notification_only,
++    Changed document_changed)
++    : settings_map_(settings_map),
++      notification_only_(notification_only),
++      document_changed_(std::move(document_changed)),
++      clock_(base::DefaultClock::GetInstance()) {}
+ 
+ PermissionDecisionAutoBlocker::~PermissionDecisionAutoBlocker() = default;
++
++PermissionDecisionAutoBlocker::Changed
++PermissionDecisionAutoBlocker::GetDocumentNotificationCallback() {
++  if (shutting_down_) {
++    return {};
++  }
++  return base::BindRepeating(
++      &PermissionDecisionAutoBlocker::NotifyEmbargoStarted,
++      weak_factory_.GetWeakPtr());
++}
++
++void PermissionDecisionAutoBlocker::Shutdown() {
++  shutting_down_ = true;
++  weak_factory_.InvalidateWeakPtrs();
++  document_changed_.Reset();
++}
+ 
+ void PermissionDecisionAutoBlocker::PlaceUnderEmbargo(
+     const GURL& request_origin,
+     ContentSettingsType permission,
+     const char* key) {
++  auto alive = weak_factory_.GetWeakPtr();
++  scoped_refptr<HostContentSettingsMap> settings_owner(settings_map_.get());
++
+   base::DictValue dict =
+-      GetOriginAutoBlockerData(settings_map_, request_origin);
++      GetOriginAutoBlockerData(settings_owner.get(), request_origin);
+   base::DictValue* permission_dict =
+       GetOrCreatePermissionDict(dict, GetStringForContentType(permission));
+   permission_dict->Set(
+       key, base::Value(static_cast<double>(clock_->Now().ToInternalValue())));
+-  settings_map_->SetWebsiteSettingDefaultScope(
++  settings_owner.get()->SetWebsiteSettingDefaultScope(
+       request_origin, GURL(), ContentSettingsType::PERMISSION_AUTOBLOCKER_DATA,
+       base::Value(std::move(dict)));
++  if (!alive) {
++    return;
++  }
++
+   NotifyEmbargoStarted(request_origin, permission);
+ }
+ 
+ void PermissionDecisionAutoBlocker::NotifyEmbargoStarted(
+     const GURL& origin,
+     ContentSettingsType content_setting) {
++  // A local observer may retire the owner, including this service. Capture
++  // everything needed before entering external code and do not forward a
++  // retired document's event into the profile's notification-only hub.
++  auto alive = weak_factory_.GetWeakPtr();
++  auto changed = document_changed_;
+   for (Observer& obs : observers_) {
+     obs.OnEmbargoStarted(origin, content_setting);
++    if (!alive) {
++      return;
++    }
++  }
++  if (changed) {
++    changed.Run(origin, content_setting);
+   }
+ }
+ 
+--- a/components/permissions/permission_decision_auto_blocker.h
++++ b/components/permissions/permission_decision_auto_blocker.h
+@@ -10,6 +10,7 @@
+ 
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/observer_list_types.h"
+ #include "base/time/default_clock.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+@@ -77,7 +78,14 @@
+ 
+   PermissionDecisionAutoBlocker() = delete;
+ 
+-  explicit PermissionDecisionAutoBlocker(HostContentSettingsMap* settings_map);
++  using Changed =
++      base::RepeatingCallback<void(const GURL&, ContentSettingsType)>;
++  explicit PermissionDecisionAutoBlocker(HostContentSettingsMap* settings_map,
++                                         bool notification_only = false,
++                                         Changed document_changed = {});
++
++  Changed GetDocumentNotificationCallback();
++  void Shutdown() override;
+ 
+   ~PermissionDecisionAutoBlocker() override;
+ 
+@@ -178,10 +186,14 @@
+   static const char kPermissionDisplayEmbargoKey[];
+ 
+   raw_ptr<HostContentSettingsMap> settings_map_;
++  const bool notification_only_;
++  Changed document_changed_;
++  bool shutting_down_ = false;
+ 
+   raw_ptr<base::Clock> clock_;
+ 
+   base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<PermissionDecisionAutoBlocker> weak_factory_{this};
+ };
+ 
+ }  // namespace permissions
+--- a/components/permissions/permission_request.h
++++ b/components/permissions/permission_request.h
+@@ -85,6 +85,9 @@
+ 
+   virtual ~PermissionRequest();
+ 
++  const content::WeakDocumentPtr& alloy_document() const {
++    return data_->alloy_document;
++  }
+   const GURL& requesting_origin() const { return data_->requesting_origin; }
+   const GURL& embedding_origin() const { return data_->embedding_origin; }
+   RequestType request_type() const;
+--- a/components/permissions/permission_request_manager.cc
++++ b/components/permissions/permission_request_manager.cc
+@@ -1438,6 +1438,12 @@
+   }
+ 
+   for (auto& request : requests_) {
++    if (PermissionsClient::Get()->RequiresDocumentPermissionContext(
++            browser_context) &&
++        !PermissionsClient::Get()->GetPermissionRequestDocument(browser_context,
++                                                                *request)) {
++      continue;
++    }
+     // TODO(timloh): We only support dismiss and ignore embargo for
+     // permissions which use PermissionRequestImpl as the other subclasses
+     // don't support GetContentSettingsType.
+@@ -1459,7 +1465,13 @@
+     PermissionUmaUtil::RecordEmbargoStatus(RecordActionAndGetEmbargoStatus(
+         browser_context, request.get(), permission_action));
+     PermissionActionsHistory* actions_history =
+-        PermissionsClient::Get()->GetPermissionActionsHistory(browser_context);
++        PermissionsClient::Get()->GetPermissionActionsHistoryForDocument(
++            browser_context,
++            PermissionsClient::Get()->GetPermissionRequestDocument(
++                browser_context, *request));
++    if (!actions_history) {
++      continue;
++    }
+     if (request->IsEligibleForHeuristicAutoGrant()) {
+       if (permission_action == PermissionAction::GRANTED_ONCE) {
+         actions_history->RecordTemporaryGrant(
+@@ -1954,8 +1966,13 @@
+   }
+ 
+   PermissionDecisionAutoBlocker* const autoblocker =
+-      PermissionsClient::Get()->GetPermissionDecisionAutoBlocker(
+-          browser_context);
++      PermissionsClient::Get()->GetPermissionDecisionAutoBlockerForDocument(
++          browser_context,
++          PermissionsClient::Get()->GetPermissionRequestDocument(
++              browser_context, *request));
++  if (!autoblocker) {
++    return PermissionEmbargoStatus::NOT_EMBARGOED;
++  }
+ 
+   if (permission_action == PermissionAction::DISMISSED &&
+       !request->IsEmbeddedPermissionElementInitiated()) {
+@@ -1988,9 +2005,11 @@
+     return;
+   }
+ 
+-  auto* map = PermissionsClient::Get()->GetSettingsMap(
+-      web_contents()->GetBrowserContext());
++  auto* client = PermissionsClient::Get();
++  auto* context = web_contents()->GetBrowserContext();
+   for (const auto& request : requests_) {
++    auto* map = client->GetSettingsMapForDocument(
++        context, client->GetPermissionRequestDocument(context, *request));
+     // It's possible in tests for |map| to not be initialized yet. Also there
+     // are some permission requests (like SMART_CARD_DATA) which are not for
+     // content settings.
+--- a/components/permissions/permission_uma_util.cc
++++ b/components/permissions/permission_uma_util.cc
+@@ -1088,11 +1088,13 @@
+   }
+   std::string action_string = GetPermissionActionString(permission_action);
+ 
+-  PermissionDecisionAutoBlocker* autoblocker =
+-      PermissionsClient::Get()->GetPermissionDecisionAutoBlocker(
+-          browser_context);
+-
+   for (const auto& request : requests) {
++    auto* request_document =
++        PermissionsClient::Get()->GetPermissionRequestDocument(browser_context,
++                                                               *request);
++    auto* autoblocker =
++        PermissionsClient::Get()->GetPermissionDecisionAutoBlockerForDocument(
++            browser_context, request_document);
+     ContentSettingsType permission = request->GetContentSettingsType();
+     // TODO(timloh): We only record these metrics for permissions which have a
+     // ContentSettingsType, as otherwise they don't support GetGestureType.
+@@ -1106,23 +1108,24 @@
+     RecordPermissionAction(
+         permission, permission_action, PermissionSourceUI::PROMPT, gesture_type,
+         time_to_action, ui_disposition, ui_reason, variants, requesting_origin,
+-        browser_context,
+-        content::RenderFrameHost::FromID(request->get_requesting_frame_id()),
+-        predicted_grant_likelihood, permission_request_relevance,
+-        permission_ai_relevance_model, prediction_decision_held_back,
+-        prompt_options, initial_geolocation_accuracy_selection,
++        browser_context, request_document, predicted_grant_likelihood,
++        permission_request_relevance, permission_ai_relevance_model,
++        prediction_decision_held_back, prompt_options,
++        initial_geolocation_accuracy_selection,
+         request->GetGeolocationPromptType(), request->get_ukm_source_id());
+ 
+     std::string priorDismissPrefix = base::StrCat(
+         {"Permissions.Prompt.", action_string, ".PriorDismissCount2."});
+     std::string priorIgnorePrefix = base::StrCat(
+         {"Permissions.Prompt.", action_string, ".PriorIgnoreCount2."});
+-    RecordPermissionPromptPriorCount(
+-        permission, priorDismissPrefix,
+-        autoblocker->GetDismissCount(requesting_origin, permission));
+-    RecordPermissionPromptPriorCount(
+-        permission, priorIgnorePrefix,
+-        autoblocker->GetIgnoreCount(requesting_origin, permission));
++    if (autoblocker) {
++      RecordPermissionPromptPriorCount(
++          permission, priorDismissPrefix,
++          autoblocker->GetDismissCount(requesting_origin, permission));
++      RecordPermissionPromptPriorCount(
++          permission, priorIgnorePrefix,
++          autoblocker->GetIgnoreCount(requesting_origin, permission));
++    }
+   }
+ 
+   base::UmaHistogramEnumeration(
+@@ -1454,16 +1457,20 @@
+     std::optional<GeolocationPromptType> geolocation_prompt_type,
+     std::optional<ukm::SourceId> source_id) {
+   DCHECK(PermissionUtil::IsPermission(permission));
+-  PermissionDecisionAutoBlocker* autoblocker =
+-      PermissionsClient::Get()->GetPermissionDecisionAutoBlocker(
+-          browser_context);
++  auto* autoblocker =
++      PermissionsClient::Get()->GetPermissionDecisionAutoBlockerForDocument(
++          browser_context, render_frame_host);
+   int dismiss_count =
+-      autoblocker->GetDismissCount(requesting_origin, permission);
+-  int ignore_count = autoblocker->GetIgnoreCount(requesting_origin, permission);
++      autoblocker ? autoblocker->GetDismissCount(requesting_origin, permission)
++                  : 0;
++  int ignore_count =
++      autoblocker ? autoblocker->GetIgnoreCount(requesting_origin, permission)
++                  : 0;
+ 
+   const base::Time cutoff = base::Time::Now() - base::Days(28);
+   PermissionActionsHistory* permission_actions_history =
+-      PermissionsClient::Get()->GetPermissionActionsHistory(browser_context);
++      PermissionsClient::Get()->GetPermissionActionsHistoryForDocument(
++          browser_context, render_frame_host);
+ 
+   PredictionRequestFeatures::ActionCounts
+       loud_ui_actions_counts_per_request_type;
+--- a/components/permissions/permissions_client.cc
++++ b/components/permissions/permissions_client.cc
+@@ -9,11 +9,13 @@
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/omnibox/common/omnibox_feature_configs.h"
++#include "components/permissions/permission_request.h"
+ #include "components/permissions/permission_request_data.h"
+ #include "components/permissions/permission_request_enums.h"
+ #include "components/permissions/permission_uma_util.h"
+ #include "components/permissions/resolvers/permission_prompt_options.h"
+ #include "content/public/browser/permission_result.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -71,6 +73,38 @@
+       ->SetPermissionSettingDefaultScope(request.requesting_origin,
+                                          request.embedding_origin, type,
+                                          setting, constraints);
++}
++
++content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
++    content::BrowserContext* context,
++    const PermissionRequestData& request) {
++  return RequiresDocumentPermissionContext(context)
++             ? request.alloy_document.AsRenderFrameHostIfValid()
++             : content::RenderFrameHost::FromID(
++                   request.id.global_render_frame_host_id());
++}
++
++content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
++    content::BrowserContext* context,
++    const PermissionRequest& request) {
++  return RequiresDocumentPermissionContext(context)
++             ? request.alloy_document().AsRenderFrameHostIfValid()
++             : content::RenderFrameHost::FromID(
++                   request.get_requesting_frame_id());
++}
++
++PermissionActionsHistory*
++PermissionsClient::GetPermissionActionsHistoryForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost*) {
++  return GetPermissionActionsHistory(context);
++}
++
++PermissionDecisionAutoBlocker*
++PermissionsClient::GetPermissionDecisionAutoBlockerForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost*) {
++  return GetPermissionDecisionAutoBlocker(context);
+ }
+ 
+ double PermissionsClient::GetSiteEngagementScore(
+--- a/components/permissions/permissions_client.h
++++ b/components/permissions/permissions_client.h
+@@ -46,6 +46,7 @@
+ 
+ namespace permissions {
+ class ObjectPermissionContextBase;
++class PermissionRequest;
+ struct PermissionRequestData;
+ class PermissionActionsHistory;
+ class PermissionDecisionAutoBlocker;
+@@ -92,6 +93,22 @@
+       ContentSettingsType type,
+       const PermissionSetting& setting,
+       const content_settings::ContentSettingConstraints& constraints);
++
++  virtual bool RequiresDocumentPermissionContext(content::BrowserContext*) {
++    return false;
++  }
++  content::RenderFrameHost* GetPermissionRequestDocument(
++      content::BrowserContext*,
++      const PermissionRequestData&);
++  content::RenderFrameHost* GetPermissionRequestDocument(
++      content::BrowserContext*,
++      const PermissionRequest&);
++  virtual PermissionActionsHistory* GetPermissionActionsHistoryForDocument(
++      content::BrowserContext*,
++      content::RenderFrameHost*);
++  virtual PermissionDecisionAutoBlocker*
++  GetPermissionDecisionAutoBlockerForDocument(content::BrowserContext*,
++                                              content::RenderFrameHost*);
+ 
+   // Retrieves the CookieSettings for this context.
+   virtual scoped_refptr<content_settings::CookieSettings> GetCookieSettings(

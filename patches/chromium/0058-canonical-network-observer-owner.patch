@@ -1,0 +1,270 @@
+--- a/content/browser/storage_partition_impl.h
++++ b/content/browser/storage_partition_impl.h
+@@ -173,6 +173,11 @@
+   mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
+   CreateURLLoaderNetworkObserverForNavigationRequest(
+       NavigationRequest& navigation_request) override;
++  // A document factory can be constructed before commit. Bind its canonical
++  // navigation/document handle, not the frame's replaceable placeholder.
++  mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++  CreateURLLoaderNetworkObserverForDocument(
++      scoped_refptr<NavigationOrDocumentHandle> owner);
+   storage::QuotaManager* GetQuotaManager() override;
+   BackgroundSyncContextImpl* GetBackgroundSyncContext() override;
+   storage::FileSystemContext* GetFileSystemContext() override;
+@@ -580,6 +585,9 @@
+     CreateForRenderFrameHost(
+         GlobalRenderFrameHostId global_render_frame_host_id);
+ 
++    static StoragePartitionImpl::URLLoaderNetworkContext CreateForDocument(
++        scoped_refptr<NavigationOrDocumentHandle> owner);
++
+     // Creates a URLLoaderNetworkContext for the navigation request.
+     static StoragePartitionImpl::URLLoaderNetworkContext CreateForNavigation(
+         NavigationRequest& navigation_request);
+@@ -620,6 +628,8 @@
+     // Used when `context_` holds `RenderFrameHostContext`.
+     explicit URLLoaderNetworkContext(
+         GlobalRenderFrameHostId global_render_frame_host_id);
++
++    explicit URLLoaderNetworkContext(RenderFrameHostContext frame_context);
+ 
+     // Used when `context_` holds `SharedOrServiceWorkerContext`.
+     URLLoaderNetworkContext(
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -2685,6 +2685,17 @@
+ }
+ 
+ mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++StoragePartitionImpl::CreateURLLoaderNetworkObserverForDocument(
++    scoped_refptr<NavigationOrDocumentHandle> owner) {
++  CHECK(owner);
++  mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver> remote;
++  url_loader_network_observers_.Add(
++      this, remote.InitWithNewPipeAndPassReceiver(),
++      URLLoaderNetworkContext::CreateForDocument(std::move(owner)));
++  return remote;
++}
++
++mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
+ StoragePartitionImpl::CreateURLLoaderNetworkObserverForNavigationRequest(
+     NavigationRequest& navigation_request) {
+   mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver> remote;
+@@ -3945,6 +3956,10 @@
+ }
+ 
+ StoragePartitionImpl::URLLoaderNetworkContext::URLLoaderNetworkContext(
++    RenderFrameHostContext frame_context)
++    : context_(std::move(frame_context)) {}
++
++StoragePartitionImpl::URLLoaderNetworkContext::URLLoaderNetworkContext(
+     NavigationRequest& navigation_request)
+     : context_(NavigationRequestContext{
+           navigation_request.navigation_or_document_handle()}) {}
+@@ -3973,6 +3988,12 @@
+ StoragePartitionImpl::URLLoaderNetworkContext::CreateForRenderFrameHost(
+     GlobalRenderFrameHostId render_frame_host_id) {
+   return StoragePartitionImpl::URLLoaderNetworkContext(render_frame_host_id);
++}
++
++StoragePartitionImpl::URLLoaderNetworkContext
++StoragePartitionImpl::URLLoaderNetworkContext::CreateForDocument(
++    scoped_refptr<NavigationOrDocumentHandle> owner) {
++  return URLLoaderNetworkContext(RenderFrameHostContext{std::move(owner)});
+ }
+ 
+ StoragePartitionImpl::URLLoaderNetworkContext
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -2027,6 +2027,8 @@
+   static SubresourceLoaderFactoriesConfig ForLastCommittedNavigation(
+       RenderFrameHostImpl& frame) {
+     SubresourceLoaderFactoriesConfig result;
++    result.navigation_or_document_handle_ =
++        frame.GetNavigationOrDocumentHandle();
+     result.alloy_network_generation_ =
+         GetAlloyNetworkGenerationForDocument(&frame);
+     result.origin_ = frame.GetLastCommittedOrigin();
+@@ -2084,6 +2086,8 @@
+   static SubresourceLoaderFactoriesConfig ForPendingNavigation(
+       NavigationRequest& navigation_request) {
+     SubresourceLoaderFactoriesConfig result;
++    result.navigation_or_document_handle_ =
++        navigation_request.navigation_or_document_handle();
+     result.alloy_network_generation_ =
+         navigation_request.GetAlloyNetworkGeneration();
+     result.origin_ = navigation_request.GetOriginToCommit().value();
+@@ -2192,6 +2196,13 @@
+   SubresourceLoaderFactoriesConfig& operator=(
+       const SubresourceLoaderFactoriesConfig&) = delete;
+ 
++  mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++  CreateNetworkObserver(RenderFrameHostImpl& frame) const {
++    return frame.GetStoragePartition()
++        ->CreateURLLoaderNetworkObserverForDocument(
++            navigation_or_document_handle_);
++  }
++
+   network::mojom::NetworkContext* alloy_network_context() const {
+     return alloy_network_generation_
+                ? alloy_network_generation_->GetNetworkContext()
+@@ -2250,6 +2261,7 @@
+   // Private constructor - please go through the static For... methods.
+   SubresourceLoaderFactoriesConfig() = default;
+ 
++  scoped_refptr<NavigationOrDocumentHandle> navigation_or_document_handle_;
+   scoped_refptr<AlloyNetworkGeneration> alloy_network_generation_;
+   url::Origin origin_;
+   net::IsolationInfo isolation_info_;
+@@ -3825,8 +3837,9 @@
+   for (const url::Origin& isolated_world_origin : isolated_world_origins) {
+     network::mojom::URLLoaderFactoryParamsPtr factory_params =
+         URLLoaderFactoryParamsHelper::CreateForIsolatedWorld(
+-            this, isolated_world_origin, config.origin(),
+-            config.isolation_info(), config.GetClientSecurityState(),
++            this, config.CreateNetworkObserver(*this), isolated_world_origin,
++            config.origin(), config.isolation_info(),
++            config.GetClientSecurityState(),
+             config.trust_token_issuance_policy(),
+             config.trust_token_redemption_policy(),
+             config.cookie_setting_overrides());
+@@ -14225,9 +14238,9 @@
+     const SubresourceLoaderFactoriesConfig& config,
+     std::string_view debug_tag) {
+   return URLLoaderFactoryParamsHelper::CreateForFrame(
+-      this, config.origin(), config.isolation_info(),
+-      config.GetClientSecurityState(), config.GetCoepReporter(),
+-      config.GetDipReporter(), GetProcess(),
++      this, config.CreateNetworkObserver(*this), config.origin(),
++      config.isolation_info(), config.GetClientSecurityState(),
++      config.GetCoepReporter(), config.GetDipReporter(), GetProcess(),
+       config.trust_token_issuance_policy(),
+       config.trust_token_redemption_policy(), config.cookie_setting_overrides(),
+       config.network_restrictions_id(),
+--- a/content/browser/url_loader_factory_params_helper.h
++++ b/content/browser/url_loader_factory_params_helper.h
+@@ -56,6 +56,8 @@
+   CONTENT_EXPORT static network::mojom::URLLoaderFactoryParamsPtr
+   CreateForFrame(
+       RenderFrameHostImpl* frame,
++      mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++          url_loader_network_observer,
+       const url::Origin& origin,
+       const net::IsolationInfo& isolation_info,
+       network::mojom::ClientSecurityStatePtr client_security_state,
+@@ -80,6 +82,8 @@
+   // once Chrome Platform Apps are gone.
+   static network::mojom::URLLoaderFactoryParamsPtr CreateForIsolatedWorld(
+       RenderFrameHostImpl* frame,
++      mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++          url_loader_network_observer,
+       const url::Origin& isolated_world_origin,
+       const url::Origin& main_world_origin,
+       const net::IsolationInfo& isolation_info,
+--- a/content/browser/url_loader_factory_params_helper.cc
++++ b/content/browser/url_loader_factory_params_helper.cc
+@@ -13,6 +13,7 @@
+ #include "base/no_destructor.h"
+ #include "base/not_fatal_until.h"
+ #include "content/browser/devtools/network_service_devtools_observer.h"
++#include "content/browser/navigation_or_document_handle.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
+ #include "content/browser/renderer_host/navigation_request.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+@@ -177,6 +178,8 @@
+ network::mojom::URLLoaderFactoryParamsPtr
+ URLLoaderFactoryParamsHelper::CreateForFrame(
+     RenderFrameHostImpl* frame,
++    mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++        url_loader_network_observer,
+     const url::Origin& frame_origin,
+     const net::IsolationInfo& isolation_info,
+     network::mojom::ClientSecurityStatePtr client_security_state,
+@@ -210,7 +213,7 @@
+           CookieAccessDetails::Source::kNonNavigation),
+       frame->CreateTrustTokenAccessObserver(),
+       frame->CreateSharedDictionaryAccessObserver(),
+-      frame->CreateURLLoaderNetworkObserver(),
++      std::move(url_loader_network_observer),
+       NetworkServiceDevToolsObserver::MakeSelfOwned(frame->frame_tree_node()),
+       frame->CreateDeviceBoundSessionObserver(), trust_token_issuance_policy,
+       trust_token_redemption_policy, cookie_setting_overrides, debug_tag,
+@@ -225,6 +228,8 @@
+ network::mojom::URLLoaderFactoryParamsPtr
+ URLLoaderFactoryParamsHelper::CreateForIsolatedWorld(
+     RenderFrameHostImpl* frame,
++    mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
++        url_loader_network_observer,
+     const url::Origin& isolated_world_origin,
+     const url::Origin& main_world_origin,
+     const net::IsolationInfo& isolation_info,
+@@ -252,7 +257,7 @@
+           CookieAccessDetails::Source::kNonNavigation),
+       frame->CreateTrustTokenAccessObserver(),
+       frame->CreateSharedDictionaryAccessObserver(),
+-      frame->CreateURLLoaderNetworkObserver(),
++      std::move(url_loader_network_observer),
+       NetworkServiceDevToolsObserver::MakeSelfOwned(frame->frame_tree_node()),
+       frame->CreateDeviceBoundSessionObserver(), trust_token_issuance_policy,
+       trust_token_redemption_policy, cookie_setting_overrides,
+@@ -386,17 +391,11 @@
+         device_bound_session_observer) {
+   CHECK(navigation_request.GetURL().SchemeIsHTTPOrHTTPS());
+ 
+-  // TODO(crbug.com/40188470): Consider not using the speculative
+-  // RenderFrameHostImpl to create URLLoaderNetworkServiceObserver.
+-  // In general we should avoid using speculative RenderFrameHostImpl
+-  // to fill URLLoaderFactoryParams because some parameters can be calculated
+-  // only after the RenderFrameHostImpl is committed.
+-  // See also the design doc linked from the bug entry. It describes options
+-  // to create the observer without RenderFrameHostImpl.
+-  mojo::PendingRemote<network::mojom::URLLoaderNetworkServiceObserver>
+-      url_loader_network_observer = navigation_request.frame_tree_node()
+-                                        ->current_frame_host()
+-                                        ->CreateURLLoaderNetworkObserver();
++  // Preloads belong to this navigation and then its committed document.
++  auto url_loader_network_observer =
++      static_cast<StoragePartitionImpl*>(process->GetStoragePartition())
++          ->CreateURLLoaderNetworkObserverForDocument(
++              navigation_request.navigation_or_document_handle());
+ 
+   auto isolation_info = net::IsolationInfo::Create(
+       net::IsolationInfo::RequestType::kOther,
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -705,7 +705,9 @@
+   // (e.g., static imports in module workers).
+   network::mojom::URLLoaderFactoryParamsPtr factory_params =
+       URLLoaderFactoryParamsHelper::CreateForFrame(
+-          ancestor_render_frame_host, creator_origin_, isolation_info_,
++          ancestor_render_frame_host,
++          ancestor_render_frame_host->CreateURLLoaderNetworkObserver(),
++          creator_origin_, isolation_info_,
+           worker_client_security_state_->Clone(), std::move(coep_reporter),
+           std::move(dip_reporter), worker_process_host_,
+           ancestor_render_frame_host->IsFeatureEnabled(
+--- a/content/browser/devtools/protocol/network_handler.cc
++++ b/content/browser/devtools/protocol/network_handler.cc
+@@ -4251,7 +4251,8 @@
+     }
+ 
+     auto params = URLLoaderFactoryParamsHelper::CreateForFrame(
+-        frame, frame->GetLastCommittedOrigin(),
++        frame, frame->CreateURLLoaderNetworkObserver(),
++        frame->GetLastCommittedOrigin(),
+         frame->GetIsolationInfoForSubresources(),
+         frame->BuildClientSecurityState(),
+         /*coep_reporter=*/mojo::NullRemote(),
+--- a/content/browser/devtools/protocol/devtools_network_resource_loader_browsertest.cc
++++ b/content/browser/devtools/protocol/devtools_network_resource_loader_browsertest.cc
+@@ -74,7 +74,8 @@
+   mojo::Remote<network::mojom::URLLoaderFactory> CreateURLLoaderFactory() {
+     auto* frame = current_frame_host();
+     auto params = URLLoaderFactoryParamsHelper::CreateForFrame(
+-        frame, frame->GetLastCommittedOrigin(),
++        frame, frame->CreateURLLoaderNetworkObserver(),
++        frame->GetLastCommittedOrigin(),
+         frame->GetIsolationInfoForSubresources(),
+         frame->BuildClientSecurityState(),
+         /*coep_reporter=*/mojo::NullRemote(),

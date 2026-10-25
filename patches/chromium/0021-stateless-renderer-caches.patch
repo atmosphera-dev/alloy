@@ -1,0 +1,265 @@
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -2048,12 +2048,17 @@
+   uint64_t trace_id = base::Token::CreateRandom().high();
+   TRACE_EVENT("navigation", "RenderProcessHostImpl::Init",
+               perfetto::Flow::Global(trace_id));
++  const auto* storage_policy =
++      alloy::site_records::RequestContextPolicy::Get(*browser_context_);
++  const bool alloy_stateless = storage_policy &&
++      storage_policy->StorageCapability(alloy::site_records::StorePurpose::kDomStorage)
++          .mode() == alloy::site_records::StorageMode::kStateless;
+   GetRendererInterface()->InitializeRenderer(
+       GetContentClient()->browser()->GetUserAgent(),
+       GetContentClient()->browser()->GetUserAgentMetadata(),
+       storage_partition_impl_->cors_exempt_header_list(),
+       GetContentClient()->browser()->GetOriginTrialsSettings(), cpu_tier,
+-      trace_id);
++      trace_id, alloy_stateless);
+ 
+   if (run_renderer_in_process()) {
+     CHECK(g_renderer_main_thread_factory, base::NotFatalUntil::M152);
+--- a/content/common/renderer.mojom
++++ b/content/common/renderer.mojom
+@@ -171,5 +171,5 @@
+                      array<string> cors_exempt_header_list,
+                      blink.mojom.OriginTrialsSettings? origin_trials_settings,
+                      blink.mojom.PerformanceTier cpu_performance_tier,
+-                     uint64 trace_id);
++                     uint64 trace_id, bool alloy_stateless);
+ };
+--- a/content/renderer/render_thread_impl.cc
++++ b/content/renderer/render_thread_impl.cc
+@@ -858,7 +858,11 @@
+     const std::vector<std::string>& cors_exempt_header_list,
+     blink::mojom::OriginTrialsSettingsPtr origin_trials_settings,
+     blink::mojom::PerformanceTier cpu_performance_tier,
+-    uint64_t trace_id) {
++    uint64_t trace_id, bool alloy_stateless) {
++  if (alloy_stateless) {
++    blink_platform_impl_->SetAlloyStateless();
++    blink::WebCache::DisableForAlloyStateless();
++  }
+   TRACE_EVENT("navigation", "RenderThreadImpl::InitializeRenderer",
+               perfetto::TerminatingFlow::Global(trace_id));
+   DCHECK(user_agent_.IsNull());
+--- a/content/renderer/render_thread_impl.h
++++ b/content/renderer/render_thread_impl.h
+@@ -406,7 +406,7 @@
+       const std::vector<std::string>& cors_exempt_header_list,
+       blink::mojom::OriginTrialsSettingsPtr origin_trial_settings,
+       blink::mojom::PerformanceTier cpu_performance_tier,
+-      uint64_t trace_id) override;
++      uint64_t trace_id, bool alloy_stateless) override;
+ #if BUILDFLAG(IS_MAC)
+   void UpdateScrollbarTheme(
+       mojom::UpdateScrollbarThemeParamsPtr params) override;
+--- a/content/renderer/renderer_blink_platform_impl.h
++++ b/content/renderer/renderer_blink_platform_impl.h
+@@ -9,6 +9,7 @@
+ #include <stdint.h>
+ 
+ #include <memory>
++#include <atomic>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -277,6 +278,12 @@
+   // Tells this platform that the renderer is locked to a site (i.e., a scheme
+   // plus eTLD+1, such as https://google.com), or to a more specific origin.
+   void SetIsLockedToSite();
++  void SetAlloyStateless() {
++    alloy_stateless_.store(true, std::memory_order_release);
++  }
++  bool IsAlloyStateless() const override {
++    return alloy_stateless_.load(std::memory_order_acquire);
++  }
+ 
+   void set_webui_resource_to_code_cache_id_map(
+       const base::flat_map<GURL, int>& resource_map) {
+@@ -299,6 +306,7 @@
+ 
+   // If true, the renderer process is locked to a site.
+   bool is_locked_to_site_;
++  std::atomic<bool> alloy_stateless_{false};
+ 
+   // NOT OWNED
+   raw_ptr<blink::scheduler::WebThreadScheduler> main_thread_scheduler_;
+--- a/third_party/blink/public/platform/platform.h
++++ b/third_party/blink/public/platform/platform.h
+@@ -154,6 +154,9 @@
+ 
+ class BLINK_PLATFORM_EXPORT Platform {
+  public:
++  // Browser-owned process context policy, never selected by script inputs.
++  virtual bool IsAlloyStateless() const { return false; }
++
+   // Initialize platform and wtf. If you need to initialize the entire Blink,
+   // you should use blink::Initialize. WebThreadScheduler must be owned by
+   // the embedder. InitializeBlink must be called before WebThreadScheduler is
+--- a/third_party/blink/public/platform/web_cache.h
++++ b/third_party/blink/public/platform/web_cache.h
+@@ -43,6 +43,8 @@
+   // cleared if they are actively referenced). Note that this method
+   // only removes resources from live list, w/o releasing cache memory.
+   static void Clear();
++  // One-way admission barrier during renderer initialization, before frames.
++  static void DisableForAlloyStateless();
+ 
+   // Get usage stats about the resource cache.
+   static void GetResourceTypeStats(WebCacheResourceTypeStats*);
+--- a/third_party/blink/renderer/platform/bindings/v8_per_isolate_data.cc
++++ b/third_party/blink/renderer/platform/bindings/v8_per_isolate_data.cc
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include "third_party/blink/renderer/platform/bindings/v8_per_isolate_data.h"
++#include "v8/include/v8-alloy-cache-control.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -150,6 +151,9 @@
+   DCHECK(data);
+ 
+   v8::Isolate* isolate = data->GetIsolate();
++  if (Platform::Current()->IsAlloyStateless()) {
++    v8::AlloyDisableCompilationCaches(isolate);
++  }
+   isolate->SetData(gin::kEmbedderBlink, data);
+   return isolate;
+ }
+--- a/third_party/blink/renderer/platform/exported/web_cache.cc
++++ b/third_party/blink/renderer/platform/exported/web_cache.cc
+@@ -29,6 +29,11 @@
+  */
+ 
+ #include "third_party/blink/public/platform/web_cache.h"
++#include "third_party/blink/renderer/platform/scheduler/public/thread_scheduler.h"
++#include "third_party/blink/renderer/platform/scheduler/public/thread.h"
++#include "third_party/blink/renderer/platform/scheduler/public/main_thread_scheduler.h"
++#include "third_party/blink/renderer/platform/scheduler/public/main_thread.h"
++#include "v8/include/v8-alloy-cache-control.h"
+ 
+ #include "third_party/blink/renderer/platform/loader/fetch/memory_cache.h"
+ 
+@@ -41,6 +46,13 @@
+   to.count = from.count;
+   to.size = from.size;
+   to.decoded_size = from.decoded_size;
++}
++
++void WebCache::DisableForAlloyStateless() {
++  Thread::MainThread()->Scheduler()->ToMainThreadScheduler()
++      ->ForEachMainThreadIsolate([](v8::Isolate* isolate) {
++        v8::AlloyDisableCompilationCaches(isolate);
++      });
+ }
+ 
+ void WebCache::Clear() {
+--- a/third_party/blink/renderer/platform/loader/fetch/memory_cache.cc
++++ b/third_party/blink/renderer/platform/loader/fetch/memory_cache.cc
+@@ -243,6 +243,7 @@
+ }
+ 
+ void MemoryCache::Add(Resource* resource) {
++  if (Platform::Current()->IsAlloyStateless()) return;
+   DCHECK(resource);
+   ResourceMap* resources = EnsureResourceMap(resource->CacheIdentifier());
+   AddInternal(resources, MakeGarbageCollected<MemoryCacheEntry>(resource));
+@@ -350,6 +351,7 @@
+ 
+ Resource* MemoryCache::ResourceForURL(const KURL& resource_url,
+                                       const String& cache_identifier) {
++  if (Platform::Current()->IsAlloyStateless()) return nullptr;
+   DCHECK(IsMainThread());
+   if (!resource_url.IsValid() || resource_url.IsNull())
+     return nullptr;
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -3850,6 +3850,7 @@
+     "include/v8-initialization.h",
+     "include/v8-internal.h",
+     "include/v8-isolate.h",
++    "include/v8-alloy-cache-control.h",
+     "include/v8-json.h",
+     "include/v8-local-handle.h",
+     "include/v8-locker.h",
+--- a/v8/src/api/api.cc
++++ b/v8/src/api/api.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "src/api/api.h"
++#include "include/v8-alloy-cache-control.h"
+ 
+ #include <algorithm>  // For min
+ #include <cmath>      // For isnan.
+@@ -12736,6 +12737,11 @@
+       .str();
+ }
+ 
++void AlloyDisableCompilationCaches(Isolate* isolate) {
++  auto* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
++  i_isolate->compilation_cache()->DisableForAlloyStateless();
++}
++
+ }  // namespace v8
+ 
+ #ifdef ENABLE_SLOW_DCHECKS
+--- a/v8/src/codegen/compilation-cache.cc
++++ b/v8/src/codegen/compilation-cache.cc
+@@ -249,6 +249,7 @@
+                                   DirectHandle<SharedFunctionInfo> outer_info,
+                                   DirectHandle<JSFunction> js_function,
+                                   LanguageMode language_mode, int position) {
++  if (disabled_for_alloy_stateless_) return;
+   if (IsNativeContext(js_function->context())) {
+     eval_global_.UpdateEval(source, outer_info, js_function, language_mode,
+                             position);
+@@ -291,6 +292,7 @@
+ 
+ MaybeDirectHandle<RegExpData> CompilationCache::LookupRegExp(
+     DirectHandle<String> original_source, JSRegExp::Flags flags) {
++  if (disabled_for_alloy_stateless_) return {};
+   return reg_exp_.Lookup(original_source, flags);
+ }
+ 
+@@ -325,6 +327,7 @@
+ void CompilationCache::PutRegExp(DirectHandle<String> original_source,
+                                  JSRegExp::Flags flags,
+                                  DirectHandle<RegExpData> data) {
++  if (disabled_for_alloy_stateless_) return;
+   reg_exp_.Put(original_source, flags, data);
+ }
+ 
+--- a/v8/src/codegen/compilation-cache.h
++++ b/v8/src/codegen/compilation-cache.h
+@@ -211,6 +211,10 @@
+   // to just fix the pressing performance problem for RegExp individually first.
+   void EnableScriptAndEval();
+   void DisableScriptAndEval();
++  void DisableForAlloyStateless() {
++    disabled_for_alloy_stateless_ = true;
++    Clear();
++  }
+ 
+  private:
+   explicit CompilationCache(Isolate* isolate);
+@@ -219,7 +223,8 @@
+   base::HashMap* EagerOptimizingSet();
+ 
+   bool IsEnabledScriptAndEval() const {
+-    return v8_flags.compilation_cache && enabled_script_and_eval_;
++    return !disabled_for_alloy_stateless_ &&
++           v8_flags.compilation_cache && enabled_script_and_eval_;
+   }
+   bool IsEnabledScript(LanguageMode language_mode) {
+     // Tests can change v8_flags.use_strict at runtime. The compilation cache
+@@ -238,6 +243,7 @@
+ 
+   // Current enable state of the compilation cache for scripts and eval.
+   bool enabled_script_and_eval_;
++  bool disabled_for_alloy_stateless_ = false;
+ 
+   friend class Isolate;
+ };

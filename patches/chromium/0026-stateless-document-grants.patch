@@ -1,0 +1,800 @@
+--- a/chrome/browser/bluetooth/bluetooth_chooser_context_factory.cc
++++ b/chrome/browser/bluetooth/bluetooth_chooser_context_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/bluetooth/bluetooth_chooser_context_factory.h"
+ 
+ #include "base/no_destructor.h"
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/permissions/contexts/bluetooth_chooser_context.h"
+@@ -46,6 +47,12 @@
+ 
+ BluetoothChooserContextFactory::~BluetoothChooserContextFactory() = default;
+ 
++permissions::BluetoothChooserContext*
++BluetoothChooserContextFactory::GetForFrame(content::RenderFrameHost* frame) {
++  return alloy::site_records::DocumentPermissionContext<
++      permissions::BluetoothChooserContext>(frame, &GetForProfile);
++}
++
+ std::unique_ptr<KeyedService>
+ BluetoothChooserContextFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+--- a/chrome/browser/bluetooth/bluetooth_chooser_context_factory.h
++++ b/chrome/browser/bluetooth/bluetooth_chooser_context_factory.h
+@@ -8,6 +8,10 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ 
++namespace content {
++class RenderFrameHost;
++}
++
+ class Profile;
+ 
+ namespace permissions {
+@@ -17,6 +21,8 @@
+ class BluetoothChooserContextFactory : public ProfileKeyedServiceFactory {
+  public:
+   static permissions::BluetoothChooserContext* GetForProfile(Profile* profile);
++  static permissions::BluetoothChooserContext* GetForFrame(
++      content::RenderFrameHost* frame);
+   static permissions::BluetoothChooserContext* GetForProfileIfExists(
+       Profile* profile);
+   static BluetoothChooserContextFactory* GetInstance();
+--- a/chrome/browser/bluetooth/chrome_bluetooth_delegate.cc
++++ b/chrome/browser/bluetooth/chrome_bluetooth_delegate.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "base/metrics/field_trial_params.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+@@ -70,6 +71,46 @@
+   return AllowWebBluetoothResult::kAllow;
+ }
+ 
++ChromeBluetoothDelegate::AllowWebBluetoothResult
++ChromeBluetoothDelegate::AllowWebBluetoothForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost* frame,
++    const url::Origin& requesting,
++    const url::Origin& embedding) {
++  auto result = AllowWebBluetooth(context, requesting, embedding);
++  if (result != AllowWebBluetoothResult::kAllow) {
++    return result;
++  }
++  if (HostContentSettingsMapFactory::GetForFrame(frame)->GetContentSetting(
++          requesting.GetURL(), embedding.GetURL(),
++          ContentSettingsType::BLUETOOTH_GUARD) == CONTENT_SETTING_BLOCK) {
++    return AllowWebBluetoothResult::kBlockPolicy;
++  }
++  return result;
++}
++
++bool ChromeBluetoothDelegate::IsBluetoothScanningBlockedForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost* frame,
++    const url::Origin& requesting,
++    const url::Origin& embedding) {
++  return IsBluetoothScanningBlocked(context, requesting, embedding) ||
++         HostContentSettingsMapFactory::GetForFrame(frame)->GetContentSetting(
++             requesting.GetURL(), embedding.GetURL(),
++             ContentSettingsType::BLUETOOTH_SCANNING) == CONTENT_SETTING_BLOCK;
++}
++
++void ChromeBluetoothDelegate::BlockBluetoothScanningForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost* frame,
++    const url::Origin& requesting,
++    const url::Origin& embedding) {
++  HostContentSettingsMapFactory::GetForFrame(frame)
++      ->SetContentSettingDefaultScope(requesting.GetURL(), embedding.GetURL(),
++                                      ContentSettingsType::BLUETOOTH_SCANNING,
++                                      CONTENT_SETTING_BLOCK);
++}
++
+ std::string ChromeBluetoothDelegate::GetWebBluetoothBlocklist() {
+   return base::GetFieldTrialParamValue("WebBluetoothBlocklist",
+                                        "blocklist_additions");
+--- a/chrome/browser/bluetooth/chrome_bluetooth_delegate.h
++++ b/chrome/browser/bluetooth/chrome_bluetooth_delegate.h
+@@ -22,6 +22,20 @@
+       content::BrowserContext* browser_context,
+       const url::Origin& requesting_origin,
+       const url::Origin& embedding_origin) override;
++  AllowWebBluetoothResult AllowWebBluetoothForDocument(
++      content::BrowserContext* context,
++      content::RenderFrameHost* frame,
++      const url::Origin& requesting,
++      const url::Origin& embedding) override;
++  bool IsBluetoothScanningBlockedForDocument(
++      content::BrowserContext* context,
++      content::RenderFrameHost* frame,
++      const url::Origin& requesting,
++      const url::Origin& embedding) override;
++  void BlockBluetoothScanningForDocument(content::BrowserContext* context,
++                                         content::RenderFrameHost* frame,
++                                         const url::Origin& requesting,
++                                         const url::Origin& embedding) override;
+   std::string GetWebBluetoothBlocklist() override;
+   bool IsBluetoothScanningBlocked(content::BrowserContext* browser_context,
+                                   const url::Origin& requesting_origin,
+--- a/chrome/browser/bluetooth/chrome_bluetooth_delegate_impl_client.cc
++++ b/chrome/browser/bluetooth/chrome_bluetooth_delegate_impl_client.cc
+@@ -36,8 +36,7 @@
+ permissions::BluetoothChooserContext*
+ ChromeBluetoothDelegateImplClient::GetBluetoothChooserContext(
+     content::RenderFrameHost* frame) {
+-  auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
+-  return BluetoothChooserContextFactory::GetForProfile(profile);
++  return BluetoothChooserContextFactory::GetForFrame(frame);
+ }
+ 
+ std::unique_ptr<content::BluetoothChooser>
+--- a/chrome/browser/content_settings/BUILD.gn
++++ b/chrome/browser/content_settings/BUILD.gn
+@@ -147,9 +147,12 @@
+   sources = [
+     "cookie_settings_factory.h",
+     "host_content_settings_map_factory.h",
++    "alloy_document_permission_context.h",
+   ]
+ 
+   public_deps = [
++    "//brave/alloy/site_records:capabilities",
++    "//content/public/browser",
+     "//base",
+     "//chrome/browser/profiles:profile",
+   ]
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -110,6 +110,18 @@
+               ->settings.settings();
+ }
+ 
++KeyedService* HostContentSettingsMapFactory::GetStatelessDocumentService(
++    content::RenderFrameHost* frame,
++    const void* key,
++    base::OnceCallback<std::unique_ptr<KeyedService>(HostContentSettingsMap*)>
++        factory) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  CHECK(alloy::site_records::RequestContextPolicy::IsStateless(
++      *frame->GetBrowserContext()));
++  return AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)
++      ->settings.GetOrCreateService(key, std::move(factory));
++}
++
+ HostContentSettingsMapFactory::HostContentSettingsMapFactory()
+     : RefcountedProfileKeyedServiceFactory(
+           "HostContentSettingsMap",
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.h
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.h
+@@ -5,11 +5,13 @@
+ #ifndef CHROME_BROWSER_CONTENT_SETTINGS_HOST_CONTENT_SETTINGS_MAP_FACTORY_H_
+ #define CHROME_BROWSER_CONTENT_SETTINGS_HOST_CONTENT_SETTINGS_MAP_FACTORY_H_
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/refcounted_profile_keyed_service_factory.h"
+ 
+ class HostContentSettingsMap;
++class KeyedService;
+ namespace content {
+ class RenderFrameHost;
+ }
+@@ -22,6 +24,11 @@
+   static HostContentSettingsMapFactory* GetInstance();
+   // Stateless user decisions belong to the actual document, not its profile.
+   static HostContentSettingsMap* GetForFrame(content::RenderFrameHost* frame);
++  static KeyedService* GetStatelessDocumentService(
++      content::RenderFrameHost* frame,
++      const void* key,
++      base::OnceCallback<std::unique_ptr<KeyedService>(HostContentSettingsMap*)>
++          factory);
+ 
+   HostContentSettingsMapFactory(const HostContentSettingsMapFactory&) = delete;
+   HostContentSettingsMapFactory& operator=(
+--- a/chrome/browser/hid/chrome_hid_delegate.cc
++++ b/chrome/browser/hid/chrome_hid_delegate.cc
+@@ -12,6 +12,7 @@
+ #include "base/notimplemented.h"
+ #include "base/observer_list.h"
+ #include "base/scoped_observation.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/hid/hid_chooser_context.h"
+ #include "chrome/browser/hid/hid_chooser_context_factory.h"
+ #include "chrome/browser/hid/hid_connection_tracker.h"
+@@ -257,10 +258,17 @@
+     content::RenderFrameHost* render_frame_host,
+     const url::Origin& origin,
+     const device::mojom::HidDeviceInfo& device) {
+-  return browser_context &&
+-         GetChooserContext(browser_context)
+-             ->HasDevicePermission(origin, device,
+-                                   GetWebViewEmbedderOrigin(render_frame_host));
++  auto* context =
++      render_frame_host
++          ? HidChooserContextFactory::GetForFrame(render_frame_host)
++          : (browser_context &&
++                     !alloy::site_records::RequestContextPolicy::IsStateless(
++                         *browser_context)
++                 ? GetChooserContext(browser_context)
++                 : nullptr);
++  return context &&
++         context->HasDevicePermission(
++             origin, device, GetWebViewEmbedderOrigin(render_frame_host));
+ }
+ 
+ void ChromeHidDelegate::RevokeDevicePermission(
+@@ -269,9 +277,17 @@
+     const url::Origin& origin,
+     const device::mojom::HidDeviceInfo& device) {
+   if (browser_context) {
+-    GetChooserContext(browser_context)
+-        ->RevokeDevicePermission(origin, device,
+-                                 GetWebViewEmbedderOrigin(render_frame_host));
++    auto* context =
++        render_frame_host
++            ? HidChooserContextFactory::GetForFrame(render_frame_host)
++            : (!alloy::site_records::RequestContextPolicy::IsStateless(
++                   *browser_context)
++                   ? GetChooserContext(browser_context)
++                   : nullptr);
++    if (context) {
++      context->RevokeDevicePermission(
++          origin, device, GetWebViewEmbedderOrigin(render_frame_host));
++    }
+   }
+ }
+ 
+--- a/chrome/browser/hid/hid_chooser_context.cc
++++ b/chrome/browser/hid/hid_chooser_context.cc
+@@ -114,11 +114,13 @@
+ 
+ void HidChooserContext::DeviceObserver::OnHidManagerConnectionError() {}
+ 
+-HidChooserContext::HidChooserContext(Profile* profile)
++HidChooserContext::HidChooserContext(Profile* profile,
++                                     HostContentSettingsMap* settings)
+     : ObjectPermissionContextBase(
+           ContentSettingsType::HID_GUARD,
+           ContentSettingsType::HID_CHOOSER_DATA,
+-          HostContentSettingsMapFactory::GetForProfile(profile)),
++          settings ? settings
++                   : HostContentSettingsMapFactory::GetForProfile(profile)),
+       profile_(profile) {
+   DCHECK(profile_);
+ }
+--- a/chrome/browser/hid/hid_chooser_context.h
++++ b/chrome/browser/hid/hid_chooser_context.h
+@@ -54,7 +54,8 @@
+     virtual void OnHidChooserContextShutdown() = 0;
+   };
+ 
+-  explicit HidChooserContext(Profile* profile);
++  explicit HidChooserContext(Profile* profile,
++                             HostContentSettingsMap* settings = nullptr);
+   HidChooserContext(const HidChooserContext&) = delete;
+   HidChooserContext& operator=(const HidChooserContext&) = delete;
+   ~HidChooserContext() override;
+--- a/chrome/browser/hid/hid_chooser_context_factory.cc
++++ b/chrome/browser/hid/hid_chooser_context_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/hid/hid_chooser_context_factory.h"
+ 
+ #include "base/no_destructor.h"
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/hid/hid_chooser_context.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -45,6 +46,12 @@
+ 
+ HidChooserContextFactory::~HidChooserContextFactory() = default;
+ 
++HidChooserContext* HidChooserContextFactory::GetForFrame(
++    content::RenderFrameHost* frame) {
++  return alloy::site_records::DocumentPermissionContext<HidChooserContext>(
++      frame, &GetForProfile);
++}
++
+ std::unique_ptr<KeyedService>
+ HidChooserContextFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+--- a/chrome/browser/hid/hid_chooser_context_factory.h
++++ b/chrome/browser/hid/hid_chooser_context_factory.h
+@@ -8,12 +8,17 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ 
++namespace content {
++class RenderFrameHost;
++}
++
+ class HidChooserContext;
+ class Profile;
+ 
+ class HidChooserContextFactory : public ProfileKeyedServiceFactory {
+  public:
+   static HidChooserContext* GetForProfile(Profile* profile);
++  static HidChooserContext* GetForFrame(content::RenderFrameHost* frame);
+   static HidChooserContext* GetForProfileIfExists(Profile* profile);
+   static HidChooserContextFactory* GetInstance();
+ 
+--- a/chrome/browser/serial/chrome_serial_delegate.cc
++++ b/chrome/browser/serial/chrome_serial_delegate.cc
+@@ -20,8 +20,7 @@
+ namespace {
+ 
+ SerialChooserContext* GetChooserContext(content::RenderFrameHost* frame) {
+-  auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
+-  return SerialChooserContextFactory::GetForProfile(profile);
++  return SerialChooserContextFactory::GetForFrame(frame);
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/serial/serial_chooser_context.cc
++++ b/chrome/browser/serial/serial_chooser_context.cc
+@@ -131,11 +131,13 @@
+ 
+ }  // namespace
+ 
+-SerialChooserContext::SerialChooserContext(Profile* profile)
++SerialChooserContext::SerialChooserContext(Profile* profile,
++                                           HostContentSettingsMap* settings)
+     : ObjectPermissionContextBase(
+           ContentSettingsType::SERIAL_GUARD,
+           ContentSettingsType::SERIAL_CHOOSER_DATA,
+-          HostContentSettingsMapFactory::GetForProfile(profile)),
++          settings ? settings
++                   : HostContentSettingsMapFactory::GetForProfile(profile)),
+       profile_(profile) {
+   DCHECK(profile_);
+   permission_observation_.Observe(this);
+--- a/chrome/browser/serial/serial_chooser_context.h
++++ b/chrome/browser/serial/serial_chooser_context.h
+@@ -40,7 +40,8 @@
+  public:
+   using PortObserver = content::SerialDelegate::Observer;
+ 
+-  explicit SerialChooserContext(Profile* profile);
++  explicit SerialChooserContext(Profile* profile,
++                                HostContentSettingsMap* settings = nullptr);
+ 
+   SerialChooserContext(const SerialChooserContext&) = delete;
+   SerialChooserContext& operator=(const SerialChooserContext&) = delete;
+--- a/chrome/browser/serial/serial_chooser_context_factory.cc
++++ b/chrome/browser/serial/serial_chooser_context_factory.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/serial/serial_chooser_context_factory.h"
+ 
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/serial/serial_chooser_context.h"
+@@ -24,6 +25,12 @@
+ }
+ 
+ SerialChooserContextFactory::~SerialChooserContextFactory() = default;
++
++SerialChooserContext* SerialChooserContextFactory::GetForFrame(
++    content::RenderFrameHost* frame) {
++  return alloy::site_records::DocumentPermissionContext<SerialChooserContext>(
++      frame, &GetForProfile);
++}
+ 
+ std::unique_ptr<KeyedService>
+ SerialChooserContextFactory::BuildServiceInstanceForBrowserContext(
+--- a/chrome/browser/serial/serial_chooser_context_factory.h
++++ b/chrome/browser/serial/serial_chooser_context_factory.h
+@@ -8,12 +8,17 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ 
++namespace content {
++class RenderFrameHost;
++}
++
+ class SerialChooserContext;
+ class Profile;
+ 
+ class SerialChooserContextFactory : public ProfileKeyedServiceFactory {
+  public:
+   static SerialChooserContext* GetForProfile(Profile* profile);
++  static SerialChooserContext* GetForFrame(content::RenderFrameHost* frame);
+   static SerialChooserContext* GetForProfileIfExists(Profile* profile);
+   static SerialChooserContextFactory* GetInstance();
+ 
+--- a/chrome/browser/ui/hid/hid_chooser_controller.cc
++++ b/chrome/browser/ui/hid/hid_chooser_controller.cc
+@@ -100,12 +100,8 @@
+   // not created for fenced frames.
+   DCHECK(!render_frame_host->IsNestedWithinFencedFrame());
+ 
+-  auto* web_contents =
+-      content::WebContents::FromRenderFrameHost(render_frame_host);
+-  auto* profile =
+-      Profile::FromBrowserContext(web_contents->GetBrowserContext());
+   chooser_context_ =
+-      HidChooserContextFactory::GetForProfile(profile)->AsWeakPtr();
++      HidChooserContextFactory::GetForFrame(render_frame_host)->AsWeakPtr();
+   DCHECK(chooser_context_);
+ 
+   chooser_context_->GetHidManager()->GetDevices(base::BindOnce(
+--- a/chrome/browser/ui/serial/serial_chooser_controller.cc
++++ b/chrome/browser/ui/serial/serial_chooser_controller.cc
+@@ -110,10 +110,8 @@
+       initiator_document_(render_frame_host->GetWeakDocumentPtr()) {
+   origin_ = render_frame_host->GetMainFrame()->GetLastCommittedOrigin();
+ 
+-  auto* profile =
+-      Profile::FromBrowserContext(render_frame_host->GetBrowserContext());
+   chooser_context_ =
+-      SerialChooserContextFactory::GetForProfile(profile)->AsWeakPtr();
++      SerialChooserContextFactory::GetForFrame(render_frame_host)->AsWeakPtr();
+   DCHECK(chooser_context_);
+ 
+   // Post `GetDevices` to be run later after the view is set in the current
+--- a/chrome/browser/usb/chrome_usb_delegate.cc
++++ b/chrome/browser/usb/chrome_usb_delegate.cc
+@@ -11,6 +11,7 @@
+ #include "base/observer_list.h"
+ #include "base/observer_list_types.h"
+ #include "base/scoped_observation.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/dialogs/browser_dialogs.h"
+ #include "chrome/browser/usb/usb_blocklist.h"
+@@ -310,6 +311,18 @@
+   }
+ }
+ 
++void ChromeUsbDelegate::RevokeDevicePermissionForDocument(
++    content::BrowserContext* context,
++    content::RenderFrameHost* frame,
++    const url::Origin& origin,
++    const device::mojom::UsbDeviceInfo& device) {
++  auto* chooser =
++      frame ? UsbChooserContextFactory::GetForFrame(frame) : nullptr;
++  if (chooser) {
++    chooser->RevokeDevicePermissionWebInitiated(origin, device);
++  }
++}
++
+ const device::mojom::UsbDeviceInfo* ChromeUsbDelegate::GetDeviceInfo(
+     content::BrowserContext* browser_context,
+     const std::string& guid) {
+@@ -344,8 +357,14 @@
+     return false;
+   }
+ 
+-  return browser_context && GetChooserContext(browser_context)
+-                                ->HasDevicePermission(origin, device_info);
++  auto* context =
++      frame ? UsbChooserContextFactory::GetForFrame(frame)
++            : (browser_context &&
++                       !alloy::site_records::RequestContextPolicy::IsStateless(
++                           *browser_context)
++                   ? GetChooserContext(browser_context)
++                   : nullptr);
++  return context && context->HasDevicePermission(origin, device_info);
+ }
+ 
+ void ChromeUsbDelegate::GetDevices(
+--- a/chrome/browser/usb/chrome_usb_delegate.h
++++ b/chrome/browser/usb/chrome_usb_delegate.h
+@@ -44,6 +44,12 @@
+       content::BrowserContext* browser_context,
+       const url::Origin& origin,
+       const device::mojom::UsbDeviceInfo& device) override;
++  void RevokeDevicePermissionForDocument(
++      content::BrowserContext* context,
++      content::RenderFrameHost* frame,
++      const url::Origin& origin,
++      const device::mojom::UsbDeviceInfo& device) override;
++
+   const device::mojom::UsbDeviceInfo* GetDeviceInfo(
+       content::BrowserContext* browser_context,
+       const std::string& guid) override;
+--- a/chrome/browser/usb/usb_chooser_context.cc
++++ b/chrome/browser/usb/usb_chooser_context.cc
+@@ -160,11 +160,13 @@
+ 
+ void UsbChooserContext::DeviceObserver::OnDeviceManagerConnectionError() {}
+ 
+-UsbChooserContext::UsbChooserContext(Profile* profile)
++UsbChooserContext::UsbChooserContext(Profile* profile,
++                                     HostContentSettingsMap* settings)
+     : ObjectPermissionContextBase(
+           ContentSettingsType::USB_GUARD,
+           ContentSettingsType::USB_CHOOSER_DATA,
+-          HostContentSettingsMapFactory::GetForProfile(profile)),
++          settings ? settings
++                   : HostContentSettingsMapFactory::GetForProfile(profile)),
+       is_incognito_(profile->IsOffTheRecord()) {
+   usb_policy_allowed_devices_ =
+       std::make_unique<UsbPolicyAllowedDevices>(profile->GetPrefs());
+--- a/chrome/browser/usb/usb_chooser_context.h
++++ b/chrome/browser/usb/usb_chooser_context.h
+@@ -31,7 +31,8 @@
+ class UsbChooserContext : public permissions::ObjectPermissionContextBase,
+                           public device::mojom::UsbDeviceManagerClient {
+  public:
+-  explicit UsbChooserContext(Profile* profile);
++  explicit UsbChooserContext(Profile* profile,
++                             HostContentSettingsMap* settings = nullptr);
+ 
+   UsbChooserContext(const UsbChooserContext&) = delete;
+   UsbChooserContext& operator=(const UsbChooserContext&) = delete;
+--- a/chrome/browser/usb/usb_chooser_context_factory.cc
++++ b/chrome/browser/usb/usb_chooser_context_factory.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/usb/usb_chooser_context_factory.h"
+ 
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/usb/usb_chooser_context.h"
+@@ -24,6 +25,12 @@
+ }
+ 
+ UsbChooserContextFactory::~UsbChooserContextFactory() = default;
++
++UsbChooserContext* UsbChooserContextFactory::GetForFrame(
++    content::RenderFrameHost* frame) {
++  return alloy::site_records::DocumentPermissionContext<UsbChooserContext>(
++      frame, &GetForProfile);
++}
+ 
+ std::unique_ptr<KeyedService>
+ UsbChooserContextFactory::BuildServiceInstanceForBrowserContext(
+--- a/chrome/browser/usb/usb_chooser_context_factory.h
++++ b/chrome/browser/usb/usb_chooser_context_factory.h
+@@ -8,12 +8,17 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ 
++namespace content {
++class RenderFrameHost;
++}
++
+ class UsbChooserContext;
+ class Profile;
+ 
+ class UsbChooserContextFactory : public ProfileKeyedServiceFactory {
+  public:
+   static UsbChooserContext* GetForProfile(Profile* profile);
++  static UsbChooserContext* GetForFrame(content::RenderFrameHost* frame);
+   static UsbChooserContext* GetForProfileIfExists(Profile* profile);
+   static UsbChooserContextFactory* GetInstance();
+ 
+--- a/chrome/browser/usb/usb_chooser_controller.cc
++++ b/chrome/browser/usb/usb_chooser_controller.cc
+@@ -101,10 +101,8 @@
+       render_frame_host_id_(render_frame_host->GetGlobalId()) {
+   RenderFrameHost* main_frame = render_frame_host->GetMainFrame();
+   origin_ = main_frame->GetLastCommittedOrigin();
+-  Profile* profile =
+-      Profile::FromBrowserContext(main_frame->GetBrowserContext());
+   chooser_context_ =
+-      UsbChooserContextFactory::GetForProfile(profile)->AsWeakPtr();
++      UsbChooserContextFactory::GetForFrame(render_frame_host)->AsWeakPtr();
+   DCHECK(chooser_context_);
+   chooser_context_->GetDevices(base::BindOnce(
+       &UsbChooserController::GotUsbDeviceList, weak_factory_.GetWeakPtr()));
+--- a/components/permissions/contexts/bluetooth_chooser_context.cc
++++ b/components/permissions/contexts/bluetooth_chooser_context.cc
+@@ -97,11 +97,14 @@
+ }  // namespace
+ 
+ BluetoothChooserContext::BluetoothChooserContext(
+-    content::BrowserContext* browser_context)
++    content::BrowserContext* browser_context,
++    HostContentSettingsMap* settings)
+     : ObjectPermissionContextBase(
+           ContentSettingsType::BLUETOOTH_GUARD,
+           ContentSettingsType::BLUETOOTH_CHOOSER_DATA,
+-          PermissionsClient::Get()->GetSettingsMap(browser_context)) {}
++          settings
++              ? settings
++              : PermissionsClient::Get()->GetSettingsMap(browser_context)) {}
+ 
+ BluetoothChooserContext::~BluetoothChooserContext() = default;
+ 
+--- a/components/permissions/contexts/bluetooth_chooser_context.h
++++ b/components/permissions/contexts/bluetooth_chooser_context.h
+@@ -41,7 +41,8 @@
+ // the WebBluetoothDeviceId and Bluetooth device address.
+ class BluetoothChooserContext : public ObjectPermissionContextBase {
+  public:
+-  explicit BluetoothChooserContext(content::BrowserContext* browser_context);
++  explicit BluetoothChooserContext(content::BrowserContext* browser_context,
++                                   HostContentSettingsMap* settings = nullptr);
+   ~BluetoothChooserContext() override;
+ 
+   // Set class as move-only.
+--- a/components/permissions/object_permission_context_base.cc
++++ b/components/permissions/object_permission_context_base.cc
+@@ -53,7 +53,15 @@
+   FlushScheduledSaveSettingsCalls();
+ }
+ 
++void ObjectPermissionContextBase::SetDocumentScope(
++    ObjectPermissionContextBase& notification_target) {
++  CHECK(&notification_target != this);
++  document_scoped_ = true;
++  notification_target_ = notification_target.weak_factory_.GetWeakPtr();
++}
++
+ void ObjectPermissionContextBase::Shutdown() {
++  notification_target_.reset();
+   if (host_content_settings_map_ && is_observing_) {
+     host_content_settings_map_->RemoveObserver(this);
+     is_observing_ = false;
+@@ -272,6 +280,9 @@
+     observer.OnObjectPermissionChanged(guard_content_settings_type_,
+                                        data_content_settings_type_);
+   }
++  if (notification_target_) {
++    notification_target_->NotifyPermissionChanged();
++  }
+ }
+ 
+ void ObjectPermissionContextBase::NotifyPermissionRevoked(
+@@ -280,6 +291,9 @@
+     observer.OnObjectPermissionChanged(guard_content_settings_type_,
+                                        data_content_settings_type_);
+     observer.OnPermissionRevoked(origin);
++  }
++  if (notification_target_) {
++    notification_target_->NotifyPermissionRevoked(origin);
+   }
+ }
+ 
+@@ -323,7 +337,8 @@
+ 
+   content_settings::ContentSettingConstraints constraints;
+ #if !BUILDFLAG(IS_ANDROID)
+-  if (base::FeatureList::IsEnabled(
++  if (!document_scoped_ &&
++      base::FeatureList::IsEnabled(
+           features::kRecordChooserPermissionLastVisitedTimestamps)) {
+     if (content_settings::CanTrackLastVisit(data_content_settings_type_)) {
+       constraints.set_track_last_visit_for_autoexpiration(true);
+--- a/components/permissions/object_permission_context_base.h
++++ b/components/permissions/object_permission_context_base.h
+@@ -15,6 +15,7 @@
+ 
+ #include "base/containers/flat_set.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/observer_list.h"
+ #include "base/observer_list_types.h"
+ #include "base/values.h"
+@@ -78,6 +79,7 @@
+ 
+   void AddObserver(PermissionObserver* observer);
+   void RemoveObserver(PermissionObserver* observer);
++  void SetDocumentScope(ObjectPermissionContextBase& notification_target);
+ 
+   ObjectPermissionContextBase(
+       ContentSettingsType guard_content_settings_type,
+@@ -243,6 +245,8 @@
+   // triggered by our own changes.
+   bool ignore_map_callbacks_ = false;
+ 
++  bool document_scoped_ = false;
++  base::WeakPtr<ObjectPermissionContextBase> notification_target_;
+   base::WeakPtrFactory<ObjectPermissionContextBase> weak_factory_{this};
+ };
+ 
+--- a/content/browser/bluetooth/web_bluetooth_service_impl.cc
++++ b/content/browser/bluetooth/web_bluetooth_service_impl.cc
+@@ -482,8 +482,9 @@
+   // |blink::mojom::WebBluetoothResult::WEB_BLUETOOTH_NOT_SUPPORTED| error.
+   auto allow_result =
+       delegate
+-          ? delegate->AllowWebBluetooth(web_contents()->GetBrowserContext(),
+-                                        requesting_origin, embedding_origin)
++          ? delegate->AllowWebBluetoothForDocument(
++                web_contents()->GetBrowserContext(), &render_frame_host(),
++                requesting_origin, embedding_origin)
+           : BluetoothDelegate::AllowWebBluetoothResult::kBlockGloballyDisabled;
+   switch (allow_result) {
+     case BluetoothDelegate::AllowWebBluetoothResult::kBlockPolicy:
+@@ -532,8 +533,9 @@
+     BluetoothDelegate* delegate =
+         GetContentClient()->browser()->GetBluetoothDelegate();
+     if (delegate) {
+-      delegate->BlockBluetoothScanning(web_contents()->GetBrowserContext(),
+-                                       requesting_origin, embedding_origin);
++      delegate->BlockBluetoothScanningForDocument(
++          web_contents()->GetBrowserContext(), &render_frame_host(),
++          requesting_origin, embedding_origin);
+     }
+   } else if (event == BluetoothScanningPrompt::Event::kCanceled) {
+     result = blink::mojom::WebBluetoothResult::PROMPT_CANCELED;
+@@ -1648,9 +1650,10 @@
+ 
+   BluetoothDelegate* delegate =
+       GetContentClient()->browser()->GetBluetoothDelegate();
+-  bool blocked = !delegate || delegate->IsBluetoothScanningBlocked(
+-                                  web_contents()->GetBrowserContext(),
+-                                  requesting_origin, embedding_origin);
++  bool blocked = !delegate ||
++                 delegate->IsBluetoothScanningBlockedForDocument(
++                     web_contents()->GetBrowserContext(), &render_frame_host(),
++                     requesting_origin, embedding_origin);
+   if (blocked) {
+     std::move(callback).Run(blink::mojom::WebBluetoothResult::SCANNING_BLOCKED);
+     return;
+--- a/content/browser/usb/web_usb_service_impl.cc
++++ b/content/browser/usb/web_usb_service_impl.cc
+@@ -385,8 +385,13 @@
+     if (device_info &&
+         delegate->HasDevicePermission(browser_context, render_frame_host_,
+                                       origin_, *device_info)) {
+-      delegate->RevokeDevicePermissionWebInitiated(browser_context, origin_,
+-                                                   *device_info);
++      if (render_frame_host_) {
++        delegate->RevokeDevicePermissionForDocument(
++            browser_context, render_frame_host_, origin_, *device_info);
++      } else {
++        delegate->RevokeDevicePermissionWebInitiated(browser_context, origin_,
++                                                     *device_info);
++      }
+     }
+   }
+   std::move(callback).Run();
+--- a/content/public/browser/bluetooth_delegate.h
++++ b/content/public/browser/bluetooth_delegate.h
+@@ -211,6 +211,27 @@
+       content::BrowserContext* browser_context,
+       const url::Origin& requesting_origin,
+       const url::Origin& embedding_origin);
++
++  virtual AllowWebBluetoothResult AllowWebBluetoothForDocument(
++      BrowserContext* context,
++      RenderFrameHost* frame,
++      const url::Origin& requesting,
++      const url::Origin& embedding) {
++    return AllowWebBluetooth(context, requesting, embedding);
++  }
++  virtual bool IsBluetoothScanningBlockedForDocument(
++      BrowserContext* context,
++      RenderFrameHost* frame,
++      const url::Origin& requesting,
++      const url::Origin& embedding) {
++    return IsBluetoothScanningBlocked(context, requesting, embedding);
++  }
++  virtual void BlockBluetoothScanningForDocument(BrowserContext* context,
++                                                 RenderFrameHost* frame,
++                                                 const url::Origin& requesting,
++                                                 const url::Origin& embedding) {
++    BlockBluetoothScanning(context, requesting, embedding);
++  }
+ 
+   // Returns a blocklist of UUIDs that have restrictions when accessed
+   // via Web Bluetooth. Parsed by BluetoothBlocklist::Add().
+--- a/content/public/browser/usb_delegate.h
++++ b/content/public/browser/usb_delegate.h
+@@ -78,6 +78,13 @@
+       BrowserContext* browser_context,
+       const url::Origin& origin,
+       const device::mojom::UsbDeviceInfo& device) = 0;
++  virtual void RevokeDevicePermissionForDocument(
++      BrowserContext* context,
++      RenderFrameHost* frame,
++      const url::Origin& origin,
++      const device::mojom::UsbDeviceInfo& device) {
++    RevokeDevicePermissionWebInitiated(context, origin, device);
++  }
+ 
+   // Returns device information for the device with matching `guid`.
+   virtual const device::mojom::UsbDeviceInfo* GetDeviceInfo(

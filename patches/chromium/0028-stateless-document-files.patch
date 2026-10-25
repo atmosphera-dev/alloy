@@ -1,0 +1,1048 @@
+--- a/chrome/browser/file_system_access/BUILD.gn
++++ b/chrome/browser/file_system_access/BUILD.gn
+@@ -46,6 +46,7 @@
+   ]
+   deps = [
+     ":file_system_access",
++    "//brave/alloy/site_records:capabilities",
+     "//chrome/browser:browser_process",
+     "//chrome/browser/content_settings",
+     "//chrome/browser/content_settings:content_settings_factory",
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+@@ -34,6 +34,7 @@
+ #include "base/timer/timer.h"
+ #include "base/types/expected.h"
+ #include "base/values.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+@@ -908,11 +909,15 @@
+         handle_type_(handle_type),
+         type_(type),
+         path_info_(path_info),
+-        access_trigger_(access_trigger) {}
++        access_trigger_(access_trigger),
++        document_scoped_(context_ && context_->document_mode_) {}
+ 
+   // FileSystemAccessPermissionGrant:
+   PermissionStatus GetStatus() override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (document_scoped_ && (!context_ || context_->document_ending_)) {
++      return PermissionStatus::DENIED;
++    }
+     // TODO(crbug.com/40101962): Determine if this should return denied for
+     // guard block, and how ancestor permission should be handled.
+     if (status_ == PermissionStatus::ASK && context_ &&
+@@ -1197,6 +1202,11 @@
+                  PersistedPermissionOptions update_options) {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++    if (document_scoped_ && (!context_ || context_->document_ending_)) {
++      new_status = PermissionStatus::DENIED;
++      update_options =
++          PersistedPermissionOptions::kDoNotUpdatePersistedPermission;
++    }
+     auto permission_changed = status_ != new_status;
+     status_ = new_status;
+ 
+@@ -1389,6 +1399,10 @@
+       PermissionAction result) {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++    if (document_scoped_ && (!context_ || context_->document_ending_)) {
++      std::move(callback).Run(PermissionRequestOutcome::kRequestAborted);
++      return;
++    }
+     if (context_) {
+       context_->UpdateGrantsOnPermissionRequestResult(origin_);
+     }
+@@ -1635,6 +1649,7 @@
+   // `path_info_.path` can be updated if the entry is moved.
+   content::PathInfo path_info_;
+   const AccessTrigger access_trigger_;
++  const bool document_scoped_;
+ 
+   // This member should only be updated via SetStatus(), to make sure
+   // observers are properly notified about any change in status.
+@@ -1677,19 +1692,29 @@
+     const BlockPathRules& other) = default;
+ 
+ ChromeFileSystemAccessPermissionContext::
+-    ChromeFileSystemAccessPermissionContext(content::BrowserContext* context,
+-                                            const base::Clock* clock)
++    ChromeFileSystemAccessPermissionContext(
++        content::BrowserContext* context,
++        const base::Clock* clock,
++        HostContentSettingsMap* document_settings)
+     : ObjectPermissionContextBase(
+           ContentSettingsType::FILE_SYSTEM_WRITE_GUARD,
+           ContentSettingsType::FILE_SYSTEM_ACCESS_CHOOSER_DATA,
+-          HostContentSettingsMapFactory::GetForProfile(context)),
++          document_settings
++              ? document_settings
++              : HostContentSettingsMapFactory::GetForProfile(context)),
+       profile_(context),
++      document_mode_(document_settings != nullptr),
+       clock_(clock),
+       should_normalize_file_path_(base::FeatureList::IsEnabled(
+           features::kFileSystemAccessSymbolicLinkCheck)) {
+   DETACH_FROM_SEQUENCE(sequence_checker_);
+   content_settings_ = base::WrapRefCounted(
+-      HostContentSettingsMapFactory::GetForProfile(profile_));
++      document_settings
++          ? document_settings
++          : HostContentSettingsMapFactory::GetForProfile(profile_));
++  if (RequiresDocumentContext()) {
++    return;
++  }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   one_time_permissions_tracker_.Observe(
+@@ -1724,6 +1749,36 @@
+ 
+ ChromeFileSystemAccessPermissionContext::
+     ~ChromeFileSystemAccessPermissionContext() = default;
++
++bool ChromeFileSystemAccessPermissionContext::RequiresDocumentContext() const {
++  return alloy::site_records::RequestContextPolicy::IsStateless(*profile_);
++}
++
++content::FileSystemAccessPermissionContext*
++ChromeFileSystemAccessPermissionContext::ForDocument(
++    const content::WeakDocumentPtr& document) {
++  if (!RequiresDocumentContext()) {
++    return this;
++  }
++  auto* frame = document.AsRenderFrameHostIfValid();
++  if (!frame || frame->GetBrowserContext() != profile_) {
++    return nullptr;
++  }
++  static const int service_key = 0;
++  return static_cast<ChromeFileSystemAccessPermissionContext*>(
++      HostContentSettingsMapFactory::GetStatelessDocumentService(
++          frame, &service_key,
++          base::BindOnce(
++              [](ChromeFileSystemAccessPermissionContext* root,
++                 HostContentSettingsMap* map) -> std::unique_ptr<KeyedService> {
++                auto context =
++                    std::make_unique<ChromeFileSystemAccessPermissionContext>(
++                        root->profile_, root->clock_, map);
++                context->SetDocumentScope(*root);
++                return context;
++              },
++              this)));
++}
+ 
+ void ChromeFileSystemAccessPermissionContext::InitializeBlockPaths() {
+   // This method should only be called when the `block_path_rules_status_` are
+@@ -3693,6 +3748,25 @@
+ }
+ 
+ void ChromeFileSystemAccessPermissionContext::Shutdown() {
++  if (document_mode_) {
++    document_ending_ = true;
++    std::vector<scoped_refptr<PermissionGrantImpl>> grants;
++    for (const auto& [origin, state] : active_permissions_map_) {
++      for (const auto& [path, grant] : state.read_grants) {
++        grants.emplace_back(grant.get());
++      }
++      for (const auto& [path, grant] : state.write_grants) {
++        grants.emplace_back(grant.get());
++      }
++    }
++    weak_factory_.InvalidateWeakPtrs();
++    for (auto& grant : grants) {
++      grant->SetStatus(
++          PermissionStatus::DENIED,
++          PersistedPermissionOptions::kDoNotUpdatePersistedPermission);
++    }
++    active_permissions_map_.clear();
++  }
+   FlushScheduledSaveSettingsCalls();
+   permissions::ObjectPermissionContextBase::Shutdown();
+ }
+@@ -3756,6 +3830,9 @@
+ bool ChromeFileSystemAccessPermissionContext::OriginHasExtendedPermission(
+     const url::Origin& origin) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (RequiresDocumentContext()) {
++    return false;
++  }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   // TODO(crbug.com/40101963): Enable when android persisted permissions are
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
+@@ -244,12 +244,17 @@
+ 
+   explicit ChromeFileSystemAccessPermissionContext(
+       content::BrowserContext* context,
+-      const base::Clock* clock = base::DefaultClock::GetInstance());
++      const base::Clock* clock = base::DefaultClock::GetInstance(),
++      HostContentSettingsMap* document_settings = nullptr);
+   ChromeFileSystemAccessPermissionContext(
+       const ChromeFileSystemAccessPermissionContext&) = delete;
+   ChromeFileSystemAccessPermissionContext& operator=(
+       const ChromeFileSystemAccessPermissionContext&) = delete;
+   ~ChromeFileSystemAccessPermissionContext() override;
++
++  bool RequiresDocumentContext() const override;
++  content::FileSystemAccessPermissionContext* ForDocument(
++      const content::WeakDocumentPtr& document) override;
+ 
+   // permissions::ObjectPermissionContextBase
+   std::vector<std::unique_ptr<Object>> GetGrantedObjects(
+@@ -673,6 +678,8 @@
+   bool usage_icon_update_scheduled_ = false;
+ 
+   scoped_refptr<HostContentSettingsMap> content_settings_;
++  const bool document_mode_;
++  bool document_ending_ = false;
+ 
+   base::ScopedObservation<OneTimePermissionsTracker,
+                           OneTimePermissionsTrackerObserver>
+--- a/content/browser/file_system_access/file_system_access_directory_handle_impl.cc
++++ b/content/browser/file_system_access/file_system_access_directory_handle_impl.cc
+@@ -797,6 +797,13 @@
+     return;
+   }
+ 
++  if (!manager()->IsBindingContextValid(context())) {
++    listener_holder->listener->DidReadDirectory(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        {}, false);
++    return;
++  }
+   if (result != base::File::FILE_OK) {
+     CHECK(!has_more_entries, base::NotFatalUntil::M159);
+     listener_holder->listener->DidReadDirectory(
+@@ -809,7 +816,7 @@
+ 
+   if (base::FeatureList::IsEnabled(
+           features::kFileSystemAccessDirectoryIterationBlocklistCheck) &&
+-      manager()->permission_context()) {
++      manager()->permission_context(context())) {
+     // While this directory handle already has obtained the permission and
+     // checked for the blocklist, a child symlink file may have been created
+     // since then, pointing to a blocklisted file or directory. Before merging
+@@ -853,7 +860,7 @@
+ 
+       // Only run sensitive entry check on a file, which could be a symbolic
+       // link.
+-      manager()->permission_context()->ConfirmSensitiveEntryAccess(
++      manager()->permission_context(context())->ConfirmSensitiveEntryAccess(
+           context().storage_key.origin(),
+           PathInfo(
+               child_url.type() == storage::FileSystemType::kFileSystemTypeLocal
+--- a/content/browser/file_system_access/file_system_access_handle_base.cc
++++ b/content/browser/file_system_access/file_system_access_handle_base.cc
+@@ -91,6 +91,9 @@
+ FileSystemAccessHandleBase::PermissionStatus
+ FileSystemAccessHandleBase::GetReadPermissionStatus() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!manager()->IsBindingContextValid(context())) {
++    return PermissionStatus::DENIED;
++  }
+   return handle_state_.read_grant->GetStatus();
+ }
+ 
+@@ -107,6 +110,9 @@
+ FileSystemAccessHandleBase::PermissionStatus
+ FileSystemAccessHandleBase::GetWritePermissionStatus() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!manager()->IsBindingContextValid(context())) {
++    return PermissionStatus::DENIED;
++  }
+   if (!base::FeatureList::IsEnabled(
+           blink::features::kFileSystemAccessWriteMode)) {
+     // It is not currently possible to have write only handles, so no one should
+@@ -349,7 +355,8 @@
+           // use AccessTrigger::kProgrammaticWrite rather than
+           // kProgrammaticRead. This CL is a pure refactoring so we avoid making
+           // behavioral changes here; this will be addressed in a follow-up CL.
+-          FileSystemAccessPermissionContext::AccessTrigger::kProgrammaticRead);
++          FileSystemAccessPermissionContext::AccessTrigger::kProgrammaticRead,
++          &context());
+ 
+   if (destination_shared_handle_state.write_grant->GetStatus() ==
+       PermissionStatus::GRANTED) {
+@@ -402,8 +409,8 @@
+             // kProgrammaticRead. This CL is a pure refactoring so we avoid
+             // making behavioral changes here; this will be addressed in a
+             // follow-up CL.
+-            FileSystemAccessPermissionContext::AccessTrigger::
+-                kProgrammaticRead);
++            FileSystemAccessPermissionContext::AccessTrigger::kProgrammaticRead,
++            &context());
+ 
+     if (parent_shared_handle_state.write_grant->GetStatus() ==
+         PermissionStatus::GRANTED) {
+@@ -729,8 +736,8 @@
+     //   path. We should clean this up, but since it's effectively a remove()
+     //   this isn't the worst behavior for now.
+     if (ShouldTrackUsage(url_) && ShouldTrackUsage(destination_url) &&
+-        manager()->permission_context()) {
+-      manager()->permission_context()->NotifyEntryMoved(
++        manager()->permission_context(context())) {
++      manager()->permission_context(context())->NotifyEntryMoved(
+           context_.storage_key.origin(), content::PathInfo(url_.path()),
+           content::PathInfo(destination_url.path()));
+     }
+@@ -794,9 +801,9 @@
+   // See crbug.com/421690393.
+   if (base::FeatureList::IsEnabled(
+           blink::features::kFileSystemAccessRevokeReadOnRemove) &&
+-      result == base::File::FILE_OK && manager()->permission_context() &&
+-      ShouldTrackUsage(url_)) {
+-    manager()->permission_context()->NotifyEntryRemoved(
++      result == base::File::FILE_OK &&
++      manager()->permission_context(context()) && ShouldTrackUsage(url_)) {
++    manager()->permission_context(context())->NotifyEntryRemoved(
+         context_.storage_key.origin(), PathInfo(url.path()));
+   }
+ 
+@@ -852,8 +859,8 @@
+ 
+   if (base::FeatureList::IsEnabled(
+           blink::features::kFileSystemAccessRevokeReadOnRemove) &&
+-      manager()->permission_context() && ShouldTrackUsage(url)) {
+-    manager()->permission_context()->NotifyEntryModified(
++      manager()->permission_context(context()) && ShouldTrackUsage(url)) {
++    manager()->permission_context(context())->NotifyEntryModified(
+         context().storage_key.origin(), PathInfo(url.path()));
+   }
+ }
+--- a/content/browser/file_system_access/file_system_access_handle_base.h
++++ b/content/browser/file_system_access/file_system_access_handle_base.h
+@@ -341,8 +341,12 @@
+     base::OnceCallback<void(CallbackArgType)> blocked_callback,
+     CallbackArgType callback_arg) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  if (!manager()->permission_context() ||
++  if (!manager()->IsBindingContextValid(context())) {
++    std::move(blocked_callback).Run(std::move(callback_arg));
++    return;
++  }
++
++  if (!manager()->permission_context(context()) ||
+       url.type() == storage::FileSystemType::kFileSystemTypeTemporary) {
+     // Skipping ConfirmSensitiveEntryAccess() as either of the following holds:
+     // (1) no permission context. Possibly because manager() is being destroyed
+@@ -359,7 +363,7 @@
+   PathInfo path_info = display_name.empty()
+                            ? PathInfo(path_type, url.path())
+                            : PathInfo(path_type, url.path(), display_name);
+-  manager()->permission_context()->ConfirmSensitiveEntryAccess(
++  manager()->permission_context(context())->ConfirmSensitiveEntryAccess(
+       context().storage_key.origin(), path_info, handle_type, access_trigger,
+       context().frame_id,
+       base::BindOnce(&FileSystemAccessHandleBase::DidVerifySensitiveEntryAccess<
+@@ -375,6 +379,10 @@
+     CallbackArgType callback_arg,
+     SensitiveEntryResult result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!manager()->IsBindingContextValid(context())) {
++    std::move(blocked_callback).Run(std::move(callback_arg));
++    return;
++  }
+   switch (result) {
+     case SensitiveEntryResult::kAllowed:
+       std::move(callback).Run(std::move(callback_arg));
+--- a/content/browser/file_system_access/file_system_access_manager_impl.cc
++++ b/content/browser/file_system_access/file_system_access_manager_impl.cc
+@@ -224,9 +224,18 @@
+     FileSystemAccessPermissionContext* permission_context,
+     const url::Origin& requesting_origin,
+     GlobalRenderFrameHostId frame_id,
++    const WeakDocumentPtr& initiating_document,
+     const FileSystemChooser::Options& options,
+     FileSystemChooser::ResultCallback callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
++  const bool document_required =
++      permission_context && permission_context->RequiresDocumentContext();
++  if (document_required && !initiating_document.AsRenderFrameHostIfValid()) {
++    std::move(callback).Run(file_system_access_error::FromStatus(
++                                FileSystemAccessStatus::kOperationAborted),
++                            {});
++    return;
++  }
+   RenderFrameHost* rfh = RenderFrameHost::FromID(frame_id);
+   WebContents* web_contents = WebContents::FromRenderFrameHost(rfh);
+   RenderFrameHost* outermost_rfh = rfh ? rfh->GetOutermostMainFrame() : nullptr;
+@@ -290,7 +299,8 @@
+     // `CanShowFilePicker()` runs nested message loops during which the frame
+     // could be destroyed or navigated. Re-resolve and re-validate the frame.
+     auto re_resolved = ResolveAndValidateFrame(frame_id);
+-    if (!re_resolved) {
++    if (!re_resolved || (document_required &&
++                         !initiating_document.AsRenderFrameHostIfValid())) {
+       std::move(callback).Run(file_system_access_error::FromStatus(
+                                   FileSystemAccessStatus::kOperationAborted),
+                               {});
+@@ -344,7 +354,8 @@
+   // and re-validate the frame, and ensure the fullscreen blocker was
+   // successfully acquired.
+   auto post_fullscreen_resolved = ResolveAndValidateFrame(frame_id);
+-  if (!post_fullscreen_resolved || !blocker) {
++  if (!post_fullscreen_resolved || !blocker ||
++      (document_required && !initiating_document.AsRenderFrameHostIfValid())) {
+     std::move(callback).Run(file_system_access_error::FromStatus(
+                                 FileSystemAccessStatus::kOperationAborted),
+                             {});
+@@ -557,6 +568,8 @@
+     : context_(std::move(context)),
+       blob_context_(std::move(blob_context)),
+       permission_context_(permission_context),
++      document_context_required_(permission_context &&
++                                 permission_context->RequiresDocumentContext()),
+       lock_manager_(
+           base::MakeRefCounted<FileSystemAccessLockManager>(PassKey())),
+       watcher_manager_(this, PassKey()),
+@@ -581,6 +594,9 @@
+     return;
+   }
+ 
++  if (!IsBindingContextValid(binding_context)) {
++    return;
++  }
+   receivers_.Add(this, std::move(receiver), binding_context);
+ }
+ 
+@@ -667,6 +683,14 @@
+     ChooseEntriesCallback callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   const BindingContext& context = receivers_.current_context();
++  if (!IsBindingContextValid(context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(context);
+ 
+   // ChooseEntries API is only available to windows, as we need a frame to
+   // anchor the picker to.
+@@ -681,11 +705,11 @@
+     return;
+   }
+ 
+-  if (permission_context_) {
++  if (document_permission_context) {
+     // When site setting is block, it's better not to show file chooser.
+     // Write permission will be requested for either a save file picker or
+     // a directory picker with `request_writable` true.
+-    if (!permission_context_->CanObtainReadPermission(
++    if (!document_permission_context->CanObtainReadPermission(
+             context.storage_key.origin()) ||
+         ((options->type_specific_options->is_save_file_picker_options() ||
+           (options->type_specific_options->is_directory_picker_options() &&
+@@ -693,7 +717,7 @@
+            options->type_specific_options->get_directory_picker_options()
+                    ->permission_mode ==
+                blink::mojom::FileSystemAccessPermissionMode::kReadWrite)) &&
+-         !permission_context_->CanObtainWritePermission(
++         !document_permission_context->CanObtainWritePermission(
+              context.storage_key.origin()))) {
+       std::move(callback).Run(
+           file_system_access_error::FromStatus(
+@@ -797,6 +821,14 @@
+     ChooseEntriesCallback callback,
+     FileSystemAccessTransferTokenImpl* resolved_directory_token) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(context);
+ 
+   if (resolved_directory_token &&
+       resolved_directory_token->origin() != context.storage_key.origin()) {
+@@ -814,10 +846,10 @@
+     HandleTransferTokenAsDefaultDirectory(resolved_directory_token, path_info);
+   }
+ 
+-  if (path_info.path.empty() && permission_context_) {
++  if (path_info.path.empty() && document_permission_context) {
+     if (!options->starting_directory_id.empty()) {
+       // Prioritize an `id` over a well-known directory.
+-      path_info = permission_context_->GetLastPickedDirectory(
++      path_info = document_permission_context->GetLastPickedDirectory(
+           context.storage_key.origin(), options->starting_directory_id);
+     }
+     if (path_info.path.empty()) {
+@@ -825,12 +857,12 @@
+           options->start_in_options->is_well_known_directory()) {
+         // Prioritize an explicitly stated well-known directory over an
+         // implicitly remembered LastPicked directory.
+-        path_info.path = permission_context_->GetWellKnownDirectoryPath(
++        path_info.path = document_permission_context->GetWellKnownDirectoryPath(
+             options->start_in_options->get_well_known_directory(),
+             context.storage_key.origin());
+       } else {
+         // If `id` empty or unset, fall back to the default LastPickedDirectory.
+-        path_info = permission_context_->GetLastPickedDirectory(
++        path_info = document_permission_context->GetLastPickedDirectory(
+             context.storage_key.origin(), std::string());
+       }
+     }
+@@ -863,9 +895,17 @@
+     ChooseEntriesCallback callback,
+     bool default_directory_exists) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  if (!default_directory_exists && permission_context_) {
+-    default_directory = permission_context_->GetWellKnownDirectoryPath(
++  if (!IsBindingContextValid(context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(context);
++
++  if (!default_directory_exists && document_permission_context) {
++    default_directory = document_permission_context->GetWellKnownDirectoryPath(
+         blink::mojom::WellKnownDirectory::kDirDocuments,
+         context.storage_key.origin());
+   }
+@@ -902,9 +942,10 @@
+     }
+   }
+ 
+-  std::u16string title = permission_context_
+-                             ? permission_context_->GetPickerTitle(options)
+-                             : std::u16string();
++  std::u16string title =
++      document_permission_context
++          ? document_permission_context->GetPickerTitle(options)
++          : std::u16string();
+   FileSystemChooser::Options file_system_chooser_options(
+       GetSelectFileDialogType(options->type_specific_options),
+       GetAndMoveAcceptsTypesInfo(options->type_specific_options),
+@@ -920,8 +961,8 @@
+   }
+ 
+   ShowFilePickerOnUIThread(
+-      permission_context(), context.storage_key.origin(), context.frame_id,
+-      file_system_chooser_options,
++      permission_context(context), context.storage_key.origin(),
++      context.frame_id, context.document, file_system_chooser_options,
+       base::BindOnce(&FileSystemAccessManagerImpl::DidChooseEntries,
+                      weak_factory_.GetWeakPtr(), context,
+                      file_system_chooser_options,
+@@ -1019,8 +1060,16 @@
+     GetEntryFromDataTransferTokenCallback token_resolved_callback,
+     HandleType file_type) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  if (!permission_context_) {
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(token_resolved_callback)
++        .Run(file_system_access_error::FromStatus(
++                 FileSystemAccessStatus::kOperationAborted),
++             nullptr);
++    return;
++  }
++  auto* document_permission_context = permission_context(binding_context);
++
++  if (!document_permission_context) {
+     DidVerifySensitiveDirectoryAccessForDataTransfer(
+         binding_context, path_info, url, file_type,
+         std::move(token_resolved_callback), SensitiveEntryResult::kAllowed);
+@@ -1037,7 +1086,7 @@
+   }
+ 
+   auto can_show_file_picker_result =
+-      permission_context_->CanShowFilePicker(rfh);
++      document_permission_context->CanShowFilePicker(rfh);
+   if (!can_show_file_picker_result.has_value()) {
+     std::move(token_resolved_callback)
+         .Run(file_system_access_error::FromStatus(
+@@ -1062,7 +1111,7 @@
+   // TODO(crbug.com/40061211): Add a prompt specific to D&D. For now, run
+   // the same security checks and show the same prompt for D&D as for the file
+   // picker.
+-  permission_context_->ConfirmSensitiveEntryAccess(
++  document_permission_context->ConfirmSensitiveEntryAccess(
+       binding_context.storage_key.origin(), path_info, file_type,
+       AccessTrigger::kDragAndDrop, binding_context.frame_id,
+       base::BindOnce(&FileSystemAccessManagerImpl::
+@@ -1080,6 +1129,13 @@
+         GetEntryFromDataTransferTokenCallback token_resolved_callback,
+         SensitiveEntryResult result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(token_resolved_callback)
++        .Run(file_system_access_error::FromStatus(
++                 FileSystemAccessStatus::kOperationAborted),
++             nullptr);
++    return;
++  }
+ 
+   if (result != SensitiveEntryResult::kAllowed) {
+     std::move(token_resolved_callback)
+@@ -1092,7 +1148,7 @@
+   SharedHandleState shared_handle_state =
+       GetSharedHandleStateForNonSandboxedPath(
+           path_info, binding_context.storage_key, file_type,
+-          AccessTrigger::kDragAndDrop);
++          AccessTrigger::kDragAndDrop, &binding_context);
+ 
+   blink::mojom::FileSystemAccessEntryPtr entry;
+   if (file_type == HandleType::kDirectory) {
+@@ -1297,6 +1353,11 @@
+     const std::vector<uint8_t>& bits,
+     mojo::PendingReceiver<blink::mojom::FileSystemAccessTransferToken> token) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Storage restoration has no live document authority in stateless mode.
++  // Refuse before even opening a bucket or creating a transfer token.
++  if (document_context_required_) {
++    return;
++  }
+   CHECK(!bits.empty(), base::NotFatalUntil::M159);
+ 
+   FileSystemAccessHandleData data;
+@@ -1405,7 +1466,7 @@
+   SharedHandleState shared_handle_state =
+       GetSharedHandleStateForNonSandboxedPath(
+           file_path_info, binding_context.storage_key, HandleType::kFile,
+-          access_trigger);
++          access_trigger, &binding_context);
+ 
+   return blink::mojom::FileSystemAccessEntry::New(
+       blink::mojom::FileSystemAccessHandle::NewFile(
+@@ -1425,7 +1486,7 @@
+   SharedHandleState shared_handle_state =
+       GetSharedHandleStateForNonSandboxedPath(
+           file_path_info, binding_context.storage_key, HandleType::kDirectory,
+-          access_trigger);
++          access_trigger, &binding_context);
+ 
+   return blink::mojom::FileSystemAccessEntry::New(
+       blink::mojom::FileSystemAccessHandle::NewDirectory(
+@@ -1756,6 +1817,14 @@
+     blink::mojom::FileSystemAccessErrorPtr result,
+     std::vector<PathInfo> entries) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(binding_context);
+ 
+   if (result->status != FileSystemAccessStatus::kOk || entries.empty()) {
+     std::move(callback).Run(
+@@ -1764,7 +1833,7 @@
+     return;
+   }
+ 
+-  if (!permission_context_) {
++  if (!document_permission_context) {
+     DidVerifySensitiveDirectoryAccess(
+         binding_context, options, starting_directory_id,
+         request_directory_write_access, std::move(callback), std::move(entries),
+@@ -1791,6 +1860,15 @@
+     std::vector<PathInfo> entries,
+     size_t current_entry_index) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(binding_context);
++
+   if (current_entry_index >= entries.size()) {
+     // All the entries have passed the check with `kAllowed`.
+     DidVerifySensitiveDirectoryAccess(
+@@ -1802,7 +1880,7 @@
+         options.type() == ui::SelectFileDialog::SELECT_FOLDER;
+     PathInfo entry = entries[current_entry_index];
+     // Calculate the sensitivity of `entries[current_entry_index]`.
+-    permission_context_->ConfirmSensitiveEntryAccess(
++    document_permission_context->ConfirmSensitiveEntryAccess(
+         binding_context.storage_key.origin(), entry,
+         is_directory ? HandleType::kDirectory : HandleType::kFile,
+         options.type() == ui::SelectFileDialog::SELECT_SAVEAS_FILE
+@@ -1828,6 +1906,14 @@
+     size_t current_entry_index,
+     FileSystemAccessPermissionContext::SensitiveEntryResult result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++
+   if (result == SensitiveEntryResult::kAbort) {
+     std::move(callback).Run(
+         file_system_access_error::FromStatus(
+@@ -1836,8 +1922,9 @@
+     return;
+   } else if (result == SensitiveEntryResult::kTryAgain) {
+     ShowFilePickerOnUIThread(
+-        permission_context(), binding_context.storage_key.origin(),
+-        binding_context.frame_id, options,
++        permission_context(binding_context),
++        binding_context.storage_key.origin(), binding_context.frame_id,
++        binding_context.document, options,
+         base::BindOnce(&FileSystemAccessManagerImpl::DidChooseEntries,
+                        weak_factory_.GetWeakPtr(), binding_context, options,
+                        starting_directory_id, request_directory_write_access,
+@@ -1862,6 +1949,15 @@
+     std::vector<PathInfo> entries,
+     SensitiveEntryResult result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(binding_context);
++
+   if (result == SensitiveEntryResult::kAbort) {
+     std::move(callback).Run(
+         file_system_access_error::FromStatus(
+@@ -1871,8 +1967,9 @@
+   }
+   if (result == SensitiveEntryResult::kTryAgain) {
+     ShowFilePickerOnUIThread(
+-        permission_context(), binding_context.storage_key.origin(),
+-        binding_context.frame_id, options,
++        permission_context(binding_context),
++        binding_context.storage_key.origin(), binding_context.frame_id,
++        binding_context.document, options,
+         base::BindOnce(&FileSystemAccessManagerImpl::DidChooseEntries,
+                        weak_factory_.GetWeakPtr(), binding_context, options,
+                        starting_directory_id, request_directory_write_access,
+@@ -1883,9 +1980,9 @@
+   // There is no need to scan the file in case of saving, since it's
+   // data is truncated at this point, so it won't be available for
+   // the web page.
+-  if (permission_context_ &&
++  if (document_permission_context &&
+       options.type() != ui::SelectFileDialog::SELECT_SAVEAS_FILE) {
+-    permission_context_->CheckPathsAgainstEnterprisePolicy(
++    document_permission_context->CheckPathsAgainstEnterprisePolicy(
+         std::move(entries), binding_context.frame_id,
+         base::BindOnce(
+             &FileSystemAccessManagerImpl::OnCheckPathsAgainstEnterprisePolicy,
+@@ -1908,6 +2005,14 @@
+     ChooseEntriesCallback callback,
+     std::vector<PathInfo> entries) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(binding_context);
+ 
+   // It is possible for `entries` to be empty if enterprise policy blocked all
+   // files or folders selected by the user.  If there are no entries, simulate
+@@ -1920,14 +2025,14 @@
+     return;
+   }
+ 
+-  if (permission_context_) {
++  if (document_permission_context) {
+     auto picked_directory = entries.front();
+     if (options.type() != ui::SelectFileDialog::SELECT_FOLDER) {
+       picked_directory.path = picked_directory.path.DirName();
+       picked_directory.display_name =
+           picked_directory.path.BaseName().AsUTF8Unsafe();
+     }
+-    permission_context_->SetLastPickedDirectory(
++    document_permission_context->SetLastPickedDirectory(
+         binding_context.storage_key.origin(), starting_directory_id,
+         picked_directory);
+   }
+@@ -1938,7 +2043,8 @@
+         GetSharedHandleStateForNonSandboxedPath(
+             entries.front(), binding_context.storage_key,
+             HandleType::kDirectory,
+-            FileSystemAccessPermissionContext::AccessTrigger::kOpen);
++            FileSystemAccessPermissionContext::AccessTrigger::kOpen,
++            &binding_context);
+     // Ask for both read and write permission at the same time. The permission
+     // context should coalesce these into one prompt.
+     if (request_directory_write_access) {
+@@ -1999,6 +2105,15 @@
+     ChooseEntriesCallback callback,
+     base::File::Error result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
++  auto* document_permission_context = permission_context(binding_context);
++
+   std::vector<blink::mojom::FileSystemAccessEntryPtr> result_entries;
+   if (result != base::File::FILE_OK) {
+     std::move(callback).Run(file_system_access_error::FromFileError(result),
+@@ -2006,15 +2121,15 @@
+     return;
+   }
+ 
+-  if (permission_context_) {
+-    permission_context_->OnFileCreatedFromShowSaveFilePicker(
++  if (document_permission_context) {
++    document_permission_context->OnFileCreatedFromShowSaveFilePicker(
+         /*file_picker_binding_context=*/binding_context.url, url);
+   }
+ 
+   SharedHandleState shared_handle_state =
+       GetSharedHandleStateForNonSandboxedPath(
+           entry, binding_context.storage_key, HandleType::kFile,
+-          AccessTrigger::kSave);
++          AccessTrigger::kSave, &binding_context);
+ 
+   result_entries.push_back(blink::mojom::FileSystemAccessEntry::New(
+       blink::mojom::FileSystemAccessHandle::NewFile(CreateFileHandle(
+@@ -2032,6 +2147,13 @@
+     const SharedHandleState& shared_handle_state,
+     FileSystemAccessPermissionGrant::PermissionRequestOutcome outcome) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(
++        file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted),
++        std::vector<blink::mojom::FileSystemAccessEntryPtr>());
++    return;
++  }
+ 
+   std::vector<blink::mojom::FileSystemAccessEntryPtr> result_entries;
+   if (shared_handle_state.read_grant->GetStatus() !=
+@@ -2141,13 +2263,23 @@
+     const content::PathInfo& path_info,
+     const blink::StorageKey& storage_key,
+     HandleType handle_type,
+-    FileSystemAccessPermissionContext::AccessTrigger access_trigger) {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    FileSystemAccessPermissionContext::AccessTrigger access_trigger,
++    const BindingContext* binding_context) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto* document_permission_context = binding_context
++                                          ? permission_context(*binding_context)
++                                          : permission_context_.get();
++  if (document_context_required_ &&
++      (!binding_context || !document_permission_context)) {
++    auto denied = base::MakeRefCounted<FixedFileSystemAccessPermissionGrant>(
++        PermissionStatus::DENIED, path_info);
++    return SharedHandleState(denied, denied);
++  }
+   scoped_refptr<FileSystemAccessPermissionGrant> read_grant, write_grant;
+-  if (permission_context_) {
+-    read_grant = permission_context_->GetReadPermissionGrant(
++  if (document_permission_context) {
++    read_grant = document_permission_context->GetReadPermissionGrant(
+         storage_key.origin(), path_info, handle_type, access_trigger);
+-    write_grant = permission_context_->GetWritePermissionGrant(
++    write_grant = document_permission_context->GetWritePermissionGrant(
+         storage_key.origin(), path_info, handle_type, access_trigger);
+   } else {
+     // Auto-deny all write grants if no permission context is available, unless
+--- a/content/browser/file_system_access/file_system_access_manager_impl.h
++++ b/content/browser/file_system_access/file_system_access_manager_impl.h
+@@ -329,9 +329,16 @@
+   const base::SequenceBound<storage::FileSystemOperationRunner>&
+   operation_runner();
+ 
+-  FileSystemAccessPermissionContext* permission_context() {
++  FileSystemAccessPermissionContext* permission_context(
++      const BindingContext& binding_context) {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-    return permission_context_;
++    return permission_context_
++               ? permission_context_->ForDocument(binding_context.document)
++               : nullptr;
++  }
++
++  bool IsBindingContextValid(const BindingContext& binding_context) {
++    return !document_context_required_ || permission_context(binding_context);
+   }
+ 
+   FileSystemAccessWatcherManager& watcher_manager() {
+@@ -400,7 +407,8 @@
+       const PathInfo& path_info,
+       const blink::StorageKey& storage_key,
+       FileSystemAccessPermissionContext::HandleType handle_type,
+-      FileSystemAccessPermissionContext::AccessTrigger access_trigger);
++      FileSystemAccessPermissionContext::AccessTrigger access_trigger,
++      const BindingContext* binding_context = nullptr);
+   // Same as above, but for paths in a sandboxed file system.
+   SharedHandleState GetSharedHandleStateForSandboxedPath();
+ 
+@@ -689,6 +697,7 @@
+       GUARDED_BY_CONTEXT(sequence_checker_);
+   raw_ptr<FileSystemAccessPermissionContext> permission_context_
+       GUARDED_BY_CONTEXT(sequence_checker_) = nullptr;
++  const bool document_context_required_;
+ 
+   // All the mojo receivers for this FileSystemAccessManager itself. Keeps
+   // track of associated origin and other state as well to not have to rely on
+--- a/content/browser/file_system_access/file_system_access_safe_move_helper.cc
++++ b/content/browser/file_system_access/file_system_access_safe_move_helper.cc
+@@ -169,13 +169,13 @@
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   callback_ = std::move(callback);
+ 
+-  if (!manager_) {
++  if (!manager_ || !manager_->IsBindingContextValid(context_)) {
+     std::move(callback_).Run(file_system_access_error::FromStatus(
+         blink::mojom::FileSystemAccessStatus::kOperationAborted));
+     return;
+   }
+ 
+-  if (!RequireAfterWriteChecks() || !manager_->permission_context()) {
++  if (!RequireAfterWriteChecks() || !manager_->permission_context(context_)) {
+     DidAfterWriteCheck(
+         FileSystemAccessPermissionContext::AfterWriteCheckResult::kAllow);
+     return;
+@@ -190,7 +190,7 @@
+     HashCallback callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  if (!manager_) {
++  if (!manager_ || !manager_->IsBindingContextValid(context_)) {
+     std::move(callback_).Run(file_system_access_error::FromStatus(
+         blink::mojom::FileSystemAccessStatus::kOperationAborted));
+     return;
+@@ -236,7 +236,7 @@
+     return;
+   }
+ 
+-  if (!manager_) {
++  if (!manager_ || !manager_->IsBindingContextValid(context_)) {
+     std::move(callback_).Run(file_system_access_error::FromStatus(
+         blink::mojom::FileSystemAccessStatus::kOperationAborted));
+     return;
+@@ -256,7 +256,7 @@
+   item->outermost_main_frame_id = outermost_main_frame_id;
+   item->initiating_frame_id = context_.frame_id;
+   item->has_user_gesture = has_transient_user_activation_;
+-  manager_->permission_context()->PerformAfterWriteChecks(
++  manager_->permission_context(context_)->PerformAfterWriteChecks(
+       std::move(item), context_.frame_id,
+       base::BindOnce(&FileSystemAccessSafeMoveHelper::DidAfterWriteCheck,
+                      weak_factory_.GetWeakPtr()));
+@@ -274,7 +274,7 @@
+     return;
+   }
+ 
+-  if (!manager_) {
++  if (!manager_ || !manager_->IsBindingContextValid(context_)) {
+     std::move(callback_).Run(file_system_access_error::FromStatus(
+         blink::mojom::FileSystemAccessStatus::kOperationAborted));
+     return;
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -1049,16 +1049,16 @@
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   auto* storage_partition_impl = GetStoragePartitionImpl();
+   auto* manager = storage_partition_impl->GetFileSystemAccessManager();
+-  manager->BindReceiver(FileSystemAccessManagerImpl::BindingContext(
+-                            GetWorkerStorageKey(),
+-                            // TODO(crbug.com/41473757): Obtain and use a better
+-                            // URL for workers instead of the origin as source
+-                            // url. This URL will be used for SafeBrowsing
+-                            // checks and for the Quarantine Service.
+-                            GetWorkerStorageKey().origin().GetURL(),
+-                            GetAncestorRenderFrameHostId(),
+-                            /*is_worker=*/true),
+-                        std::move(receiver));
++  FileSystemAccessManagerImpl::BindingContext binding_context(
++      GetWorkerStorageKey(),
++      // TODO(crbug.com/41473757): Obtain and use a better
++      // URL for workers instead of the origin as source
++      // url. This URL will be used for SafeBrowsing
++      // checks and for the Quarantine Service.
++      GetWorkerStorageKey().origin().GetURL(), GetAncestorRenderFrameHostId(),
++      /*is_worker=*/true);
++  binding_context.document = ancestor_document_;
++  manager->BindReceiver(binding_context, std::move(receiver));
+ }
+ 
+ #if BUILDFLAG(ENABLE_COMPUTE_PRESSURE)
+--- a/content/public/browser/file_system_access_entry_factory.h
++++ b/content/public/browser/file_system_access_entry_factory.h
+@@ -11,6 +11,8 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/file_system_access_permission_context.h"
+ #include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "ipc/constants.mojom-forward.h"
+ #include "storage/browser/file_system/file_system_url.h"
+ #include "third_party/blink/public/common/storage_key/storage_key.h"
+@@ -42,7 +44,11 @@
+         : storage_key(storage_key),
+           url(url),
+           frame_id(frame_id),
+-          is_worker(is_worker) {}
++          is_worker(is_worker) {
++      if (auto* frame = RenderFrameHost::FromID(frame_id)) {
++        document = frame->GetWeakDocumentPtr();
++      }
++    }
+     // Used for frames that don't have an associated rfh (e.g. Service Workers,
+     // Shared Workers).
+     BindingContext(const blink::StorageKey& storage_key,
+@@ -56,6 +62,9 @@
+     GURL url;
+     GlobalRenderFrameHostId frame_id;
+     bool is_worker;
++    // Browser-captured original authority; copies never re-resolve a reused
++    // RFH.
++    WeakDocumentPtr document;
+     int process_id() const {
+       // TODO(crbug.com/379869738) Remove GetUnsafeValue.
+       return frame_id.child_id.GetUnsafeValue();
+--- a/content/public/browser/file_system_access_permission_context.h
++++ b/content/public/browser/file_system_access_permission_context.h
+@@ -17,6 +17,7 @@
+ #include "content/public/browser/file_system_access_permission_grant.h"
+ #include "content/public/browser/file_system_access_write_item.h"
+ #include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "third_party/blink/public/mojom/file_system_access/file_system_access_manager.mojom-forward.h"
+ #include "url/origin.h"
+ 
+@@ -155,6 +156,14 @@
+   using EntriesAllowedByEnterprisePolicyCallback =
+       base::OnceCallback<void(std::vector<PathInfo>)>;
+ 
++  // Ordinary embedders keep their existing context. Stateless implementations
++  // require the original captured document and return null after it ends.
++  virtual bool RequiresDocumentContext() const { return false; }
++  virtual FileSystemAccessPermissionContext* ForDocument(
++      const WeakDocumentPtr& document) {
++    return this;
++  }
++
+   // Returns the read permission grant to use for a particular path.
+   virtual scoped_refptr<FileSystemAccessPermissionGrant> GetReadPermissionGrant(
+       const url::Origin& origin,

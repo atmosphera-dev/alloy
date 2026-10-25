@@ -1,0 +1,33 @@
+--- a/chrome/browser/ui/autofill/autofill_client_provider_factory.cc
++++ b/chrome/browser/ui/autofill/autofill_client_provider_factory.cc
+@@ -41,6 +41,7 @@
+           "AutofillClientProvider",
+           // TODO: crbug.com/326231439 - Other/no provider for OTR profiles?
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               .WithGuest(ProfileSelection::kRedirectedToOriginal)
+               .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+--- a/chrome/test/base/testing_profile_key.cc
++++ b/chrome/test/base/testing_profile_key.cc
+@@ -5,12 +5,19 @@
+ #include "chrome/test/base/testing_profile_key.h"
+ 
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/storage_partition.h"
+ 
+ TestingProfileKey::TestingProfileKey(TestingProfile* testing_profile,
+                                      const base::FilePath& path,
+                                      ProfileKey* original_key)
+-    : ProfileKey(path, original_key), testing_profile_(testing_profile) {}
++    : ProfileKey(
++          path,
++          original_key,
++          alloy::site_records::RequestContextPolicy::IsStateless(*testing_profile)
++              ? std::make_optional(alloy::site_records::StorageMode::kStateless)
++              : std::nullopt),
++      testing_profile_(testing_profile) {}
+ 
+ TestingProfileKey::~TestingProfileKey() = default;
+ 

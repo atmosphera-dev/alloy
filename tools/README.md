@@ -287,6 +287,36 @@ GDB's demangled lookup can otherwise conflate destructor variants. The request-
 context deleting destructor directly invokes D2, bypassing its D1 tail-jump
 wrapper; the observer follows the actual body rather than requiring that wrapper.
 
+Fixture user actions also require a native completion barrier. A DevTools gesture
+notification and a file-picker request use separate IPC pipes; evaluating the
+picker with `userGesture: true` does not order browser-side activation first.
+The shared `profile_user_action.mjs` sequencer primes a gesture, waits for the GDB
+observer's completed native activation receipt, then dispatches the action without
+another gesture injection. Receipts bind the browser PID, native frame-tree node
+and monotone serial; the probe also checks that its document has not changed.
+All four open/save/held/replacement actions use this owner. Picker, file-byte,
+permission and stale-handle assertions are unchanged.
+
+The native suite imports that same sequencer into a Node transport adapter and
+deliberately withholds the real native activation notification. It exercises the
+actual `FileSystemAccessManagerImpl`, selected file and Chrome permission context.
+Original-order dispatch reaches the native missing-activation denial; acknowledged
+dispatch returns the selected native entry/grant. Run this deterministic regression
+on the assigned NUC B workspace, from `/home/builder/work/alloy-b`:
+
+```sh
+env TMPDIR=/home/builder/work/alloy-b/tmp xvfb-run -a \
+  src/out/Release_Alloy/alloy_native_grants_unittests \
+  --ozone-platform=x11 --test-launcher-retry-limit=0 \
+  --alloy-test-log-dir=/home/builder/work/alloy-b/evidence/gesture-regression/guard \
+  --alloy-probe-tools-dir=/home/builder/work/alloy-b/repo/tools \
+  --gtest_filter=FixtureGestureTest.NativeAcknowledgementOrdersGestureBeforePicker
+```
+
+Use the matching Verify output for its equivalent check. Supply
+`--alloy-probe-tools-dir=<selected-workspace>/repo/tools` when running the full
+native suite too; it is an explicit test-data input, not a production setting.
+
 Evidence and failed roots are retained under `evidence/profile-stateless-*`.
 The isolated test user's external OS/NSS certificate input is created before
 either page or no-page run and must remain byte-identical. All raw inventories

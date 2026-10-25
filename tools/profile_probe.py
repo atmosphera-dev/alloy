@@ -96,9 +96,42 @@ async function datalistOutcome(c){
 
 DRIVE = r'''
 import {readFile} from 'node:fs/promises';
-const [port,base,mode,secret,baseline,eventLog,exerciseFiles,certificateBase,popupReceipt]=process.argv.slice(1);
+const [port,base,mode,secret,baseline,eventLog,exerciseFiles,certificateBase,popupReceipt,gestureReceipt,browserPID,actionModule]=process.argv.slice(1);
+const {createNativeActionSequencer}=await import(actionModule);
 const filesEnabled=exerciseFiles==='1';
 ''' + CDP_HELPERS + DATALIST_HELPERS + r'''
+const nativeActions=[],gestureOwners=new WeakMap();
+async function gestureSnapshot(){
+  const receipt=JSON.parse(await readFile(gestureReceipt,'utf8'));
+  check(Number.isInteger(receipt.serial)&&receipt.serial>=0,'invalid native gesture receipt');
+  return receipt;
+}
+const userAction=createNativeActionSequencer({
+  prime:async target=>{
+    const before=await gestureSnapshot();
+    const result=await target.send('Runtime.evaluate',{userGesture:true,awaitPromise:true,returnByValue:true,
+      expression:'({url:location.href,nonce:window.docNonce})'});
+    check(!result.exceptionDetails,'native gesture priming '+JSON.stringify(result));
+    return {before:before.serial,document:result.result.value};
+  },
+  acknowledge:async(target,ticket)=>{
+    const receipt=await until(async()=>{const value=await gestureSnapshot();return value.serial>ticket.before?value:null},
+      'browser-native gesture acknowledgement');
+    check(receipt.serial===ticket.before+1&&receipt.pid===Number(browserPID)&&receipt.active===true,
+      'native gesture identity '+JSON.stringify(receipt));
+    const previous=gestureOwners.get(target);
+    check(previous===undefined||previous===receipt.node,'native gesture reached a different tab');
+    gestureOwners.set(target,receipt.node);ticket.native=receipt;
+  },
+  dispatch:async(target,options,ticket)=>{
+    check(!('userGesture' in options),'action must not inject another racing gesture');
+    const document=await value(target,'({url:location.href,nonce:window.docNonce})');
+    check(JSON.stringify(document)===JSON.stringify(ticket.document),'gesture document retired before action');
+    const result=await target.send('Runtime.evaluate',options);
+    nativeActions.push({serial:ticket.native.serial,node:ticket.native.node,document});
+    return result;
+  },
+});
 const parentTarget=await until(async()=>{const t=await pageTargets();return t.length===1&&t[0].url==='about:blank'?t[0]:null},'ready parent browser');
 async function targets(){return(await pageTargets()).filter(t=>t.id!==parentTarget.id)}
 const parent=await connect(parentTarget);await parent.send('Page.enable');await committedHistory(parent);
@@ -224,7 +257,7 @@ else {
   await value(keeper,`window.fileChannel=new BroadcastChannel('alloy-explicit-file');
     fileChannel.onmessage=e=>{if(e.data.kind==='save')window.receivedOutput=e.data.file;
       else window.receivedFile=e.data};true`);
-  const picked=await main.send('Runtime.evaluate',{userGesture:true,awaitPromise:true,returnByValue:true,
+  const picked=await userAction(main,{awaitPromise:true,returnByValue:true,
     expression:`(async()=>{[window.selectedFile]=await showOpenFilePicker();
       const file=await selectedFile.getFile();
       window.fileChannel=new BroadcastChannel('alloy-explicit-file');fileChannel.postMessage(selectedFile);
@@ -234,7 +267,7 @@ else {
   await until(async()=>await value(keeper,'!!window.receivedFile'),'explicit live file handle communication');
   check(await value(keeper,'receivedFile.getFile().then(f=>f.text())')===secret,'live communicated file unreadable');
   proof.files={selected:picked.result.value};
-  const saved=await main.send('Runtime.evaluate',{userGesture:true,awaitPromise:true,returnByValue:true,
+  const saved=await userAction(main,{awaitPromise:true,returnByValue:true,
     expression:`(async()=>{window.savedFile=await showSaveFilePicker({suggestedName:'selected-output.txt'});
       const writer=await savedFile.createWritable();await writer.write(${JSON.stringify(secret)});await writer.close();
       fileChannel.postMessage({kind:'save',file:savedFile});
@@ -302,14 +335,14 @@ else {
   if(filesEnabled){
   await value(main,"document.title='ALLOY_PROFILE_PROBE:hold-file'");
   await until(async()=>(await nativeEvents()).some(e=>e.event==='file-hold-ready'),'native file hold control');
-  await main.send('Runtime.evaluate',{userGesture:true,expression:"window.pendingFile=showOpenFilePicker().catch(e=>e.name);true"});
+  await userAction(main,{expression:"window.pendingFile=showOpenFilePicker().catch(e=>e.name);true"});
   await until(async()=>(await nativeEvents()).some(e=>e.event==='file-picker'&&e.held),'native held file picker');
   await load('file-replacement');
   await value(main,"document.title='ALLOY_PROFILE_PROBE:release-held-file'");
   await until(async()=>(await nativeEvents()).some(e=>e.event==='file-released'),'late native file picker callback');
-  const freshFile=await main.send('Runtime.evaluate',{userGesture:true,awaitPromise:true,returnByValue:true,
+  const freshFile=await userAction(main,{awaitPromise:true,returnByValue:true,
     expression:"showOpenFilePicker().then(async([f])=>({permission:await f.queryPermission({mode:'read'}),text:await(await f.getFile()).text()}))"});
-  check(!freshFile.exceptionDetails&&freshFile.result.value.permission==='granted'&&freshFile.result.value.text===secret,'replacement cannot select its own file');
+  check(!freshFile.exceptionDetails&&freshFile.result.value.permission==='granted'&&freshFile.result.value.text===secret,'replacement cannot select its own file '+JSON.stringify(freshFile));
   check(await value(keeper,"receivedFile.queryPermission({mode:'read'})")==='denied','replacement grant revived old file authority');
   proof.files.replacement=freshFile.result.value;pass('expired-file-picker-callback');
   }
@@ -328,6 +361,8 @@ else {
   check(empty.entries.length<=1&&empty.entries.every(e=>e.url==='about:blank'),'closed tab history retained '+JSON.stringify(empty));
   proof.closedTab={empty};pass('tab-close-stack');fresh.ws.close();
 }
+if(filesEnabled&&Number(baseline)<0)check(nativeActions.length===4,'native gesture action count');
+proof.nativeGestureActions=nativeActions;
 proof.driveSeconds=(performance.now()-start)/1000;main.ws.close();keeper.ws.close();console.log(JSON.stringify(proof));
 '''.replace('__NOISE_FUNCTION__', NOISE_FUNCTION)
 
@@ -607,7 +642,8 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
             response = subprocess.run(['node', '--input-type=module', '-e', DRIVE,
                 str(port), base, mode, marker, str(baseline), str(root/'stdio.log'),
                   '1' if exercise_files else '0', certificate_base,
-                  str(root/'native-popup-completed.json')], capture_output=True,
+                  str(root/'native-popup-completed.json'),str(root/'native-gesture.json'),str(ready['pid']),
+                  str(REPO/'tools/profile_user_action.mjs')], capture_output=True,
                 text=True, timeout=120)
             (root / 'driver.stdout').write_text(response.stdout)
             (root / 'driver.stderr').write_text(response.stderr)

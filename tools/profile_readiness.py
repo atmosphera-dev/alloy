@@ -5,6 +5,7 @@
 No inferior calls, application-state writes or product instrumentation. Finish breakpoints
 observe the original parent's startup completion, PreferredApps write reply and
 blob-limit setup before the C consumer is permitted to create a stateless context.
+The gesture observer acknowledges browser-native activation before fixture actions.
 """
 import json
 import os
@@ -19,6 +20,7 @@ assert socket.gethostname() == 'wakaba-build'
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace import temp_path, validate_workspace, workspace_path
+from profile_gesture_observer import observe_native_gestures
 REPO = Path(__file__).resolve().parents[1]
 WORK = workspace_path(REPO)
 validate_workspace(WORK, REPO)
@@ -133,6 +135,7 @@ for symbol, name in (
      'blob-limit-setup')):
     entries.append(Observe(symbol, name))
 ObservePopup('autofill::AutofillPopupControllerImpl::Show', internal=True)
+gesture_observer = observe_native_gestures(receipt.with_name('native-gesture.json'), save)
 def library_loaded(event):
     progress['objects'].append(event.new_objfile.filename)
     report()

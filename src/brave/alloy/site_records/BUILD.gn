@@ -82,6 +82,7 @@ test("alloy_native_grants_unittests") {
     "bootstrap_factory_unittest.cc",
     "document_native_grants_unittest.cc",
     "extension_storage_admission_unittest.cc",
+    "fixture_gesture_unittest.cc",
     "native_audit_consumers_unittest.cc",
     "native_profile_service_fence_unittest.cc",
     "stateless_spelling_owner_unittest.cc",

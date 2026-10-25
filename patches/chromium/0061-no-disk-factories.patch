@@ -1,0 +1,37 @@
+--- a/components/keyed_service/content/BUILD.gn
++++ b/components/keyed_service/content/BUILD.gn
+@@ -29,3 +29,4 @@
+   deps = [
++    "//brave/alloy/site_records:capabilities",
+     "//components/pref_registry",
+     "//content/public/browser",
+--- a/components/keyed_service/content/browser_context_keyed_service_factory.cc
++++ b/components/keyed_service/content/browser_context_keyed_service_factory.cc
+@@ -9,2 +9,3 @@
+ #include "base/check_op.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "base/functional/bind.h"
+@@ -68,5 +69,7 @@
+   // Safe default for Incognito mode: no service.
+-  if (context->IsOffTheRecord())
++  if (context->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
+     return nullptr;
++  }
+ 
+   return context;
+--- a/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.cc
++++ b/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.cc
+@@ -7,2 +7,3 @@
+ #include "base/check_op.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "base/functional/bind.h"
+@@ -68,5 +69,7 @@
+   // Safe default for Incognito mode: no service.
+-  if (context->IsOffTheRecord())
++  if (context->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
+     return nullptr;
++  }
+ 
+   return context;

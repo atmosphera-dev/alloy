@@ -422,6 +422,86 @@
       "patch": "brave-core/0060-stateless-native-consumer-contracts.patch",
       "root": "brave",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-bootstrap.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-factories.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0061-no-disk-bootstrap.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-native-lifecycle.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0061-no-disk-native-lifecycle.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-install-maintenance.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0061-no-disk-install-envelope.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-component-hints.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-native-delegates.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-safe-browsing.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-startup-selection.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-post-profile-maintenance.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-value-store.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0061-no-disk-dat-cache.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0061-backing-profile-lifetime.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0061-no-disk-recording-owners.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

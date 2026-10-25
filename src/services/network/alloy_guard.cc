@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "services/network/alloy_guard.h"
 
+#include "base/alloy/storage_policy.h"
 #include "base/containers/span.h"
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
 #include "base/functional/bind.h"
@@ -32,7 +33,11 @@ AlloyGuard::~AlloyGuard() = default;
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
 void AlloyGuard::Configure(base::File log, Options options) {
   base::AutoLock lock(lock_);
-  log_ = std::make_shared<base::File>(std::move(log));
+  if (base::alloy::IsNoDiskProcess()) {
+    log_.reset();
+  } else {
+    log_ = std::make_shared<base::File>(std::move(log));
+  }
   options_ = options;
 }
 #endif
@@ -143,7 +148,7 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
                       result.traffic_class != TrafficClass::kWebRtc)))
     result.allowed = false;
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
-  if (!result.allowed) {
+  if (!result.allowed && !base::alloy::IsNoDiskProcess()) {
     base::DictValue row;
     row.Set("time", base::Time::Now().InMillisecondsFSinceUnixEpoch());
     row.Set("annotation_id", result.annotation_id);

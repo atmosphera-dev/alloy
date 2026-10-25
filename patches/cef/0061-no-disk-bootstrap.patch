@@ -1,0 +1,157 @@
+--- a/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -11,2 +11,4 @@
+ #include "base/alloy/buildflags.h"
++#include "base/alloy/storage_policy.h"
++#include "base/environment.h"
+ #include "base/base_switches.h"
+@@ -77,2 +79,6 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    logging::SetMinLogLevel(logging::LOGGING_FATAL);
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   logging::SetMinLogLevel(logging::LOGGING_FATAL);
+@@ -168,2 +174,17 @@
++  auto* bootstrap_command_line = base::CommandLine::ForCurrentProcess();
++  base::alloy::InitializeStoragePolicy(
++      (settings_ && settings_->cache_path.length == 0) ||
++      bootstrap_command_line->HasSwitch(base::alloy::kNoDiskSwitch));
++  if (settings_ && settings_->cache_path.length == 0) {
++    bootstrap_command_line->AppendSwitch(base::alloy::kNoDiskSwitch);
++  }
++  if (base::alloy::IsNoDiskProcess()) {
++    // Driver caches are outside Chromium's own GPU cache factories. Set their
++    // native no-disk options before loading GL/Vulkan or launching children.
++    auto environment = base::Environment::Create();
++    environment->SetVar("MESA_SHADER_CACHE_DISABLE", "true");
++    environment->SetVar("__GL_SHADER_DISK_CACHE", "0");
++  }
++
+   // Returns no value if startup should proceed.
+   auto result = BraveMainDelegate::BasicStartupComplete();
+@@ -197,2 +216,5 @@
++      if (settings_->cache_path.length == 0) {
++        command_line->AppendSwitch(base::alloy::kNoDiskSwitch);
++      }
+     }
+ 
+@@ -438,2 +460,5 @@
++  if (settings_ && settings_->cache_path.length == 0) {
++    command_line->AppendSwitch(base::alloy::kNoDiskSwitch);
++  }
+   // Call as early as possible.
+   InitLogging(command_line);
+--- a/libcef/common/resource_util.cc
++++ b/libcef/common/resource_util.cc
+@@ -5,2 +5,3 @@
+ #include "cef/libcef/common/resource_util.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -126,16 +127,19 @@
+ void OverrideUserDataDir(CefSettings* settings,
+                          const base::CommandLine* command_line) {
+   const base::FilePath& user_data_path =
+       GetUserDataPath(settings, command_line);
+-  base::PathService::Override(chrome::DIR_USER_DATA, user_data_path);
++  const bool create = !base::alloy::IsNoDiskProcess();
++  base::PathService::OverrideAndCreateIfNeeded(
++      chrome::DIR_USER_DATA, user_data_path, user_data_path.IsAbsolute(), create);
+ 
+   // Path used for crash dumps.
+-  base::PathService::Override(chrome::DIR_CRASH_DUMPS, user_data_path);
++  base::PathService::OverrideAndCreateIfNeeded(
++      chrome::DIR_CRASH_DUMPS, user_data_path, user_data_path.IsAbsolute(), create);
+ 
+   // Path used for spell checking dictionary files.
+   base::PathService::OverrideAndCreateIfNeeded(
+       chrome::DIR_APP_DICTIONARIES,
+       user_data_path.Append(FILE_PATH_LITERAL("Dictionaries")),
+-      false,  // May not be an absolute path.
++      user_data_path.IsAbsolute(),
+-      true);  // Create if necessary.
++      create);
+ }
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.cc
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+@@ -6,2 +6,3 @@
+ #include "cef/libcef/browser/chrome/chrome_content_browser_client_cef.h"
++#include "base/alloy/storage_policy.h"
+ #include "content/public/browser/generated_code_cache_settings.h"
+@@ -247,2 +248,3 @@
++        base::alloy::kNoDiskSwitch,
+ #if BUILDFLAG(IS_MAC)
+         switches::kFrameworkDirPath,
+@@ -308,6 +310,9 @@
+       handler->OnBeforeChildProcessLaunch(commandLinePtr.get());
+       std::ignore = commandLinePtr->Detach(nullptr);
+     }
+   }
++  if (base::alloy::IsNoDiskProcess()) {
++    command_line->AppendSwitch(base::alloy::kNoDiskSwitch);
++  }
+ }
+ 
+--- a/libcef/common/crash_reporting.cc
++++ b/libcef/common/crash_reporting.cc
+@@ -5,2 +5,3 @@
+ #include "cef/libcef/common/crash_reporting.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -195,2 +196,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return;
+@@ -205,2 +209,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return;
+@@ -232,2 +239,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return;
+--- a/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc
++++ b/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc
+@@ -5,2 +5,3 @@
+ #include "cef/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -51,2 +52,4 @@
+-  CefString(&settings.cache_path) = profile->GetPath().value();
++  if (!base::alloy::IsNoDiskProcess()) {
++    CefString(&settings.cache_path) = profile->GetPath().value();
++  }
+ 
+--- a/libcef/browser/request_context_impl.cc
++++ b/libcef/browser/request_context_impl.cc
+@@ -5,2 +5,3 @@
+ #include "cef/libcef/browser/request_context_impl.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -221,2 +222,7 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    config.stateless_network_state = alloy::site_records::NetworkState::kKeep;
++    config.settings.cookieable_schemes_exclude_defaults = true;
++  }
++
+   CefRefPtr<CefRequestContextImpl> impl =
+       new CefRequestContextImpl(std::move(config));
+--- a/libcef/browser/context.cc
++++ b/libcef/browser/context.cc
+@@ -5,2 +5,3 @@
+ #include "cef/libcef/browser/context.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -159,2 +160,6 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
++
+   if (!root_cache_path.empty() && root_cache_path != cache_path &&
+       !root_cache_path.IsParent(cache_path)) {

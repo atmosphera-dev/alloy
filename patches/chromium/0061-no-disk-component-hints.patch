@@ -1,0 +1,20 @@
+--- a/chrome/common/media/component_widevine_cdm_hint_file_linux.cc
++++ b/chrome/common/media/component_widevine_cdm_hint_file_linux.cc
+@@ -5,2 +5,3 @@
+ #include "chrome/common/media/component_widevine_cdm_hint_file_linux.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -53,3 +54,6 @@
+ base::DictValue GetHintFileContents() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {};
++  }
+   base::FilePath hint_file_path;
+   CHECK(base::PathService::Get(chrome::FILE_COMPONENT_WIDEVINE_CDM_HINT,
+@@ -87,3 +91,6 @@
+                                std::optional<base::Version> bundled_version) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+   DCHECK(!cdm_base_path.empty());
+ 

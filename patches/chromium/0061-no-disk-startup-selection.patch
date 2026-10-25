@@ -1,0 +1,58 @@
+--- a/chrome/browser/ui/startup/startup_browser_creator.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <stddef.h>
+ 
+@@ -323,6 +324,9 @@
+ 
+ #if !BUILDFLAG(IS_CHROMEOS)
+ StartupProfileInfo GetProfilePickerStartupProfileInfo() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {.profile = nullptr, .mode = StartupProfileMode::kError};
++  }
+   // We can only show the profile picker if the system profile (where the
+   // profile picker lives) also exists (or is creatable).
+   // TODO(crbug.com/40205861): Remove unnecessary system profile check here.
+@@ -1627,6 +1631,13 @@
+     bool ignore_profile_picker) {
+   ProfileManager* profile_manager = g_browser_process->profile_manager();
+   const base::FilePath& user_data_dir = profile_manager->user_data_dir();
++  if (base::alloy::IsNoDiskProcess()) {
++    // No persisted profile identity/catalogue exists. This is only the native
++    // lifecycle anchor; actual request-context authority comes from its mode.
++    return {.path = profiles::GetDefaultProfileDir(user_data_dir),
++            .mode = StartupProfileMode::kBrowserWindow};
++  }
++
+ // If the browser is launched due to activation on Windows native notification,
+ // the profile id encoded in the notification launch id should be chosen over
+ // all others.
+@@ -1781,6 +1792,13 @@
+   // NOTE: GetProfile() does synchronous file I/O on the main thread.
+   Profile* profile = profile_manager->GetProfile(path_info.path);
+ 
++  if (base::alloy::IsNoDiskProcess()) {
++    // A missing catalogue entry is expected, not evidence of deletion/lock.
++    // Never create a picker/System Profile to replace the valid bootstrap.
++    return {profile, profile ? StartupProfileMode::kBrowserWindow
++                             : StartupProfileMode::kError};
++  }
++
+   // There are several cases where we should show the profile picker:
+   // - if there is no entry in profile attributes storage, which means that the
+   //   profile is deleted,
+@@ -1798,6 +1816,9 @@
+ }
+ 
+ StartupProfileInfo GetFallbackStartupProfile() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {nullptr, StartupProfileMode::kError};
++  }
+   ProfileManager* profile_manager = g_browser_process->profile_manager();
+   // The only known reason for profiles to fail initialization is being unable
+   // to create the profile directory, and this has already happened in

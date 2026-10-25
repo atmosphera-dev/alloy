@@ -24,6 +24,7 @@ class RequestContextPolicy final : public base::SupportsUserData::Data {
   static const RequestContextPolicy* Get(
       const base::SupportsUserData& browser_context);
   static bool IsStateless(const base::SupportsUserData& browser_context);
+  static bool IsNoDisk(const base::SupportsUserData& browser_context);
 
   ~RequestContextPolicy() override;
 

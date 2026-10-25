@@ -1,0 +1,24 @@
+--- a/chrome/browser/content_index/content_index_provider_factory.cc
++++ b/chrome/browser/content_index/content_index_provider_factory.cc
+@@ -27,4 +27,5 @@
+     : ProfileKeyedServiceFactory(
+           "ContentIndexProvider",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kNone)
+               .WithRegular(ProfileSelection::kOwnInstance)
+--- a/chrome/browser/background_fetch/background_fetch_delegate_factory.cc
++++ b/chrome/browser/background_fetch/background_fetch_delegate_factory.cc
+@@ -31,4 +31,5 @@
+     : ProfileKeyedServiceFactory(
+           "BackgroundFetchService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kNone)
+               .WithRegular(ProfileSelection::kOwnInstance)
+--- a/chrome/browser/background_sync/background_sync_controller_factory.cc
++++ b/chrome/browser/background_sync/background_sync_controller_factory.cc
+@@ -32,4 +32,5 @@
+     : ProfileKeyedServiceFactory(
+           "BackgroundSyncService",
+           ProfileSelections::Builder()
++              .WithAlloyStateless(ProfileSelection::kNone)
+               .WithRegular(ProfileSelection::kOwnInstance)

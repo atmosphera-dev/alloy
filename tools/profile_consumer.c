@@ -14,6 +14,7 @@
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
+#include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_dialog_handler_capi.h"
 #include "include/capi/cef_preference_capi.h"
 #include "include/capi/cef_permission_handler_capi.h"
@@ -40,6 +41,7 @@ static cef_request_context_t* shared_context;
 static alloy_network_state_t network_state;
 static int browser_count;
 static int bootstrap_browser;
+static int no_disk_bootstrap;
 static cef_permission_prompt_callback_t* held_permission;
 static uint64_t held_prompt_id;
 static int hold_next_permission;
@@ -93,6 +95,26 @@ static cef_dialog_handler_t* CEF_CALLBACK get_dialogs(cef_client_t* self) {
 }
 static cef_request_handler_t* CEF_CALLBACK get_requests(cef_client_t* self) {
   return &requests;
+}
+static void remove_no_disk_transport(cef_command_line_t* command_line,
+                                    const char* stage) {
+  if (no_disk_bootstrap) {
+    cef_string_t key={0};text(&key,"alloy-no-disk");
+    if (command_line->is_read_only(command_line)) fail("read-only launch command line");
+    command_line->remove_switch(command_line,&key);
+    if (command_line->has_switch(command_line,&key)) fail("launch switch not removed");
+    cef_string_clear(&key);
+    printf("PROFILE_EVENT {\"event\":\"no-disk-command-line-test\",\"stage\":\"%s\"}\n",stage);
+  }
+  release_ref(command_line);
+}
+static void CEF_CALLBACK process_command_line(cef_app_t* self,
+    const cef_string_t* process_type,cef_command_line_t* command_line) {
+  remove_no_disk_transport(command_line,"bootstrap");
+}
+static void CEF_CALLBACK child_command_line(cef_browser_process_handler_t* self,
+    cef_command_line_t* command_line) {
+  remove_no_disk_transport(command_line,"child");
 }
 static int CEF_CALLBACK certificate_error(cef_request_handler_t* self,
     cef_browser_t* browser,cef_errorcode_t error,const cef_string_t* url,
@@ -330,6 +352,10 @@ static void start_stateless(void) {
   make_browser(&blank_url,shared_context);
 }
 static void CEF_CALLBACK initialized(cef_browser_process_handler_t* self) {
+  if (no_disk_bootstrap) {
+    start_stateless();
+    return;
+  }
   /* This explicit persistent parent is only fixture setup. Observe its native
    * startup/store completion and inventory it before starting the context. */
   cef_request_context_t* parent=cef_request_context_get_global_context();
@@ -356,6 +382,7 @@ int main(int argc,char** argv) {
   const char* network=getenv("ALLOY_PROFILE_NETWORK");
   const char* file=getenv("ALLOY_PROFILE_SELECTED_FILE");
   const char* output=getenv("ALLOY_PROFILE_OUTPUT_FILE");
+  no_disk_bootstrap=getenv("ALLOY_PROFILE_NO_DISK")!=NULL;
   if (!url || !root || !network || !file || !output) return 9;
   if (!strcmp(network,"keep")) network_state=ALLOY_NETWORK_STATE_KEEP;
   else if (!strcmp(network,"cut")) network_state=ALLOY_NETWORK_STATE_CUT;
@@ -372,7 +399,9 @@ int main(int argc,char** argv) {
   base(&requests.base,sizeof(requests));requests.on_certificate_error=certificate_error;
   base(&dialogs.base,sizeof(dialogs));dialogs.on_file_dialog=file_dialog;
   app.get_browser_process_handler=get_process;
+  app.on_before_command_line_processing=process_command_line;
   process_handler.on_context_initialized=initialized;
+  process_handler.on_before_child_process_launch=child_command_line;
   process_handler.on_register_custom_preferences=register_preferences;
   client.get_render_handler=get_render; client.get_life_span_handler=get_life;
   client.get_display_handler=get_display;
@@ -387,7 +416,8 @@ int main(int argc,char** argv) {
   display.on_title_change=title_changed;
   cef_settings_t settings={0}; settings.size=sizeof(settings);
   settings.windowless_rendering_enabled=1;
-  cef_string_copy(profile_root.str,profile_root.length,&settings.cache_path);
+  if (!no_disk_bootstrap)
+    cef_string_copy(profile_root.str,profile_root.length,&settings.cache_path);
   cef_string_copy(profile_root.str,profile_root.length,&settings.root_cache_path);
   if (!cef_initialize(&args,&settings,&app,NULL)) return cef_get_exit_code();
   cef_run_message_loop();

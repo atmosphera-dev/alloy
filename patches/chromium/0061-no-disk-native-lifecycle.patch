@@ -1,0 +1,846 @@
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -1548,13 +1548,15 @@
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   // Ephemeral profiles may have been left behind if the browser crashed.
+-  g_browser_process->profile_manager()
+-      ->GetDeleteProfileHelper()
+-      .CleanUpEphemeralProfiles();
+-  // Files of deleted profiles can also be left behind after a crash.
+-  g_browser_process->profile_manager()
+-      ->GetDeleteProfileHelper()
+-      .CleanUpDeletedProfiles();
++  if (!base::alloy::IsNoDiskProcess()) {
++    g_browser_process->profile_manager()
++        ->GetDeleteProfileHelper()
++        .CleanUpEphemeralProfiles();
++    // Files of deleted profiles can also be left behind after a crash.
++    g_browser_process->profile_manager()
++        ->GetDeleteProfileHelper()
++        .CleanUpDeletedProfiles();
++  }
+ 
+   // Inject the publisher dependency to AppService.
+   publisher_host_factory_resetter_ =
+@@ -1635,28 +1637,31 @@
+     BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+   // Delete the media history database if it still exists.
+   // TODO(crbug.com/40177301): Remove this.
+-  base::ThreadPool::PostTask(
+-      FROM_HERE,
+-      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
+-       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+-      base::BindOnce(&DeleteMediaHistoryDatabase, profile->GetPath()));
+-
+-  // Delete the deprecated AccessibilityAnnotatorDB if it still exists.
+-  // TODO(crbug.com/531591319): Remove this in August 2027.
+-  base::ThreadPool::PostTask(
+-      FROM_HERE,
+-      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
+-       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+-      base::BindOnce(&DeleteAccessibilityAnnotatorDatabase,
+-                     profile->GetPath()));
+-
+-  // Delete the deprecated Privacy Sandbox data if they still exist.
+-  // TODO(crbug.com/462465887): Remove this in August 2028.
+-  base::ThreadPool::PostTask(
+-      FROM_HERE,
+-      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
+-       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+-      base::BindOnce(&DeleteDeprecatedPrivacySandboxData, profile->GetPath()));
++  if (!base::alloy::IsNoDiskProcess()) {
++    base::ThreadPool::PostTask(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++         base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++        base::BindOnce(&DeleteMediaHistoryDatabase, profile->GetPath()));
++
++    // Delete the deprecated AccessibilityAnnotatorDB if it still exists.
++    // TODO(crbug.com/531591319): Remove this in August 2027.
++    base::ThreadPool::PostTask(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++         base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++        base::BindOnce(&DeleteAccessibilityAnnotatorDatabase,
++                       profile->GetPath()));
++
++    // Delete the deprecated Privacy Sandbox data if they still exist.
++    // TODO(crbug.com/462465887): Remove this in August 2028.
++    base::ThreadPool::PostTask(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++         base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++        base::BindOnce(&DeleteDeprecatedPrivacySandboxData,
++                       profile->GetPath()));
++  }
+ #endif
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+--- a/chrome/browser/extensions/chrome_extension_system_factory.cc
++++ b/chrome/browser/extensions/chrome_extension_system_factory.cc
+@@ -129,6 +129,7 @@
+ content::BrowserContext* ChromeExtensionSystemFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
+   return ProfileSelections::Builder()
++      .WithAlloyStateless(ProfileSelection::kOwnInstance)
+       .WithRegular(ProfileSelection::kOwnInstance)
+       .WithGuest(ProfileSelection::kOwnInstance)
+       // TODO(crbug.com/41488885): Check if this service is needed for
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/prefs/browser_prefs.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <array>
+ #include <optional>
+@@ -2437,6 +2438,9 @@
+ // This method should be periodically pruned of year+ old migrations.
+ // See chrome/browser/prefs/README.md for details.
+ void MigrateObsoleteLocalStatePrefs(PrefService* local_state) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   [&]() -> void {
+   // IMPORTANT NOTE: This code is *not* run on iOS Chrome. If a pref is migrated
+   // or cleared here, and that pref is also used in iOS Chrome, it may also need
+@@ -2574,6 +2578,9 @@
+ // See chrome/browser/prefs/README.md for details.
+ void MigrateObsoleteProfilePrefs(PrefService* profile_prefs,
+                                  const base::FilePath& profile_path) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   [&]() -> void {
+   MigrateObsoleteBraveProfilePrefsBeforeChromium(profile_prefs);
+   // IMPORTANT NOTE: This code is *not* run on iOS Chrome. If a pref is migrated
+--- a/chrome/browser/profiles/profile_attributes_storage.cc
++++ b/chrome/browser/profiles/profile_attributes_storage.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -269,6 +270,10 @@
+           {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
+            base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN})),
+       user_data_dir_(user_data_dir) {
++  if (base::alloy::IsNoDiskProcess()) {
++    // Native runtime may query an empty catalogue; no persisted entries exist.
++    return;
++  }
+   // Populate the attributes storage.
+   ScopedDictPrefUpdate update(prefs_, prefs::kProfileAttributes);
+   base::DictValue& attributes = update.Get();
+--- a/chrome/browser/profiles/profile_impl.cc
++++ b/chrome/browser/profiles/profile_impl.cc
+@@ -7,6 +7,7 @@
+ #include "base/alloy/storage_policy.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/prefs/chrome_command_line_pref_store.h"
++#include "chrome/browser/ui/zoom/chrome_zoom_level_otr_delegate.h"
+ #include "components/prefs/in_memory_pref_store.h"
+ #include "components/sync_preferences/pref_service_syncable_factory.h"
+ 
+@@ -789,68 +790,70 @@
+ void ProfileImpl::DoFinalInit(CreateMode create_mode) {
+   TRACE_EVENT0("browser", "ProfileImpl::DoFinalInit");
+ 
+-  PrefService* prefs = GetPrefs();
+-
+-  // Do not override the existing pref in case a profile directory is copied, or
+-  // if the file system does not support creation time and the property (i.e.
+-  // st_ctim in posix which is actually the last status change time when the
+-  // inode was last updated) use to mimic it changes because of some other
+-  // modification.
+-  if (!prefs->HasPrefPath(prefs::kProfileCreationTime))
+-    prefs->SetTime(prefs::kProfileCreationTime, path_creation_time_);
+-
+-  pref_change_registrar_.Init(prefs);
+-  pref_change_registrar_.Add(
+-      prefs::kSupervisedUserId,
+-      base::BindRepeating(&ProfileImpl::UpdateSupervisedUserIdInStorage,
+-                          base::Unretained(this)));
+-
+-  // Changes in the profile avatar.
+-  pref_change_registrar_.Add(
+-      prefs::kProfileAvatarIndex,
+-      base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
+-                          base::Unretained(this)));
+-  pref_change_registrar_.Add(
+-      prefs::kProfileUsingDefaultAvatar,
+-      base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
+-                          base::Unretained(this)));
+-  pref_change_registrar_.Add(
+-      prefs::kProfileUsingGAIAAvatar,
+-      base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
+-                          base::Unretained(this)));
+-
+-  // Changes in the profile name.
+-  pref_change_registrar_.Add(
+-      prefs::kProfileUsingDefaultName,
+-      base::BindRepeating(&ProfileImpl::UpdateNameInStorage,
+-                          base::Unretained(this)));
+-  pref_change_registrar_.Add(
+-      prefs::kProfileName,
+-      base::BindRepeating(&ProfileImpl::UpdateNameInStorage,
+-                          base::Unretained(this)));
+-
+-  pref_change_registrar_.Add(
+-      prefs::kForceEphemeralProfiles,
+-      base::BindRepeating(&ProfileImpl::UpdateIsEphemeralInStorage,
+-                          base::Unretained(this)));
+-
+-  pref_change_registrar_.Add(
+-      subscription_eligibility::prefs::kAiSubscriptionTier,
+-      base::BindRepeating(&ProfileImpl::UpdateAiSubscriptionTierInStorage,
+-                          base::Unretained(this)));
+-
+-  base::FilePath base_cache_path;
+-  // It would be nice to use PathService for fetching this directory, but
+-  // the cache directory depends on the profile directory, which isn't available
+-  // to PathService.
+-  chrome::GetUserCacheDirectory(path_, &base_cache_path);
+-  // Always create the cache directory asynchronously.
+-  CreateProfileDirectory(io_task_runner_.get(), base_cache_path, false);
+-
+-  // Initialize components that depend on the current value.
+-  UpdateSupervisedUserIdInStorage();
+-  UpdateIsEphemeralInStorage();
+-  UpdateAiSubscriptionTierInStorage();
++  if (!base::alloy::IsNoDiskProcess()) {
++    PrefService* prefs = GetPrefs();
++
++    // Do not override the existing pref in case a profile directory is copied,
++    // or if the file system does not support creation time and the property
++    // (i.e. st_ctim in posix which is actually the last status change time when
++    // the inode was last updated) use to mimic it changes because of some other
++    // modification.
++    if (!prefs->HasPrefPath(prefs::kProfileCreationTime))
++      prefs->SetTime(prefs::kProfileCreationTime, path_creation_time_);
++
++    pref_change_registrar_.Init(prefs);
++    pref_change_registrar_.Add(
++        prefs::kSupervisedUserId,
++        base::BindRepeating(&ProfileImpl::UpdateSupervisedUserIdInStorage,
++                            base::Unretained(this)));
++
++    // Changes in the profile avatar.
++    pref_change_registrar_.Add(
++        prefs::kProfileAvatarIndex,
++        base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
++                            base::Unretained(this)));
++    pref_change_registrar_.Add(
++        prefs::kProfileUsingDefaultAvatar,
++        base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
++                            base::Unretained(this)));
++    pref_change_registrar_.Add(
++        prefs::kProfileUsingGAIAAvatar,
++        base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
++                            base::Unretained(this)));
++
++    // Changes in the profile name.
++    pref_change_registrar_.Add(
++        prefs::kProfileUsingDefaultName,
++        base::BindRepeating(&ProfileImpl::UpdateNameInStorage,
++                            base::Unretained(this)));
++    pref_change_registrar_.Add(
++        prefs::kProfileName,
++        base::BindRepeating(&ProfileImpl::UpdateNameInStorage,
++                            base::Unretained(this)));
++
++    pref_change_registrar_.Add(
++        prefs::kForceEphemeralProfiles,
++        base::BindRepeating(&ProfileImpl::UpdateIsEphemeralInStorage,
++                            base::Unretained(this)));
++
++    pref_change_registrar_.Add(
++        subscription_eligibility::prefs::kAiSubscriptionTier,
++        base::BindRepeating(&ProfileImpl::UpdateAiSubscriptionTierInStorage,
++                            base::Unretained(this)));
++
++    base::FilePath base_cache_path;
++    // It would be nice to use PathService for fetching this directory, but
++    // the cache directory depends on the profile directory, which isn't
++    // available to PathService.
++    chrome::GetUserCacheDirectory(path_, &base_cache_path);
++    // Always create the cache directory asynchronously.
++    CreateProfileDirectory(io_task_runner_.get(), base_cache_path, false);
++
++    // Initialize components that depend on the current value.
++    UpdateSupervisedUserIdInStorage();
++    UpdateIsEphemeralInStorage();
++    UpdateAiSubscriptionTierInStorage();
++  }
+ 
+   // Background mode and plugins are not used with all profiles. These use
+   // KeyedServices that might not be available such as the ExtensionSystem for
+@@ -900,7 +903,9 @@
+   // Listen for bookmark model load, to bootstrap the sync service.
+   // Not necessary for profiles that don't have a BookmarkModel.
+   // On CrOS sync service will be initialized after sign in.
+-  BookmarkModel* model = BookmarkModelFactory::GetForBrowserContext(this);
++  BookmarkModel* model = base::alloy::IsNoDiskProcess()
++                             ? nullptr
++                             : BookmarkModelFactory::GetForBrowserContext(this);
+   if (model) {
+     // `BookmarkModelLoadedObserver` destroys itself eventually, when loading
+     // completes.
+@@ -925,7 +930,9 @@
+ 
+   PushMessagingServiceImpl::InitializeForProfile(this);
+ 
+-  site_isolation::SiteIsolationPolicy::ApplyPersistedIsolatedOrigins(this);
++  if (!base::alloy::IsNoDiskProcess()) {
++    site_isolation::SiteIsolationPolicy::ApplyPersistedIsolatedOrigins(this);
++  }
+ 
+   content::URLDataSource::Add(this,
+                               std::make_unique<PrefsInternalsSource>(this));
+@@ -960,18 +967,22 @@
+ 
+   NotifyProfileInitializationComplete();
+ 
+-  RecordPrefValuesAfterProfileInitialization();
++  if (!base::alloy::IsNoDiskProcess()) {
++    RecordPrefValuesAfterProfileInitialization();
++  }
+ 
+   SharingServiceFactory::GetForBrowserContext(this);
+ 
+   HttpsFirstModeServiceFactory::GetForProfile(this);
+ 
+   // The Privacy Metrics service should start alongside each profile session.
+-  PrivacyMetricsServiceFactory::GetForProfile(this);
+-
+-  // The Privacy Sandbox service must be created with the profile to ensure that
+-  // preference reconciliation occurs.
+-  PrivacySandboxServiceFactory::GetForProfile(this);
++  if (!base::alloy::IsNoDiskProcess()) {
++    PrivacyMetricsServiceFactory::GetForProfile(this);
++
++    // The Privacy Sandbox service must be created with the profile to ensure
++    // that preference reconciliation occurs.
++    PrivacySandboxServiceFactory::GetForProfile(this);
++  }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   // The password settings service needs to start listening to settings
+@@ -986,9 +997,11 @@
+ 
+   // The announcement notification  service might not be available for some
+   // irregular profiles, like the System Profile.
+-  if (AnnouncementNotificationService* announcement_notification =
+-          AnnouncementNotificationServiceFactory::GetForProfile(this)) {
+-    announcement_notification->MaybeShowNotification();
++  if (!base::alloy::IsNoDiskProcess()) {
++    if (AnnouncementNotificationService* announcement_notification =
++            AnnouncementNotificationServiceFactory::GetForProfile(this)) {
++      announcement_notification->MaybeShowNotification();
++    }
+   }
+ 
+   // Request an OriginTrialsControllerDelegate to ensure it is initialized.
+@@ -1012,6 +1025,9 @@
+ }
+ 
+ ProfileImpl::~ProfileImpl() {
++  if (auto* policy = alloy::site_records::RequestContextPolicy::Get(*this)) {
++    policy->Revoke();
++  }
+   MaybeSendDestroyedNotification();
+ 
+ #if BUILDFLAG(ENABLE_SESSION_SERVICE)
+@@ -1044,7 +1060,7 @@
+     ProfileDestroyer::DestroyOTRProfileImmediately(otr_profile);
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  if (!primary_otr_available &&
++  if (!base::alloy::IsNoDiskProcess() && !primary_otr_available &&
+       !extensions::ChromeContentBrowserClientExtensionsPart::
+           AreExtensionsDisabledForProfile(this)) {
+     ExtensionPrefValueMap* pref_value_map =
+@@ -1097,6 +1113,10 @@
+ 
+ std::unique_ptr<content::ZoomLevelDelegate>
+ ProfileImpl::CreateZoomLevelDelegate(const base::FilePath& partition_path) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return std::make_unique<ChromeZoomLevelOTRDelegate>(
++        zoom::ZoomEventManager::GetForBrowserContext(this)->GetWeakPtr());
++  }
+   return std::make_unique<ChromeZoomLevelPrefs>(
+       GetPrefs(), GetPath(), partition_path,
+       zoom::ZoomEventManager::GetForBrowserContext(this)->GetWeakPtr());
+@@ -1154,7 +1174,8 @@
+   otr_profiles_.erase(profile_id);
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   // Extensions are only supported on primary OTR profile.
+-  if (profile_id == OTRProfileID::PrimaryID() &&
++  if (!base::alloy::IsNoDiskProcess() &&
++      profile_id == OTRProfileID::PrimaryID() &&
+       !extensions::ChromeContentBrowserClientExtensionsPart::
+           AreExtensionsDisabledForProfile(this)) {
+     ExtensionPrefValueMap* pref_value_map =
+@@ -1202,6 +1223,12 @@
+ 
+ void ProfileImpl::OnLocaleReady(CreateMode create_mode) {
+   TRACE_EVENT0("browser", "ProfileImpl::OnLocaleReady");
++  if (base::alloy::IsNoDiskProcess()) {
++    // There is no persisted user profile. Do not enter any regular-profile
++    // pref/extension/sync migration before native runtime initialization.
++    InitializeRuntime(create_mode);
++    return;
++  }
+ 
+   // Migrate obsolete prefs.
+   MigrateObsoleteProfilePrefs(GetPrefs(), GetPath());
+@@ -1255,6 +1282,10 @@
+   }
+ #endif
+ 
++  InitializeRuntime(create_mode);
++}
++
++void ProfileImpl::InitializeRuntime(CreateMode create_mode) {
+   g_browser_process->profile_manager()->InitProfileUserPrefs(this);
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -1273,7 +1304,9 @@
+ 
+   FullBrowserTransitionManager::Get()->OnProfileCreated(this);
+ 
+-  ChromeVersionService::OnProfileLoaded(prefs_.get(), IsNewProfile());
++  if (!base::alloy::IsNoDiskProcess()) {
++    ChromeVersionService::OnProfileLoaded(prefs_.get(), IsNewProfile());
++  }
+   DoFinalInit(create_mode);
+ }
+ 
+@@ -1315,9 +1348,11 @@
+   // SessionService depends on Profile::GetPrefs() and therefore shouldn't be
+   // forced initialized before prefs are loaded. Starting this Timer before
+   // that point resulted in a racy use-before-initialized in the past.
+-  create_session_service_timer_.Start(
+-      FROM_HERE, kCreateSessionServiceDelay, this,
+-      &ProfileImpl::EnsureSessionServiceCreated);
++  if (!base::alloy::IsNoDiskProcess()) {
++    create_session_service_timer_.Start(
++        FROM_HERE, kCreateSessionServiceDelay, this,
++        &ProfileImpl::EnsureSessionServiceCreated);
++  }
+ #endif
+ }
+ 
+@@ -1328,6 +1363,9 @@
+ }
+ 
+ bool ProfileImpl::ShouldRestoreOldSessionCookies() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   SessionStartupPref startup_pref(SessionStartupPref::GetDefaultStartupType());
+   return startup_pref.ShouldRestoreLastSession();
+@@ -1341,10 +1379,13 @@
+ }
+ 
+ bool ProfileImpl::ShouldPersistSessionCookies() const {
+-  return true;
++  return !base::alloy::IsNoDiskProcess();
+ }
+ 
+ bool ProfileImpl::ShouldClearSessionStorageOnStartup() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   // On Android, Session Storage doesn't support restore. So, we always clear
+   // session storage on open. As such, we don't need to signal it from the
+@@ -1376,6 +1417,9 @@
+ }
+ 
+ ChromeZoomLevelPrefs* ProfileImpl::GetZoomLevelPrefs() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return nullptr;
++  }
+   return static_cast<ChromeZoomLevelPrefs*>(
+       GetDefaultStoragePartition()->GetZoomLevelDelegate());
+ }
+@@ -1383,8 +1427,16 @@
+ // TODO(crbug.com/40526371): Remove this function.
+ PrefService* ProfileImpl::GetReadOnlyOffTheRecordPrefs() {
+   if (!dummy_otr_prefs_) {
+-    dummy_otr_prefs_ = CreateIncognitoPrefServiceSyncable(
+-        prefs_.get(), CreateExtensionPrefStore(this, true));
++    if (base::alloy::IsNoDiskProcess()) {
++      dummy_otr_prefs_ = prefs_->CreateIndependentPrefService(
++          profile_policy_connector_->policy_service(),
++          g_browser_process->browser_policy_connector(),
++          base::MakeRefCounted<ChromeCommandLinePrefStore>(
++              base::CommandLine::ForCurrentProcess()));
++    } else {
++      dummy_otr_prefs_ = CreateIncognitoPrefServiceSyncable(
++          prefs_.get(), CreateExtensionPrefStore(this, true));
++    }
+   }
+   return dummy_otr_prefs_.get();
+ }
+@@ -1590,6 +1642,9 @@
+ }
+ 
+ void ProfileImpl::EnsureSessionServiceCreated() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   SessionServiceFactory::GetForProfile(this);
+ }
+ #endif
+--- a/chrome/browser/profiles/profile_impl.h
++++ b/chrome/browser/profiles/profile_impl.h
+@@ -220,6 +220,10 @@
+   // initialization.
+   void OnSyncToSigninMigrationMaybeCompleted(CreateMode create_mode);
+ 
++  // Native runtime continuation shared by a migrated regular profile and the
++  // no-disk bootstrap, which has no persisted profile to migrate or maintain.
++  void InitializeRuntime(CreateMode create_mode);
++
+ #if BUILDFLAG(ENABLE_SESSION_SERVICE)
+   void StopCreateSessionServiceTimer();
+ 
+--- a/chrome/browser/profiles/profile_manager.cc
++++ b/chrome/browser/profiles/profile_manager.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/profiles/profile_manager.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <stdint.h>
+ 
+@@ -463,11 +464,13 @@
+   profile_manager_android_ = std::make_unique<ProfileManagerAndroid>(this);
+ #endif
+ 
+-  if (ProfileShortcutManager::IsFeatureEnabled() && !user_data_dir_.empty())
+-    profile_shortcut_manager_ = ProfileShortcutManager::Create(this);
+-
+-  zombie_metrics_timer_.Start(FROM_HERE, base::Minutes(30), this,
+-                              &ProfileManager::RecordZombieMetrics);
++  if (!base::alloy::IsNoDiskProcess()) {
++    if (ProfileShortcutManager::IsFeatureEnabled() && !user_data_dir_.empty())
++      profile_shortcut_manager_ = ProfileShortcutManager::Create(this);
++
++    zombie_metrics_timer_.Start(FROM_HERE, base::Minutes(30), this,
++                                &ProfileManager::RecordZombieMetrics);
++  }
+ }
+ 
+ ProfileManager::~ProfileManager() {
+@@ -1186,6 +1189,9 @@
+ }
+ 
+ void ProfileManager::InitProfileUserPrefs(Profile* profile) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   TRACE_EVENT0("browser", "ProfileManager::InitProfileUserPrefs");
+   ProfileAttributesStorage& storage = GetProfileAttributesStorage();
+ 
+@@ -1444,8 +1450,10 @@
+   // When removing the last keep alive of an ephemeral profile, schedule the
+   // profile for deletion if it is not yet marked.
+   bool ephemeral =
++      !base::alloy::IsNoDiskProcess() &&
+       IsRegisteredAsEphemeral(&GetProfileAttributesStorage(), profile_path);
+-  bool marked_for_deletion = IsProfileDirectoryMarkedForDeletion(profile_path);
++  bool marked_for_deletion = !base::alloy::IsNoDiskProcess() &&
++                             IsProfileDirectoryMarkedForDeletion(profile_path);
+   if (ephemeral && !marked_for_deletion &&
+       GetTotalRefCount(info->keep_alives) == 1) {
+     delete_profile_helper_->ScheduleEphemeralProfileForDeletion(
+@@ -1544,13 +1552,15 @@
+ 
+   // Delete browsing data specified by the ClearBrowsingDataOnExitList policy
+   // if they were not properly deleted on the last browser shutdown.
+-  auto* browsing_data_lifetime_manager =
+-      ChromeBrowsingDataLifetimeManagerFactory::GetForProfile(profile);
+-  if (browsing_data_lifetime_manager && !profile->IsOffTheRecord() &&
+-      profile->GetPrefs()->GetBoolean(
+-          browsing_data::prefs::kClearBrowsingDataOnExitDeletionPending)) {
+-    browsing_data_lifetime_manager->ClearBrowsingDataForOnExitPolicy(
+-        /*keep_browser_alive=*/false);
++  if (!base::alloy::IsNoDiskProcess()) {
++    auto* browsing_data_lifetime_manager =
++        ChromeBrowsingDataLifetimeManagerFactory::GetForProfile(profile);
++    if (browsing_data_lifetime_manager && !profile->IsOffTheRecord() &&
++        profile->GetPrefs()->GetBoolean(
++            browsing_data::prefs::kClearBrowsingDataOnExitDeletionPending)) {
++      browsing_data_lifetime_manager->ClearBrowsingDataForOnExitPolicy(
++          /*keep_browser_alive=*/false);
++    }
+   }
+ }
+ 
+@@ -1564,7 +1574,13 @@
+   TRACE_EVENT0("browser", "ProfileManager::DoFinalInitForServices");
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  bool extensions_enabled = !go_off_the_record;
++  if (base::alloy::IsNoDiskProcess()) {
++    // Keep the native private namespace/InitPrefs runtime used by independent
++    // request contexts. There is no installed-user-extension/app profile to
++    // restore, update or reconcile in the hidden bootstrap.
++    extensions::ExtensionSystem::Get(profile);
++  } else {
++    bool extensions_enabled = !go_off_the_record;
+ #if BUILDFLAG(IS_CHROMEOS)
+   bool are_extensions_allowed_for_profile =
+       ash::IsSigninBrowserContext(profile) ||
+@@ -1598,13 +1614,16 @@
+       ->Get(profile)
+       ->GetSupervisedUserExtensionsDelegate()
+       ->UpdateManagementPolicyRegistration();
++  }
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ 
+-  // Ensure NavigationPredictorKeyedService is started.
+-  NavigationPredictorKeyedServiceFactory::GetForProfile(profile);
+-
+-  // Ensure PreloadingModelKeyedService is started.
+-  PreloadingModelKeyedServiceFactory::GetForProfile(profile);
++  if (!base::alloy::IsNoDiskProcess()) {
++    // Ensure NavigationPredictorKeyedService is started.
++    NavigationPredictorKeyedServiceFactory::GetForProfile(profile);
++
++    // Ensure PreloadingModelKeyedService is started.
++    PreloadingModelKeyedServiceFactory::GetForProfile(profile);
++  }
+ 
+   IdentityManagerFactory::GetForProfile(profile)->OnNetworkInitialized();
+   AccountReconcilorFactory::GetForProfile(profile);
+@@ -1613,8 +1632,9 @@
+   SigninManagerAndroidFactory::GetForProfile(profile);
+ #endif
+ 
++  if (!base::alloy::IsNoDiskProcess()) {
+ #if BUILDFLAG(ENABLE_BOUND_SESSION_CREDENTIALS)
+-  BoundSessionCookieRefreshServiceFactory::GetForProfile(profile);
++    BoundSessionCookieRefreshServiceFactory::GetForProfile(profile);
+ #endif  // BUILDFLAG(ENABLE_BOUND_SESSION_CREDENTIALS)
+ 
+   // Initialization needs to happen after the browser context is available
+@@ -1624,6 +1644,7 @@
+ #if BUILDFLAG(IS_WIN) && BUILDFLAG(ENABLE_DICE_SUPPORT)
+   signin_util::SigninWithCredentialProviderIfPossible(profile);
+ #endif
++  }
+ 
+   // TODO(accessibility): Dynamically create AccessibilityLabelsService when
+   // needed and destroy it when no longer needed.
+@@ -1638,6 +1659,9 @@
+ }
+ 
+ void ProfileManager::DoFinalInitLogging(Profile* profile) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   TRACE_EVENT0("browser", "ProfileManager::DoFinalInitLogging");
+   base::UmaHistogramCounts100("Profile.NumberOfProfilesAtProfileInit",
+                               GetNumberOfProfiles());
+@@ -1772,6 +1796,10 @@
+ 
+   DCHECK(profiles_info_.contains(profile_dir));
+ 
++  if (base::alloy::IsNoDiskProcess()) {
++    profiles_info_.erase(profile_dir);
++    return;
++  }
+   bool ephemeral =
+       IsRegisteredAsEphemeral(&GetProfileAttributesStorage(), profile_dir);
+   bool marked_for_deletion = IsProfileDirectoryMarkedForDeletion(profile_dir);
+@@ -1994,7 +2022,7 @@
+   ProfileInfo* info_raw = info.get();
+   profiles_info_.insert(
+       std::make_pair(profile_ptr->GetPath(), std::move(info)));
+-  if (profile_ptr->IsRegularProfile())
++  if (!base::alloy::IsNoDiskProcess() && profile_ptr->IsRegularProfile())
+     ever_loaded_profiles_.insert(profile_ptr->GetPath());
+   return info_raw;
+ }
+@@ -2011,7 +2039,7 @@
+   auto info = ProfileInfo::FromUnownedProfile(profile);
+   ProfileInfo* info_raw = info.get();
+   profiles_info_.insert(std::make_pair(path, std::move(info)));
+-  if (profile->IsRegularProfile())
++  if (!base::alloy::IsNoDiskProcess() && profile->IsRegularProfile())
+     ever_loaded_profiles_.insert(path);
+   return info_raw;
+ }
+@@ -2023,6 +2051,9 @@
+ }
+ 
+ void ProfileManager::AddProfileToStorage(Profile* profile) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   TRACE_EVENT0("browser", "ProfileManager::AddProfileToCache");
+   if (profile->IsGuestSession() || profile->IsSystemProfile())
+     return;
+@@ -2119,6 +2150,9 @@
+ }
+ 
+ void ProfileManager::SaveActiveProfiles() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   PrefService* local_state = g_browser_process->local_state();
+   DCHECK(local_state);
+   ScopedListPrefUpdate update(local_state, prefs::kProfilesLastActive);
+@@ -2198,6 +2232,9 @@
+ }
+ 
+ void ProfileManager::SetProfileAsLastUsed(Profile* last_active) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(IS_ANDROID)
+   // The profile may incorrectly become "active" during its destruction, caused
+   // by the UI teardown. See https://crbug.com/40686320
+@@ -2267,8 +2304,9 @@
+   DCHECK(profile);
+ 
+   if (!profile->IsOffTheRecord() &&
+-      !IsRegisteredAsEphemeral(&GetProfileAttributesStorage(),
+-                               profile->GetPath()) &&
++      (base::alloy::IsNoDiskProcess() ||
++       !IsRegisteredAsEphemeral(&GetProfileAttributesStorage(),
++                                profile->GetPath())) &&
+       browser->GetType() != BrowserWindowInterface::Type::TYPE_APP &&
+       ++browser_counts_[profile] == 1) {
+     active_profiles_.push_back(profile);
+@@ -2292,6 +2330,11 @@
+       SaveActiveProfiles();
+   }
+ 
++  if (base::alloy::IsNoDiskProcess()) {
++    // Browser counts above are runtime. Persisted-profile/guest-directory and
++    // unfinished on-exit cleanup below have no no-disk owner.
++    return;
++  }
+   Profile* const original_profile = profile->GetOriginalProfile();
+   // Do nothing if the closed window is not the last window of the same profile.
+   bool has_other_window = false;
+--- a/chrome/common/chrome_paths.cc
++++ b/chrome/common/chrome_paths.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/common/chrome_paths.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ 
+@@ -514,7 +515,8 @@
+ 
+   // TODO(bauerb): http://crbug.com/41025680
+   base::ScopedAllowBlocking allow_blocking;
+-  if (create_dir && !base::PathExists(cur) && !base::CreateDirectory(cur)) {
++  if (create_dir && !base::alloy::IsNoDiskProcess() && !base::PathExists(cur) &&
++      !base::CreateDirectory(cur)) {
+     return false;
+   }
+ 
+--- a/components/metrics/clean_exit_beacon.cc
++++ b/components/metrics/clean_exit_beacon.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/metrics/clean_exit_beacon.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -228,6 +229,14 @@
+ 
+ void CleanExitBeacon::Initialize() {
+   DCHECK(!initialized_);
++  if (base::alloy::IsNoDiskProcess()) {
++    // Local State is independently memory-backed. No previous installation
++    // beacon or crash-streak file is an input to this process.
++    did_previous_session_exit_cleanly_ =
++        local_state_->GetBoolean(prefs::kStabilityExitedCleanly);
++    initialized_ = true;
++    return;
++  }
+ 
+   if (!user_data_dir_.empty()) {
+     // Platforms that pass an empty path do so deliberately. They should not
+@@ -280,6 +289,12 @@
+ void CleanExitBeacon::WriteBeaconValue(bool exited_cleanly,
+                                        bool is_extended_safe_mode) {
+   DCHECK(initialized_);
++  if (base::alloy::IsNoDiskProcess()) {
++    UpdateLastLiveTimestamp();
++    local_state_->SetBoolean(prefs::kStabilityExitedCleanly, exited_cleanly);
++    has_exited_cleanly_ = exited_cleanly;
++    return;
++  }
+   if (g_skip_clean_shutdown_steps)
+     return;
+ 
+--- a/extensions/browser/extension_prefs.cc
++++ b/extensions/browser/extension_prefs.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "extensions/browser/extension_prefs.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "content/public/browser/browser_context.h"
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+@@ -2200,7 +2201,9 @@
+       extension_pref_value_map_(extension_pref_value_map),
+       clock_(clock),
+       extensions_disabled_(extensions_disabled) {
+-  MakePathsRelative();
++  if (!alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_)) {
++    MakePathsRelative();
++  }
+ 
+   // Ensure that any early observers are watching before prefs are initialized.
+   for (auto* observer : early_observers)
+@@ -2208,17 +2211,19 @@
+ 
+   InitPrefStore();
+ 
+-  MigrateDeprecatedDisableReasons();
+-
+-  CleanUpCdpInstalledExtensions();
+-
+-  CleanUpDuplicateSubEventFilters();
+-
+-  CleanUpEmptyFilteredEventLists();
++  if (!alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_)) {
++    MigrateDeprecatedDisableReasons();
++
++    CleanUpCdpInstalledExtensions();
++
++    CleanUpDuplicateSubEventFilters();
++
++    CleanUpEmptyFilteredEventLists();
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   ApplyPendingUpdates();
+ #endif
++  }
+ }
+ 
+ AppSorting* ExtensionPrefs::app_sorting() const {

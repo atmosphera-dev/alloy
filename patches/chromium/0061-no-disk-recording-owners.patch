@@ -1,0 +1,142 @@
+--- a/components/metrics/persistent_histograms.cc
++++ b/components/metrics/persistent_histograms.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/metrics/persistent_histograms.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <string_view>
+ 
+@@ -254,6 +255,9 @@
+ 
+ base::FilePath GetPersistentHistogramsSpareFilePath(
+     const base::FilePath& metrics_dir) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {};
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return base::FilePath();
+ #else
+@@ -264,6 +268,9 @@
+ void InstantiatePersistentHistograms(const base::FilePath& metrics_dir,
+                                      bool persistent_histograms_enabled,
+                                      std::string_view storage) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return;
+ #else
+@@ -283,6 +290,9 @@
+ }
+ 
+ void PersistentHistogramsCleanup(const base::FilePath& metrics_dir) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return;
+ #else
+@@ -316,6 +326,9 @@
+ 
+ void InstantiatePersistentHistogramsWithFeaturesAndCleanup(
+     const base::FilePath& metrics_dir) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return;
+ #else
+@@ -327,6 +340,9 @@
+ }
+ 
+ bool DeferBrowserMetrics(const base::FilePath& metrics_dir) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   return false;
+ #else
+--- a/components/segmentation_platform/internal/database/ukm_database_backend.cc
++++ b/components/segmentation_platform/internal/database/ukm_database_backend.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/segmentation_platform/internal/database/ukm_database_backend.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <vector>
+ 
+@@ -131,6 +132,10 @@
+ }
+ 
+ bool UkmDatabaseBackend::InitDatabase() {
++  if (base::alloy::IsNoDiskProcess()) {
++    status_ = Status::INIT_FAILED;
++    return false;
++  }
+ #if !BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
+   status_ = Status::INIT_FAILED;
+   return false;
+--- a/content/browser/network_sandbox.cc
++++ b/content/browser/network_sandbox.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/network_sandbox.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include "base/dcheck_is_on.h"
+ #include "base/files/file_util.h"
+@@ -376,6 +377,10 @@
+     const SandboxParameters& sandbox_params,
+     network::mojom::NetworkContextParams* params) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
++  if (base::alloy::IsNoDiskProcess()) {
++    params->alloy_guard_log_path.clear();
++    params->alloy_guard_log = base::File();
++  }
+   if (!params->alloy_guard_log_path.empty()) {
+     CHECK(base::CreateDirectory(params->alloy_guard_log_path.DirName()));
+     params->alloy_guard_log =
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/network_context.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -750,9 +751,11 @@
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+-    CHECK(params_->alloy_guard_log.IsValid())
+-        << "Alloy requires a browser-opened denial log";
+-    alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
++    if (!base::alloy::IsNoDiskProcess()) {
++      CHECK(params_->alloy_guard_log.IsValid())
++          << "Alloy requires a browser-opened denial log";
++      alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
++    }
+ #endif
+     alloy_guard_->SetOptions(
+         {params_->alloy_favicons_enabled, params_->alloy_open_search_enabled,
+@@ -971,9 +974,11 @@
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+-    CHECK(params_->alloy_guard_log.IsValid())
+-        << "Alloy requires a browser-opened denial log";
+-    alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
++    if (!base::alloy::IsNoDiskProcess()) {
++      CHECK(params_->alloy_guard_log.IsValid())
++          << "Alloy requires a browser-opened denial log";
++      alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
++    }
+ #endif
+     alloy_guard_->SetOptions(
+         {params_->alloy_favicons_enabled, params_->alloy_open_search_enabled,

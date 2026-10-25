@@ -63,6 +63,17 @@ RecordCapability RequestContextPolicy::StorageCapability(
   return storage_issuer_.Issue(purpose);
 }
 
+// static
+bool RequestContextPolicy::IsNoDisk(
+    const base::SupportsUserData& browser_context) {
+  const auto* policy = Get(browser_context);
+  if (!policy) {
+    return false;
+  }
+  const auto mode = policy->StorageCapability(StorePurpose::kDomStorage).mode();
+  return mode == StorageMode::kStateless || mode == StorageMode::kMemory;
+}
+
 void RequestContextPolicy::Revoke() {
   storage_issuer_.Revoke();
 }

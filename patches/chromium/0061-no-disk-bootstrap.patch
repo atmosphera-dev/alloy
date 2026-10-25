@@ -1,0 +1,248 @@
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -245,4 +245,6 @@
+ component("base") {
+   sources = [
++    "alloy/storage_policy.cc",
++    "alloy/storage_policy.h",
+     "allocator/allocator_check.cc",
+     "allocator/allocator_check.h",
+--- a/chrome/browser/profiles/profile_impl.cc
++++ b/chrome/browser/profiles/profile_impl.cc
+@@ -5,2 +5,8 @@
+ #include "chrome/browser/profiles/profile_impl.h"
++
++#include "base/alloy/storage_policy.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "chrome/browser/prefs/chrome_command_line_pref_store.h"
++#include "components/prefs/in_memory_pref_store.h"
++#include "components/sync_preferences/pref_service_syncable_factory.h"
+ 
+@@ -325,2 +329,5 @@
+   // Create the profile directory synchronously otherwise we would need to
++  if (base::alloy::IsNoDiskProcess()) {
++    return base::Time::Now();
++  }
+   // sequence every otherwise independent I/O operation inside the profile
+@@ -386,2 +393,3 @@
+-  switch (create_mode) {
++  if (!base::alloy::IsNoDiskProcess()) {
++    switch (create_mode) {
+     case CreateMode::kAsynchronous:
+@@ -404,4 +412,5 @@
+       break;
+   }
++  }
+ 
+   std::unique_ptr<Profile> profile = base::WrapUnique(new ProfileImpl(
+@@ -497,2 +506,6 @@
+   TRACE_EVENT0("browser,startup", "ProfileImpl::ctor");
++  if (base::alloy::IsNoDiskProcess()) {
++    alloy::site_records::RequestContextPolicy::AttachStateless(
++        *this, alloy::site_records::NetworkState::kKeep);
++  }
+   DCHECK(!path.empty()) << "Using an empty path will attempt to write "
+@@ -625,2 +638,5 @@
+-  key_ = std::make_unique<ProfileKey>(GetPath());
++  key_ = std::make_unique<ProfileKey>(
++      GetPath(), nullptr, base::alloy::IsNoDiskProcess()
++          ? std::make_optional(alloy::site_records::StorageMode::kStateless)
++          : std::nullopt);
+   pref_registry_ = base::MakeRefCounted<user_prefs::PrefRegistrySyncable>();
+@@ -635,2 +651,26 @@
+   // If we are creating the profile synchronously, then we should load the
++  if (base::alloy::IsNoDiskProcess()) {
++    // The primary profile is only a native lifecycle/bootstrap owner. Keep its
++    // identity intact, but give it no persistent state or storage admission.
++    // No disk pref store, cloud-policy cache or pref migration is constructed.
++    profile_policy_connector_ =
++        policy::CreateProfilePolicyConnectorForBrowserContext(
++            schema_registry_service_->registry(), nullptr, nullptr, connector,
++            !async_prefs, this);
++    ::RegisterProfilePrefs(false, g_browser_process->GetApplicationLocale(),
++                           pref_registry_.get());
++    sync_preferences::PrefServiceSyncableFactory factory;
++    factory.set_user_prefs(base::MakeRefCounted<InMemoryPrefStore>());
++    factory.SetAccountPrefStore(base::MakeRefCounted<InMemoryPrefStore>());
++    factory.set_command_line_prefs(
++        base::MakeRefCounted<ChromeCommandLinePrefStore>(
++            base::CommandLine::ForCurrentProcess()));
++    factory.SetManagedPolicies(profile_policy_connector_->policy_service(),
++                               connector);
++    factory.SetRecommendedPolicies(profile_policy_connector_->policy_service(),
++                                   connector);
++    prefs_ = factory.CreateSyncable(pref_registry_);
++    key_->SetPrefs(prefs_.get());
++    return;
++  }
+   // policy data immediately.
+--- a/chrome/browser/metrics/chrome_feature_list_creator.cc
++++ b/chrome/browser/metrics/chrome_feature_list_creator.cc
+@@ -5,2 +5,5 @@
+ #include "chrome/browser/metrics/chrome_feature_list_creator.h"
++
++#include "base/alloy/storage_policy.h"
++#include "components/prefs/in_memory_pref_store.h"
+ 
+@@ -131,2 +134,10 @@
+   // ManagementService needs Local State but creating local state needs
++  if (base::alloy::IsNoDiskProcess()) {
++    local_state_ = chrome_prefs::CreateLocalState(
++        base::FilePath(), base::MakeRefCounted<InMemoryPrefStore>(),
++        browser_policy_connector_->GetPolicyService(), std::move(pref_registry),
++        browser_policy_connector_.get());
++    return;
++  }
++
+   // ManagementService, instantiate the underlying PrefStore early and share it
+--- a/chrome/browser/chrome_process_singleton.cc
++++ b/chrome/browser/chrome_process_singleton.cc
+@@ -5,2 +5,3 @@
+ #include "chrome/browser/chrome_process_singleton.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -38,2 +39,6 @@
+   CHECK(!is_singleton_instance_);
++  if (base::alloy::IsNoDiskProcess()) {
++    // No persistent profile exists to lock or forward another process into.
++    return ProcessSingleton::PROCESS_NONE;
++  }
+   ProcessSingleton::NotifyResult result =
+@@ -48,2 +53,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   process_singleton_.StartWatching();
+ }
+--- a/chrome/browser/first_run/first_run.cc
++++ b/chrome/browser/first_run/first_run.cc
+@@ -5,2 +5,3 @@
+ #include "chrome/browser/first_run/first_run.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -353,2 +354,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+   if (g_first_run == internal::FIRST_RUN_UNKNOWN) {
+     const base::CommandLine* command_line =
+@@ -371,2 +375,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   if (IsChromeFirstRun()) {
+     auto sentinel_creation_result = CreateSentinel();
+@@ -383,2 +390,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return base::Time();
++  }
+   if (g_cached_sentinel_creation_time.is_null())
+     g_cached_sentinel_creation_time = ReadFirstRunSentinelCreationTime();
+--- a/components/component_updater/component_installer.cc
++++ b/components/component_updater/component_installer.cc
+@@ -5,2 +5,3 @@
+ #include "components/component_updater/component_installer.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -481,2 +482,7 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    // StartRegistration still discovers immutable release assets. A mutable
++    // user installation, including an empty component-ID directory, is not one.
++    return std::nullopt;
++  }
+   base::FilePath base_component_dir;
+   if (!base::PathService::Get(DIR_COMPONENT_USER, &base_component_dir)) {
+--- a/content/browser/gpu/gpu_process_host.cc
++++ b/content/browser/gpu/gpu_process_host.cc
+@@ -5,2 +5,3 @@
+ #include "content/browser/gpu/gpu_process_host.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -575,2 +576,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   if ((features::SkiaGraphiteUsesPersistentCache() ||
+        base::FeatureList::IsEnabled(features::kGpuPersistentCache)) &&
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -5,2 +5,3 @@
+ #include "chrome/app/chrome_main_delegate.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -739,2 +740,5 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   logging::OldFileDeletionState file_state = logging::APPEND_TO_OLD_LOG_FILE;
+   if (process_type.empty()) {
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -5,2 +5,3 @@
+ #include "chrome/browser/chrome_browser_main.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -1354,2 +1355,3 @@
+-  if (!base::PathExists(user_native_messaging_dir)) {
++  if (!base::alloy::IsNoDiskProcess() &&
++      !base::PathExists(user_native_messaging_dir)) {
+     base::CreateDirectory(user_native_messaging_dir);
+--- a/components/variations/seed_reader_writer.cc
++++ b/components/variations/seed_reader_writer.cc
+@@ -5,2 +5,3 @@
+ #include "components/variations/seed_reader_writer.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -427,2 +428,7 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    // Local State is an independent memory store in this process. Neither
++    // regular nor safe seed files may be opened, migrated or written.
++    return;
++  }
+   if (!seed_file_dir.empty()) {
+     seed_writer_ = std::make_unique<base::ImportantFileWriter>(
+--- a/content/browser/blob_storage/chrome_blob_storage_context.cc
++++ b/content/browser/blob_storage/chrome_blob_storage_context.cc
+@@ -5,2 +5,3 @@
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -128,2 +129,3 @@
+-    if (!context->IsOffTheRecord() && io_thread_valid) {
++    if (!context->IsOffTheRecord() && !base::alloy::IsNoDiskProcess() &&
++        io_thread_valid) {
+       file_task_runner = base::ThreadPool::CreateTaskRunner(
+--- a/content/public/browser/storage_partition_config.cc
++++ b/content/public/browser/storage_partition_config.cc
+@@ -5,2 +5,3 @@
+ #include "content/public/browser/storage_partition_config.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -48,2 +49,2 @@
+-      in_memory_(in_memory) {}
++      in_memory_(in_memory || base::alloy::IsNoDiskProcess()) {}
+ 
+--- a/chrome/browser/profiles/profile_selections.cc
++++ b/chrome/browser/profiles/profile_selections.cc
+@@ -128,4 +128,9 @@
+   CHECK(profile);
+ 
++  // Service eligibility follows immutable storage mode as well as native OTR
++  // identity. The bootstrap uses the same private graph as a stateless OTR;
++  // this never changes Profile identity or parent/lifecycle ownership.
++  const bool private_context = profile->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(*profile);
+   ProfileSelection selection = GetProfileSelection(profile);
+   switch (selection) {
+@@ -133,4 +137,4 @@
+       return nullptr;
+     case ProfileSelection::kOriginalOnly:
+-      return profile->IsOffTheRecord() ? nullptr : profile;
++      return private_context ? nullptr : profile;
+     case ProfileSelection::kOwnInstance:
+@@ -146,4 +150,4 @@
+     case ProfileSelection::kOffTheRecordOnly:
+-      return profile->IsOffTheRecord() ? profile : nullptr;
++      return private_context ? profile : nullptr;
+   }
+ }

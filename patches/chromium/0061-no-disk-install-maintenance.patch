@@ -1,0 +1,43 @@
+--- a/chrome/browser/downgrade/downgrade_manager.cc
++++ b/chrome/browser/downgrade/downgrade_manager.cc
+@@ -5,2 +5,3 @@
+ #include "chrome/browser/downgrade/downgrade_manager.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -160,3 +161,6 @@
+     DowngradeManagerDelegate* delegate) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+   DCHECK_EQ(type_, Type::kNone);
+   DCHECK(!user_data_dir.empty());
+@@ -230,3 +234,6 @@
+ void DowngradeManager::UpdateLastVersion(const base::FilePath& user_data_dir) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   DCHECK(!user_data_dir.empty());
+   DCHECK_NE(type_, Type::kAdministrativeWipe);
+@@ -239,3 +246,6 @@
+     DowngradeManagerDelegate* delegate) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   DCHECK(!user_data_dir.empty());
+   // IWYU note: base/location.h and base/task/task_traits.h are guaranteed to be
+@@ -254,3 +264,6 @@
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   DCHECK(type_ == Type::kAdministrativeWipe || type_ == Type::kSnapshotRestore);
+   DCHECK(!user_data_dir.empty());
+ 
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -640,3 +640,6 @@
+     const base::CommandLine& command_line,
+     const Profile* const profile) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+ #if BUILDFLAG(IS_CHROMEOS)

@@ -60,9 +60,26 @@ test("alloy_site_records_unittests") {
   ]
 }
 
+test("alloy_no_disk_owner_unittests") {
+  sources = [ "no_disk_owner_unittest.cc", "no_disk_test_main.cc" ]
+  deps = [
+    "//base",
+    "//base/test:test_support",
+    "//brave/components/brave_shields/core/browser",
+    "//brave/components/brave_shields/core/common",
+    "//components/value_store",
+    "//components/safe_browsing/core/browser/db:sb_store",
+    "//crypto",
+    "//mojo/core/embedder",
+    "//net:test_support",
+    "//testing/gtest",
+  ]
+}
+
 test("alloy_native_grants_unittests") {
   configs += [ "//cef/libcef/features:config" ]
   sources = [
+    "bootstrap_factory_unittest.cc",
     "document_native_grants_unittest.cc",
     "extension_storage_admission_unittest.cc",
     "native_audit_consumers_unittest.cc",
@@ -75,6 +92,9 @@ test("alloy_native_grants_unittests") {
     "//cef:libcef_test_support",
     "//base/test:test_support",
     "//chrome/browser/autofill",
+    "//chrome/browser/background_fetch",
+    "//chrome/browser/background_sync",
+    "//chrome/browser/content_index",
     "//brave/components/url_sanitizer/core/browser",
     "//brave/components/request_otr/browser",
     "//chrome/browser",

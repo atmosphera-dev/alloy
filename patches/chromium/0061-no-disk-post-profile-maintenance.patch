@@ -1,0 +1,32 @@
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -1623,6 +1623,13 @@
+   for (auto& chrome_extra_part : chrome_extra_parts_) {
+     chrome_extra_part->PostProfileInit(profile, is_initial_profile);
+   }
+ 
++  if (base::alloy::IsNoDiskProcess()) {
++    // Native extra-part runtime/CEF context setup above is required. The
++    // persisted-profile cleanup, component installation and metrics below
++    // have no owner in a process with no persisted profile.
++    return;
++  }
++
+ #if BUILDFLAG(IS_WIN)
+   // Verify that the profile is not on a network share and if so prepare to show
+@@ -1757,9 +1763,11 @@
+   // Set up a task to delete old WebRTC log files for all profiles. Use a delay
+   // to reduce the impact on startup time.
+-  content::GetUIThreadTaskRunner({})->PostDelayedTask(
+-      FROM_HERE,
+-      base::BindOnce(&WebRtcLogUtil::DeleteOldWebRtcLogFilesForAllProfiles),
+-      base::Minutes(1));
++  if (!base::alloy::IsNoDiskProcess()) {
++    content::GetUIThreadTaskRunner({})->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&WebRtcLogUtil::DeleteOldWebRtcLogFilesForAllProfiles),
++        base::Minutes(1));
++  }
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   if (base::FeatureList::IsEnabled(features::kWebUsb)) {

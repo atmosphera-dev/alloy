@@ -1,0 +1,125 @@
+--- a/libcef/browser/chrome/chrome_browser_context.cc
++++ b/libcef/browser/chrome/chrome_browser_context.cc
+@@ -64,7 +64,8 @@
+ }
+ 
+ content::BrowserContext* ChromeBrowserContext::AsBrowserContext() {
+-  CHECK(!destroyed_);
++  // Manager enumeration can outlive native-profile detachment. A detached
++  // binding is absent, never a stale native context or a new association.
+   return profile_;
+ }
+ 
+@@ -138,17 +139,19 @@
+   // by ProfileManager).
+   profile_keep_alive_.reset();
+ 
+-  // |g_browser_process| may be nullptr during shutdown.
+-  if (g_browser_process) {
+-    if (should_destroy_) {
+-      net_service::ProxyURLLoaderFactory::ClearProxiesForBrowserContextAsync(
+-          profile_);
+-
+-      GetPrimaryUserProfile()->DestroyOffTheRecordProfile(
+-          profile_.ExtractAsDangling());
+-    } else if (profile_) {
+-      OnProfileWillBeDestroyed(profile_);
+-    }
++  // Releasing the keepalive may have synchronously destroyed the observed
++  // profile. A cleared binding must never be dereferenced by a late global RCI.
++  if (!profile_) {
++    return;
++  }
++  Profile* profile = profile_;
++  const bool owned = should_destroy_;
++  Profile* parent = owned ? profile->GetOriginalProfile() : nullptr;
++  // Detach before native destruction, so self-initiated and external teardown
++  // use the same revocation/observation contract without a dangling callback.
++  OnProfileWillBeDestroyed(profile);
++  if (owned) {
++    parent->DestroyOffTheRecordProfile(profile);
+   }
+ }
+ 
+@@ -176,12 +179,13 @@
+     otr_profile = static_cast<OffTheRecordProfileImpl*>(profile_);
+     status = CreateStatus::kInitialized;
+     should_destroy_ = true;
++    profile_observation_.Observe(profile_);
+   } else if (profile && !profile_) {
+     // May be CREATE_STATUS_CREATED or CREATE_STATUS_INITIALIZED since
+     // *CREATED isn't always sent for a disk-based profile that already
+     // exists.
+     profile_ = profile;
+-    profile_->AddObserver(this);
++    profile_observation_.Observe(profile_);
+     if (!profile_->IsOffTheRecord()) {
+       // The Profile will only be destroyed if the total KeepAlive refcount is
+       // 0 in ProfileManager::UnloadProfileIfNoKeepAlive. This requires a value
+@@ -233,11 +237,17 @@
+ 
+ void ChromeBrowserContext::OnProfileWillBeDestroyed(Profile* profile) {
+   CHECK_EQ(profile_, profile);
+-  profile_->RemoveObserver(this);
++  if (auto* policy =
++          alloy::site_records::RequestContextPolicy::Get(*profile_)) {
++    policy->Revoke();
++  }
++  profile_observation_.Reset();
+ 
+   net_service::ProxyURLLoaderFactory::ClearProxiesForBrowserContextAsync(
+       profile_);
+ 
++  InvalidateContextGetters();
+   profile_ = nullptr;
++  should_destroy_ = false;
+   destroyed_ = true;
+ }
+--- a/libcef/browser/chrome/chrome_browser_context.h
++++ b/libcef/browser/chrome/chrome_browser_context.h
+@@ -6,9 +6,10 @@
+ #define CEF_LIBCEF_BROWSER_CHROME_CHROME_BROWSER_CONTEXT_H_
+ #pragma once
+ 
+-#include "brave/alloy/site_records/storage_mode.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "brave/alloy/site_records/storage_mode.h"
+ #include "cef/libcef/browser/browser_context.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile_observer.h"
+@@ -62,6 +63,7 @@
+   bool should_destroy_ = false;
+ 
+   bool destroyed_ = false;
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
+   std::unique_ptr<ScopedProfileKeepAlive> profile_keep_alive_;
+ 
+   std::vector<base::OnceClosure> init_callbacks_;
+--- a/libcef/browser/browser_context.h
++++ b/libcef/browser/browser_context.h
+@@ -202,6 +202,10 @@
+   // Will be called immediately before this object is deleted.
+   virtual void Shutdown();
+ 
++  // Native lifetime can end before the last request-context reference. Stop
++  // asynchronous borrowers from resolving an already detached native binding.
++  void InvalidateContextGetters();
++
+   // Members initialized during construction or Initialize() are safe to access
+   // from any thread.
+   const CefRequestContextSettings settings_;
+--- a/libcef/browser/browser_context.cc
++++ b/libcef/browser/browser_context.cc
+@@ -227,6 +227,10 @@
+   media_router_manager_.reset();
+ 
+   // Invalidate any Getter references to this object.
++  InvalidateContextGetters();
++}
++
++void CefBrowserContext::InvalidateContextGetters() {
+   weak_ptr_factory_.InvalidateWeakPtrs();
+ }
+ 

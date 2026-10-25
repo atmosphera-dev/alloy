@@ -1,0 +1,44 @@
+--- a/components/brave_shields/core/browser/ad_block_dat_cache_manager.cc
++++ b/components/brave_shields/core/browser/ad_block_dat_cache_manager.cc
+@@ -4,6 +4,7 @@
+ // You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ #include "brave/components/brave_shields/core/browser/ad_block_dat_cache_manager.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ #include <string_view>
+@@ -58,6 +59,9 @@
+ void AdBlockDATCacheManager::WriteDATFile(bool is_default_engine,
+                                           DATFileDataBuffer dat) {
+   CHECK(base::FeatureList::IsEnabled(features::kAdblockDATCache));
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   task_runner_->PostTask(
+       FROM_HERE,
+       base::BindOnce(
+@@ -74,6 +78,9 @@
+ }
+ 
+ void AdBlockDATCacheManager::DropDATCache() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   task_runner_->PostTask(FROM_HERE,
+                          base::BindOnce(
+                              [](base::FilePath cache_dir) {
+@@ -86,6 +93,13 @@
+     base::OnceCallback<void(std::optional<DATFileDataBuffer>,
+                             std::optional<DATFileDataBuffer>)> on_complete) {
+   CHECK(base::FeatureList::IsEnabled(features::kAdblockDATCache));
++  if (base::alloy::IsNoDiskProcess()) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(std::move(on_complete), std::nullopt, std::nullopt));
++    return;
++  }
++
+   task_runner_->PostTaskAndReplyWithResult(
+       FROM_HERE, base::BindOnce(&ReadCachedDATFilesFromDisk, cache_dir_),
+       base::BindOnce(

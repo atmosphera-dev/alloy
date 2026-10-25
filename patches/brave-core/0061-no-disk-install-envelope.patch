@@ -1,0 +1,36 @@
+--- a/app/brave_main_delegate.cc
++++ b/app/brave_main_delegate.cc
+@@ -5,2 +5,3 @@
+ #include "brave/app/brave_main_delegate.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -162,10 +163,13 @@
+ #endif  // BUILDFLAG(IS_MAC)
++  const auto user_native_messaging_dir =
++      chrome_user_data_dir.Append(FILE_PATH_LITERAL("NativeMessagingHosts"));
++  const bool create = !base::alloy::IsNoDiskProcess();
+   base::PathService::OverrideAndCreateIfNeeded(
+       chrome::DIR_USER_NATIVE_MESSAGING,
+-      chrome_user_data_dir.Append(FILE_PATH_LITERAL("NativeMessagingHosts")),
+-      false, true);
++      user_native_messaging_dir, user_native_messaging_dir.IsAbsolute(), create);
+   base::PathService::OverrideAndCreateIfNeeded(
+-      chrome::DIR_NATIVE_MESSAGING, native_messaging_dir, false, true);
++      chrome::DIR_NATIVE_MESSAGING, native_messaging_dir,
++      native_messaging_dir.IsAbsolute(), create);
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
+ 
+ #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
+--- a/common/brave_content_client.cc
++++ b/common/brave_content_client.cc
+@@ -6,2 +6,3 @@
+ #include "brave/common/brave_content_client.h"
++#include "base/alloy/storage_policy.h"
+ 
+@@ -44,3 +45,6 @@
+ void CreateDefaultWidevineCdmHintFile() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   base::FilePath hint_file_path;
+   CHECK(base::PathService::Get(chrome::FILE_COMPONENT_WIDEVINE_CDM_HINT,

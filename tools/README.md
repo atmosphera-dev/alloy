@@ -308,3 +308,63 @@ Preferences/Secure Preferences, and HttpServerProperties' unconditional
 destructor write to Network Persistent State) are reported after it. Item 3's
 no-disk/bootstrap check is **absolute zero**
 when only stateless/memory contexts exist, not this pre-context baseline.
+
+## Absolute-zero kernel observer (NUC only)
+
+`profile_fs_observer.py` provides a notification-only kernel filesystem collector
+for the no-disk fixtures. The controller starts it with `sudo -n`, waits for its
+ready receipt **before native exec**, and stops it only after native consumers
+and descendants have exited. Closing the observer releases its marks; it changes
+no permissions, mount, audit, sysctl or system configuration.
+
+The collector uses `FAN_MARK_FILESYSTEM` with `FAN_CREATE | FAN_MODIFY |
+FAN_MOVED_TO | FAN_DELETE | FAN_ATTRIB | FAN_ONDIR` and
+`FAN_REPORT_DFID_NAME | FAN_REPORT_FID | FAN_REPORT_PIDFD`. Filesystem marks cover
+all mount aliases, including paths outside the CEF/XDG roots. On the dedicated
+NUC these include the workspace/root filesystem, `/dev/shm`, `/tmp`, `/run`, the
+user runtime tmpfs and devtmpfs. Mount identities and each coverage decision are
+recorded. No test workload writes to `/tmp`.
+
+Kernel control interfaces are identified separately from ordinary storage
+filesystems. The NUC's unsupported hugetlbfs must have an empty root owned by
+root with no builder/ACL-mask write permission; its permission/entry metadata
+must remain unchanged. A writable or changed unsupported filesystem fails
+coverage. The collector refuses changed mount coverage, queue overflow,
+malformed/version-mismatched data, unsupported information records and required
+mark failures.
+
+The caller supplies completed native process accounting, including forks and
+detached descendants. Any attributed native mutation fails no-disk verification;
+an event whose process cannot be attributed also fails. Live identities are
+checked against kernel pidfds. Seeded parent files additionally get per-inode
+`FAN_OPEN | FAN_ACCESS` marks, so actual parent-state intake fails independently
+of the diagnostic syscall decoder. Native pressure controls correlate real spill
+files with the kernel's opaque file handles (`name_to_handle_at`).
+
+On the NUC's kernel, `PIDFD_GET_INFO` with `PIDFD_INFO_EXIT` retains a valid
+cgroup identity after reaping. This allows attribution to a different,
+pre-existing workload even when its `/proc` entry has disappeared. Returned
+validity flags are checked; the controller's group and unknown groups do not
+qualify. Native task IDs/ancestry always take precedence, so a native mutation
+cannot be hidden by a different cgroup value. This identity query changes no
+cgroup membership or configuration.
+
+Native stdout/stderr must be pipes: the controller, not the browser process,
+owns evidence-file writes. Auxiliary tracers remain identifiable with
+`waitid(WNOWAIT)` until their last notifications are drained, then are reaped.
+`profile_test_display.py` owns an authenticated Xvfb workload separately from
+the controller/browser, so late display helpers have a kernel-identifiable
+fixture owner after reaping. It passes DISPLAY/XAUTHORITY through a pipe; the
+browser remains in the fixture's loopback-only network namespace. The display
+workload shuts down through its owned bridge, including Xvfb's normal cleanup.
+There are no log-path or cache-path exclusions. `fanotify-ready.json` preserves
+coverage and initial process identities; `fanotify-result.json` preserves raw
+events, native mutations, parent reads and attribution failures. Failed runs
+retain notifications without a passing attribution verdict.
+
+Strace remains a secondary writer-location diagnostic and process-accounting
+source. Its filesystem decoding is not the create/modify pass criterion; no
+unresolved syscall is accepted as filesystem evidence. Raw live/final root and
+seed-byte inventories, actual consumer readbacks and normal exit are additional
+gates. Fanotify does not promise mmap/msync modification notifications; the
+inventories and native backing-owner checks remain necessary alongside it.

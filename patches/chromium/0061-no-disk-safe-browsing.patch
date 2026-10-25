@@ -1,0 +1,568 @@
+--- a/chrome/browser/enterprise/reporting/extension_request/extension_request_observer_factory.cc
++++ b/chrome/browser/enterprise/reporting/extension_request/extension_request_observer_factory.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/enterprise/reporting/extension_request/extension_request_observer_factory.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+@@ -55,7 +56,8 @@
+ 
+ void ExtensionRequestObserverFactory::OnProfileAdded(Profile* profile) {
+   if (profile->IsSystemProfile() || profile->IsGuestSession() ||
+-      profile->IsOffTheRecord()) {
++      profile->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)) {
+     return;
+   }
+ 
+--- a/chrome/browser/safe_browsing/safe_browsing_service.cc
++++ b/chrome/browser/safe_browsing/safe_browsing_service.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/safe_browsing/safe_browsing_service.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <stddef.h>
+ 
+@@ -571,99 +572,110 @@
+   RefreshState();
+   UpdateMinAllowedTimeForReferrerChains(profile);
+ 
+-  std::unique_ptr<PrefChangeRegistrar> user_population_registrar =
+-      std::make_unique<PrefChangeRegistrar>();
+-  user_population_registrar->Init(pref_service);
+-  user_population_registrar->Add(
+-      prefs::kSafeBrowsingEnabled,
+-      base::BindRepeating(&ClearCachedUserPopulation, profile,
+-                          NoCachedPopulationReason::kChangeSbPref));
+-  user_population_registrar->Add(
+-      prefs::kSafeBrowsingScoutReportingEnabled,
+-      base::BindRepeating(&ClearCachedUserPopulation, profile,
+-                          NoCachedPopulationReason::kChangeSbPref));
+-  user_population_registrar->Add(
+-      prefs::kSafeBrowsingEnhanced,
+-      base::BindRepeating(&ClearCachedUserPopulation, profile,
+-                          NoCachedPopulationReason::kChangeSbPref));
+-  user_population_registrar->Add(
+-      unified_consent::prefs::kUrlKeyedAnonymizedDataCollectionEnabled,
+-      base::BindRepeating(&ClearCachedUserPopulation, profile,
+-                          NoCachedPopulationReason::kChangeMbbPref));
+-  user_population_prefs_[pref_service] = std::move(user_population_registrar);
+-
+-  // Record the current pref state for standard protection.
+-  UMA_HISTOGRAM_BOOLEAN(kSafeBrowsingEnabledHistogramName,
+-                        pref_service->GetBoolean(prefs::kSafeBrowsingEnabled));
+-  // Record the current pref state for enhanced protection. Enhanced protection
+-  // is a subset of the standard protection. Thus, |kSafeBrowsingEnabled| count
+-  // should always be more than the count of enhanced protection.
+-  UMA_HISTOGRAM_BOOLEAN("SafeBrowsing.Pref.Enhanced",
+-                        pref_service->GetBoolean(prefs::kSafeBrowsingEnhanced));
+-
+-  // Record the current enhanced protection pref state and JS Optimizer setting
+-  // for regular profiles only
+-  if (profiles::IsRegularUserProfile(profile)) {
++  const bool no_disk =
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile);
++  if (!no_disk) {
++    // Persisted population/reporting state is not private runtime
++    // initialization.
++    std::unique_ptr<PrefChangeRegistrar> user_population_registrar =
++        std::make_unique<PrefChangeRegistrar>();
++    user_population_registrar->Init(pref_service);
++    user_population_registrar->Add(
++        prefs::kSafeBrowsingEnabled,
++        base::BindRepeating(&ClearCachedUserPopulation, profile,
++                            NoCachedPopulationReason::kChangeSbPref));
++    user_population_registrar->Add(
++        prefs::kSafeBrowsingScoutReportingEnabled,
++        base::BindRepeating(&ClearCachedUserPopulation, profile,
++                            NoCachedPopulationReason::kChangeSbPref));
++    user_population_registrar->Add(
++        prefs::kSafeBrowsingEnhanced,
++        base::BindRepeating(&ClearCachedUserPopulation, profile,
++                            NoCachedPopulationReason::kChangeSbPref));
++    user_population_registrar->Add(
++        unified_consent::prefs::kUrlKeyedAnonymizedDataCollectionEnabled,
++        base::BindRepeating(&ClearCachedUserPopulation, profile,
++                            NoCachedPopulationReason::kChangeMbbPref));
++    user_population_prefs_[pref_service] = std::move(user_population_registrar);
++
++    // Record the current pref state for standard protection.
+     UMA_HISTOGRAM_BOOLEAN(
+-        "SafeBrowsing.Pref.Enhanced.RegularProfile",
++        kSafeBrowsingEnabledHistogramName,
++        pref_service->GetBoolean(prefs::kSafeBrowsingEnabled));
++    // Record the current pref state for enhanced protection. Enhanced
++    // protection is a subset of the standard protection. Thus,
++    // |kSafeBrowsingEnabled| count should always be more than the count of
++    // enhanced protection.
++    UMA_HISTOGRAM_BOOLEAN(
++        "SafeBrowsing.Pref.Enhanced",
+         pref_service->GetBoolean(prefs::kSafeBrowsingEnhanced));
+-    UMA_HISTOGRAM_ENUMERATION(
+-        "SafeBrowsing.Pref.JsOptimizerSetting",
+-        site_protection::ComputeDefaultJavascriptOptimizerSetting(profile));
+-  }
+-
+-  // Extended Reporting metrics are handled together elsewhere.
+-  RecordExtendedReportingMetrics(*pref_service);
+-
+-  // TODO(crbug.com/339468572): Set the new pref value in iOS and WebView
+-  // For users in the extended reporting deprecation experiment group, save the
+-  // extended reporting preference value.
+-  if (base::FeatureList::IsEnabled(kExtendedReportingRemovePrefDependency)) {
+-    pref_service->SetBoolean(
+-        prefs::kSafeBrowsingScoutReportingEnabledWhenDeprecated,
+-        pref_service->GetBoolean(prefs::kSafeBrowsingScoutReportingEnabled));
+-  } else {
+-    // Set the pref value to false as this feature is not deprecated when the
+-    // feature flag is off.
+-    pref_service->SetBoolean(
+-        prefs::kSafeBrowsingScoutReportingEnabledWhenDeprecated, false);
+-  }
+-
++
++    // Record the current enhanced protection pref state and JS Optimizer
++    // setting for regular profiles only
++    if (profiles::IsRegularUserProfile(profile)) {
++      UMA_HISTOGRAM_BOOLEAN(
++          "SafeBrowsing.Pref.Enhanced.RegularProfile",
++          pref_service->GetBoolean(prefs::kSafeBrowsingEnhanced));
++      UMA_HISTOGRAM_ENUMERATION(
++          "SafeBrowsing.Pref.JsOptimizerSetting",
++          site_protection::ComputeDefaultJavascriptOptimizerSetting(profile));
++    }
++
++    // Extended Reporting metrics are handled together elsewhere.
++    RecordExtendedReportingMetrics(*pref_service);
++
++    // TODO(crbug.com/339468572): Set the new pref value in iOS and WebView
++    // For users in the extended reporting deprecation experiment group, save
++    // the extended reporting preference value.
++    if (base::FeatureList::IsEnabled(kExtendedReportingRemovePrefDependency)) {
++      pref_service->SetBoolean(
++          prefs::kSafeBrowsingScoutReportingEnabledWhenDeprecated,
++          pref_service->GetBoolean(prefs::kSafeBrowsingScoutReportingEnabled));
++    } else {
++      // Set the pref value to false as this feature is not deprecated when the
++      // feature flag is off.
++      pref_service->SetBoolean(
++          prefs::kSafeBrowsingScoutReportingEnabledWhenDeprecated, false);
++    }
++  }
+   // Create pref change handler for each profile.
+   pref_change_handlers_map_[profile] =
+       std::make_unique<SafeBrowsingPrefChangeHandler>(profile);
+   bundled_settings_pref_change_handlers_map_[profile] =
+       std::make_unique<SecuritySettingsBundlePrefChangeHandler>(profile);
+ 
+-  SafeBrowsingMetricsCollectorFactory::GetForProfile(profile)->StartLogging();
++  if (!no_disk) {
++    SafeBrowsingMetricsCollectorFactory::GetForProfile(profile)->StartLogging();
++  }
+ 
+   CreateServicesForProfile(profile);
+ 
+-  // Post task to isolate enhanced-security-bundle migration from other code
+-  // which reads settings controlled by the bundle on startup. Migration should
+-  // be viewed similarly to user changing individual settings in the bundle via
+-  // chrome://settings.
+-  content::BrowserThread::GetTaskRunnerForThread(content::BrowserThread::UI)
+-      ->PostTask(FROM_HERE,
+-                 base::BindOnce(&MigrateUserToEnhancedSecurityBundleIfNeeded,
+-                                profile->GetWeakPtr()));
+-
+-  // If the user was migrated to the enhanced security bundle, show the toast.
+-  // This is separate from the above task in case the browser was killed after
+-  // the migration occurred.
+-  content::BrowserThread::GetTaskRunnerForThread(content::BrowserThread::UI)
+-      ->PostTask(FROM_HERE,
+-                 base::BindOnce(&TriggerSecuritySettingsBundleToastIfNeeded,
+-                                profile->GetWeakPtr()));
+-
+-  // Post task to isolate the automatic js-opt blocking migration from other
+-  // code that may be accessing the setting. The feature should be viewed
+-  // similarly to a user changing the setting through the settings UI.
+-  content::BrowserThread::GetTaskRunnerForThread(content::BrowserThread::UI)
+-      ->PostTask(FROM_HERE,
+-                 base::BindOnce(&MigrateUserToAutomaticJavaScriptBlocking,
+-                                profile->GetWeakPtr()));
+-
++  if (!no_disk) {
++    // Post task to isolate enhanced-security-bundle migration from other code
++    // which reads settings controlled by the bundle on startup. Migration
++    // should be viewed similarly to user changing individual settings in the
++    // bundle via chrome://settings.
++    content::BrowserThread::GetTaskRunnerForThread(content::BrowserThread::UI)
++        ->PostTask(FROM_HERE,
++                   base::BindOnce(&MigrateUserToEnhancedSecurityBundleIfNeeded,
++                                  profile->GetWeakPtr()));
++
++    // If the user was migrated to the enhanced security bundle, show the toast.
++    // This is separate from the above task in case the browser was killed after
++    // the migration occurred.
++    content::BrowserThread::GetTaskRunnerForThread(content::BrowserThread::UI)
++        ->PostTask(FROM_HERE,
++                   base::BindOnce(&TriggerSecuritySettingsBundleToastIfNeeded,
++                                  profile->GetWeakPtr()));
++
++    // Post task to isolate the automatic js-opt blocking migration from other
++    // code that may be accessing the setting. The feature should be viewed
++    // similarly to a user changing the setting through the settings UI.
++    content::BrowserThread::GetTaskRunnerForThread(content::BrowserThread::UI)
++        ->PostTask(FROM_HERE,
++                   base::BindOnce(&MigrateUserToAutomaticJavaScriptBlocking,
++                                  profile->GetWeakPtr()));
++  }
+   base::OnceClosure add_profile_tasks_completed_closure_for_testing =
+       TakeAddProfileTasksCompletedClosureForTesting();  // IN-TEST
+   if (add_profile_tasks_completed_closure_for_testing) {
+--- a/components/safe_browsing/content/browser/safe_browsing_network_context.cc
++++ b/components/safe_browsing/content/browser/safe_browsing_network_context.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/content/browser/safe_browsing_network_context.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <memory>
+ #include <utility>
+@@ -118,6 +119,10 @@
+         network_context_params_factory_.Run();
+ 
+     network_context_params->http_cache_enabled = false;
++    if (base::alloy::IsNoDiskProcess()) {
++      network_context_params->file_paths.reset();
++      return network_context_params;
++    }
+ 
+     network_context_params->file_paths =
+         network::mojom::NetworkContextFilePaths::New();
+--- a/components/safe_browsing/core/browser/db/hash_prefix_container.cc
++++ b/components/safe_browsing/core/browser/db/hash_prefix_container.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/hash_prefix_container.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ #include <string_view>
+@@ -52,8 +53,12 @@
+       path_(GetPath(store_path, extension_)),
+       prefix_size_(prefix_size),
+       buffer_size_(buffer_size),
+-      file_(path_, base::File::FLAG_CREATE_ALWAYS | base::File::FLAG_WRITE),
+-      has_error_(!file_.IsValid()),
++      memory_only_(base::alloy::IsNoDiskProcess()),
++      file_(memory_only_ ? base::File()
++                         : base::File(path_,
++                                      base::File::FLAG_CREATE_ALWAYS |
++                                          base::File::FLAG_WRITE)),
++      has_error_(!memory_only_ && !file_.IsValid()),
+       metric_prefix_(metric_prefix) {
+   if (has_error_) {
+     base::UmaHistogramExactLinear(
+@@ -80,6 +85,10 @@
+   }
+ 
+   cur_size_ += data.size();
++  if (memory_only_) {
++    buffer_.append(data);
++    return;
++  }
+ 
+   if (buffer_.size() + data.size() >= buffer_size_) {
+     Flush();
+@@ -93,6 +102,9 @@
+ }
+ 
+ bool HashPrefixContainer::BufferedFileWriter::Finish() {
++  if (memory_only_) {
++    return !has_error_ && cur_size_ % prefix_size_ == 0;
++  }
+   Flush();
+   file_.Close();
+   return !has_error_ && cur_size_ % prefix_size_ == 0;
+@@ -108,6 +120,12 @@
+ 
+ bool HashPrefixContainer::BufferedFileWriter::has_error() const {
+   return has_error_;
++}
++
++std::string HashPrefixContainer::BufferedFileWriter::TakeMemoryData() {
++  CHECK(memory_only_);
++  CHECK_EQ(cur_size_, buffer_.size());
++  return std::move(buffer_);
+ }
+ 
+ void HashPrefixContainer::BufferedFileWriter::Flush() {
+@@ -147,6 +165,9 @@
+ 
+ HashPrefixesView HashPrefixContainer::FileInfo::GetView() const {
+   CHECK(IsReadable());
++  if (memory_data_) {
++    return *memory_data_;
++  }
+   return base::as_string_view(file_.bytes());
+ }
+ 
+@@ -155,6 +176,10 @@
+                                                bool initialize_after_write,
+                                                std::string_view metric_prefix) {
+   extension_ = extension;
++  if (base::alloy::IsNoDiskProcess()) {
++    return initialize_after_write && memory_data_ &&
++           memory_data_->size() == expected_file_size;
++  }
+   // Make sure file size is correct before attempting to mmap.
+   base::FilePath path = HashPrefixContainer::GetPath(store_path_, extension);
+   std::optional<int64_t> actual_file_size = base::GetFileSize(path);
+@@ -206,6 +231,9 @@
+ 
+   FinalizedFileInfo info{.extension = writer_->extension(),
+                          .file_size = writer_->GetFileSize()};
++  if (base::alloy::IsNoDiskProcess()) {
++    memory_data_ = writer_->TakeMemoryData();
++  }
+   writer_.reset();
+   return info;
+ }
+@@ -247,7 +275,7 @@
+     size_t buffer_size,
+     const std::string& extension,
+     std::string_view metric_prefix) {
+-  CHECK(!file_.IsValid());
++  CHECK(!IsReadable());
+   if (!writer_) {
+     writer_ = std::make_unique<BufferedFileWriter>(
+         store_path_, prefix_size_, buffer_size, extension, metric_prefix);
+@@ -261,7 +289,7 @@
+ }
+ 
+ bool HashPrefixContainer::FileInfo::IsReadable() const {
+-  return file_.IsValid();
++  return memory_data_.has_value() || file_.IsValid();
+ }
+ 
+ base::FilePath HashPrefixContainer::FileInfo::GetPath() const {
+--- a/components/safe_browsing/core/browser/db/hash_prefix_container.h
++++ b/components/safe_browsing/core/browser/db/hash_prefix_container.h
+@@ -87,6 +87,9 @@
+ 
+     bool has_error() const;
+ 
++    // Moves the completed resident payload to its native FileInfo owner.
++    std::string TakeMemoryData();
++
+    private:
+     void Flush();
+     void WriteToFile(HashPrefixesView data);
+@@ -95,6 +98,7 @@
+     const base::FilePath path_;
+     const size_t prefix_size_;
+     const size_t buffer_size_;
++    const bool memory_only_;
+     size_t cur_size_ = 0;
+     base::File file_;
+     std::string buffer_;
+@@ -139,6 +143,7 @@
+     const PrefixSize prefix_size_;
+     std::string extension_;
+ 
++    std::optional<std::string> memory_data_;
+     base::MemoryMappedFile file_;
+     std::unique_ptr<BufferedFileWriter> writer_;
+   };
+--- a/components/safe_browsing/core/browser/db/hash_prefix_list.cc
++++ b/components/safe_browsing/core/browser/db/hash_prefix_list.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/hash_prefix_list.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ #include <string_view>
+@@ -187,6 +188,9 @@
+ }
+ 
+ std::vector<base::FilePath> HashPrefixList::GetPaths() const {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {};
++  }
+   std::vector<base::FilePath> paths;
+   if (file_info_ && file_info_->IsReadable()) {
+     paths.push_back(file_info_->GetPath());
+--- a/components/safe_browsing/core/browser/db/hash_prefix_map.cc
++++ b/components/safe_browsing/core/browser/db/hash_prefix_map.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/hash_prefix_map.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ #include <string_view>
+@@ -177,6 +178,9 @@
+ }
+ 
+ std::vector<base::FilePath> HashPrefixMap::GetPaths() const {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {};
++  }
+   std::vector<base::FilePath> paths;
+   for (const auto& [size, file_info] : map_) {
+     if (file_info.IsReadable()) {
+--- a/components/safe_browsing/core/browser/db/sb_database.cc
++++ b/components/safe_browsing/core/browser/db/sb_database.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/sb_database.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <memory>
+ #include <utility>
+@@ -158,7 +159,7 @@
+   CHECK(db_task_runner->RunsTasksInCurrentSequence(),
+         base::NotFatalUntil::M162);
+ 
+-  if (!base::CreateDirectory(base_path)) {
++  if (!base::alloy::IsNoDiskProcess() && !base::CreateDirectory(base_path)) {
+     return;
+   }
+ 
+@@ -191,7 +192,8 @@
+   std::unique_ptr<SBDatabase, base::OnTaskRunnerDeleter> sb_database =
+       GetDatabaseFactory()->Create(db_task_runner, std::move(store_map));
+ 
+-  if (base::FeatureList::IsEnabled(kSafeBrowsingDeleteUnusedStores)) {
++  if (!base::alloy::IsNoDiskProcess() &&
++      base::FeatureList::IsEnabled(kSafeBrowsingDeleteUnusedStores)) {
+     sb_database->DeleteUnusedStoreFiles(base_path);
+   }
+ 
+--- a/components/safe_browsing/core/browser/db/sb_store.cc
++++ b/components/safe_browsing/core/browser/db/sb_store.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/sb_store.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ #include <vector>
+@@ -464,6 +465,16 @@
+     base::FunctionRef<void()> set_file_metadata,
+     base::FunctionRef<void(const base::FilePath&)> cleanup_on_error,
+     base::FunctionRef<int64_t()> get_hash_files_size) {
++  if (base::alloy::IsNoDiskProcess()) {
++    // The native container still finalizes and validates its resident payload.
++    // No physical serialization, migration, temp file or rename is admitted.
++    SBStoreFileFormat resident_format(file_format);
++    if (!container->WriteToDisk(resident_format)) {
++      return base::unexpected(SBStoreWriteResult::kUnexpectedWriteFailure);
++    }
++    return 0;
++  }
++
+   // Attempt writing to a temporary file first and at the end, swap the files.
+   const base::FilePath new_filename = TemporaryFileForFilename(store_path);
+ 
+@@ -507,6 +518,9 @@
+ void SBStore::CleanupExtraFiles(
+     const base::FilePath& store_path,
+     const base::flat_set<base::FilePath>& paths_in_use) {
++  if (base::alloy::IsNoDiskProcess()) {
++    return;
++  }
+   // Iterate through all files that start with the store path name. All hash
+   // files will be the store path plus an extension.
+   base::FileEnumerator e(
+--- a/components/safe_browsing/core/browser/db/v4_store.cc
++++ b/components/safe_browsing/core/browser/db/v4_store.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/v4_store.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -211,6 +212,10 @@
+   // If a state already exists, don't re-initilize.
+   DCHECK(state_.empty());
+ 
++  if (base::alloy::IsNoDiskProcess()) {
++    is_new_database_ = true;
++    return;
++  }
+   StoreReadResult store_read_result = ReadFromDisk();
+   has_valid_data_ = (store_read_result == READ_SUCCESS);
+   RecordStoreReadResult(store_read_result);
+@@ -270,6 +275,9 @@
+ }
+ 
+ std::vector<base::FilePath> V4Store::GetPathsInUse() const {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {};
++  }
+   std::vector<base::FilePath> paths{store_path_};
+   for (const auto& path : hash_prefix_map_->GetPaths()) {
+     paths.push_back(path);
+--- a/components/safe_browsing/core/browser/db/v5_store.cc
++++ b/components/safe_browsing/core/browser/db/v5_store.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "components/safe_browsing/core/browser/db/v5_store.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <optional>
+ #include <utility>
+@@ -175,6 +176,10 @@
+ void V5Store::Initialize() {
+   CHECK(version_.empty());
+ 
++  if (base::alloy::IsNoDiskProcess()) {
++    is_new_database_ = true;
++    return;
++  }
+   V5StoreReadResult store_read_result = ReadFromDisk();
+   has_valid_data_ = (store_read_result == V5StoreReadResult::kReadSuccess);
+   RecordStoreReadResult(store_read_result);
+@@ -514,6 +519,9 @@
+ }
+ 
+ std::vector<base::FilePath> V5Store::GetPathsInUse() const {
++  if (base::alloy::IsNoDiskProcess()) {
++    return {};
++  }
+   std::vector<base::FilePath> paths{store_path_};
+   for (const auto& path : hash_prefix_list_->GetPaths()) {
+     paths.push_back(path);
+--- a/chrome/browser/optimization_guide/prediction/chrome_profile_download_service_tracker.cc
++++ b/chrome/browser/optimization_guide/prediction/chrome_profile_download_service_tracker.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/optimization_guide/prediction/chrome_profile_download_service_tracker.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/download/background_download_service_factory.h"
+@@ -31,7 +32,8 @@
+ 
+ void ChromeProfileDownloadServiceTracker::OnProfileAdded(Profile* profile) {
+   if (profile->IsOffTheRecord() || profile->IsSystemProfile() ||
+-      !profile->AllowsBrowserWindows()) {
++      !profile->AllowsBrowserWindows() ||
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)) {
+     return;
+   }
+   observed_profiles_.push_back(profile);

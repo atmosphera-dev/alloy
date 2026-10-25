@@ -1,0 +1,60 @@
+--- a/browser/profiles/brave_profile_manager.cc
++++ b/browser/profiles/brave_profile_manager.cc
+@@ -4,6 +4,7 @@
+ // you can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ #include "brave/browser/profiles/brave_profile_manager.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <string>
+ #include <utility>
+@@ -188,8 +189,10 @@
+   // migrate obsolete plugin prefs to temporary migration pref because otherwise
+   // they get deleteed by PrefProvider before we can migrate them in
+   // BravePrefProvider
+-  content_settings::BravePrefProvider::CopyPluginSettingsForMigration(
+-      profile->GetPrefs());
++  if (!base::alloy::IsNoDiskProcess()) {
++    content_settings::BravePrefProvider::CopyPluginSettingsForMigration(
++        profile->GetPrefs());
++  }
+ 
+ // Chromecast is enabled by default on Android.
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -232,10 +235,12 @@
+   // Android tests
+   // TODO(https://github.com/brave/brave-browser/issues/50822)
+   // Move RecordInitialP3AValues from here
+-  RecordInitialP3AValues(profile);
+-  // TODO(https://github.com/brave/brave-browser/issues/50823)
+-  // Move MigrateHttpsUpgradeSettings from here as well
+-  MigrateHttpsUpgradeSettings(profile);
++  if (!base::alloy::IsNoDiskProcess()) {
++    RecordInitialP3AValues(profile);
++    // TODO(https://github.com/brave/brave-browser/issues/50823)
++    // Move MigrateHttpsUpgradeSettings from here as well
++    MigrateHttpsUpgradeSettings(profile);
++  }
+ 
+   ProfileManager::DoFinalInitForServices(profile, go_off_the_record);
+   // Mirror the upstream guard so Brave services aren't created for profiles
+--- a/chromium_src/chrome/browser/profiles/profile_impl.cc
++++ b/chromium_src/chrome/browser/profiles/profile_impl.cc
+@@ -5,6 +5,7 @@
+ 
+ #include "chrome/browser/profiles/profile_impl.h"
+ 
++#include "base/alloy/storage_policy.h"
+ #include "brave/browser/brave_browser_features.h"
+ #include "build/build_config.h"
+ 
+@@ -17,6 +18,9 @@
+ #undef ShouldRestoreOldSessionCookies
+ 
+ bool ProfileImpl::ShouldRestoreOldSessionCookies() {
++  if (base::alloy::IsNoDiskProcess()) {
++    return false;
++  }
+   bool should_restore = ShouldRestoreOldSessionCookies_ChromiumImpl();
+   if (base::FeatureList::IsEnabled(
+           features::kBraveCleanupSessionCookiesOnSessionRestore)) {

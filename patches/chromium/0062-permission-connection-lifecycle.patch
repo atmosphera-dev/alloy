@@ -1,0 +1,127 @@
+--- a/third_party/blink/renderer/core/dom/build.gni
++++ b/third_party/blink/renderer/core/dom/build.gni
+@@ -231,6 +231,8 @@
+   "opaque_range.cc",
+   "opaque_range.h",
+   "parser_content_policy.h",
++  "permission_service_connection.cc",
++  "permission_service_connection.h",
+   "popover_data.h",
+   "presentation_attribute_style.cc",
+   "presentation_attribute_style.h",
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -178,6 +178,7 @@
+ #include "third_party/blink/renderer/core/dom/node_lists_node_data.h"
+ #include "third_party/blink/renderer/core/dom/node_traversal.h"
+ #include "third_party/blink/renderer/core/dom/node_with_index.h"
++#include "third_party/blink/renderer/core/dom/permission_service_connection.h"
+ #include "third_party/blink/renderer/core/dom/processing_instruction.h"
+ #include "third_party/blink/renderer/core/dom/scripted_animation_controller.h"
+ #include "third_party/blink/renderer/core/dom/scroll_marker_group_data.h"
+@@ -7192,8 +7193,9 @@
+ mojom::blink::PermissionService* Document::GetPermissionService(
+     ExecutionContext* execution_context) {
+   if (!data_->permission_service_.is_bound()) {
+-    execution_context->GetBrowserInterfaceBroker().GetInterface(
+-        data_->permission_service_.BindNewPipeAndPassReceiver(
++    ConnectToPermissionService(
++        execution_context,
++        data_->permission_service_.BindNewPipeAndPassReceiver(
+             execution_context->GetTaskRunner(TaskType::kPermission)));
+     data_->permission_service_.set_disconnect_handler(BindOnce(
+         &Document::PermissionServiceConnectionError, WrapWeakPersistent(this)));
+--- a/third_party/blink/renderer/modules/permissions/permission_utils.h
++++ b/third_party/blink/renderer/modules/permissions/permission_utils.h
+@@ -8,6 +8,7 @@
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "third_party/blink/public/mojom/permissions/permission.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_accuracy_mode.h"
++#include "third_party/blink/renderer/core/dom/permission_service_connection.h"
+ #include "third_party/blink/renderer/modules/modules_export.h"
+ #include "third_party/blink/renderer/platform/wtf/forward.h"
+
+@@ -18,10 +19,6 @@
+ class ScriptState;
+ class ScriptValue;
+ class V8PermissionState;
+-
+-void ConnectToPermissionService(
+-    ExecutionContext*,
+-    mojo::PendingReceiver<mojom::blink::PermissionService>);
+
+ V8PermissionState ToV8PermissionState(mojom::blink::PermissionStatus);
+
+--- a/third_party/blink/renderer/modules/permissions/permission_utils.cc
++++ b/third_party/blink/renderer/modules/permissions/permission_utils.cc
+@@ -10,7 +10,6 @@
+ #include "third_party/blink/public/mojom/permissions/permission.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink-forward.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
+-#include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/renderer/bindings/core/v8/native_value_traits_impl.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_permission_state.h"
+@@ -62,13 +61,6 @@
+ using MojoPermissionDescriptor = mojom::blink::PermissionDescriptor;
+ using mojom::blink::PermissionDescriptorPtr;
+ using mojom::blink::PermissionName;
+-
+-void ConnectToPermissionService(
+-    ExecutionContext* execution_context,
+-    mojo::PendingReceiver<mojom::blink::PermissionService> receiver) {
+-  execution_context->GetBrowserInterfaceBroker().GetInterface(
+-      std::move(receiver));
+-}
+
+ V8PermissionState ToV8PermissionState(mojom::blink::PermissionStatus status) {
+   return V8PermissionState(ToPermissionStateEnum(status));
+--- a/third_party/blink/renderer/modules/permissions/BUILD.gn
++++ b/third_party/blink/renderer/modules/permissions/BUILD.gn
+@@ -41,3 +41,26 @@
+     "//third_party/blink/renderer/platform/wtf",
+   ]
+ }
++
++import("//testing/test.gni")
++
++test("alloy_permission_lifecycle_unittests") {
++  sources = [
++    "alloy_permission_lifecycle_unittest.cc",
++    "//third_party/blink/renderer/controller/tests/run_all_tests.cc",
++  ]
++  configs += [
++    "//third_party/blink/renderer:config",
++    "//third_party/blink/renderer:inside_blink",
++    "//third_party/blink/renderer/core:blink_core_pch",
++  ]
++  deps = [
++    "//base/test:test_support",
++    "//content/test:test_support",
++    "//testing/gtest",
++    "//third_party/blink/renderer/core:unit_test_support",
++    "//third_party/blink/renderer/modules",
++    "//third_party/blink/renderer/platform:test_support",
++  ]
++  data_deps = [ "//content/shell:pak" ]
++}
+--- a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -64,6 +64,7 @@
+ #include "third_party/blink/public/web/web_local_frame.h"
+ #include "third_party/blink/public/web/web_view.h"
+ #include "third_party/blink/renderer/core/core_probes_inl.h"
++#include "third_party/blink/renderer/core/dom/permission_service_connection.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
+ #include "third_party/blink/renderer/core/frame/dom_window.h"
+@@ -1338,8 +1339,7 @@
+     return;
+   }
+
+-  execution_context->GetBrowserInterfaceBroker().GetInterface(
+-      std::move(permission_service));
++  ConnectToPermissionService(execution_context, std::move(permission_service));
+ }
+
+ std::unique_ptr<webrtc::LocalNetworkAccessPermissionFactoryInterface>

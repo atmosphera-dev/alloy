@@ -502,6 +502,11 @@
       "patch": "chromium/0061-no-disk-recording-owners.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0062-permission-connection-lifecycle.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

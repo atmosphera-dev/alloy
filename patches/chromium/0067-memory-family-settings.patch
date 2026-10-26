@@ -1,0 +1,26 @@
+--- a/chrome/browser/supervised_user/family_link_settings_service_factory.cc
++++ b/chrome/browser/supervised_user/family_link_settings_service_factory.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/profiles/profile_key.h"
+ #include "components/keyed_service/core/simple_dependency_manager.h"
++#include "components/prefs/in_memory_pref_store.h"
+ #include "components/supervised_user/core/browser/family_link_settings_service.h"
+ 
+ namespace supervised_user {
+@@ -33,7 +34,14 @@
+ std::unique_ptr<KeyedService>
+ FamilyLinkSettingsServiceFactory::BuildServiceInstanceFor(
+     SimpleFactoryKey* key) const {
+-  return std::make_unique<supervised_user::FamilyLinkSettingsService>();
++  auto service = std::make_unique<supervised_user::FamilyLinkSettingsService>();
++  if (ProfileKey::FromSimpleFactoryKey(key)->IsAlloyNoDisk()) {
++    // Ordinary originals initialize their file store during profile startup.
++    // A private native owner has no original-profile initialization phase;
++    // expose it only after its own resident pref backend is ready.
++    service->Init(base::MakeRefCounted<InMemoryPrefStore>());
++  }
++  return service;
+ }
+ 
+ SimpleFactoryKey* FamilyLinkSettingsServiceFactory::GetKeyToUse(

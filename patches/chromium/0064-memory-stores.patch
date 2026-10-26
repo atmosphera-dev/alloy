@@ -1,0 +1,443 @@
+--- a/chrome/browser/favicon/favicon_service_factory.cc
++++ b/chrome/browser/favicon/favicon_service_factory.cc
+@@ -45,7 +45,8 @@
+   if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
+     return nullptr;
+   }
+-  if (!profile->IsOffTheRecord()) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*profile) ||
++      !profile->IsOffTheRecord()) {
+     return static_cast<favicon::FaviconService*>(
+         GetInstance()->GetServiceForBrowserContext(profile, true));
+   } else if (sat == ServiceAccessType::EXPLICIT_ACCESS) {
+@@ -75,6 +76,7 @@
+     : ProfileKeyedServiceFactory(
+           "FaviconService",
+           ProfileSelections::Builder()
++              .WithAlloyMemory(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kOriginalOnly)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+--- a/chrome/browser/history/history_service_factory.cc
++++ b/chrome/browser/history/history_service_factory.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/history/history_service_factory.h"
++
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "chrome/browser/bookmarks/bookmark_model_factory.h"
+ #include "chrome/browser/history/chrome_history_client.h"
+@@ -27,7 +29,10 @@
+       std::make_unique<history::ContentVisitDelegate>(context),
+       /*device_info_tracker=*/nullptr, /*local_device_info_provider=*/nullptr);
+   history_service->Init(history::HistoryDatabaseParamsForPath(
+-      context->GetPath(), chrome::GetChannel()));
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*context)
++          ? base::FilePath()
++          : context->GetPath(),
++      chrome::GetChannel()));
+   return history_service;
+   }();
+   built_service->InitHistoryRetentionPref(
+@@ -95,6 +100,7 @@
+     : ProfileKeyedServiceFactory(
+           "HistoryService",
+           ProfileSelections::Builder()
++              .WithAlloyMemory(ProfileSelection::kOwnInstance)
+               .WithRegular(ProfileSelection::kRedirectedToOriginal)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+--- a/chrome/browser/history/history_tab_helper.cc
++++ b/chrome/browser/history/history_tab_helper.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/history/history_tab_helper.h"
++
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <optional>
+ #include <string>
+@@ -649,7 +651,12 @@
+   }
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents()->GetBrowserContext());
+-  if (profile->IsOffTheRecord()) {
++  const auto* policy = alloy::site_records::RequestContextPolicy::Get(*profile);
++  if (profile->IsOffTheRecord() &&
++      (!policy ||
++       !policy->StorageCapability(alloy::site_records::StorePurpose::kHistory)
++            .Allows(alloy::site_records::StorePurpose::kHistory,
++                    alloy::site_records::StorageAccess::kWriteMemory))) {
+     return nullptr;
+   }
+ 
+--- a/chrome/browser/media/webrtc/media_device_salt_service_factory.cc
++++ b/chrome/browser/media/webrtc/media_device_salt_service_factory.cc
+@@ -25,6 +25,7 @@
+     : ProfileKeyedServiceFactory(
+           "MediaDeviceSaltServiceFactory",
+           ProfileSelections::Builder()
++              .WithAlloyMemory(ProfileSelection::kOwnInstance)
+               // TODO(crbug.com/40257657): Check if this service is needed in
+               // Guest mode.
+               .WithGuest(ProfileSelection::kOriginalOnly)
+--- a/chrome/browser/origin_trials/origin_trials_factory.cc
++++ b/chrome/browser/origin_trials/origin_trials_factory.cc
+@@ -36,6 +36,7 @@
+     : ProfileKeyedServiceFactory(
+           "OriginTrials",
+           ProfileSelections::Builder()
++              .WithAlloyMemory(ProfileSelection::kOwnInstance)
+               // Do not use for system and internal profiles
+               // TODO(crbug.com/40247867): May need to enable Guest in the
+               // future.
+--- a/chrome/browser/profiles/off_the_record_profile_impl.cc
++++ b/chrome/browser/profiles/off_the_record_profile_impl.cc
+@@ -603,6 +603,19 @@
+   return ReduceAcceptLanguageFactory::GetForProfile(this);
+ }
+ 
++content::OriginTrialsControllerDelegate*
++OffTheRecordProfileImpl::GetOriginTrialsControllerDelegate() {
++  const auto* policy = alloy::site_records::RequestContextPolicy::Get(*this);
++  if (!policy ||
++      !policy
++           ->StorageCapability(alloy::site_records::StorePurpose::kOriginTrials)
++           .Allows(alloy::site_records::StorePurpose::kOriginTrials,
++                   alloy::site_records::StorageAccess::kWriteMemory)) {
++    return nullptr;
++  }
++  return OriginTrialsFactory::GetForBrowserContext(this);
++}
++
+ std::unique_ptr<media::VideoDecodePerfHistory>
+ OffTheRecordProfileImpl::CreateVideoDecodePerfHistory() {
+   // Use the original profile's DB to seed the OTR VideoDecodePerfHistory. The
+--- a/chrome/browser/profiles/off_the_record_profile_impl.h
++++ b/chrome/browser/profiles/off_the_record_profile_impl.h
+@@ -113,6 +113,8 @@
+       override;
+   content::ReduceAcceptLanguageControllerDelegate*
+   GetReduceAcceptLanguageControllerDelegate() override;
++  content::OriginTrialsControllerDelegate* GetOriginTrialsControllerDelegate()
++      override;
+   std::unique_ptr<media::VideoDecodePerfHistory> CreateVideoDecodePerfHistory()
+       override;
+   content::FileSystemAccessPermissionContext*
+--- a/chrome/browser/profiles/profile_selections.cc
++++ b/chrome/browser/profiles/profile_selections.cc
+@@ -53,6 +53,14 @@
+   CHECK(selection == ProfileSelection::kNone ||
+         selection == ProfileSelection::kOwnInstance);
+   selections_->alloy_stateless_profile_selection_ = selection;
++  return *this;
++}
++
++ProfileSelections::Builder& ProfileSelections::Builder::WithAlloyMemory(
++    ProfileSelection selection) {
++  CHECK(selection == ProfileSelection::kNone ||
++        selection == ProfileSelection::kOwnInstance);
++  selections_->alloy_memory_profile_selection_ = selection;
+   return *this;
+ }
+ 
+@@ -155,6 +163,12 @@
+ 
+ ProfileSelection ProfileSelections::GetProfileSelection(
+     Profile* profile) const {
++  const auto* policy = alloy::site_records::RequestContextPolicy::Get(*profile);
++  if (policy &&
++      policy->storage_mode() == alloy::site_records::StorageMode::kMemory &&
++      alloy_memory_profile_selection_) {
++    return *alloy_memory_profile_selection_;
++  }
+   if (alloy::site_records::RequestContextPolicy::IsNoDisk(*profile) &&
+       alloy_stateless_profile_selection_ &&
+       (alloy::site_records::RequestContextPolicy::IsStateless(*profile) ||
+--- a/chrome/browser/profiles/profile_selections.h
++++ b/chrome/browser/profiles/profile_selections.h
+@@ -69,6 +69,9 @@
+     // Configuration/runtime factories may opt into a private native instance.
+     // Retained stores keep their normal stateless rejection. Never redirects.
+     Builder& WithAlloyStateless(ProfileSelection selection);
++    // A retained native store may own a memory backend without granting the
++    // stateless mode storage or permitting a redirect to an original profile.
++    Builder& WithAlloyMemory(ProfileSelection selection);
+ 
+     // In Ash there are internal profiles that are not user profiles, such as a
+     // the signin or the lockscreen profile.
+@@ -161,6 +164,8 @@
+   ProfileSelection guest_profile_selection_ = ProfileSelection::kNone;
+   ProfileSelection system_profile_selection_ = ProfileSelection::kNone;
+   ProfileSelection ash_internals_profile_selection_ = ProfileSelection::kNone;
++  std::optional<ProfileSelection> alloy_memory_profile_selection_ =
++      std::nullopt;
+   std::optional<ProfileSelection> alloy_stateless_profile_selection_ =
+       std::nullopt;
+   std::optional<ProfileSelection> isolated_mode_profile_selection_ =
+--- a/chrome/browser/ui/tab_helpers.cc
++++ b/chrome/browser/ui/tab_helpers.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/tab_helpers.h"
++
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <cstdint>
+ #include <memory>
+@@ -370,11 +372,19 @@
+   FindBarState::ConfigureWebContents(web_contents);
+   history::WebContentsTopSitesObserver::CreateForWebContents(
+       web_contents, TopSitesFactory::GetForProfile(profile).get());
++  const auto* history_policy =
++      alloy::site_records::RequestContextPolicy::Get(*profile);
++  if (!profile->IsOffTheRecord() ||
++      (history_policy &&
++       history_policy
++           ->StorageCapability(alloy::site_records::StorePurpose::kHistory)
++           .Allows(alloy::site_records::StorePurpose::kHistory,
++                   alloy::site_records::StorageAccess::kWriteMemory))) {
++    HistoryTabHelper::GetOrCreateForWebContents(web_contents);
++  }
+   if (!profile->IsOffTheRecord()) {
+-    auto* history_tab_helper =
+-        HistoryTabHelper::GetOrCreateForWebContents(web_contents);
+-    HistoryClustersTabHelper::CreateForWebContents(web_contents,
+-                                                   history_tab_helper);
++    HistoryClustersTabHelper::CreateForWebContents(
++        web_contents, HistoryTabHelper::FromWebContents(web_contents));
+   }
+   HttpsOnlyModeTabHelper::CreateForWebContents(web_contents);
+   webapps::InstallableManager::CreateForWebContents(web_contents);
+--- a/components/favicon/content/content_favicon_driver.cc
++++ b/components/favicon/content/content_favicon_driver.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/favicon/content/content_favicon_driver.h"
++
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+@@ -133,6 +135,17 @@
+   return web_contents()->GetBrowserContext()->IsOffTheRecord();
+ }
+ 
++bool ContentFaviconDriver::CanRetainFaviconState() {
++  const auto* policy = alloy::site_records::RequestContextPolicy::Get(
++      *web_contents()->GetBrowserContext());
++  return policy ? policy
++                      ->StorageCapability(
++                          alloy::site_records::StorePurpose::kFavicons)
++                      .Allows(alloy::site_records::StorePurpose::kFavicons,
++                              alloy::site_records::StorageAccess::kWriteMemory)
++                : !IsOffTheRecord();
++}
++
+ void ContentFaviconDriver::OnFaviconUpdated(
+     const GURL& page_url,
+     FaviconDriverObserver::NotificationIconType notification_icon_type,
+@@ -230,7 +243,7 @@
+     return;
+ 
+   content::ReloadType reload_type = navigation_handle->GetReloadType();
+-  if (reload_type == content::ReloadType::NONE || IsOffTheRecord())
++  if (reload_type == content::ReloadType::NONE || !CanRetainFaviconState())
+     return;
+ 
+   if (!navigation_handle->IsSameDocument()) {
+--- a/components/favicon/content/content_favicon_driver.h
++++ b/components/favicon/content/content_favicon_driver.h
+@@ -83,6 +83,7 @@
+   void DownloadManifest(const GURL& url,
+                         ManifestDownloadCallback callback) override;
+   bool IsOffTheRecord() override;
++  bool CanRetainFaviconState() override;
+   void OnFaviconUpdated(const GURL& page_url,
+                         FaviconDriverObserver::NotificationIconType icon_type,
+                         const GURL& icon_url,
+--- a/components/favicon/core/favicon_database.cc
++++ b/components/favicon/core/favicon_database.cc
+@@ -1039,7 +1039,9 @@
+   if (!db_.has_error_callback()) {
+     db->set_error_callback(base::BindRepeating(&DatabaseErrorCallback, db));
+   }
+-  return db->Open(db_name) ? sql::INIT_OK : sql::INIT_FAILURE;
++  return (db_name.empty() ? db->OpenInMemory() : db->Open(db_name))
++             ? sql::INIT_OK
++             : sql::INIT_FAILURE;
+ }
+ 
+ sql::InitStatus FaviconDatabase::InitImpl(const base::FilePath& db_name) {
+--- a/components/favicon/core/favicon_handler.cc
++++ b/components/favicon/core/favicon_handler.cc
+@@ -273,7 +273,7 @@
+   // Associate the icon to all URLs in `page_urls_`, which contains page URLs
+   // within the same site/document that have been considered to reliably share
+   // the same icon candidates.
+-  if (service_ && !delegate_->IsOffTheRecord()) {
++  if (service_ && delegate_->CanRetainFaviconState()) {
+     service_->SetFavicons(page_urls_, icon_url, icon_type, image);
+   }
+ 
+@@ -288,7 +288,7 @@
+   // state to be checked at the very end.
+   if (!error_other_than_404_found_ &&
+       notification_icon_type_ != favicon_base::IconType::kInvalid) {
+-    if (service_ && !delegate_->IsOffTheRecord()) {
++    if (service_ && delegate_->CanRetainFaviconState()) {
+       service_->DeleteFaviconMappings(page_urls_, notification_icon_type_);
+     }
+ 
+@@ -398,7 +398,7 @@
+   // UI, as there is no privacy downside in showing favicons fetched while the
+   // user was browsing in non-incognito mode.
+   bool has_expired_or_incomplete_result =
+-      !has_valid_result || delegate_->IsOffTheRecord() ||
++      !has_valid_result || !delegate_->CanRetainFaviconState() ||
+       HasExpiredOrIncompleteResult(preferred_icon_size(),
+                                    favicon_bitmap_results);
+ 
+@@ -610,7 +610,7 @@
+   // UI, as there is no privacy downside in showing favicons fetched while the
+   // user was browsing in non-incognito mode.
+   initial_history_result_expired_or_incomplete_ =
+-      !has_valid_result || delegate_->IsOffTheRecord() ||
++      !has_valid_result || !delegate_->CanRetainFaviconState() ||
+       HasExpiredOrIncompleteResult(preferred_icon_size(),
+                                    favicon_bitmap_results);
+   redownload_icons_ = initial_history_result_expired_or_incomplete_ &&
+@@ -627,7 +627,7 @@
+     // - The favicon in the database is expired.
+     // AND
+     // - Redownloading the favicon fails with a non-404 error code.
+-    if (service_ && !delegate_->IsOffTheRecord()) {
++    if (service_ && delegate_->CanRetainFaviconState()) {
+       service_->CloneFaviconMappingsForPages(last_page_url_, icon_types_,
+                                              page_urls_);
+     }
+@@ -675,7 +675,7 @@
+   // We don't know the favicon, but we may have previously downloaded the
+   // favicon for another page that shares the same favicon. Ask for the
+   // favicon given the favicon URL.
+-  if (delegate_->IsOffTheRecord()) {
++  if (!delegate_->CanRetainFaviconState()) {
+     service_->GetFavicon(icon_url, icon_type, preferred_icon_size(),
+                          std::move(callback),
+                          &cancelable_task_tracker_for_candidates_);
+@@ -699,7 +699,7 @@
+   // expired so websites don't know if a site was previously visited in regular
+   // mode.
+   bool has_expired_or_incomplete_result =
+-      !has_valid_result || delegate_->IsOffTheRecord() ||
++      !has_valid_result || !delegate_->CanRetainFaviconState() ||
+       HasExpiredOrIncompleteResult(preferred_icon_size(),
+                                    favicon_bitmap_results);
+ 
+--- a/components/favicon/core/favicon_handler.h
++++ b/components/favicon/core/favicon_handler.h
+@@ -107,6 +107,10 @@
+     // Returns whether the user is operating in an off-the-record context.
+     virtual bool IsOffTheRecord() = 0;
+ 
++    // Whether this owner's favicon store can retain and reuse mappings. This
++    // differs from OTR identity for a private, context-lifetime memory store.
++    virtual bool CanRetainFaviconState() { return !IsOffTheRecord(); }
++
+     // Notifies that the favicon image has been updated. Most delegates
+     // propagate the notification to FaviconDriverObserver::OnFaviconUpdated().
+     // See its documentation for details.
+--- a/components/history/content/browser/content_visit_delegate.cc
++++ b/components/history/content/browser/content_visit_delegate.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/history/content/browser/content_visit_delegate.h"
++
++#include "content/public/browser/browser_context.h"
+ 
+ #include <utility>
+ 
+@@ -140,7 +142,7 @@
+             browser_context, this);
+   } else {
+     visitedlink_writer_ = std::make_unique<visitedlink::VisitedLinkWriter>(
+-        browser_context, this, true);
++        browser_context, this, !browser_context->IsOffTheRecord());
+   }
+ }
+ 
+--- a/components/history/core/browser/history_backend.cc
++++ b/components/history/core/browser/history_backend.cc
+@@ -128,6 +128,8 @@
+   }
+ 
+   void AddPath(const base::FilePath& file_path) {
++    if (file_path.empty())
++      return;
+     base::AutoLock auto_lock(lock_);
+     paths_.insert(file_path);
+   }
+@@ -446,7 +448,8 @@
+ 
+   TRACE_EVENT0("browser", "HistoryBackend::Init");
+ 
+-  DCHECK(base::PathExists(history_database_params_->history_dir))
++  DCHECK(history_database_params_->history_dir.empty() ||
++         base::PathExists(history_database_params_->history_dir))
+       << "History directory does not exist. If you are in a test make sure "
+          "that ~TestingProfile() has not been called or that the "
+          "ScopedTempDirectory used outlives this task.";
+@@ -519,7 +522,8 @@
+ }
+ 
+ base::FilePath HistoryBackend::GetFaviconsFileName() const {
+-  return history_dir_.Append(kFaviconsFilename);
++  return history_dir_.empty() ? base::FilePath()
++                              : history_dir_.Append(kFaviconsFilename);
+ }
+ 
+ SegmentID HistoryBackend::GetLastSegmentID(VisitID from_visit) {
+@@ -1310,7 +1314,9 @@
+   HistoryPathsTracker::GetInstance()->AddPath(history_dir_);
+ #endif
+ 
+-  base::FilePath history_name = history_dir_.Append(kHistoryFilename);
++  base::FilePath history_name = history_dir_.empty()
++                                    ? base::FilePath()
++                                    : history_dir_.Append(kHistoryFilename);
+   base::FilePath favicon_name = GetFaviconsFileName();
+ 
+   // History database.
+@@ -4108,7 +4114,9 @@
+     // error opening it. In this case, we just try to blow it away to try to
+     // fix the error if it exists. This may fail, in which case either the
+     // file doesn't exist or there's no more we can do.
+-    sql::Database::Delete(GetFaviconsFileName());
++    if (!history_dir_.empty()) {
++      sql::Database::Delete(GetFaviconsFileName());
++    }
+     return true;
+   }
+   if (!favicon_backend_->ClearAllExcept(kept_urls)) {
+--- a/components/history/core/browser/history_database.cc
++++ b/components/history/core/browser/history_database.cc
+@@ -117,9 +117,10 @@
+ }
+ 
+ sql::InitStatus HistoryDatabase::Init(const base::FilePath& history_name) {
+-  const bool database_exists = base::PathExists(history_name);
+-
+-  if (!db_.Open(history_name))
++  const bool database_exists =
++      !history_name.empty() && base::PathExists(history_name);
++
++  if (!(history_name.empty() ? db_.OpenInMemory() : db_.Open(history_name)))
+     return LogInitFailure(InitStep::OPEN);
+ 
+   if (database_exists) {

@@ -25,6 +25,20 @@
 CefRefPtr<CefRequestContext> AlloyCreateStatelessRequestContext(
     alloy_network_state_t network_state,
     CefRefPtr<CefRequestContextHandler> handler);
+
+///
+/// EXPERIMENTAL: Creates an isolated memory-only request context. Site storage,
+/// cookies and caches are retained only for this context's lifetime. Nothing is
+/// read from the persistent parent or written to disk. Independent contexts do
+/// not share state; CEF's sharing-context API preserves this context and mode.
+/// Closing the last browser alone does not release a retained context
+/// reference. Release all sharing references to end the session and retire its
+/// state. Returns NULL for an invalid CEF initialization state. |handler| is
+/// optional. Calling semantics match CefRequestContext::CreateContext.
+///
+/*--cef(added=experimental,optional_param=handler)--*/
+CefRefPtr<CefRequestContext> AlloyCreateMemoryRequestContext(
+    CefRefPtr<CefRequestContextHandler> handler);
 #endif
 
 #endif  // ALLOY_INCLUDE_ALLOY_REQUEST_CONTEXT_H_

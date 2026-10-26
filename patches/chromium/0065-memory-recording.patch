@@ -1,0 +1,74 @@
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/net/profile_network_context_service.h"
++
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <memory>
+ #include <string>
+@@ -1424,6 +1426,8 @@
+ 
+   g_browser_process->system_network_context_manager()
+       ->ConfigureDefaultNetworkContextParams(network_context_params);
++  network_context_params->alloy_no_recording =
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_);
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+   base::FilePath root;
+   chrome::GetUserCacheDirectory(profile_->GetPath(), &root);
+--- a/content/browser/network_sandbox.cc
++++ b/content/browser/network_sandbox.cc
+@@ -377,7 +377,7 @@
+     const SandboxParameters& sandbox_params,
+     network::mojom::NetworkContextParams* params) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (base::alloy::IsNoDiskProcess() || params->alloy_no_recording) {
+     params->alloy_guard_log_path.clear();
+     params->alloy_guard_log = base::File();
+   }
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -725,6 +725,10 @@
+ #if BUILDFLAG(ENABLE_REPORTING)
+       is_observing_reporting_service_(false),
+ #endif  // BUILDFLAG(ENABLE_REPORTING)
++      alloy_guard_(base::MakeRefCounted<AlloyGuard>(
++          params && params->alloy_no_recording
++              ? AlloyGuard::RecordingMode::kForbidden
++              : AlloyGuard::RecordingMode::kPermitted)),
+       params_(std::move(params)),
+       on_connection_close_callback_(std::move(on_connection_close_callback)),
+       receiver_(std::in_place_type<Receiver>, this),
+@@ -751,7 +755,7 @@
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+-    if (!base::alloy::IsNoDiskProcess()) {
++    if (!base::alloy::IsNoDiskProcess() && !params_->alloy_no_recording) {
+       CHECK(params_->alloy_guard_log.IsValid())
+           << "Alloy requires a browser-opened denial log";
+       alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
+@@ -974,7 +978,7 @@
+   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
+   if (params_) {
+ #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+-    if (!base::alloy::IsNoDiskProcess()) {
++    if (!base::alloy::IsNoDiskProcess() && !params_->alloy_no_recording) {
+       CHECK(params_->alloy_guard_log.IsValid())
+           << "Alloy requires a browser-opened denial log";
+       alloy_guard_->Configure(std::move(params_->alloy_guard_log), {});
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -354,6 +354,9 @@
+ struct NetworkContextParams {
+   // Engine-owned stateless storage admission. Never selected by a renderer.
+   bool alloy_stateless = false;
++  // Derived from the browser-owned context policy, independently of storage
++  // admission. A guest retains memory stores but cannot acquire a log writer.
++  bool alloy_no_recording = false;
+   mojo_base.mojom.File? alloy_guard_log;
+   mojo_base.mojom.FilePath alloy_guard_log_path;
+   bool alloy_favicons_enabled = true;

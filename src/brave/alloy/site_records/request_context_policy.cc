@@ -15,13 +15,24 @@ const char kRequestContextPolicyKey = 0;
 void RequestContextPolicy::AttachStateless(
     base::SupportsUserData& browser_context,
     NetworkState network_state) {
-  CHECK(!Get(browser_context));
   CHECK(network_state == NetworkState::kKeep ||
         network_state == NetworkState::kCut);
-  browser_context.SetUserData(
-      &kRequestContextPolicyKey,
-      std::unique_ptr<RequestContextPolicy>(
-          new RequestContextPolicy(network_state)));
+  Attach(browser_context, ContextMode::Stateless(network_state));
+}
+
+// static
+void RequestContextPolicy::AttachMemory(
+    base::SupportsUserData& browser_context) {
+  Attach(browser_context, ContextMode::Memory());
+}
+
+// static
+void RequestContextPolicy::Attach(base::SupportsUserData& browser_context,
+                                  ContextMode context_mode) {
+  CHECK(!Get(browser_context));
+  browser_context.SetUserData(&kRequestContextPolicyKey,
+                              std::unique_ptr<RequestContextPolicy>(
+                                  new RequestContextPolicy(context_mode)));
 }
 
 // static
@@ -38,11 +49,13 @@ const RequestContextPolicy* RequestContextPolicy::Get(
       browser_context.GetUserData(&kRequestContextPolicyKey));
 }
 
-RequestContextPolicy::RequestContextPolicy(NetworkState network_state)
-    : network_state_(network_state),
+RequestContextPolicy::RequestContextPolicy(ContextMode context_mode)
+    : context_mode_(context_mode),
       profile_(base::UnguessableToken::Create()),
-      storage_issuer_(profile_, base::UnguessableToken::Create(),
-                      base::UnguessableToken::Create(), StorageMode::kStateless) {}
+      storage_issuer_(profile_,
+                      base::UnguessableToken::Create(),
+                      base::UnguessableToken::Create(),
+                      context_mode.storage_mode()) {}
 
 RequestContextPolicy::~RequestContextPolicy() = default;
 
@@ -50,8 +63,7 @@ RequestContextPolicy::~RequestContextPolicy() = default;
 bool RequestContextPolicy::IsStateless(
     const base::SupportsUserData& browser_context) {
   const auto* policy = Get(browser_context);
-  return policy && policy->StorageCapability(StorePurpose::kDomStorage).mode() ==
-                       StorageMode::kStateless;
+  return policy && policy->storage_mode() == StorageMode::kStateless;
 }
 
 RecordCapability RequestContextPolicy::StorageCapability(
@@ -70,7 +82,7 @@ bool RequestContextPolicy::IsNoDisk(
   if (!policy) {
     return false;
   }
-  const auto mode = policy->StorageCapability(StorePurpose::kDomStorage).mode();
+  const auto mode = policy->storage_mode();
   return mode == StorageMode::kStateless || mode == StorageMode::kMemory;
 }
 

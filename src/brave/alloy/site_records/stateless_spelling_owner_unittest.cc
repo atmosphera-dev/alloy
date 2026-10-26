@@ -129,6 +129,62 @@ TEST_P(StatelessSpellingOwnerTest, RefusesLocalAndAccountWordsBeforeAdmission) {
   EXPECT_TRUE(base::IsDirectoryEmpty(empty.GetPath()));
 }
 
+TEST_P(StatelessSpellingOwnerTest,
+       MemoryWordsRetainNativeChangesWithoutParentFilesAndEndWithOwner) {
+  base::test::ScopedFeatureList features;
+  features.InitWithFeatureState(
+      syncer::kSpellcheckSeparateLocalAndAccountDictionaries, GetParam());
+  base::ScopedTempDir root;
+  ASSERT_TRUE(root.CreateUniqueTempDir());
+  SpellcheckCustomDictionary parent(root.GetPath());
+  parent.Load();
+  task_environment_.RunUntilIdle();
+  ASSERT_TRUE(parent.AddWord("parentword"));
+  task_environment_.RunUntilIdle();
+  const auto before = DictionaryFiles(root.GetPath());
+  ASSERT_FALSE(before.empty());
+  DictionaryEvents events;
+  {
+    SpellcheckCustomDictionary memory(
+        root.GetPath(), SpellcheckCustomDictionary::Storage::kMemory);
+    SpellcheckCustomDictionary isolated(
+        root.GetPath(), SpellcheckCustomDictionary::Storage::kMemory);
+    memory.AddObserver(&events);
+    base::test::TestFuture<void> ready;
+    memory.WaitUntilReadyToSync(ready.GetCallback());
+    memory.Load();
+    isolated.Load();
+    ASSERT_TRUE(ready.Wait());
+    EXPECT_TRUE(memory.IsLoaded());
+    EXPECT_EQ(events.loads, 1);
+    EXPECT_FALSE(memory.HasWord("parentword"));
+    ASSERT_TRUE(memory.AddWord("guestword"));
+    EXPECT_TRUE(memory.HasWord("guestword"));
+    EXPECT_FALSE(isolated.HasWord("guestword"));
+    EXPECT_FALSE(memory.AddWord("guestword"));
+    EXPECT_FALSE(memory.AddWord(" leading-space"));
+    EXPECT_TRUE(memory.RemoveWord("guestword"));
+    EXPECT_FALSE(memory.HasWord("guestword"));
+    ASSERT_TRUE(memory.AddWord("retainedword"));
+    task_environment_.RunUntilIdle();
+    EXPECT_TRUE(memory.HasWord("retainedword"));
+    EXPECT_GE(events.changes, 3);
+    EXPECT_EQ(DictionaryFiles(root.GetPath()), before);
+    memory.Clear();
+    EXPECT_TRUE(memory.GetWords().empty());
+    ASSERT_TRUE(memory.AddWord("retiredword"));
+    memory.RemoveObserver(&events);
+  }
+  task_environment_.RunUntilIdle();
+  SpellcheckCustomDictionary recreated(
+      root.GetPath(), SpellcheckCustomDictionary::Storage::kMemory);
+  recreated.Load();
+  EXPECT_TRUE(recreated.GetWords().empty());
+  EXPECT_EQ(DictionaryFiles(root.GetPath()), before);
+  EXPECT_TRUE(parent.HasWord("parentword"));
+  EXPECT_FALSE(parent.HasWord("retiredword"));
+}
+
 INSTANTIATE_TEST_SUITE_P(LocalAndAccount,
                          StatelessSpellingOwnerTest,
                          testing::Bool());

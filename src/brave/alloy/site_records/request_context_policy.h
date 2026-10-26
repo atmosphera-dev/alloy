@@ -20,6 +20,7 @@ class RequestContextPolicy final : public base::SupportsUserData::Data {
  public:
   static void AttachStateless(base::SupportsUserData& browser_context,
                               NetworkState network_state);
+  static void AttachMemory(base::SupportsUserData& browser_context);
   static RequestContextPolicy* Get(base::SupportsUserData& browser_context);
   static const RequestContextPolicy* Get(
       const base::SupportsUserData& browser_context);
@@ -28,7 +29,8 @@ class RequestContextPolicy final : public base::SupportsUserData::Data {
 
   ~RequestContextPolicy() override;
 
-  NetworkState network_state() const { return network_state_; }
+  NetworkState network_state() const { return context_mode_.network_state(); }
+  StorageMode storage_mode() const { return context_mode_.storage_mode(); }
   base::UnguessableToken profile() const { return profile_; }
 
   // Context-level storage authority never authorizes document/network working
@@ -40,9 +42,11 @@ class RequestContextPolicy final : public base::SupportsUserData::Data {
   void Revoke();
 
  private:
-  explicit RequestContextPolicy(NetworkState network_state);
+  static void Attach(base::SupportsUserData& browser_context,
+                     ContextMode context_mode);
+  explicit RequestContextPolicy(ContextMode context_mode);
 
-  const NetworkState network_state_;
+  const ContextMode context_mode_;
   const base::UnguessableToken profile_;
   RecordCapabilityIssuer storage_issuer_;
 };

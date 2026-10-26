@@ -139,6 +139,35 @@ TEST_F(AlloyGuardTest, ProductDenialRetainsClassWithoutLogWriter) {
 }
 #endif
 
+TEST_F(AlloyGuardTest,
+       NoRecordingOwnerCannotAcquireAWriterThroughConfiguration) {
+  auto guard =
+      base::MakeRefCounted<AlloyGuard>(AlloyGuard::RecordingMode::kForbidden);
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  base::ScopedTempDir dir;
+  ASSERT_TRUE(dir.CreateUniqueTempDir());
+  const auto path = dir.GetPath().AppendASCII("unusable-descriptor.log");
+  guard->Configure(base::File(path, base::File::FLAG_CREATE_ALWAYS |
+                                        base::File::FLAG_APPEND),
+                   {});
+#endif
+  const auto denied =
+      guard->Decide(guard->Hash("alloy_guard_canary"),
+                    "https://guest.test/private", "memory-owner");
+  EXPECT_FALSE(denied.allowed);
+  EXPECT_EQ(denied.traffic_class, C::kBrowserService);
+  EXPECT_TRUE(guard
+                  ->Decide(guard->Hash("blink_resource_loader"),
+                           "https://guest.test/page", "page")
+                  .allowed);
+  tasks_.RunUntilIdle();
+#if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  std::string bytes;
+  ASSERT_TRUE(base::ReadFileToString(path, &bytes));
+  EXPECT_TRUE(bytes.empty());
+#endif
+}
+
 TEST_F(AlloyGuardTest, ChildCannotLaunderMissingOrUnknownOwner) {
   auto guard = base::MakeRefCounted<AlloyGuard>();
   const int page = guard->Hash("blink_resource_loader");

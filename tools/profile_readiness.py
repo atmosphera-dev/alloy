@@ -34,6 +34,7 @@ browser_inferior = gdb.selected_inferior()
 symbol_source = json.loads(Path(os.environ['ALLOY_PROFILE_SYMBOLS']).read_text())
 progress = dict(objects=[], installed={}, entries={}, returns={})
 popup_completions = []
+observe_lifetime = os.environ.get('ALLOY_PROFILE_OBSERVE_LIFETIME') == '1'
 
 
 def report():
@@ -61,12 +62,13 @@ class Completed(gdb.FinishBreakpoint):
             stopped = receipt.with_name('native-context-stopped.json')
             if (len(destroyed.get('request-context', [])) >= 2 and
                     destroyed.get('browser-context') and destroyed.get('otr-profile') and
-                    not stopped.exists()):
+                    (observe_lifetime or not stopped.exists())):
                 save(stopped, dict(pid=gdb.selected_inferior().pid, completed=destroyed,
                      scope='Two request contexts, browser context and OTR profile destructed'))
-                for entry in entries:
-                    if entry.phase == 'destroyed':
-                        entry.enabled = False
+                if not observe_lifetime:
+                    for entry in entries:
+                        if entry.phase == 'destroyed':
+                            entry.enabled = False
             return False
         completed.setdefault(self.name, observation)
         if len(completed) == 3 and not receipt.exists():

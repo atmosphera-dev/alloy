@@ -57,5 +57,33 @@ TEST(RequestContextPolicyTest, ShutdownRevokesEveryOutstandingStorageHandle) {
   EXPECT_FALSE(pending.active());
 }
 
+TEST(RequestContextPolicyTest, MemoryOwnerAdmitsOnlyItsOwnResidentStorage) {
+  BrowserOwner first;
+  BrowserOwner second;
+  RequestContextPolicy::AttachMemory(first);
+  RequestContextPolicy::AttachMemory(second);
+  const auto* policy = RequestContextPolicy::Get(first);
+  EXPECT_TRUE(RequestContextPolicy::IsNoDisk(first));
+  EXPECT_FALSE(RequestContextPolicy::IsStateless(first));
+  EXPECT_EQ(policy->network_state(), NetworkState::kKeep);
+  EXPECT_NE(policy->profile(), RequestContextPolicy::Get(second)->profile());
+  for (auto purpose : {StorePurpose::kCookies, StorePurpose::kDomStorage,
+                       StorePurpose::kIndexedDb, StorePurpose::kCacheStorage,
+                       StorePurpose::kHttpCache, StorePurpose::kSiteSettings}) {
+    auto capability = policy->StorageCapability(purpose);
+    EXPECT_TRUE(capability.Allows(purpose, StorageAccess::kReadMemory));
+    EXPECT_TRUE(capability.Allows(purpose, StorageAccess::kWriteMemory));
+    EXPECT_FALSE(capability.Allows(purpose, StorageAccess::kReadParentProfile));
+    EXPECT_FALSE(capability.Allows(purpose, StorageAccess::kReadRecordFiles));
+    EXPECT_FALSE(capability.Allows(purpose, StorageAccess::kWriteRecordFiles));
+  }
+  auto pending = policy->StorageCapability(StorePurpose::kCookies);
+  RequestContextPolicy::Get(first)->Revoke();
+  EXPECT_FALSE(pending.active());
+  EXPECT_TRUE(RequestContextPolicy::Get(second)
+                  ->StorageCapability(StorePurpose::kCookies)
+                  .Allows(StorePurpose::kCookies, StorageAccess::kWriteMemory));
+}
+
 }  // namespace
 }  // namespace alloy::site_records

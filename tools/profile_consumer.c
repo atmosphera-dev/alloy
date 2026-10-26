@@ -38,10 +38,14 @@ static int hold_next_file;
 static cef_string_t initial_url, blank_url, profile_root;
 static cef_request_context_t* context;
 static cef_request_context_t* shared_context;
+static cef_request_context_t* peer_context;
+static int peer_browser;
+static int peer_memory_only;
 static alloy_network_state_t network_state;
 static int browser_count;
 static int bootstrap_browser;
 static int no_disk_bootstrap;
+static int memory_only;
 static cef_permission_prompt_callback_t* held_permission;
 static uint64_t held_prompt_id;
 static int hold_next_permission;
@@ -238,7 +242,14 @@ static void CEF_CALLBACK created(cef_life_span_handler_t* self,
     release_ref(actual); release_ref(host); release_ref(browser);
     return;
   }
-  int shares=actual->is_sharing_with(actual,dll_arg(context));
+  int peer=peer_context && actual->is_sharing_with(actual,dll_arg(peer_context));
+  if (peer) {
+    if (peer_browser) fail("multiple independent peer browsers");
+    peer_browser=browser->get_identifier(browser);
+    if (actual->is_sharing_with(actual,dll_arg(context)))
+      fail("independent context shares with primary");
+  }
+  int shares=actual->is_sharing_with(actual,dll_arg(peer?peer_context:context));
   cef_string_userfree_t cache=actual->get_cache_path(actual);
   int no_cache_path=!cache || cache->length==0;
   int isolated=parent_preference_isolated(actual);
@@ -246,8 +257,9 @@ static void CEF_CALLBACK created(cef_life_span_handler_t* self,
   printf("PROFILE_EVENT {\"event\":\"created\",\"browser\":%d,"
       "\"shares_context\":%d,\"empty_cache_path\":%d,"
       "\"parent_preference_isolated\":%d,\"can_back\":%d,"
-      "\"can_forward\":%d}\n",browser->get_identifier(browser),shares,
-      no_cache_path,isolated,browser->can_go_back(browser),browser->can_go_forward(browser));
+      "\"can_forward\":%d,\"slot\":\"%s\",\"memory\":%d}\n",browser->get_identifier(browser),shares,
+      no_cache_path,isolated,browser->can_go_back(browser),browser->can_go_forward(browser),
+      peer?"peer":"primary",peer?peer_memory_only:memory_only);
   release_ref(actual); release_ref(host);
   if (!shares || !no_cache_path || !isolated) fail("browser lost stateless context");
   release_ref(browser);
@@ -257,6 +269,7 @@ static void CEF_CALLBACK closed(cef_life_span_handler_t* self,
   printf("PROFILE_EVENT {\"event\":\"%s\",\"browser\":%d}\n",
        browser->get_identifier(browser)==bootstrap_browser ? "bootstrap-closed" : "closed",
        browser->get_identifier(browser));
+  if (browser->get_identifier(browser)==peer_browser) peer_browser=0;
   if (--browser_count==0) cef_quit_message_loop();
   release_ref(browser);
 }
@@ -284,8 +297,29 @@ static void CEF_CALLBACK title_changed(cef_display_handler_t* self,
            fail("stateless disposal before its browsers closed");
          release_ref(shared_context); shared_context=NULL;
          release_ref(context); context=NULL;
-         printf("PROFILE_EVENT {\"event\":\"stateless-released\"}\n");
-       }
+          printf("PROFILE_EVENT {\"event\":\"stateless-released\"}\n");
+        }
+        if (!strcmp(token,"memory-peer") || !strcmp(token,"memory-peer-stateless")) {
+          if (!memory_only || !context || peer_context)
+            fail("invalid independent context creation");
+          peer_memory_only=!strcmp(token,"memory-peer");
+          peer_context=peer_memory_only?alloy_create_memory_request_context(NULL):
+              alloy_create_stateless_request_context(ALLOY_NETWORK_STATE_CUT,NULL);
+          if (!peer_context || peer_context->is_sharing_with(peer_context,dll_arg(context)))
+            fail("independent context is not isolated");
+          make_browser(&blank_url,peer_context);
+        }
+        if (!strcmp(token,"memory-release-peer")) {
+          if (!memory_only || !peer_context || peer_browser)
+            fail("independent context released before its browser closed");
+          release_ref(peer_context);peer_context=NULL;
+          printf("PROFILE_EVENT {\"event\":\"memory-peer-released\"}\n");
+        }
+        if (!strcmp(token,"memory-restart")) {
+          if (!memory_only || context || browser->get_identifier(browser)!=bootstrap_browser)
+            fail("memory recreation before primary context disposal");
+          start_stateless();
+        }
        if (!strcmp(token,"zoom-set")) {
          cef_browser_host_t* host=browser->get_host(browser);
          host->set_zoom_level(host,1.0);
@@ -338,11 +372,12 @@ static void make_browser(const cef_string_t* url,cef_request_context_t* request_
                                       dll_arg(request_context))) fail("browser creation refused");
 }
 static void start_stateless(void) {
-  printf("PROFILE_EVENT {\"event\":\"stateless-start\"}\n");
-  if (alloy_create_stateless_request_context((alloy_network_state_t)-1,NULL))
+  printf("PROFILE_EVENT {\"event\":\"%s-start\"}\n",memory_only?"memory":"stateless");
+  if (!memory_only && alloy_create_stateless_request_context((alloy_network_state_t)-1,NULL))
     fail("invalid network option accepted");
-  context=alloy_create_stateless_request_context(network_state,NULL);
-  if (!context || context->is_global(context)) fail("stateless creation failed");
+  context=memory_only?alloy_create_memory_request_context(NULL):
+      alloy_create_stateless_request_context(network_state,NULL);
+  if (!context || context->is_global(context)) fail("isolated context creation failed");
   shared_context=cef_request_context_cef_create_context_shared(dll_arg(context),NULL);
   if (!shared_context || !shared_context->is_sharing_with(shared_context,dll_arg(context)))
     fail("shared context creation failed");
@@ -383,6 +418,7 @@ int main(int argc,char** argv) {
   const char* file=getenv("ALLOY_PROFILE_SELECTED_FILE");
   const char* output=getenv("ALLOY_PROFILE_OUTPUT_FILE");
   no_disk_bootstrap=getenv("ALLOY_PROFILE_NO_DISK")!=NULL;
+  memory_only=getenv("ALLOY_PROFILE_MEMORY")!=NULL;
   if (!url || !root || !network || !file || !output) return 9;
   if (!strcmp(network,"keep")) network_state=ALLOY_NETWORK_STATE_KEEP;
   else if (!strcmp(network,"cut")) network_state=ALLOY_NETWORK_STATE_CUT;
@@ -424,7 +460,7 @@ int main(int argc,char** argv) {
   if (held_permission) fail("held permission not exercised");
   if (held_file) fail("held file picker not exercised");
   if (held_certificate) fail("held certificate decision not exercised");
-  release_ref(shared_context); release_ref(context);
+  release_ref(peer_context); release_ref(shared_context); release_ref(context);
   cef_shutdown();
   cef_string_clear(&settings.cache_path); cef_string_clear(&settings.root_cache_path);
   cef_string_clear(&initial_url); cef_string_clear(&blank_url);

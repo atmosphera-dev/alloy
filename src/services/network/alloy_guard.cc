@@ -21,9 +21,10 @@ constexpr AlloyGuard::Annotation kCatalog[] = {
 };
 }  // namespace
 
-AlloyGuard::AlloyGuard()
+AlloyGuard::AlloyGuard([[maybe_unused]] RecordingMode recording_mode)
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
-    : log_runner_(base::ThreadPool::CreateSequencedTaskRunner(
+    : recording_permitted_(recording_mode == RecordingMode::kPermitted),
+      log_runner_(base::ThreadPool::CreateSequencedTaskRunner(
           {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
            base::TaskShutdownBehavior::BLOCK_SHUTDOWN}))
 #endif
@@ -33,7 +34,7 @@ AlloyGuard::~AlloyGuard() = default;
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
 void AlloyGuard::Configure(base::File log, Options options) {
   base::AutoLock lock(lock_);
-  if (base::alloy::IsNoDiskProcess()) {
+  if (!recording_permitted_ || base::alloy::IsNoDiskProcess()) {
     log_.reset();
   } else {
     log_ = std::make_shared<base::File>(std::move(log));
@@ -148,7 +149,8 @@ AlloyGuard::Decision AlloyGuard::Decide(int hash, std::string_view endpoint,
                       result.traffic_class != TrafficClass::kWebRtc)))
     result.allowed = false;
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
-  if (!result.allowed && !base::alloy::IsNoDiskProcess()) {
+  if (!result.allowed && recording_permitted_ &&
+      !base::alloy::IsNoDiskProcess()) {
     base::DictValue row;
     row.Set("time", base::Time::Now().InMillisecondsFSinceUnixEpoch());
     row.Set("annotation_id", result.annotation_id);

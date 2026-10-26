@@ -44,7 +44,8 @@ class AlloyGuard : public base::RefCountedThreadSafe<AlloyGuard> {
   };
   struct Annotation { int hash; std::string_view id; };
 
-  AlloyGuard();
+  enum class RecordingMode { kPermitted, kForbidden };
+  explicit AlloyGuard(RecordingMode recording_mode = RecordingMode::kPermitted);
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
   // The browser opens an append-only log before passing the FD into the
   // sandbox. A network child never opens a filesystem path or gains directory
@@ -75,6 +76,7 @@ class AlloyGuard : public base::RefCountedThreadSafe<AlloyGuard> {
   base::Lock lock_;
   Options options_ GUARDED_BY(lock_);
 #if BUILDFLAG(ALLOY_ENABLE_GUARD_LOG)
+  const bool recording_permitted_;
   std::shared_ptr<base::File> log_ GUARDED_BY(lock_);
   const scoped_refptr<base::SequencedTaskRunner> log_runner_;
 #endif

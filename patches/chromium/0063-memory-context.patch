@@ -1,0 +1,738 @@
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -193,14 +193,15 @@
+   // extensions::ContentSettingsService::Get() needs the original profile.
+   const bool stateless =
+       alloy::site_records::RequestContextPolicy::IsStateless(*profile);
+-  Profile* original_profile =
+-      stateless ? profile : profile->GetOriginalProfile();
++  const bool no_disk =
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile);
++  Profile* original_profile = no_disk ? profile : profile->GetOriginalProfile();
+ 
+   // In OffTheRecord mode, retrieve the host content settings map of the parent
+   // profile in order to ensure the preferences have been migrated.
+   // This is not required for guest sessions, since the parent profile of a
+   // guest OTR profile is empty.
+-  if (!stateless && profile->IsOffTheRecord() && !profile->IsGuestSession()) {
++  if (!no_disk && profile->IsOffTheRecord() && !profile->IsGuestSession()) {
+     GetForProfile(original_profile);
+   }
+ 
+--- a/chrome/browser/extensions/chrome_extension_system.cc
++++ b/chrome/browser/extensions/chrome_extension_system.cc
+@@ -123,7 +123,7 @@
+ 
+ void ChromeExtensionSystem::Shared::InitPrefs() {
+   const bool stateless =
+-      alloy::site_records::RequestContextPolicy::IsStateless(*profile_);
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_);
+   store_factory_ = base::MakeRefCounted<value_store::ValueStoreFactoryImpl>(
+       stateless ? base::FilePath() : profile_->GetPath(), stateless);
+ 
+@@ -216,7 +216,7 @@
+ }
+ 
+ void ChromeExtensionSystem::Shared::Init(bool extensions_enabled) {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile_)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_)) {
+     extensions_enabled = false;
+   }
+ 
+@@ -237,7 +237,7 @@
+ 
+   bool autoupdate_enabled =
+       !profile_->IsGuestSession() && !profile_->IsSystemProfile() &&
+-      !alloy::site_records::RequestContextPolicy::IsStateless(*profile_);
++      !alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_);
+ #if BUILDFLAG(IS_CHROMEOS)
+   if (!extensions_enabled) {
+     autoupdate_enabled = false;
+@@ -394,7 +394,7 @@
+   shared_ = ChromeExtensionSystemSharedFactory::GetForBrowserContext(profile);
+ 
+   if (!profile->IsOffTheRecord() ||
+-      alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)) {
+     shared_->InitPrefs();
+   }
+ }
+--- a/chrome/browser/extensions/chrome_extensions_browser_client.cc
++++ b/chrome/browser/extensions/chrome_extensions_browser_client.cc
+@@ -315,8 +315,8 @@
+ bool ChromeExtensionsBrowserClient::IsSameContext(
+     content::BrowserContext* first,
+     content::BrowserContext* second) {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*first) ||
+-      alloy::site_records::RequestContextPolicy::IsStateless(*second)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*first) ||
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*second)) {
+     return first == second;
+   }
+ 
+@@ -327,7 +327,7 @@
+ 
+ bool ChromeExtensionsBrowserClient::HasOffTheRecordContext(
+     content::BrowserContext* context) {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return true;
+   }
+ 
+@@ -337,7 +337,7 @@
+ content::BrowserContext* ChromeExtensionsBrowserClient::GetOffTheRecordContext(
+     content::BrowserContext* context) {
+   // The stateless runtime's native namespace is this context, never its parent.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+ 
+@@ -348,7 +348,7 @@
+ content::BrowserContext* ChromeExtensionsBrowserClient::GetOriginalContext(
+     content::BrowserContext* context) {
+   // The stateless runtime's native namespace is this context, never its parent.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+ 
+@@ -360,7 +360,7 @@
+ ChromeExtensionsBrowserClient::GetContextRedirectedToOriginal(
+     content::BrowserContext* context) {
+   // The stateless runtime's native namespace is this context, never its parent.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+ 
+@@ -378,7 +378,7 @@
+     GetContextRedirectedToOriginalWithoutAshInternals(
+         content::BrowserContext* context) {
+   // The stateless runtime's native namespace is this context, never its parent.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+ 
+@@ -405,7 +405,7 @@
+ ChromeExtensionsBrowserClient::GetContextForOriginalOnly(
+     content::BrowserContext* context) {
+   // The stateless runtime's native namespace is this context, never its parent.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+ 
+--- a/chrome/browser/extensions/tab_helper.cc
++++ b/chrome/browser/extensions/tab_helper.cc
+@@ -195,7 +195,7 @@
+       func(content_rules_registry);
+     }
+     if (profile_->IsOffTheRecord() &&
+-        !alloy::site_records::RequestContextPolicy::IsStateless(*profile_)) {
++        !alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_)) {
+       // The original profile's content rules registry handles rules for
+       // spanning extensions in incognito profiles, so invoke it also.
+       RulesRegistryService* original_profile_rules_registry_service =
+--- a/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
++++ b/chrome/browser/notifications/scheduler/notification_schedule_service_factory.cc
+@@ -61,7 +61,7 @@
+     SimpleFactoryKey* key) const {
+   // Separate incognito instance that does nothing.
+   ProfileKey* profile_key = ProfileKey::FromSimpleFactoryKey(key);
+-  if (profile_key->IsAlloyStateless()) {
++  if (profile_key->IsAlloyNoDisk()) {
+     return key;
+   }
+   return profile_key->GetOriginalKey();
+--- a/chrome/browser/offline_items_collection/offline_content_aggregator_factory.cc
++++ b/chrome/browser/offline_items_collection/offline_content_aggregator_factory.cc
+@@ -34,7 +34,9 @@
+ std::unique_ptr<KeyedService>
+ OfflineContentAggregatorFactory::BuildServiceInstanceFor(
+     SimpleFactoryKey* key) const {
+-  DCHECK(!key->IsOffTheRecord());
++  DCHECK(!key->IsOffTheRecord() ||
++         (ProfileKey::FromSimpleFactoryKey(key)->IsAlloyNoDisk() &&
++          !ProfileKey::FromSimpleFactoryKey(key)->IsAlloyStateless()));
+   return std::make_unique<offline_items_collection::OfflineContentAggregator>();
+ }
+ 
+@@ -44,5 +46,8 @@
+   if (profile_key->IsAlloyStateless()) {
+     return nullptr;
+   }
++  if (profile_key->IsAlloyNoDisk()) {
++    return key;
++  }
+   return profile_key->GetOriginalKey();
+ }
+--- a/chrome/browser/profiles/incognito_helpers.cc
++++ b/chrome/browser/profiles/incognito_helpers.cc
+@@ -9,7 +9,7 @@
+ 
+ content::BrowserContext* GetBrowserContextRedirectedInIncognito(
+     content::BrowserContext* context) {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return nullptr;
+   }
+   return Profile::FromBrowserContext(context)->GetOriginalProfile();
+@@ -17,7 +17,7 @@
+ 
+ const content::BrowserContext* GetBrowserContextRedirectedInIncognito(
+     const content::BrowserContext* context) {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return nullptr;
+   }
+   const Profile* profile = Profile::FromBrowserContext(
+--- a/chrome/browser/profiles/off_the_record_profile_impl.cc
++++ b/chrome/browser/profiles/off_the_record_profile_impl.cc
+@@ -183,8 +183,9 @@
+       key_(std::make_unique<ProfileKey>(
+           profile_->GetPath(),
+           profile_->GetProfileKey(),
+-          otr_profile_id.GetAlloyStatelessNetworkState()
+-              ? std::make_optional(alloy::site_records::StorageMode::kStateless)
++          otr_profile_id.GetAlloyContextMode()
++              ? std::make_optional(
++                    otr_profile_id.GetAlloyContextMode()->storage_mode())
+               : std::nullopt)) {
+   // It's OK to delete a System Profile, even if it still has an active OTR
+   // Profile.
+@@ -193,9 +194,14 @@
+         profile_, ProfileKeepAliveOrigin::kOffTheRecordProfile);
+   }
+ 
+-  if (auto network_state = otr_profile_id.GetAlloyStatelessNetworkState()) {
+-    alloy::site_records::RequestContextPolicy::AttachStateless(
+-        *this, *network_state);
++  if (auto context_mode = otr_profile_id.GetAlloyContextMode()) {
++    if (context_mode->storage_mode() ==
++        alloy::site_records::StorageMode::kMemory) {
++      alloy::site_records::RequestContextPolicy::AttachMemory(*this);
++    } else {
++      alloy::site_records::RequestContextPolicy::AttachStateless(
++          *this, context_mode->network_state());
++    }
+     auto* connector = g_browser_process->browser_policy_connector();
+     CHECK(connector);
+     alloy_schema_registry_service_ = policy::BuildSchemaRegistryService(
+@@ -260,11 +266,11 @@
+   // Make the chrome//extension-icon/ resource available.
+   content::URLDataSource::Add(
+       this, std::make_unique<extensions::ExtensionIconSource>(
+-                alloy::site_records::RequestContextPolicy::IsStateless(*this)
++                alloy::site_records::RequestContextPolicy::IsNoDisk(*this)
+                     ? this
+                     : profile_.get()));
+ 
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (!alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     extensions::WebRequestEventRouter::OnOTRBrowserContextCreated(profile_,
+                                                                   this);
+   }
+@@ -332,7 +338,7 @@
+   }
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (!alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     extensions::WebRequestEventRouter::OnOTRBrowserContextDestroyed(profile_,
+                                                                     this);
+   }
+@@ -421,7 +427,7 @@
+ }
+ 
+ std::vector<Profile*> OffTheRecordProfileImpl::GetAllOffTheRecordProfiles() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return {this};
+   }
+   return profile_->GetAllOffTheRecordProfiles();
+@@ -457,7 +463,7 @@
+ ExtensionSpecialStoragePolicy*
+ OffTheRecordProfileImpl::GetExtensionSpecialStoragePolicy() {
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     if (!alloy_special_storage_policy_) {
+       alloy_special_storage_policy_ =
+           base::MakeRefCounted<ExtensionSpecialStoragePolicy>(
+@@ -470,7 +476,7 @@
+ }
+ 
+ bool OffTheRecordProfileImpl::IsChild() const {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return GetPrefs()->GetString(prefs::kSupervisedUserId) ==
+            supervised_user::kChildAccountSUID;
+   }
+@@ -498,7 +504,7 @@
+ #if BUILDFLAG(IS_CHROMEOS)
+ policy::UserCloudPolicyManagerAsh*
+ OffTheRecordProfileImpl::GetUserCloudPolicyManagerAsh() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return nullptr;
+   }
+   return GetOriginalProfile()->GetUserCloudPolicyManagerAsh();
+@@ -506,21 +512,21 @@
+ #else
+ policy::UserCloudPolicyManager*
+ OffTheRecordProfileImpl::GetUserCloudPolicyManager() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return nullptr;
+   }
+   return GetOriginalProfile()->GetUserCloudPolicyManager();
+ }
+ policy::ProfileCloudPolicyManager*
+ OffTheRecordProfileImpl::GetProfileCloudPolicyManager() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return nullptr;
+   }
+   return GetOriginalProfile()->GetProfileCloudPolicyManager();
+ }
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ policy::CloudPolicyManager* OffTheRecordProfileImpl::GetCloudPolicyManager() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return nullptr;
+   }
+   return GetOriginalProfile()->GetCloudPolicyManager();
+@@ -635,7 +641,7 @@
+ 
+ policy::ProfilePolicyConnector*
+ OffTheRecordProfileImpl::GetProfilePolicyConnector() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return alloy_policy_connector_.get();
+   }
+   return profile_->GetProfilePolicyConnector();
+@@ -643,7 +649,7 @@
+ 
+ const policy::ProfilePolicyConnector*
+ OffTheRecordProfileImpl::GetProfilePolicyConnector() const {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return alloy_policy_connector_.get();
+   }
+   return profile_->GetProfilePolicyConnector();
+@@ -654,6 +660,9 @@
+   if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
+     return base::FilePath();
+   }
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
++    return directory;
++  }
+   if (directory.empty()) {
+     return profile_->last_selected_directory();
+   }
+@@ -690,7 +699,7 @@
+ }
+ 
+ GURL OffTheRecordProfileImpl::GetHomePage() {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return ProfileImpl::GetHomePageForPrefs(GetPrefs());
+   }
+   return profile_->GetHomePage();
+--- a/chrome/browser/profiles/profile.cc
++++ b/chrome/browser/profiles/profile.cc
+@@ -176,8 +176,15 @@
+ // static
+ Profile::OTRProfileID Profile::OTRProfileID::CreateUniqueForAlloyStateless(
+     alloy::site_records::NetworkState network_state) {
++  return CreateUniqueForAlloy(
++      alloy::site_records::ContextMode::Stateless(network_state));
++}
++
++// static
++Profile::OTRProfileID Profile::OTRProfileID::CreateUniqueForAlloy(
++    alloy::site_records::ContextMode context_mode) {
+   auto id = CreateUniqueForCEF();
+-  id.alloy_network_state_ = network_state;
++  id.alloy_context_mode_ = context_mode;
+   return id;
+ }
+ 
+--- a/chrome/browser/profiles/profile.h
++++ b/chrome/browser/profiles/profile.h
+@@ -102,8 +102,12 @@
+     // or keyed services can observe a parent profile. Identity remains CEF OTR.
+     static OTRProfileID CreateUniqueForAlloyStateless(
+         alloy::site_records::NetworkState network_state);
+-    std::optional<alloy::site_records::NetworkState>
+-    GetAlloyStatelessNetworkState() const { return alloy_network_state_; }
++    static OTRProfileID CreateUniqueForAlloy(
++        alloy::site_records::ContextMode context_mode);
++    const std::optional<alloy::site_records::ContextMode>& GetAlloyContextMode()
++        const {
++      return alloy_context_mode_;
++    }
+     bool IsUniqueForCEF() const;
+ 
+     // Creates a unique OTR profile id to be used for DevTools browser contexts.
+@@ -176,7 +180,7 @@
+     const std::string& ToString() const;
+ 
+     const std::string profile_id_;
+-    std::optional<alloy::site_records::NetworkState> alloy_network_state_;
++    std::optional<alloy::site_records::ContextMode> alloy_context_mode_;
+   };
+ 
+   class Delegate {
+--- a/chrome/browser/profiles/profile_key.h
++++ b/chrome/browser/profiles/profile_key.h
+@@ -41,6 +41,11 @@
+   bool IsAlloyStateless() const {
+     return alloy_mode_ == alloy::site_records::StorageMode::kStateless;
+   }
++  bool IsAlloyNoDisk() const {
++    return IsAlloyStateless() ||
++           alloy_mode_ == alloy::site_records::StorageMode::kMemory;
++  }
++  bool AllowsServiceRedirection() const override { return !IsAlloyNoDisk(); }
+   PrefService* GetPrefs();
+   void SetPrefs(PrefService* prefs);
+ 
+--- a/chrome/browser/profiles/profile_selections.cc
++++ b/chrome/browser/profiles/profile_selections.cc
+@@ -144,7 +144,7 @@
+       // Shared by ordinary and refcounted keyed-service factories. Reject
+       // before either constructing or retrieving any service owned by the
+       // parent.
+-      if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++      if (alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)) {
+         return nullptr;
+       }
+       return profile->GetOriginalProfile();
+@@ -155,8 +155,10 @@
+ 
+ ProfileSelection ProfileSelections::GetProfileSelection(
+     Profile* profile) const {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile) &&
+-      alloy_stateless_profile_selection_) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*profile) &&
++      alloy_stateless_profile_selection_ &&
++      (alloy::site_records::RequestContextPolicy::IsStateless(*profile) ||
++       *alloy_stateless_profile_selection_ == ProfileSelection::kOwnInstance)) {
+     return *alloy_stateless_profile_selection_;
+   }
+ 
+--- a/chrome/browser/supervised_user/family_link_settings_service_factory.cc
++++ b/chrome/browser/supervised_user/family_link_settings_service_factory.cc
+@@ -42,6 +42,9 @@
+   if (profile_key->IsAlloyStateless()) {
+     return nullptr;
+   }
++  if (profile_key->IsAlloyNoDisk()) {
++    return key;
++  }
+   return profile_key->GetOriginalKey();
+ }
+ }  // namespace supervised_user
+--- a/chrome/browser/themes/theme_service.cc
++++ b/chrome/browser/themes/theme_service.cc
+@@ -353,9 +353,8 @@
+ 
+ ThemeService::ThemeService(Profile* profile, const ThemeHelper& theme_helper)
+     : profile_(profile),
+-      stateless_(
+-          profile &&
+-          alloy::site_records::RequestContextPolicy::IsStateless(*profile)),
++      no_disk_(profile &&
++               alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)),
+       theme_helper_(theme_helper),
+       original_theme_provider_(*theme_helper_, false, this),
+       incognito_theme_provider_(*theme_helper_, true, this),
+@@ -370,7 +369,7 @@
+ 
+   InitFromPrefs();
+ 
+-  if (!stateless_) {
++  if (!no_disk_) {
+     // ThemeObserver should be constructed before calling
+     // OnExtensionServiceReady. Otherwise, the ThemeObserver won't be
+     // constructed in time to observe the corresponding events.
+@@ -467,7 +466,7 @@
+ }
+ 
+ void ThemeService::RevertToExtensionTheme(const std::string& extension_id) {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   const auto* extension = extensions::ExtensionRegistry::Get(profile_)
+@@ -579,7 +578,7 @@
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ void ThemeService::RemoveUnusedThemes() {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   // We do not want to garbage collect themes on startup (|ready_| is false).
+@@ -741,7 +740,7 @@
+     const ui::ColorProviderKey& base_key,
+     const Profile* profile) const {
+   DCHECK(profile);
+-  DCHECK_EQ(stateless_ ? profile : profile->GetOriginalProfile(), profile_);
++  DCHECK_EQ(no_disk_ ? profile : profile->GetOriginalProfile(), profile_);
+ 
+   ui::ColorProviderKey key = base_key;
+   const bool is_incognito = profile->IsIncognitoProfile();
+@@ -962,7 +961,7 @@
+ 
+   SwapThemeSupplier(nullptr);
+   ClearThemePrefs();
+-  if (reset_all_settings && !stateless_) {
++  if (reset_all_settings && !no_disk_) {
+ #if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_WIN)
+     // This toggle is currently supported on ChromeOS and Windows and we only
+     // want platforms to set the value if they have a visible toggle.
+@@ -981,7 +980,7 @@
+ }
+ 
+ void ThemeService::InitFromPrefs() {
+-  if (stateless_) {
++  if (no_disk_) {
+     // Configuration has no extension-asset or migration intake in this mode.
+     // Keep the native providers, readiness, observers and live policy colors.
+     set_ready();
+@@ -1074,7 +1073,7 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ void ThemeService::DoSetTheme(const extensions::Extension* extension,
+                               bool suppress_infobar) {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   DCHECK(extension->is_theme());
+@@ -1085,7 +1084,7 @@
+ }
+ 
+ void ThemeService::OnExtensionServiceReady() {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   if (!ready_) {
+@@ -1103,7 +1102,7 @@
+ }
+ 
+ void ThemeService::MigrateTheme() {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   TRACE_EVENT0("browser", "ThemeService::MigrateTheme");
+@@ -1132,7 +1131,7 @@
+ }
+ void ThemeService::BuildFromExtension(const extensions::Extension* extension,
+                                       bool suppress_infobar) {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   build_extension_task_tracker_.TryCancelAll();
+@@ -1155,7 +1154,7 @@
+     const extensions::ExtensionId& extension_id,
+     scoped_refptr<BrowserThemePack> pack,
+     bool suppress_infobar) {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   if (UsingPolicyTheme()) {
+@@ -1314,7 +1313,7 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ void ThemeService::SetThemePrefsForExtension(
+     const extensions::Extension* extension) {
+-  if (stateless_) {
++  if (no_disk_) {
+     return;
+   }
+   ClearThemePrefs();
+@@ -1334,7 +1333,7 @@
+ }
+ 
+ bool ThemeService::DisableExtension(const std::string& extension_id) {
+-  if (stateless_) {
++  if (no_disk_) {
+     return false;
+   }
+   auto* registry = extensions::ExtensionRegistry::Get(profile_);
+--- a/chrome/browser/themes/theme_service.h
++++ b/chrome/browser/themes/theme_service.h
+@@ -311,7 +311,7 @@
+ 
+   Profile* profile() const { return profile_; }
+ 
+-  bool is_stateless() const { return stateless_; }
++  bool is_no_disk() const { return no_disk_; }
+ 
+   void set_ready() { ready_ = true; }
+ 
+@@ -418,7 +418,7 @@
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS)
+ 
+   raw_ptr<Profile> profile_;
+-  const bool stateless_;
++  const bool no_disk_;
+   PrefChangeRegistrar pref_change_registrar_;
+ 
+   const raw_ref<const ThemeHelper> theme_helper_;
+--- a/chrome/test/base/testing_profile.cc
++++ b/chrome/test/base/testing_profile.cc
+@@ -353,8 +353,13 @@
+ 
+ void TestingProfile::Init(bool is_supervised_profile, CreateMode create_mode) {
+   if (IsOffTheRecord()) {
+-    if (auto mode = GetOTRProfileID().GetAlloyStatelessNetworkState()) {
+-      alloy::site_records::RequestContextPolicy::AttachStateless(*this, *mode);
++    if (auto mode = GetOTRProfileID().GetAlloyContextMode()) {
++      if (mode->storage_mode() == alloy::site_records::StorageMode::kMemory) {
++        alloy::site_records::RequestContextPolicy::AttachMemory(*this);
++      } else {
++        alloy::site_records::RequestContextPolicy::AttachStateless(
++            *this, mode->network_state());
++      }
+     }
+   }
+   if (!g_browser_process) {
+--- a/chrome/test/base/testing_profile_key.cc
++++ b/chrome/test/base/testing_profile_key.cc
+@@ -14,8 +14,11 @@
+     : ProfileKey(
+           path,
+           original_key,
+-          alloy::site_records::RequestContextPolicy::IsStateless(*testing_profile)
+-              ? std::make_optional(alloy::site_records::StorageMode::kStateless)
++          alloy::site_records::RequestContextPolicy::Get(*testing_profile)
++              ? std::make_optional(
++                    alloy::site_records::RequestContextPolicy::Get(
++                        *testing_profile)
++                        ->storage_mode())
+               : std::nullopt),
+       testing_profile_(testing_profile) {}
+ 
+--- a/components/keyed_service/content/browser_context_keyed_service_factory.cc
++++ b/components/keyed_service/content/browser_context_keyed_service_factory.cc
+@@ -104,7 +104,13 @@
+ void* BrowserContextKeyedServiceFactory::GetContextToUse(void* context) const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   AssertContextWasntDestroyed(context);
+-  return GetBrowserContextToUse(static_cast<content::BrowserContext*>(context));
++  auto* supplied = static_cast<content::BrowserContext*>(context);
++  auto* selected = GetBrowserContextToUse(supplied);
++  if (selected && selected != supplied &&
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*supplied)) {
++    return nullptr;
++  }
++  return selected;
+ }
+ 
+ bool BrowserContextKeyedServiceFactory::ServiceIsCreatedWithContext() const {
+--- a/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.cc
++++ b/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.cc
+@@ -106,7 +106,13 @@
+     void* context) const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   AssertContextWasntDestroyed(context);
+-  return GetBrowserContextToUse(static_cast<content::BrowserContext*>(context));
++  auto* supplied = static_cast<content::BrowserContext*>(context);
++  auto* selected = GetBrowserContextToUse(supplied);
++  if (selected && selected != supplied &&
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*supplied)) {
++    return nullptr;
++  }
++  return selected;
+ }
+ 
+ bool RefcountedBrowserContextKeyedServiceFactory::ServiceIsCreatedWithContext()
+--- a/components/keyed_service/core/simple_factory_key.h
++++ b/components/keyed_service/core/simple_factory_key.h
+@@ -27,6 +27,10 @@
+ 
+   bool IsOffTheRecord() const { return is_off_the_record_; }
+ 
++  // Identity and service-sharing authority are separate. A key whose immutable
++  // owner policy forbids sharing must not be redirected by a factory selector.
++  virtual bool AllowsServiceRedirection() const { return true; }
++
+  private:
+   base::FilePath path_;
+   bool is_off_the_record_;
+--- a/components/keyed_service/core/simple_keyed_service_factory.cc
++++ b/components/keyed_service/core/simple_keyed_service_factory.cc
+@@ -87,7 +87,13 @@
+ 
+ void* SimpleKeyedServiceFactory::GetContextToUse(void* context) const {
+   AssertContextWasntDestroyed(context);
+-  return GetKeyToUse(static_cast<SimpleFactoryKey*>(context));
++  auto* supplied = static_cast<SimpleFactoryKey*>(context);
++  auto* selected = GetKeyToUse(supplied);
++  if (selected && selected != supplied &&
++      !supplied->AllowsServiceRedirection()) {
++    return nullptr;
++  }
++  return selected;
+ }
+ 
+ bool SimpleKeyedServiceFactory::ServiceIsCreatedWithContext() const {
+--- a/extensions/browser/extension_action_manager.cc
++++ b/extensions/browser/extension_action_manager.cc
+@@ -62,9 +62,8 @@
+ ExtensionActionManager::ExtensionActionManager(
+     content::BrowserContext* browser_context)
+     : browser_context_(browser_context) {
+-  CHECK(
+-      !browser_context_->IsOffTheRecord() ||
+-      alloy::site_records::RequestContextPolicy::IsStateless(*browser_context_))
++  CHECK(!browser_context_->IsOffTheRecord() ||
++        alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_))
+       << "Don't instantiate this with an off-the-record context.";
+   extension_registry_observation_.Observe(
+       ExtensionRegistry::Get(browser_context_));
+--- a/extensions/browser/extension_registrar.cc
++++ b/extensions/browser/extension_registrar.cc
+@@ -1396,8 +1396,7 @@
+ }
+ 
+ bool ExtensionRegistrar::CanAddExtension(const Extension* extension) const {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(
+-          *browser_context_) &&
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_) &&
+       !Manifest::IsComponentLocation(extension->location())) {
+     return false;
+   }
+--- a/extensions/browser/unpacked_installer.cc
++++ b/extensions/browser/unpacked_installer.cc
+@@ -138,10 +138,9 @@
+ 
+ void UnpackedInstaller::Load(const base::FilePath& path_in) {
+   if (browser_context_ &&
+-      alloy::site_records::RequestContextPolicy::IsStateless(
+-          *browser_context_)) {
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_)) {
+     ReportExtensionLoadError(
+-        u"Extension installation is unavailable in stateless contexts");
++        u"Extension installation is unavailable in no-disk contexts");
+     return;
+   }
+ 
+@@ -159,8 +158,7 @@
+                                             std::string* extension_id,
+                                             bool only_allow_apps) {
+   if (browser_context_ &&
+-      alloy::site_records::RequestContextPolicy::IsStateless(
+-          *browser_context_)) {
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_)) {
+     return false;
+   }
+ 

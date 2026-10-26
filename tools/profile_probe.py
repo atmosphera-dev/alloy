@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""NUC-only native stateless, URL-history and managed TLS/network outcome probe."""
+"""NUC-only native request-context storage, lifetime and TLS/network probe."""
 import argparse
 from datetime import datetime, timezone
 import errno
@@ -488,6 +488,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == '/cache.js':
             kind = 'application/javascript'
             body = b'window.resourceLoaded = true;'
+        elif path == '/memory-cache':
+            kind = 'text/plain'
+            body = b'memory-http-value'
         elif path == '/sw.js':
             kind = 'application/javascript'
             body = b'self.addEventListener("fetch",()=>{});'
@@ -502,7 +505,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'public,max-age=31536000' if path == '/cache.js' else 'no-store')
+        self.send_header('Cache-Control', 'public,max-age=31536000' if path in ('/cache.js', '/memory-cache') else 'no-store')
         if path.startswith('/page/'):
             self.send_header('Set-Cookie', 'alloy_http_probe=refused; SameSite=Lax')
         if close:
@@ -574,7 +577,8 @@ def await_context_stopped(root, process, parent_id, port):
 
 
 def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1,
-              exercise_files=False, certificate_base='', fixture=None, alternate_fixture=None):
+              exercise_files=False, certificate_base='', fixture=None, alternate_fixture=None,
+              memory=False, trusted_certificate=None):
     root.mkdir()
     # An explicitly selected external user file is outside browser-owned roots.
     # Its original bytes must survive both grant lifetime and browser teardown.
@@ -593,6 +597,14 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
     with (root/'nss-fixture.log').open('xb') as log:
         subprocess.run(['certutil', '-N', '--empty-password', '-d', 'sql:'+str(nss)],
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=20)
+        if trusted_certificate is not None:
+            # A certificate-error response is deliberately not HTTP-cacheable.
+            # Supply this isolated fixture's CA as external OS/NSS input before
+            # startup; never bypass certificate validation for memory outcomes.
+            assert memory and trusted_certificate.is_relative_to(W/'evidence')
+            subprocess.run(['certutil', '-A', '-d', 'sql:'+str(nss),
+                '-n', 'Alloy memory fixture', '-t', 'C,,', '-i', str(trusted_certificate)],
+                stdout=log, stderr=subprocess.STDOUT, check=True, timeout=20)
     nss_before = {p.name:hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in nss.iterdir() if p.is_file()}
     save(root/'nss-before.json', nss_before)
@@ -605,7 +617,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
             '--off-screen-rendering-enabled', '--ozone-platform=x11', '--disable-gpu',
             '--use-fake-device-for-media-stream',
              '--remote-debugging-port='+str(port)]
-    if not certificate_base:
+    if not certificate_base and not memory:
         argv.append('--ignore-certificate-errors')
     if exercise_files:
         # Brave deliberately defaults its local-file API off. Test the opt-in
@@ -619,7 +631,9 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
                 ALLOY_PROFILE_READY=str(root/'native-ready.json'),
                 ALLOY_PROFILE_SYMBOLS=str(symbol_file),
                XDG_CACHE_HOME=str(roots['cache']), XDG_CONFIG_HOME=str(roots['config']),
-                XDG_DATA_HOME=str(roots['data']))
+                 XDG_DATA_HOME=str(roots['data']))
+    if memory:
+        env.update(ALLOY_PROFILE_MEMORY='1', ALLOY_PROFILE_OBSERVE_LIFETIME='1')
     browser_environment = {name:env[name] for name in
                            ('HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME')}
     # The observer's own cache/config is evidence, never a browser-owned path.
@@ -639,7 +653,11 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         try:
             ready = await_parent_ready(root, process)
             save(root/'before-paths.json', inventory(root))
-            response = subprocess.run(['node', '--input-type=module', '-e', DRIVE,
+            drive = DRIVE
+            if memory:
+                from profile_memory import DRIVE as MEMORY_DRIVE
+                drive = MEMORY_DRIVE.replace('__CDP_HELPERS__', CDP_HELPERS)
+            response = subprocess.run(['node', '--input-type=module', '-e', drive,
                 str(port), base, mode, marker, str(baseline), str(root/'stdio.log'),
                   '1' if exercise_files else '0', certificate_base,
                   str(root/'native-popup-completed.json'),str(root/'native-gesture.json'),str(ready['pid']),
@@ -650,12 +668,13 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
             assert response.returncode == 0, response.stderr
             proof = json.loads(response.stdout)
             save(root / 'live-paths.json', inventory(root))
-            dispose = subprocess.run(['node', '--input-type=module', '-e', DISPOSE,
-                str(port), str(root/'stdio.log'), proof['parentTarget']],
-                capture_output=True, text=True, timeout=40)
-            (root/'dispose.stdout').write_text(dispose.stdout)
-            (root/'dispose.stderr').write_text(dispose.stderr)
-            assert dispose.returncode == 0, dispose.stderr
+            if not memory:
+                dispose = subprocess.run(['node', '--input-type=module', '-e', DISPOSE,
+                    str(port), str(root/'stdio.log'), proof['parentTarget']],
+                    capture_output=True, text=True, timeout=40)
+                (root/'dispose.stdout').write_text(dispose.stdout)
+                (root/'dispose.stderr').write_text(dispose.stderr)
+                assert dispose.returncode == 0, dispose.stderr
             stopped = await_context_stopped(root, process, proof['parentTarget'], port)
             assert stopped['pid'] == ready['pid']
             save(root/'final-paths.json', inventory(root))
@@ -708,19 +727,19 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
     assert len(owners) == 1, owners
     proof.update(pid=owners[0], started=started, finished=time.time())
     proof['parentReadiness'] = ready
-    proof['statelessDestruction'] = stopped
+    proof['memoryDestruction' if memory else 'statelessDestruction'] = stopped
     parent_events = [e for e in events if e['event'] == 'bootstrap-created']
     assert len(parent_events) == 1 and parent_events[0]['persistent_context'], parent_events
     assert len([e for e in events if e['event'] == 'bootstrap-closed']) == 1
-    assert len([e for e in events if e['event'] == 'stateless-start']) == 1
+    assert len([e for e in events if e['event'] == ('memory-start' if memory else 'stateless-start')]) == (2 if memory else 1)
     created = [v for v in events if v['event'] == 'created']
     closed = [v for v in events if v['event'] == 'closed']
-    expected = 2 if baseline >= 0 or certificate_base else 3
+    expected = 7 if memory else 2 if baseline >= 0 or certificate_base else 3
     assert len(created) == len(closed) == expected, events
     assert {v['browser'] for v in created} == {v['browser'] for v in closed}
     assert all(v['shares_context'] and v['empty_cache_path'] and
                v['parent_preference_isolated'] for v in created), created
-    if baseline < 0 and not certificate_base:
+    if baseline < 0 and not certificate_base and not memory:
         media_events = [v for v in events if v['event'] == 'media-permission']
         assert len(media_events) == 3 and all(v['permissions'] == 2 for v in media_events), media_events
         file_events = [v for v in events if v['event'] == 'file-picker']
@@ -738,6 +757,9 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         assert any(v['event'] == 'certificate-released' for v in events)
         proof['certificate_errors_ignored'] = False
     proof['events'] = events
+    if memory:
+        assert not any(event['event'] == 'certificate' for event in events), \
+            'memory storage fixture did not establish trusted TLS'
     before = json.loads((root/'before-paths.json').read_text())
     proof['inventoryChanges'] = {}
     for name in ('live-paths.json', 'final-paths.json'):
@@ -762,7 +784,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=['stateless', 'core', 'keyring'], default='core')
+    parser.add_argument('--check', choices=['stateless', 'memory', 'core', 'keyring'], default='core')
     parser.add_argument('--exercise-files', action='store_true',
                         help='Additionally enable Brave FileSystemAccessAPI for native file-grant checks')
     parser.add_argument('--exercise-certificates', action='store_true',
@@ -774,6 +796,8 @@ def main():
         return store_main()
     if args.exercise_files and args.exercise_certificates:
         parser.error('file and certificate consumer matrices are separate runs')
+    if args.check == 'memory' and (args.exercise_files or args.exercise_certificates):
+        parser.error('memory uses its native storage and context-lifetime matrix')
     assert socket.gethostname() == 'wakaba-build'
     assert os.environ['TMPDIR'] == str(temp_path(W))
     out = args.out.resolve()
@@ -846,15 +870,29 @@ def main():
             threading.Thread(target=alternate_fixture.serve_forever, daemon=True).start()
             certificate_base = 'https://127.0.0.1:'+str(alternate_fixture.server_port)
         results = []
-        for mode in ('keep', 'cut'):
+        for mode in (('keep',) if args.check == 'memory' else ('keep', 'cut')):
             marker = 'ALLOY_STATE_'+secrets.token_hex(16)
             before = len(fixture.events)
             alternate_before = len(alternate_fixture.events) if alternate_fixture else 0
             page_root, baseline_root = evidence/(mode+'-page'), evidence/(mode+'-no-page')
             proof = run_case(out, executable, page_root, mode, base, marker, symbol_file,
-                              exercise_files=args.exercise_files, certificate_base=certificate_base,
-                              fixture=fixture, alternate_fixture=alternate_fixture)
+                               exercise_files=args.exercise_files, certificate_base=certificate_base,
+                               fixture=fixture, alternate_fixture=alternate_fixture,
+                               memory=args.check == 'memory',
+                               trusted_certificate=cert if args.check == 'memory' else None)
             events = fixture.events[before:proof['statelessServerEnd']]
+            if args.check == 'memory':
+                cache_requests = [v for v in events if v['path'] == '/memory-cache']
+                assert len(cache_requests) == 3, cache_requests
+                proof['httpCacheRequests'] = cache_requests
+                assert all(not change['added'] for change in proof['inventoryChanges'].values()), \
+                    'memory context added paths: '+json.dumps(proof['inventoryChanges'])
+                proof['checks'].extend(['memory-context-http-cache', 'memory-context-no-added-paths'])
+                results.append(proof)
+                save(evidence/'results.json', results)
+                for check in proof['checks']:
+                    print('PASS', check, flush=True)
+                continue
             if alternate_fixture:
                 events += alternate_fixture.events[alternate_before:proof['statelessAlternateServerEnd']]
                 assert not any(v['path'] == '/page/certificate-held' for v in events), events

@@ -1,0 +1,35 @@
+--- a/chrome/browser/performance_manager/persistence/site_data/site_data_cache_facade_factory.cc
++++ b/chrome/browser/performance_manager/persistence/site_data/site_data_cache_facade_factory.cc
+@@ -53,14 +53,10 @@
+ SiteDataCacheFacadeFactory::SiteDataCacheFacadeFactory()
+     : ProfileKeyedServiceFactory(
+           "SiteDataCacheFacadeFactory",
+-          ProfileSelections::Builder()
+-              .WithAlloyStateless(ProfileSelection::kNone)
+-              .WithRegular(ProfileSelection::kOwnInstance)
+-              .WithGuest(ProfileSelection::kOwnInstance)
+-              // TODO(crbug.com/41488885): Check if this service is needed for
+-              // Ash Internals.
+-              .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {
++          // The activity cache's backing/recorder was removed. Its lifecycle
++          // facade has no production consumer and must not subscribe to history
++          // or resolve an original profile in any storage mode.
++          ProfileSelections::BuildNoProfilesSelected()) {
+   DependsOn(HistoryServiceFactory::GetInstance());
+ }
+ 
+--- a/extensions/browser/unpacked_installer.cc
++++ b/extensions/browser/unpacked_installer.cc
+@@ -140,7 +140,10 @@
+   if (browser_context_ &&
+       alloy::site_records::RequestContextPolicy::IsNoDisk(*browser_context_)) {
+     ReportExtensionLoadError(
+-        u"Extension installation is unavailable in no-disk contexts");
++        alloy::site_records::RequestContextPolicy::IsStateless(
++            *browser_context_)
++            ? u"Extension installation is unavailable in stateless contexts"
++            : u"Extension installation is unavailable in memory-only contexts");
+     return;
+   }
+ 

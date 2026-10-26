@@ -517,6 +517,46 @@
       "patch": "chromium/0021-encrypted-cache-recovery.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0063-memory-context.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0063-memory-context.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0063-memory-context.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0064-memory-stores.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0065-memory-recording.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0066-memory-lifecycle.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0067-memory-family-settings.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0068-memory-native-owners.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

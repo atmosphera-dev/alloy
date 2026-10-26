@@ -1,0 +1,33 @@
+--- a/browser/brave_shields/ad_block_pref_service_factory.cc
++++ b/browser/brave_shields/ad_block_pref_service_factory.cc
+@@ -70,7 +70,7 @@
+ 
+ content::BrowserContext* AdBlockPrefServiceFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+   return GetBrowserContextRedirectedInIncognito(context);
+--- a/browser/themes/brave_theme_service.cc
++++ b/browser/themes/brave_theme_service.cc
+@@ -50,7 +50,7 @@
+ 
+ void BraveThemeService::MigrateBrowserColorSchemeFromBraveDarkModePrefs(
+     Profile* profile) {
+-  if (is_stateless()) {
++  if (is_no_disk()) {
+     return;
+   }
+   if (!g_browser_process) {
+--- a/browser/url_sanitizer/url_sanitizer_service_factory.cc
++++ b/browser/url_sanitizer/url_sanitizer_service_factory.cc
+@@ -76,7 +76,7 @@
+ 
+ content::BrowserContext* URLSanitizerServiceFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return context;
+   }
+   return GetBrowserContextRedirectedInIncognito(context);

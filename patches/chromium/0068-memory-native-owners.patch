@@ -1,0 +1,205 @@
+--- a/chrome/browser/language/language_model_manager_factory.cc
++++ b/chrome/browser/language/language_model_manager_factory.cc
+@@ -138,7 +138,7 @@
+                            language::LanguageModelManager* const manager) {
+   // Use the GeoLanguageModel as the primary Language Model if its experiment is
+   // enabled, and the FluentLanguageModel otherwise.
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile) &&
++  if (!alloy::site_records::RequestContextPolicy::IsNoDisk(*profile) &&
+       language::GetOverrideLanguageModel() ==
+           language::OverrideLanguageModel::GEO) {
+     manager->AddModel(language::LanguageModelManager::ModelType::GEO,
+@@ -155,7 +155,7 @@
+   // On Android, additionally create a ULPLanguageModel and populate it with
+   // ULP data if not disabled.
+ #if BUILDFLAG(IS_ANDROID)
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile) &&
++  if (!alloy::site_records::RequestContextPolicy::IsNoDisk(*profile) &&
+       base::FeatureList::IsEnabled(language::kGmsCoreUlp)) {
+     base::ThreadPool::PostTaskAndReplyWithResult(
+         FROM_HERE, {base::MayBlock()},
+--- a/chrome/browser/metrics/profile_metrics_service_factory.cc
++++ b/chrome/browser/metrics/profile_metrics_service_factory.cc
+@@ -46,7 +46,7 @@
+     content::BrowserContext* context) const {
+   // Brave's private identity graph requires this native configuration object.
+   // Stateless contexts have no profile label and never consult a parent/path.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*context)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*context)) {
+     return std::make_unique<metrics::ProfileMetricsService>();
+   }
+   if (!base::FeatureList::IsEnabled(metrics::features::kPerProfileMetrics)) {
+--- a/chrome/browser/plugins/plugin_prefs_factory.cc
++++ b/chrome/browser/plugins/plugin_prefs_factory.cc
+@@ -57,7 +57,7 @@
+   Profile* profile = static_cast<Profile*>(context);
+   scoped_refptr<PluginPrefs> plugin_prefs(new PluginPrefs());
+   plugin_prefs->set_profile(
+-      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)
+           ? profile
+           : profile->GetOriginalProfile());
+   plugin_prefs->SetPrefs(profile->GetPrefs());
+--- a/chrome/browser/safe_browsing/advanced_protection_status_manager_factory.cc
++++ b/chrome/browser/safe_browsing/advanced_protection_status_manager_factory.cc
+@@ -24,7 +24,7 @@
+       safe_browsing::AdvancedProtectionStatusManagerAndroid>();
+ #else
+   Profile* profile = Profile::FromBrowserContext(context);
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)) {
+     return std::make_unique<
+         safe_browsing::AdvancedProtectionStatusManagerDesktop>(
+         profile->GetPrefs(),
+--- a/chrome/browser/safe_browsing/chrome_password_reuse_detection_manager_client.cc
++++ b/chrome/browser/safe_browsing/chrome_password_reuse_detection_manager_client.cc
+@@ -238,7 +238,7 @@
+ bool ChromePasswordReuseDetectionManagerClient::IsHistorySyncAccountEmail(
+     const std::string& username) {
+   Profile* original_profile =
+-      alloy::site_records::RequestContextPolicy::IsStateless(*profile_)
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_)
+           ? profile_.get()
+           : profile_->GetOriginalProfile();
+   // Password reuse detection is tied to history sync.
+--- a/chrome/browser/spellchecker/spellcheck_custom_dictionary.cc
++++ b/chrome/browser/spellchecker/spellcheck_custom_dictionary.cc
+@@ -247,11 +247,11 @@
+     const base::FilePath& dictionary_directory_name,
+     Storage storage)
+     : storage_(storage),
+-      task_runner_(storage == Storage::kNone
++      task_runner_(storage != Storage::kProfile
+                        ? nullptr
+                        : base::ThreadPool::CreateSequencedTaskRunner(
+                              {base::MayBlock()})),
+-      custom_dictionary_path_(storage == Storage::kNone
++      custom_dictionary_path_(storage != Storage::kProfile
+                                   ? base::FilePath()
+                                   : dictionary_directory_name.Append(
+                                         chrome::kCustomDictionaryFileName)),
+@@ -333,7 +333,7 @@
+ 
+ void SpellcheckCustomDictionary::Load() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  if (storage_ == Storage::kNone) {
++  if (storage_ != Storage::kProfile) {
+     auto result = std::make_unique<LoadFileResult>();
+     result->is_valid_file = true;
+     OnLoaded(std::move(result));
+@@ -558,7 +558,7 @@
+ void SpellcheckCustomDictionary::FixInvalidFile(
+     std::unique_ptr<LoadFileResult> load_file_result) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  if (storage_ == Storage::kNone) {
++  if (storage_ != Storage::kProfile) {
+     return;
+   }
+   task_runner_->PostTask(
+@@ -570,7 +570,7 @@
+ void SpellcheckCustomDictionary::Save(
+     std::unique_ptr<Change> dictionary_change) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  if (storage_ == Storage::kNone) {
++  if (storage_ != Storage::kProfile) {
+     return;
+   }
+   fix_invalid_file_.Cancel();
+--- a/chrome/browser/spellchecker/spellcheck_custom_dictionary.h
++++ b/chrome/browser/spellchecker/spellcheck_custom_dictionary.h
+@@ -125,7 +125,9 @@
+ 
+   // Stateless contexts still use the native empty dictionary and readiness
+   // notifications, but never admit local/account words or file operations.
+-  enum class Storage { kProfile, kNone };
++  // Memory admits native words for this owner's lifetime, with no path or
++  // file task runner. None additionally refuses word admission.
++  enum class Storage { kProfile, kMemory, kNone };
+ 
+   // The dictionary will be saved in |dictionary_directory_name| for kProfile.
+   explicit SpellcheckCustomDictionary(
+@@ -240,7 +242,7 @@
+ 
+   const Storage storage_;
+ 
+-  // Task runner where the file operations takes place. Absent for kNone.
++  // Task runner for file operations. Present only for kProfile.
+   scoped_refptr<base::SequencedTaskRunner> task_runner_;
+ 
+   // In-memory cache of the custom words file. When
+--- a/chrome/browser/spellchecker/spellcheck_service.cc
++++ b/chrome/browser/spellchecker/spellcheck_service.cc
+@@ -193,9 +193,12 @@
+ 
+   const bool stateless =
+       alloy::site_records::RequestContextPolicy::IsStateless(*context_);
++  const bool no_disk =
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*context_);
+   custom_dictionary_ = std::make_unique<SpellcheckCustomDictionary>(
+-      stateless ? base::FilePath() : context_->GetPath(),
++      no_disk ? base::FilePath() : context_->GetPath(),
+       stateless ? SpellcheckCustomDictionary::Storage::kNone
++      : no_disk ? SpellcheckCustomDictionary::Storage::kMemory
+                 : SpellcheckCustomDictionary::Storage::kProfile);
+   custom_dictionary_->AddObserver(this);
+ 
+--- a/chrome/browser/ui/autofill/chrome_autofill_client.cc
++++ b/chrome/browser/ui/autofill/chrome_autofill_client.cc
+@@ -661,7 +661,7 @@
+     const {
+   Profile* profile = GetProfile();
+   return IdentityManagerFactory::GetForProfile(
+-      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)
+           ? profile
+           : profile->GetOriginalProfile());
+ }
+@@ -679,7 +679,7 @@
+   // to do per-profile feature checks.
+   Profile* profile = GetProfile();
+   return GoogleGroupsManagerFactory::GetForBrowserContext(
+-      alloy::site_records::RequestContextPolicy::IsStateless(*profile)
++      alloy::site_records::RequestContextPolicy::IsNoDisk(*profile)
+           ? profile
+           : profile->GetOriginalProfile());
+ }
+--- a/chrome/browser/ui/prefs/prefs_tab_helper.cc
++++ b/chrome/browser/ui/prefs/prefs_tab_helper.cc
+@@ -324,7 +324,7 @@
+     // If the tab is in an incognito profile, we track changes in the default
+     // zoom level of the parent profile instead.
+     Profile* profile_to_track =
+-        alloy::site_records::RequestContextPolicy::IsStateless(*profile_)
++        alloy::site_records::RequestContextPolicy::IsNoDisk(*profile_)
+             ? profile_.get()
+             : profile_->GetOriginalProfile();
+     ChromeZoomLevelPrefs* zoom_level_prefs =
+--- a/chrome/test/base/testing_profile.cc
++++ b/chrome/test/base/testing_profile.cc
+@@ -415,7 +415,7 @@
+   if (prefs_.get()) {
+     user_prefs::UserPrefs::Set(this, prefs_.get());
+   } else if (IsOffTheRecord() &&
+-             !alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++             !alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     CreateIncognitoPrefService();
+   } else {
+     CreateTestingPrefService();
+@@ -801,7 +801,7 @@
+   // A stateless double uses native independent testing stores before any
+   // keyed service is constructed, rather than the parent's supervised store.
+   scoped_refptr<TestingPrefStore> supervised_store;
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     supervised_store = base::MakeRefCounted<TestingPrefStore>();
+   } else {
+     supervised_store = supervised_user::CreateTestingPrefStore(
+@@ -1051,7 +1051,7 @@
+   // Typed stateless profiles exercise the native controller and its document
+   // services, just like OffTheRecordProfileImpl, without owning a second
+   // manager.
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(*this)) {
++  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
+     return PermissionManagerFactory::GetForProfile(this);
+   }
+   return nullptr;

@@ -21,9 +21,16 @@ bool PrivateKeyring() {
   const char* marker = std::getenv("ALLOY_TEST_KEYRING");
   const char* home = std::getenv("HOME");
   const char* address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
-  return marker && home && address && std::string(marker) == home &&
-      std::string(home).starts_with("/home/builder/work/alloy-b/") &&
-      std::string(address).starts_with("unix:");
+  const char* workspace = std::getenv("ALLOY_TEST_KEYRING_WORKSPACE");
+  const char* private_bus = std::getenv("ALLOY_TEST_KEYRING_BUS_ADDRESS");
+  const char* parent_bus = std::getenv("ALLOY_TEST_KEYRING_PARENT_BUS_ADDRESS");
+  // The parent fixture admits the workspace through tools/workspace.py. Native
+  // tests require that admitted fixture's HOME and exact fresh-bus identity.
+  return marker && home && address && workspace && private_bus && parent_bus &&
+      std::string(marker) == home &&
+      std::string(home).starts_with(std::string(workspace) + "/evidence/") &&
+      std::string(address).starts_with("unix:") &&
+      std::string(address) == private_bus && std::string(address) != parent_bus;
 }
 
 TEST(SecretServiceKeySourceTest, PerProfileKeysLookupAndDeletion) {

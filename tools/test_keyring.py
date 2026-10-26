@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """NUC-only throwaway Secret Service, never a login/user keyring.
 
-Run: python3 repo/tools/test_keyring.py --root <new-B-evidence-dir> -- <argv...>
+Run: python3 repo/tools/test_keyring.py --root <new-workspace-evidence-dir> -- <argv...>
 The child and daemon share a fresh dbus-run-session, private HOME and XDG paths.
 No activation is needed; the already-running provider is explicitly owned here.
 """
@@ -16,10 +16,35 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
-from workspace import workspace_path, temp_path
+from workspace import workspace_path, temp_path, validate_workspace
 
 REPO = Path(__file__).resolve().parents[1]
 WORK = workspace_path(REPO)
+
+
+def validate_test_root(root):
+    validate_workspace(WORK, REPO)
+    if root.resolve() != root or not root.is_relative_to(WORK / 'evidence'):
+        raise RuntimeError('Private keyring tests require owned workspace evidence')
+
+
+def validate_private_session(root, environ):
+    validate_test_root(root)
+    home = str(root / 'home')
+    if environ.get('HOME') != home or environ.get('ALLOY_TEST_KEYRING') != home:
+        raise RuntimeError('Private keyring HOME does not match its fixture')
+    if environ.get('ALLOY_TEST_KEYRING_WORKSPACE') != str(WORK):
+        raise RuntimeError('Private keyring workspace does not match its fixture')
+    if environ.get('TMPDIR') != str(temp_path(WORK)):
+        raise RuntimeError('Private keyring scratch is outside its workspace')
+    address = environ.get('DBUS_SESSION_BUS_ADDRESS', '')
+    if not address.startswith('unix:'):
+        raise RuntimeError('Private keyring requires its own Unix session bus')
+    if 'ALLOY_TEST_KEYRING_PARENT_BUS_ADDRESS' not in environ:
+        raise RuntimeError('Private keyring session has no launcher identity')
+    if address == environ.get('ALLOY_TEST_KEYRING_PARENT_BUS_ADDRESS'):
+        raise RuntimeError('Inherited session bus is not a private test session')
+    return address
 
 
 def main():
@@ -30,8 +55,10 @@ def main():
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     root = args.root.resolve()
-    if WORK != Path('/home/builder/work/alloy-b') or not root.is_relative_to(WORK / 'evidence'):
-        parser.error('Private keyring tests require owned lane-B NUC evidence')
+    try:
+        validate_test_root(root)
+    except RuntimeError as error:
+        parser.error(str(error))
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('A child command is required')
@@ -43,17 +70,24 @@ def main():
             XDG_DATA_HOME=str(root / 'data'), XDG_CONFIG_HOME=str(root / 'config'),
             XDG_CACHE_HOME=str(root / 'cache'), XDG_RUNTIME_DIR=str(root / 'runtime'),
             TMPDIR=str(temp_path(WORK)), PYTHONDONTWRITEBYTECODE='1',
-            ALLOY_TEST_KEYRING=str(root / 'home'))
+            ALLOY_TEST_KEYRING=str(root / 'home'),
+            ALLOY_TEST_KEYRING_WORKSPACE=str(WORK),
+            ALLOY_TEST_KEYRING_PARENT_BUS_ADDRESS=os.environ.get('DBUS_SESSION_BUS_ADDRESS', ''))
         for name in ('DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS',
-                     'DBUS_STARTER_BUS_TYPE', 'GNOME_KEYRING_CONTROL', 'DISPLAY', 'WAYLAND_DISPLAY'):
+                     'DBUS_STARTER_BUS_TYPE', 'GNOME_KEYRING_CONTROL', 'DISPLAY', 'WAYLAND_DISPLAY',
+                     'ALLOY_TEST_KEYRING_BUS_ADDRESS'):
             env.pop(name, None)
         return subprocess.run(['timeout', '--kill-after=20', '420',
             'dbus-run-session', '--', sys.executable, __file__, '--root', str(root),
             '--inside', *(['--absent'] if args.absent else []), '--', *command],
             env=env, cwd=WORK, timeout=450).returncode
-    assert os.environ['HOME'] == os.environ['ALLOY_TEST_KEYRING'] == str(root / 'home')
-    assert os.environ['TMPDIR'] == str(WORK / 'tmp')
-    assert os.environ['DBUS_SESSION_BUS_ADDRESS'].startswith('unix:')
+    try:
+        address = validate_private_session(root, os.environ)
+    except RuntimeError as error:
+        parser.error(str(error))
+    # Only the validated private-session launcher binds this metadata for native
+    # children. Workspace admission remains owned by tools/workspace.py.
+    os.environ['ALLOY_TEST_KEYRING_BUS_ADDRESS'] = address
 
     def owner():
         result = subprocess.run(['timeout', '5', 'gdbus', 'call', '--session',

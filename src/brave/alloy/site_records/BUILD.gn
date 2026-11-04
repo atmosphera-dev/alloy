@@ -404,3 +404,11 @@ test("alloy_native_grants_unittests") {
     "//third_party/metrics_proto",
   ]
 }
+
+executable("alloy_browser_creation_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "browser_creation_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}

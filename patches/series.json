@@ -652,6 +652,11 @@
       "patch": "chromium/0095-native-network-retirement-endpoint-lifetime.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0096-native-browser-creation-publication.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

@@ -1,0 +1,117 @@
+--- a/libcef/browser/browser_host_base.h
++++ b/libcef/browser/browser_host_base.h
+@@ -372,6 +372,9 @@
+                                     const content::OpenURLParams& params);
+ 
+   // Helpers for executing client callbacks. Must be called on the UI thread.
++  // Publish creation only while the native browser survives external callbacks.
++  // False means the client closed it; the caller must not continue creation.
++  bool NotifyBrowserCreated();
+   void OnAfterCreated();
+   void OnBeforeClose();
+   void OnBrowserDestroyed();
+--- a/libcef/browser/browser_host_base.cc
++++ b/libcef/browser/browser_host_base.cc
+@@ -1495,6 +1495,26 @@
+   return true;
+ }
+ 
++bool CefBrowserHostBase::NotifyBrowserCreated() {
++  CEF_REQUIRE_UIT_RETURN(false);
++  CefRefPtr<CefBrowserHostBase> keep_alive(this);
++  if (!platform_delegate_ || !IsValid()) {
++    return false;
++  }
++  {
++    // Preserve the creation-time navigation boundary in both runtime styles.
++    // The client may synchronously close this browser, including from tasks
++    // released when the navigation lock unwinds.
++    auto navigation_lock = browser_info_->CreateNavigationLock();
++    OnAfterCreated();
++  }
++  if (!platform_delegate_ || !IsValid()) {
++    return false;
++  }
++  platform_delegate_->NotifyBrowserCreated();
++  return platform_delegate_ && IsValid();
++}
++
+ void CefBrowserHostBase::OnAfterCreated() {
+   CEF_REQUIRE_UIT();
+   if (client_) {
+--- a/libcef/browser/alloy/alloy_browser_host_impl.cc
++++ b/libcef/browser/alloy/alloy_browser_host_impl.cc
+@@ -211,17 +211,10 @@
+         browser->platform_delegate(), browser.get(), /*is_devtools=*/false);
+   }
+ 
+-  // 2. Notify the browser's LifeSpanHandler. This must always be the first
+-  // notification for the browser. Block navigation to avoid issues with focus
+-  // changes being sent to an unbound interface.
+-  {
+-    auto navigation_lock = browser_info->CreateNavigationLock();
+-    browser->OnAfterCreated();
+-  }
+-
+-  // 3. Notify the platform delegate. With Views this will result in a call to
+-  // CefBrowserViewDelegate::OnBrowserCreated().
+-  browser->platform_delegate_->NotifyBrowserCreated();
++  // Shared creation publication owns reentrant client/delegate lifetimes.
++  if (!browser->NotifyBrowserCreated()) {
++    return nullptr;
++  }
+ 
+   return browser;
+ }
+--- a/libcef/browser/chrome/chrome_browser_host_impl.cc
++++ b/libcef/browser/chrome/chrome_browser_host_impl.cc
+@@ -478,6 +478,7 @@
+ void ChromeBrowserHostImpl::Attach(content::WebContents* web_contents,
+                                    bool is_devtools_popup,
+                                    CefRefPtr<CefBrowserHostBase> opener) {
++  CefRefPtr<ChromeBrowserHostImpl> keep_alive(this);
+   DCHECK(web_contents);
+ 
+   if (opener) {
+@@ -514,18 +515,8 @@
+                                                      this, is_devtools_popup);
+   }
+ 
+-  // 2. Notify the browser's LifeSpanHandler. This must always be the first
+-  // notification for the browser.
+-  {
+-    // The WebContents won't be added to the Browser's TabStripModel until later
+-    // in the current call stack. Block navigation until that time.
+-    auto navigation_lock = browser_info_->CreateNavigationLock();
+-    OnAfterCreated();
+-  }
+-
+-  // 3. Notify the platform delegate. With Views this will result in a call to
+-  // CefBrowserViewDelegate::OnBrowserCreated().
+-  platform_delegate_->NotifyBrowserCreated();
++  // Shared creation publication owns reentrant client/delegate lifetimes.
++  NotifyBrowserCreated();
+ }
+ 
+ void ChromeBrowserHostImpl::SetBrowser(Browser* browser) {
+--- a/libcef/browser/chrome/views/browser_platform_delegate_chrome_views.cc
++++ b/libcef/browser/chrome/views/browser_platform_delegate_chrome_views.cc
+@@ -53,8 +53,6 @@
+ 
+ void CefBrowserPlatformDelegateChromeViews::NotifyBrowserCreated() {
+   if (auto delegate = browser_view_->delegate()) {
+-    delegate->OnBrowserCreated(browser_view_.get(), browser_.get());
+-
+     // DevTools windows hide the notification bubble by default. However, we
+     // don't currently have the ability to intercept WebContents creation via
+     // DevToolsWindow::Create(), so |show_by_default| will always be true here.
+@@ -76,6 +74,9 @@
+       zoom::ZoomController::FromWebContents(web_contents_)
+           ->SetShowsNotificationBubble(show_zoom_bubble);
+     }
++
++    // External publication is last: the callback may destroy this delegate.
++    delegate->OnBrowserCreated(browser_view_.get(), browser_.get());
+   }
+ }
+ 

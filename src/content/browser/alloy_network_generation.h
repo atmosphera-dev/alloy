@@ -30,13 +30,16 @@ class AlloyNetworkGeneration : public base::RefCounted<AlloyNetworkGeneration> {
   network::mojom::NetworkContext* GetNetworkContext();
   cert_verifier::mojom::CertVerifierServiceUpdater* GetVerifier();
   base::WeakPtr<AlloyNetworkGeneration> GetWeakPtr();
+  // Retains only the current physical endpoints for an entered native drain.
+  // Shutdown still closes admission and gives late callers a disconnected pipe.
+  base::OnceClosure RetainNativeRetirementEndpoints();
   void Shutdown();
 
  private:
   friend class base::RefCounted<AlloyNetworkGeneration>;
   ~AlloyNetworkGeneration();
   struct Endpoints;
-  std::unique_ptr<Endpoints> endpoints_;
+  std::shared_ptr<Endpoints> endpoints_;
   bool closed_ = false;
   base::WeakPtrFactory<AlloyNetworkGeneration> weak_factory_{this};
 };

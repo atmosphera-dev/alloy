@@ -1,0 +1,116 @@
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache_test.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache_test.cc
+@@ -429,6 +429,113 @@
+   EXPECT_EQ(0u, cache.GetSize());
+ }
+ 
++
++class RecordConnectionCacheTest : public QuicClientSessionCacheTest {
++ protected:
++  class AlphaFilter final : public QuicCryptoClientConfig::ServerIdFilter {
++   public:
++    bool Matches(const QuicServerId& server) const override {
++      return server.host()=="alpha.test";
++    }
++  };
++  void RetireAlpha(QuicClientSessionCache& cache) {
++    cache.RetireMatching(AlphaFilter());
++  }
++  auto Open(QuicClientSessionCache& cache, const char* host) {
++    return cache.CreateConnectionState(QuicServerId(host,443));
++  }
++};
++
++TEST_F(RecordConnectionCacheTest, SelectiveCachedStatePreservesBeta) {
++  QuicClientSessionCache cache;
++  auto alpha=Open(cache,"alpha.test"), beta=Open(cache,"beta.test");
++  auto params=MakeFakeTransportParams();
++  alpha->Insert(MakeTestSession(),*params);
++  beta->Insert(MakeTestSession(),*params);
++  ASSERT_EQ(2u,cache.GetSize());
++  RetireAlpha(cache);
++  EXPECT_FALSE(cache.Lookup(QuicServerId("alpha.test",443),clock_.WallNow(),ssl_ctx_.get()));
++  EXPECT_TRUE(beta->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++}
++
++TEST_F(RecordConnectionCacheTest, OriginalUncachedAlphaCannotPublishLateTicket) {
++  QuicClientSessionCache cache;
++  auto original=Open(cache,"alpha.test");
++  auto params=MakeFakeTransportParams();
++  RetireAlpha(cache);
++  original->Insert(MakeTestSession(),*params);
++  EXPECT_FALSE(cache.Lookup(QuicServerId("alpha.test",443),clock_.WallNow(),ssl_ctx_.get()));
++}
++
++TEST_F(RecordConnectionCacheTest, OriginalViewCannotConsumeFreshGeneration) {
++  QuicClientSessionCache cache;
++  auto original=Open(cache,"alpha.test");
++  auto params=MakeFakeTransportParams();
++  RetireAlpha(cache);
++  auto fresh=Open(cache,"alpha.test");
++  fresh->Insert(MakeTestSession(),*params);
++  EXPECT_FALSE(original->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++  EXPECT_TRUE(fresh->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++}
++
++TEST_F(RecordConnectionCacheTest, OriginalPendingBetaStillPublishes) {
++  QuicClientSessionCache cache;
++  auto original=Open(cache,"beta.test");
++  auto params=MakeFakeTransportParams();
++  RetireAlpha(cache);
++  original->Insert(MakeTestSession(),*params);
++  EXPECT_TRUE(original->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++}
++
++TEST_F(RecordConnectionCacheTest, FreshAlphaCanPublish) {
++  QuicClientSessionCache cache;
++  auto params=MakeFakeTransportParams();
++  RetireAlpha(cache);
++  auto fresh=Open(cache,"alpha.test");
++  fresh->Insert(MakeTestSession(),*params);
++  EXPECT_TRUE(fresh->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++}
++
++
++TEST_F(RecordConnectionCacheTest, OriginalTokenAndEarlyDataCannotMutateFreshState) {
++  SSL_CTX_set_early_data_enabled(ssl_ctx_.get(),1);
++  QuicClientSessionCache cache;
++  auto original=Open(cache,"alpha.test");
++  RetireAlpha(cache);
++  auto fresh=Open(cache,"alpha.test");
++  auto params=MakeFakeTransportParams();
++  auto session=MakeTestSession();
++  ASSERT_TRUE(SSL_SESSION_early_data_capable(session.get()));
++  fresh->Insert(std::move(session),*params);
++  fresh->OnNewTokenReceived("fresh-token");
++  original->OnNewTokenReceived("stale-token");
++  original->ClearEarlyData();
++  auto observed=fresh->Lookup(clock_.WallNow(),ssl_ctx_.get());
++  ASSERT_TRUE(observed);
++  EXPECT_EQ("fresh-token",observed->token);
++  EXPECT_TRUE(SSL_SESSION_early_data_capable(observed->tls_session.get()));
++}
++
++TEST_F(RecordConnectionCacheTest, RetainedViewCannotAccessDestroyedRoot) {
++  auto cache=std::make_unique<QuicClientSessionCache>();
++  auto original=Open(*cache,"alpha.test");
++  auto params=MakeFakeTransportParams();
++  cache.reset();
++  original->Insert(MakeTestSession(),*params);
++  original->OnNewTokenReceived("late-token");
++  original->ClearEarlyData();
++  EXPECT_FALSE(original->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++}
++
++TEST_F(RecordConnectionCacheTest, OrdinaryEvictionPreservesLiveConnectionAdmission) {
++  QuicClientSessionCache cache;
++  auto original=Open(cache,"beta.test");
++  auto params=MakeFakeTransportParams();
++  cache.Clear();
++  original->Insert(MakeTestSession(),*params);
++  EXPECT_TRUE(original->Lookup(clock_.WallNow(),ssl_ctx_.get()));
++}
++
+ }  // namespace
+ }  // namespace test
+ }  // namespace quic

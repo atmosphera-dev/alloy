@@ -1,0 +1,357 @@
+--- a/net/http/http_stream_factory.h
++++ b/net/http/http_stream_factory.h
+@@ -132,6 +132,11 @@
+   using NetworkRecordMatcher =
+       base::RepeatingCallback<bool(const NetworkAnonymizationKey&,
+                                    const url::SchemeHostPort&)>;
++  // Prepare original admission/native work without notifying callers. The
++  // returned commit also runs on drop and never selects fresh work by key.
++  base::OnceClosure PrepareNetworkRetirement(
++      const NetworkRecordMatcher& matches,
++      base::OnceClosure done);
+   void RetireNetworkState(const NetworkRecordMatcher& matches,
+                           base::OnceClosure done);
+ 
+--- a/net/http/http_stream_factory.cc
++++ b/net/http/http_stream_factory.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "net/http/http_stream_factory.h"
++#include "net/base/alloy_network_record_target.h"
+ 
+ #include <cstddef>
+ #include <tuple>
+@@ -133,6 +134,12 @@
+ 
+ void HttpStreamFactory::RetireNetworkState(const NetworkRecordMatcher& matches,
+                                            base::OnceClosure done) {
++  PrepareNetworkRetirement(matches, std::move(done)).Run();
++}
++
++base::OnceClosure HttpStreamFactory::PrepareNetworkRetirement(
++    const NetworkRecordMatcher& matches,
++    base::OnceClosure done) {
+   std::vector<JobController*> selected;
+   for (const auto& controller : job_controller_set_)
+     if (controller->MatchesNetworkRecord(matches))
+@@ -150,8 +157,15 @@
+     originals.push_back(controller->PrepareNetworkRetirement(drained));
+   for (auto& controller : originals)
+     if (controller)
+-      controller->RevokeNetworkState();
+-  drained.Run();
++      controller->CancelNetworkWork();
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<JobController>> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& controller : originals)
++          if (controller)
++            controller->RevokeNetworkState();
++      },
++      std::move(originals), base::ScopedClosureRunner(drained)));
+ }
+ 
+ void HttpStreamFactory::ProcessAlternativeServices(
+--- a/net/http/http_stream_factory_job_controller.h
++++ b/net/http/http_stream_factory_job_controller.h
+@@ -75,6 +75,7 @@
+   bool MatchesNetworkRecord(const NetworkRecordMatcher& matches) const;
+   base::WeakPtr<JobController> PrepareNetworkRetirement(
+       const base::RepeatingClosure& drained);
++  void CancelNetworkWork();
+   void RevokeNetworkState();
+ 
+   // From HttpStreamRequest::Helper.
+--- a/net/http/http_stream_factory_job_controller.cc
++++ b/net/http/http_stream_factory_job_controller.cc
+@@ -225,10 +225,7 @@
+   return ptr_factory_.GetWeakPtr();
+ }
+ 
+-void HttpStreamFactory::JobController::RevokeNetworkState() {
+-  if (network_revoke_started_)
+-    return;
+-  network_revoke_started_ = true;
++void HttpStreamFactory::JobController::CancelNetworkWork() {
+   resume_main_job_callback_.Cancel();
+   proxy_resolve_request_.reset();
+   next_state_ = STATE_NONE;
+@@ -239,6 +236,13 @@
+   dns_alpn_h3_job_.reset();
+   ws_over_h3_job_.reset();
+   preconnect_backup_job_.reset();
++}
++
++void HttpStreamFactory::JobController::RevokeNetworkState() {
++  if (network_revoke_started_)
++    return;
++  network_revoke_started_ = true;
++  CancelNetworkWork();
+   if (!request_) {
+     auto retirement = std::move(network_retirement_);
+     auto preconnect = std::move(preconnect_callback_);
+--- a/net/http/http_stream_pool.h
++++ b/net/http/http_stream_pool.h
+@@ -251,6 +251,11 @@
+                       StreamSocketCloseReason attempt_cancel_reason,
+                       std::string_view net_log_close_reason_utf8);
+ 
++  // Prepare original admission/native work without notifying callers. The
++  // returned commit also runs on drop and never selects fresh work by key.
++  base::OnceClosure PrepareMatchingStreams(
++      const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches,
++      base::OnceClosure done);
+   void RetireMatchingStreams(
+       const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches,
+       base::OnceClosure done);
+--- a/net/http/http_stream_pool.cc
++++ b/net/http/http_stream_pool.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "net/http/http_stream_pool.h"
++#include "net/base/alloy_network_record_target.h"
+ 
+ #include "base/barrier_closure.h"
+ 
+@@ -394,6 +395,12 @@
+ void HttpStreamPool::RetireMatchingStreams(
+     const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches,
+     base::OnceClosure done) {
++  PrepareMatchingStreams(matches, std::move(done)).Run();
++}
++
++base::OnceClosure HttpStreamPool::PrepareMatchingStreams(
++    const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches,
++    base::OnceClosure done) {
+   std::vector<base::WeakPtr<Group>> groups;
+   std::vector<JobController*> preparing;
+   size_t pending = 1;
+@@ -418,10 +425,20 @@
+   for (auto* controller : preparing)
+     controllers.push_back(controller->PrepareNetworkRetirement(drained));
+   for (auto& group : groups) group->PrepareNetworkRetirement(drained);
+-  for (auto& group : groups) if (group) group->RevokeNetworkState();
++  for (auto& group : groups)
++    if (group)
++      group->RevokeNetworkState();
+   for (auto& controller : controllers)
+-    if (controller) controller->RevokeNetworkState();
+-  drained.Run();
++    if (controller)
++      controller->CancelNetworkWork();
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<JobController>> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& controller : originals)
++          if (controller)
++            controller->RevokeNetworkState();
++      },
++      std::move(controllers), base::ScopedClosureRunner(drained)));
+ }
+ 
+ void HttpStreamPool::CloseIdleStreams(
+--- a/net/http/http_stream_pool_job_controller.h
++++ b/net/http/http_stream_pool_job_controller.h
+@@ -98,6 +98,7 @@
+       const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches) const;
+   base::WeakPtr<JobController> PrepareNetworkRetirement(
+       const base::RepeatingClosure& drained);
++  void CancelNetworkWork();
+   void RevokeNetworkState();
+   base::DictValue GetInfoAsValue() const;
+ 
+--- a/net/http/http_stream_pool_job_controller.cc
++++ b/net/http/http_stream_pool_job_controller.cc
+@@ -220,12 +220,16 @@
+   return weak_ptr_factory_.GetWeakPtr();  // Cleanup view, not new admission.
+ }
+ 
++void HttpStreamPool::JobController::CancelNetworkWork() {
++  origin_job_.reset();
++  alternative_job_.reset();
++  pending_stream_.reset();
++}
++
+ void HttpStreamPool::JobController::RevokeNetworkState() {
+   if (network_retirement_started_) return;
+   network_retirement_started_ = true;
+-  origin_job_.reset();
+-  alternative_job_.reset();
+-  pending_stream_.reset();
++  CancelNetworkWork();
+   auto preconnect = std::move(preconnect_callback_);
+   if (stream_request_) {
+     if (!stream_request_->completed()) {
+--- a/net/spdy/spdy_session_pool.h
++++ b/net/spdy/spdy_session_pool.h
+@@ -319,6 +319,11 @@
+   // Let any new ones created while this method is running continue to
+   // live.
+   void CloseCurrentSessions(Error error);
++  // Prepare original admission/native work without notifying callers. The
++  // returned commit also runs on drop and never selects fresh work by key.
++  base::OnceClosure PrepareMatchingSessions(
++      const base::RepeatingCallback<bool(const SpdySessionKey&)>& matches,
++      base::OnceClosure done);
+   void RetireMatchingSessions(
+       const base::RepeatingCallback<bool(const SpdySessionKey&)>& matches,
+       base::OnceClosure done);
+--- a/net/spdy/spdy_session_pool.cc
++++ b/net/spdy/spdy_session_pool.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "net/spdy/spdy_session_pool.h"
++#include "net/base/alloy_network_record_target.h"
+ 
+ #include "base/barrier_closure.h"
+ 
+@@ -412,6 +413,12 @@
+ void SpdySessionPool::RetireMatchingSessions(
+     const base::RepeatingCallback<bool(const SpdySessionKey&)>& matches,
+     base::OnceClosure done) {
++  PrepareMatchingSessions(matches, std::move(done)).Run();
++}
++
++base::OnceClosure SpdySessionPool::PrepareMatchingSessions(
++    const base::RepeatingCallback<bool(const SpdySessionKey&)>& matches,
++    base::OnceClosure done) {
+   WeakSessionList selected;
+   for (auto& session : GetCurrentSessions()) {
+     if (!session) continue;
+@@ -427,8 +434,13 @@
+       }, std::move(done)));
+   // Unmap every original owner before any stream close callback can reenter.
+   for (auto& session : selected) session->PrepareNetworkRetirement(drained);
+-  for (auto& session : selected) if (session) session->RevokeNetworkState();
+-  drained.Run();
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](WeakSessionList originals, base::ScopedClosureRunner finish) {
++        for (auto& session : originals)
++          if (session)
++            session->RevokeNetworkState();
++      },
++      std::move(selected), base::ScopedClosureRunner(drained)));
+ }
+ 
+ void SpdySessionPool::CloseCurrentSessions(Error error) {
+--- a/net/spdy/spdy_session.cc
++++ b/net/spdy/spdy_session.cc
+@@ -2728,7 +2728,7 @@
+   drain_description_ = description;
+ 
+   // Mark host_port_pair requiring HTTP/1.1 for subsequent connections.
+-  if (err == ERR_HTTP_1_1_REQUIRED) {
++  if (err == ERR_HTTP_1_1_REQUIRED && network_retirement_.empty()) {
+     http_server_properties_->SetHTTP11Required(
+         url::SchemeHostPort(url::kHttpsScheme, host_port_pair().host(),
+                             host_port_pair().port()),
+@@ -3223,6 +3223,8 @@
+     spdy::SpdyStreamId stream_id,
+     std::string_view origin,
+     const spdy::SpdyAltSvcWireFormat::AlternativeServiceVector& altsvc_vector) {
++  if (!network_retirement_.empty())
++    return;
+   // For sessions carrying proxy traffic, the peer is not authoritative for the
+   // origins associated with the carried streams. Except for stream 0, which
+   // must specify the origin in the ALTSVC frame itself.
+--- a/net/quic/quic_session_pool.h
++++ b/net/quic/quic_session_pool.h
+@@ -321,6 +321,11 @@
+       base::RepeatingCallback<bool(const NetworkAnonymizationKey&,
+                                    const quic::QuicServerId&,
+                                    SessionUsage)>;
++  // Prepare original admission/native work without notifying callers. The
++  // returned commit also runs on drop and never selects fresh work by key.
++  base::OnceClosure PrepareNetworkRetirement(
++      const NetworkRecordMatcher& matches,
++      base::OnceClosure done);
+   void RetireNetworkState(const NetworkRecordMatcher& matches,
+                           base::OnceClosure done);
+ 
+--- a/net/quic/quic_session_pool.cc
++++ b/net/quic/quic_session_pool.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "net/quic/quic_session_pool.h"
++#include "net/base/alloy_network_record_target.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -1194,6 +1195,12 @@
+ 
+ void QuicSessionPool::RetireNetworkState(const NetworkRecordMatcher& matches,
+                                          base::OnceClosure done) {
++  PrepareNetworkRetirement(matches, std::move(done)).Run();
++}
++
++base::OnceClosure QuicSessionPool::PrepareNetworkRetirement(
++    const NetworkRecordMatcher& matches,
++    base::OnceClosure done) {
+   class Filter final : public quic::QuicCryptoClientConfig::ServerIdFilter {
+    public:
+     Filter(const NetworkRecordMatcher& matches,
+@@ -1288,13 +1295,19 @@
+       .clear();  // Destroys sockets and invalidates original continuations.
+   std::move(modern).Run();
+   jobs.clear();
+-  for (auto& session : sessions)
+-    if (session)
+-      session->RevokeNetworkState();
+-  for (auto& callback : notify)
+-    std::move(callback).Run();
+-  drained.Run();  // Legacy jobs and their actual callbacks have drained.
+-  drained.Run();  // Synchronous preparation/revocation is finished.
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<QuicChromiumClientSession>> sessions,
++         std::vector<base::OnceClosure> notify, base::RepeatingClosure drained,
++         base::ScopedClosureRunner finish) {
++        for (auto& session : sessions)
++          if (session)
++            session->RevokeNetworkState();
++        for (auto& callback : notify)
++          std::move(callback).Run();
++        drained.Run();  // Legacy request callbacks actually returned.
++      },
++      std::move(sessions), std::move(notify), drained,
++      base::ScopedClosureRunner(drained)));
+ }
+ 
+ void QuicSessionPool::CloseAllSessions(int error,
+--- a/net/quic/quic_chromium_client_session.cc
++++ b/net/quic/quic_chromium_client_session.cc
+@@ -1281,6 +1281,8 @@
+ }
+ 
+ void QuicChromiumClientSession::OnOriginFrame(const quic::OriginFrame& frame) {
++  if (network_retired_)
++    return;
+   if (!enable_origin_frame_) {
+     return;
+   }
+@@ -2169,9 +2171,10 @@
+     // connection timed out with open streams then QUIC traffic has become
+     // blackholed. Alternatively, if too many retransmission timeouts occur
+     // then QUIC traffic has become blackholed.
+-    if (session_pool_ && (error == quic::QUIC_TOO_MANY_RTOS ||
+-                          (error == quic::QUIC_NETWORK_IDLE_TIMEOUT &&
+-                           GetNumActiveStreams() > 0))) {
++    if (!network_retired_ && session_pool_ &&
++        (error == quic::QUIC_TOO_MANY_RTOS ||
++         (error == quic::QUIC_NETWORK_IDLE_TIMEOUT &&
++          GetNumActiveStreams() > 0))) {
+       session_pool_->OnBlackholeAfterHandshakeConfirmed(this);
+     }
+     UMA_HISTOGRAM_COUNTS_100(
+@@ -4129,7 +4132,7 @@
+ }
+ 
+ void QuicChromiumClientSession::OnCryptoHandshakeComplete() {
+-  if (session_pool_) {
++  if (session_pool_ && !network_retired_) {
+     session_pool_->set_has_quic_ever_worked_on_current_network(true);
+   }
+ 

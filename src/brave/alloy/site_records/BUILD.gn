@@ -171,6 +171,137 @@ test("alloy_site_records_unittests") {
   ]
 }
 
+test("alloy_h3_owner_unittests") {
+  sources = [
+    "test_main.cc",
+    "h3_owner_retirement_unittest.cc",
+    "//net/quic/mock_quic_data.cc",
+    "//net/quic/quic_session_pool_test_base.cc",
+    "//net/quic/quic_session_pool_peer.cc",
+    "//net/quic/quic_chromium_client_session_peer.cc",
+    "//net/quic/quic_test_packet_maker.cc",
+    "//net/quic/quic_test_packet_printer.cc",
+    "//net/spdy/spdy_session_test_util.cc",
+    "//net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker_test.cc",
+  ]
+  deps = [
+    "//base/alloy:buildflags",
+    "//base", "//base/test:test_support", "//mojo/core/embedder",
+    "//net", "//net:test_support", "//net:quic_test_tools",
+    "//net/third_party/quiche:quiche_test_support", "//testing/gtest",
+  ]
+}
+
+source_set("network_retirement_test_support") {
+  testonly = true
+  sources = [ "network_retirement_test_context.h" ]
+  public_deps = [
+    "//base", "//net", "//services/network:network_service",
+    "//mojo/public/cpp/bindings", "//services/network/public/cpp", "//services/network/public/mojom",
+    "//services/network:test_support", "//services/network:alloy_buildflags",
+  ]
+}
+
+test("alloy_web_bundle_retirement_unittests") {
+  sources = [ "test_main.cc", "web_bundle_retirement_unittest.cc" ]
+  deps = [
+    "//base", "//base/test:test_support", "//mojo/core/embedder",
+    "//net", "//net:test_support", "//components/web_package",
+    "//services/network:network_service", "//services/network:test_support",
+    "//services/network/public/cpp", "//services/network/public/mojom", "//testing/gtest",
+  ]
+}
+
+test("alloy_network_ipc_retirement_unittests") {
+  sources = [
+    "test_main.cc",
+    "network_ipc_retirement_unittest.cc",
+    "//net/socket/transport_client_socket_pool_test_util.cc",
+  ]
+  deps = [
+    ":network_retirement_test_support",
+    "//base", "//base/test:test_support", "//mojo/core/embedder",
+    "//net", "//net:test_support", "//components/web_package", "//third_party/boringssl",
+    "//services/network:network_service", "//services/network:test_support",
+    "//services/network/public/cpp", "//services/network/public/mojom", "//testing/gtest",
+  ]
+}
+
+test("alloy_network_fanout_unittests") {
+  sources = [ "network_fanout_test_main.cc", "network_fanout_retirement_unittest.cc" ]
+  deps = [
+    ":capabilities", "//base", "//base/test:test_support", "//net",
+    "//content/test:test_support", "//content/public/browser", "//content/public/common",
+    "//mojo/public/cpp/bindings", "//services/cert_verifier/public/mojom",
+    "//services/network:alloy_buildflags", "//services/network/public/mojom",
+    "//testing/gtest",
+  ]
+}
+
+test("alloy_loader_retirement_unittests") {
+  sources = [ "test_main.cc", "prefetch_retirement_unittest.cc", "loader_retirement_unittest.cc" ]
+  deps = [
+    ":network_retirement_test_support",
+    "//base", "//base/test:test_support", "//mojo/core/embedder",
+    "//net", "//net:test_support", "//services/network:network_service",
+    "//services/network:test_support", "//services/network/public/cpp",
+    "//services/network/public/mojom", "//testing/gtest",
+  ]
+}
+
+test("alloy_service_transport_retirement_unittests") {
+  sources = [ "test_main.cc", "service_transport_retirement_unittest.cc" ]
+  deps = [
+    ":network_retirement_test_support",
+    "//base", "//base/test:test_support", "//mojo/core/embedder",
+    "//net", "//net:test_support", "//services/network:network_service",
+    "//services/network:alloy_buildflags",
+    "//services/network:test_support", "//services/network/public/cpp",
+    "//services/network/public/mojom", "//testing/gtest",
+  ]
+}
+
+test("alloy_quic_retirement_unittests") {
+  sources = [
+    "test_main.cc",
+    "//net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache_test.cc",
+  ]
+  deps = [
+    "//base",
+    "//base/test:test_support",
+    "//mojo/core/embedder",
+    "//net:test_support",
+    "//net/third_party/quiche:quiche_test_support",
+    "//testing/gtest",
+  ]
+}
+
+test("alloy_network_retirement_unittests") {
+  sources = [
+    "network_retirement_unittest.cc",
+    "transport_retirement_unittest.cc",
+    "session_retirement_unittest.cc",
+    "factory_retirement_unittest.cc",
+    "test_main.cc",
+    "//net/ssl/ssl_client_session_cache_unittest.cc",
+    "//net/socket/transport_client_socket_pool_unittest.cc",
+    "//net/socket/transport_client_socket_pool_test_util.cc",
+    "//net/http/http_stream_pool_group_unittest.cc",
+    "//net/spdy/spdy_session_pool_unittest.cc",
+    "//net/spdy/spdy_stream_test_util.cc",
+  ]
+  deps = [
+    "//base",
+    "//base/test:test_support",
+    "//mojo/core/embedder",
+    "//net",
+    "//net:test_support",
+    "//testing/gmock",
+    "//testing/gtest",
+    "//third_party/boringssl",
+  ]
+}
+
 test("alloy_no_disk_owner_unittests") {
   sources = [ "no_disk_owner_unittest.cc", "no_disk_test_main.cc" ]
   deps = [

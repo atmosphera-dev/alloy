@@ -1,0 +1,41 @@
+--- a/content/browser/storage_partition_impl.h
++++ b/content/browser/storage_partition_impl.h
+@@ -381,6 +381,13 @@
+       base::FunctionRef<void(network::mojom::NetworkContext*,
+                              cert_verifier::mojom::CertVerifierServiceUpdater*)>
+           callback) override;
++  // The same snapshot traversal, with scoped physical-endpoint retention for
++  // asynchronous native retirement. It grants no new generation admission.
++  void ForEachNetworkContext(
++      base::FunctionRef<void(network::mojom::NetworkContext*,
++                             cert_verifier::mojom::CertVerifierServiceUpdater*)>
++          callback,
++      base::FunctionRef<void(AlloyNetworkGeneration*)> retain);
+ 
+   std::optional<base::FilePath> GetStoragePartitionPath() const;
+ 
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -3669,6 +3669,14 @@
+     base::FunctionRef<void(network::mojom::NetworkContext*,
+                            cert_verifier::mojom::CertVerifierServiceUpdater*)>
+         callback) {
++  ForEachNetworkContext(callback, [](AlloyNetworkGeneration*) {});
++}
++
++void StoragePartitionImpl::ForEachNetworkContext(
++    base::FunctionRef<void(network::mojom::NetworkContext*,
++                           cert_verifier::mojom::CertVerifierServiceUpdater*)>
++        callback,
++    base::FunctionRef<void(AlloyNetworkGeneration*)> retain) {
+   std::erase_if(alloy_network_generations_,
+                 [](const auto& value) { return !value; });
+   std::vector<scoped_refptr<AlloyNetworkGeneration>> leases;
+@@ -3680,6 +3688,7 @@
+   callback(GetNetworkContext(), GetCertVerifierServiceUpdater());
+   for (auto& lease : leases) {
+     if (auto* context = lease->GetNetworkContext()) {
++      retain(lease.get());
+       callback(context, lease->GetVerifier());
+     }
+   }

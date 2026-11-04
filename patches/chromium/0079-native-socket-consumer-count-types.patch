@@ -1,0 +1,175 @@
+--- a/net/socket/transport_client_socket_pool_unittest.cc
++++ b/net/socket/transport_client_socket_pool_unittest.cc
+@@ -1015,14 +1015,14 @@
+   base::RunLoop().RunUntilIdle();
+ 
+   // Now we should have 1 idle socket.
+-  EXPECT_EQ(1, pool_->IdleSocketCount());
++  EXPECT_EQ(1u, pool_->IdleSocketCount());
+ 
+   rv = handle.Init(group_id_, params_, std::nullopt /* proxy_annotation_tag */,
+                    LOW, SocketTag(), ClientSocketPool::RespectLimits::ENABLED,
+                    callback.callback(), ClientSocketPool::ProxyAuthCallback(),
+                    pool_.get(), NetLogWithSource());
+   EXPECT_THAT(rv, IsOk());
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+   TestLoadTimingInfoConnectedReused(handle);
+ }
+ 
+@@ -1048,13 +1048,13 @@
+   base::RunLoop().RunUntilIdle();
+ 
+   // Now we should have 1 idle socket.
+-  EXPECT_EQ(1, pool_->IdleSocketCount());
++  EXPECT_EQ(1u, pool_->IdleSocketCount());
+ 
+   // After an IP address change, we should have 0 idle sockets.
+   NetworkChangeNotifier::NotifyObserversOfIPAddressChangeForTests();
+   base::RunLoop().RunUntilIdle();  // Notification happens async.
+ 
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+ }
+ 
+ TEST(TransportClientSocketPoolStandaloneTest, DontCleanupOnIPAddressChange) {
+@@ -1106,13 +1106,13 @@
+   // Need to run all pending to release the socket back to the pool.
+   base::RunLoop().RunUntilIdle();
+   // Now we should have 1 idle socket.
+-  EXPECT_EQ(1, pool->IdleSocketCount());
++  EXPECT_EQ(1u, pool->IdleSocketCount());
+ 
+   // Since we set cleanup_on_ip_address_change = false, we should still have 1
+   // idle socket after an IP address change.
+   NetworkChangeNotifier::NotifyObserversOfIPAddressChangeForTests();
+   base::RunLoop().RunUntilIdle();  // Notification happens async.
+-  EXPECT_EQ(1, pool->IdleSocketCount());
++  EXPECT_EQ(1u, pool->IdleSocketCount());
+ }
+ 
+ TEST_P(TransportClientSocketPoolTest, SSLCertError) {
+@@ -1319,7 +1319,7 @@
+     EXPECT_TRUE(handle1.is_initialized());
+     EXPECT_TRUE(handle1.socket());
+     EXPECT_EQ(0, handle1.group_generation());
+-    EXPECT_EQ(0, pool_->IdleSocketCount());
++    EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+     handle1.Reset();
+   }
+@@ -1328,7 +1328,7 @@
+   base::RunLoop().RunUntilIdle();
+ 
+   // Now we should have 1 idle socket.
+-  EXPECT_EQ(1, pool_->IdleSocketCount());
++  EXPECT_EQ(1u, pool_->IdleSocketCount());
+ 
+   // Create another request and finish connection of the socket, but hold on to
+   // the handle until later in the test.
+@@ -1357,7 +1357,7 @@
+ 
+   // Still only have 1 idle socket since handle2 is still alive.
+   base::RunLoop().RunUntilIdle();
+-  EXPECT_EQ(1, pool_->IdleSocketCount());
++  EXPECT_EQ(1u, pool_->IdleSocketCount());
+ 
+   // Create a pending request but don't finish connection.
+   ClientSocketPool::GroupId group_id3(
+@@ -1385,7 +1385,7 @@
+   // After a configuration change, we should have 0 idle sockets. The first
+   // idle socket should have been closed, and handle2 and handle3 are still
+   // alive.
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+   // Verify the netlog messages recorded the correct reason for closing the
+   // idle sockets.
+@@ -1407,13 +1407,13 @@
+   // part of the first generation.
+   handle2.Reset();
+   base::RunLoop().RunUntilIdle();
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+   // After releasing handle3, there is now one idle socket, since that socket
+   // was connected during the new generation.
+   handle3.Reset();
+   base::RunLoop().RunUntilIdle();
+-  EXPECT_EQ(1, pool_->IdleSocketCount());
++  EXPECT_EQ(1u, pool_->IdleSocketCount());
+ }
+ 
+ INSTANTIATE_TEST_SUITE_P(
+@@ -1453,7 +1453,7 @@
+   for (auto rules : cases) {
+     client_socket_factory_.SetRules(rules);
+ 
+-    EXPECT_EQ(0, pool_->IdleSocketCount());
++    EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+     TestCompletionCallback callback;
+     ClientSocketHandle handle;
+@@ -1481,7 +1481,7 @@
+     EXPECT_TRUE(handle.socket());
+ 
+     // One socket is stalled, the other is active.
+-    EXPECT_EQ(0, pool_->IdleSocketCount());
++    EXPECT_EQ(0u, pool_->IdleSocketCount());
+     handle.Reset();
+ 
+     // Close all pending connect jobs and existing sockets.
+@@ -1498,7 +1498,7 @@
+   enum { CANCEL_BEFORE_WAIT, CANCEL_AFTER_WAIT };
+ 
+   for (int index = CANCEL_BEFORE_WAIT; index < CANCEL_AFTER_WAIT; ++index) {
+-    EXPECT_EQ(0, pool_->IdleSocketCount());
++    EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+     TestCompletionCallback callback;
+     ClientSocketHandle handle;
+@@ -1530,7 +1530,7 @@
+     EXPECT_FALSE(handle.socket());
+ 
+     // One socket is stalled, the other is active.
+-    EXPECT_EQ(0, pool_->IdleSocketCount());
++    EXPECT_EQ(0u, pool_->IdleSocketCount());
+   }
+ }
+ 
+@@ -1549,7 +1549,7 @@
+ 
+   client_socket_factory_.SetRules(rules);
+ 
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+   TestCompletionCallback callback;
+   ClientSocketHandle handle;
+@@ -1582,7 +1582,7 @@
+   ASSERT_EQ(1u, handle.connection_attempts().size());
+   EXPECT_THAT(handle.connection_attempts()[0].result,
+               IsError(ERR_CONNECTION_FAILED));
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+   handle.Reset();
+ }
+ 
+@@ -1602,7 +1602,7 @@
+   client_socket_factory_.SetRules(rules);
+   client_socket_factory_.set_delay(base::Seconds(5));
+ 
+-  EXPECT_EQ(0, pool_->IdleSocketCount());
++  EXPECT_EQ(0u, pool_->IdleSocketCount());
+ 
+   TestCompletionCallback callback;
+   ClientSocketHandle handle;
+@@ -2358,7 +2358,7 @@
+   // HasActiveSocket returns true for the idle socket.
+   EXPECT_TRUE(pool_->HasActiveSocket(group_id1));
+   // Now we should have 1 idle socket.
+-  EXPECT_EQ(1, pool_->IdleSocketCount());
++  EXPECT_EQ(1u, pool_->IdleSocketCount());
+ 
+   // HasActiveSocket() for group_id2 must still return false.
+   EXPECT_FALSE(pool_->HasActiveSocket(group_id2));

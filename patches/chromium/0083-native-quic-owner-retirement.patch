@@ -1,0 +1,776 @@
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.h
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.h
+@@ -286,6 +286,10 @@
+   // Delete CachedState objects whose server ids match |filter| from
+   // cached_states.
+   void ClearCachedStates(const ServerIdFilter& filter);
++  // Remove lookup/canonical authority now; retain cleared objects until old
++  // native connection users drain, so borrowed legacy pointers cannot dangle.
++  std::vector<std::unique_ptr<CachedState>> DetachMatchingServerState(
++      const ServerIdFilter& filter);
+ 
+   // FillInchoateClientHello sets |out| to be a CHLO message that elicits a
+   // source-address token or SCFG from a server. If |cached| is non-nullptr, the
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.cc
+@@ -423,6 +423,28 @@
+   }
+ }
+ 
++std::vector<std::unique_ptr<QuicCryptoClientConfig::CachedState>>
++QuicCryptoClientConfig::DetachMatchingServerState(
++    const ServerIdFilter& filter) {
++  std::vector<std::unique_ptr<CachedState>> detached;
++  for (auto it = cached_states_.begin(); it != cached_states_.end();) {
++    if (filter.Matches(it->first)) {
++      it->second->Clear();
++      detached.push_back(std::move(it->second));
++      it = cached_states_.erase(it);
++    } else
++      ++it;
++  }
++  for (auto it = canonical_server_map_.begin();
++       it != canonical_server_map_.end();) {
++    if (filter.Matches(it->first) || filter.Matches(it->second))
++      it = canonical_server_map_.erase(it);
++    else
++      ++it;
++  }
++  return detached;
++}
++
+ void QuicCryptoClientConfig::FillInchoateClientHello(
+     const QuicServerId& server_id, const ParsedQuicVersion preferred_version,
+     const CachedState* cached, QuicRandom* rand, bool demand_x509_proof,
+--- a/net/quic/quic_session_pool.h
++++ b/net/quic/quic_session_pool.h
+@@ -231,6 +231,7 @@
+   void OnQuicSessionCreationComplete(int rv);
+ 
+   void OnRequestComplete(int rv);
++  base::OnceClosure PrepareNetworkRetirement();
+ 
+   // Called when the original connection created on the default network for
+   // |this| fails and a new connection has been created on the alternate
+@@ -282,6 +283,7 @@
+   }
+ 
+  private:
++  bool network_retired_ = false;
+   raw_ptr<QuicSessionPool> pool_;
+   QuicSessionKey session_key_;
+   NetLogWithSource net_log_;
+@@ -315,6 +317,13 @@
+       public CertDatabase::Observer,
+       public CertVerifier::Observer {
+  public:
++  using NetworkRecordMatcher =
++      base::RepeatingCallback<bool(const NetworkAnonymizationKey&,
++                                   const quic::QuicServerId&,
++                                   SessionUsage)>;
++  void RetireNetworkState(const NetworkRecordMatcher& matches,
++                          base::OnceClosure done);
++
+   QuicSessionPool(
+       NetLog* net_log,
+       HostResolver* host_resolver,
+@@ -448,7 +457,8 @@
+                                  DatagramClientSocket* socket,
+                                  IPEndPoint addr,
+                                  handles::NetworkHandle network,
+-                                 const SocketTag& socket_tag);
++                                 const SocketTag& socket_tag,
++                                 base::RepeatingCallback<bool()> is_live = {});
+ 
+   // Helper method that configures a DatagramClientSocket once
+   // DatagramClientSocket::ConnectAsync completes. Posts a task to run
+@@ -574,6 +584,7 @@
+   class DirectJob;
+   class EndpointConnector;
+   class ProxyJob;
++  class PendingSessionCreation;
+   class QuicCryptoClientConfigOwner;
+   class CryptoClientConfigHandle;
+   friend class QuicSessionAttempt;
+@@ -718,7 +729,7 @@
+       quic::QuicPacketLength session_max_packet_length,
+       const NetLogWithSource& net_log,
+       handles::NetworkHandle network,
+-      std::unique_ptr<DatagramClientSocket> socket,
++      PendingSessionCreation* creation,
+       MultiplexedSessionCreationInitiator session_creation_initiator,
+       QuicConnectionReuseDetails quic_connection_reuse_details,
+       std::optional<ConnectionManagementConfig> connection_management_config,
+@@ -1007,6 +1018,8 @@
+ #endif
+ 
+   SEQUENCE_CHECKER(sequence_checker_);
++  std::map<PendingSessionCreation*, std::unique_ptr<PendingSessionCreation>>
++      pending_session_creations_;
+   base::WeakPtrFactory<QuicSessionPool> weak_factory_{this};
+ };
+ 
+@@ -1031,6 +1044,11 @@
+   ~QuicCryptoClientConfigOwner() override;
+ 
+   quic::QuicCryptoClientConfig* config() { return &config_; }
++  void RetireSessionCache(
++      const quic::QuicCryptoClientConfig::ServerIdFilter& filter) {
++    DCHECK_EQ(config_.session_cache(), session_cache_.get());
++    session_cache_->RetireMatching(filter);
++  }
+ 
+   int num_refs() const { return num_refs_; }
+ 
+@@ -1056,6 +1074,8 @@
+ 
+   const NetworkAnonymizationKey network_anonymization_key_;
+   int num_refs_ = 0;
++  // Same native cache as config_, not another cache or generation registry.
++  std::shared_ptr<quic::QuicClientSessionCache> session_cache_;
+   quic::QuicCryptoClientConfig config_;
+   raw_ptr<base::Clock> clock_;
+   const size_t max_cache_entries_;
+--- a/net/quic/quic_session_pool.cc
++++ b/net/quic/quic_session_pool.cc
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/barrier_closure.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -408,6 +409,7 @@
+ QuicSessionRequest::QuicSessionRequest(QuicSessionPool* pool) : pool_(pool) {}
+ 
+ QuicSessionRequest::~QuicSessionRequest() {
++  weak_factory_.InvalidateWeakPtrs();
+   if (pool_ && !callback_.is_null()) {
+     pool_->CancelRequest(this);
+   }
+@@ -436,6 +438,8 @@
+     CompletionOnceCallback failed_on_default_network_callback,
+     CompletionOnceCallback callback,
+     int originating_annotation_hash) {
++  if (network_retired_)
++    return ERR_ABORTED;
+   DCHECK_EQ(quic_version.IsKnown(), !require_dns_https_alpn);
+   DCHECK(net_error_details);
+   DCHECK(callback_.is_null());
+@@ -496,6 +500,8 @@
+     int rv,
+     base::TimeTicks dns_resolution_start_time,
+     base::TimeTicks dns_resolution_end_time) {
++  if (network_retired_)
++    return;
+   DCHECK(expect_on_host_resolution_);
+   expect_on_host_resolution_ = false;
+   dns_resolution_start_time_ = dns_resolution_start_time;
+@@ -519,6 +525,8 @@
+ }
+ 
+ void QuicSessionRequest::OnQuicSessionCreationComplete(int rv) {
++  if (network_retired_)
++    return;
+   // DCHECK(expect_on_quic_session_creation_);
+   expect_on_quic_session_creation_ = false;
+   if (!create_session_callback_.is_null()) {
+@@ -526,7 +534,30 @@
+   }
+ }
+ 
++base::OnceClosure QuicSessionRequest::PrepareNetworkRetirement() {
++  network_retired_ = true;
++  pool_ = nullptr;
++  session_.reset();
++  expect_on_host_resolution_ = false;
++  expect_on_quic_session_creation_ = false;
++  failed_on_default_network_callback_.Reset();
++  return base::BindOnce(
++      [](base::WeakPtr<QuicSessionRequest> alive, CompletionOnceCallback host,
++         CompletionOnceCallback created, CompletionOnceCallback complete) {
++        if (alive && host)
++          std::move(host).Run(ERR_ABORTED);
++        if (alive && created)
++          std::move(created).Run(ERR_ABORTED);
++        if (alive && complete)
++          std::move(complete).Run(ERR_ABORTED);
++      },
++      weak_factory_.GetWeakPtr(), std::move(host_resolution_callback_),
++      std::move(create_session_callback_), std::move(callback_));
++}
++
+ void QuicSessionRequest::OnRequestComplete(int rv) {
++  if (network_retired_)
++    return;
+   pool_ = nullptr;
+   std::move(callback_).Run(rv);
+ }
+@@ -575,7 +606,8 @@
+     size_t max_cache_entries,
+     QuicSessionPool* quic_session_pool)
+     : network_anonymization_key_(std::move(network_anonymization_key)),
+-      config_(std::move(proof_verifier), std::move(session_cache)),
++      session_cache_(std::move(session_cache)),
++      config_(std::move(proof_verifier), session_cache_),
+       clock_(quic_session_pool->clock_for_testing_
+                  ? quic_session_pool->clock_for_testing_.get()
+                  : base::DefaultClock::GetInstance()),
+@@ -766,7 +798,34 @@
+ #endif
+ }
+ 
++// Own the socket and continuation across the async creation boundary. A weak
++// callback alone on the attempt cannot stop pool work that outlives that
++// attempt.
++class QuicSessionPool::PendingSessionCreation {
++ public:
++  PendingSessionCreation(QuicSessionPool* pool,
++                         const QuicSessionAliasKey& key,
++                         std::unique_ptr<DatagramClientSocket> socket)
++      : pool_(pool), key_(key), socket_(std::move(socket)) {}
++  base::WeakPtr<PendingSessionCreation> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++  void Complete(int rv) {
++    auto node = pool_->pending_session_creations_.extract(this);
++    auto owned = std::move(node.mapped());
++    pool_ = nullptr;
++    auto callback = std::move(callback_);
++    std::move(callback).Run(rv);
++  }
++  raw_ptr<QuicSessionPool> pool_;
++  const QuicSessionAliasKey key_;
++  std::unique_ptr<DatagramClientSocket> socket_;
++  CompletionOnceCallback callback_;
++  base::WeakPtrFactory<PendingSessionCreation> weak_factory_{this};
++};
++
+ QuicSessionPool::~QuicSessionPool() {
++  pending_session_creations_.clear();
+   UMA_HISTOGRAM_COUNTS_1000("Net.NumQuicSessionsAtShutdown",
+                             all_sessions_.size());
+ 
+@@ -1071,7 +1130,7 @@
+     DCHECK_EQ(session, active_sessions_[session_key]);
+     // Track sessions which have recently gone away so that we can disable
+     // port suggestions.
+-    if (session->goaway_received()) {
++    if (session->goaway_received() && !session->network_retired()) {
+       gone_away_aliases_.insert(alias);
+     }
+ 
+@@ -1131,6 +1190,111 @@
+     return;
+   }
+   job_iter->second->SetPriority(priority);
++}
++
++void QuicSessionPool::RetireNetworkState(const NetworkRecordMatcher& matches,
++                                         base::OnceClosure done) {
++  class Filter final : public quic::QuicCryptoClientConfig::ServerIdFilter {
++   public:
++    Filter(const NetworkRecordMatcher& matches,
++           const QuicCryptoClientConfigKey& key)
++        : matches_(matches), key_(key) {}
++    bool Matches(const quic::QuicServerId& server) const override {
++      return matches_.Run(key_.network_anonymization_key, server,
++                          key_.session_usage);
++    }
++
++   private:
++    const NetworkRecordMatcher& matches_;
++    const QuicCryptoClientConfigKey& key_;
++  };
++  std::vector<std::unique_ptr<quic::QuicCryptoClientConfig::CachedState>>
++      states;
++  auto retire_config = [&](const auto& key, auto& owner) {
++    Filter filter(matches, key);
++    owner->RetireSessionCache(filter);
++    auto detached = owner->config()->DetachMatchingServerState(filter);
++    for (auto& state : detached)
++      states.push_back(std::move(state));
++  };
++  for (auto& [key, owner] : active_crypto_config_map_)
++    retire_config(key, owner);
++  for (auto& [key, owner] : recent_crypto_config_map_)
++    retire_config(key, owner);
++  std::vector<base::WeakPtr<QuicChromiumClientSession>> sessions;
++  auto owned = [&](const QuicSessionKey& key) {
++    return matches.Run(key.network_anonymization_key(), key.server_id(),
++                       key.session_usage());
++  };
++  for (auto& session : all_sessions_) {
++    bool selected = owned(session->quic_session_key());
++    auto aliases = session_aliases_.find(session.get());
++    if (aliases != session_aliases_.end())
++      for (const auto& alias : aliases->second)
++        selected = selected || owned(alias.session_key());
++    if (selected)
++      sessions.push_back(session->NetworkRetirementView());
++  }
++  std::vector<std::unique_ptr<PendingSessionCreation>> creations;
++  for (auto it = pending_session_creations_.begin();
++       it != pending_session_creations_.end();) {
++    if (owned(it->second->key_.session_key())) {
++      creations.push_back(std::move(it->second));
++      it = pending_session_creations_.erase(it);
++    } else
++      ++it;
++  }
++  std::vector<std::unique_ptr<Job>> jobs;
++  std::vector<base::OnceClosure> notify;
++  for (auto it = active_jobs_.begin(); it != active_jobs_.end();) {
++    if (owned(it->first)) {
++      auto job = std::move(it->second);
++      it = active_jobs_.erase(it);
++      job->set_is_deleting();
++      while (!job->requests().empty()) {
++        auto* request = job->requests().begin()->get();
++        job->RemoveRequest(request);
++        notify.push_back(request->PrepareNetworkRetirement());
++      }
++      jobs.push_back(std::move(job));
++    } else
++      ++it;
++  }
++  for (auto it = gone_away_aliases_.begin(); it != gone_away_aliases_.end();) {
++    if (owned(it->session_key()))
++      it = gone_away_aliases_.erase(it);
++    else
++      ++it;
++  }
++  auto drained = base::BarrierClosure(
++      sessions.size() + 3,
++      base::BindOnce(
++          [](decltype(states) states, base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE,
++                base::BindOnce(
++                    [](decltype(states) states, base::OnceClosure done) {
++                      states.clear();
++                      std::move(done).Run();
++                    },
++                    std::move(states), std::move(done)));
++          },
++          std::move(states), std::move(done)));
++  auto modern = session_attempt_manager_->PrepareNetworkRetirement(
++      matches, drained, &notify);
++  for (auto& session : sessions)
++    session->PrepareNetworkRetirement(drained);
++  creations
++      .clear();  // Destroys sockets and invalidates original continuations.
++  std::move(modern).Run();
++  jobs.clear();
++  for (auto& session : sessions)
++    if (session)
++      session->RevokeNetworkState();
++  for (auto& callback : notify)
++    std::move(callback).Run();
++  drained.Run();  // Legacy jobs and their actual callbacks have drained.
++  drained.Run();  // Synchronous preparation/revocation is finished.
+ }
+ 
+ void QuicSessionPool::CloseAllSessions(int error,
+@@ -1207,11 +1371,13 @@
+   }
+ }
+ 
+-void QuicSessionPool::ConnectAndConfigureSocket(CompletionOnceCallback callback,
+-                                                DatagramClientSocket* socket,
+-                                                IPEndPoint addr,
+-                                                handles::NetworkHandle network,
+-                                                const SocketTag& socket_tag) {
++void QuicSessionPool::ConnectAndConfigureSocket(
++    CompletionOnceCallback callback,
++    DatagramClientSocket* socket,
++    IPEndPoint addr,
++    handles::NetworkHandle network,
++    const SocketTag& socket_tag,
++    base::RepeatingCallback<bool()> is_live) {
+   socket->UseNonBlockingIO();
+ #if BUILDFLAG(ALLOY_ENABLE_CLASS_MARKING)
+   socket->ApplySocketTag(socket_tag);
+@@ -1219,10 +1385,17 @@
+ 
+   int rv;
+   auto split_callback = base::SplitOnceCallback(std::move(callback));
+-  CompletionOnceCallback connect_callback =
+-      base::BindOnce(&QuicSessionPool::FinishConnectAndConfigureSocket,
+-                     weak_factory_.GetWeakPtr(),
+-                     std::move(split_callback.first), socket, socket_tag);
++  CompletionOnceCallback connect_callback = base::BindOnce(
++      [](base::WeakPtr<QuicSessionPool> pool,
++         base::RepeatingCallback<bool()> is_live,
++         CompletionOnceCallback callback, DatagramClientSocket* socket,
++         SocketTag tag, int rv) {
++        if (pool && (!is_live || is_live.Run()))
++          pool->FinishConnectAndConfigureSocket(std::move(callback), socket,
++                                                tag, rv);
++      },
++      weak_factory_.GetWeakPtr(), is_live, std::move(split_callback.first),
++      socket, socket_tag);
+   if (!params_.migrate_sessions_on_network_change_v2) {
+     rv = socket->ConnectAsync(addr, std::move(connect_callback));
+   } else if (network == handles::kInvalidNetworkHandle) {
+@@ -1237,8 +1410,9 @@
+   // even if a Connect call returns synchronously. Therefore we always return
+   // ERR_IO_PENDING.
+   if (rv != ERR_IO_PENDING) {
+-    FinishConnectAndConfigureSocket(std::move(split_callback.second), socket,
+-                                    socket_tag, rv);
++    if (!is_live || is_live.Run())
++      FinishConnectAndConfigureSocket(std::move(split_callback.second), socket,
++                                      socket_tag, rv);
+   }
+ }
+ 
+@@ -2206,8 +2380,13 @@
+   // endpoint.
+   std::unique_ptr<DatagramClientSocket> socket(CreateSocket(
+       key.session_key().target_network(), net_log.net_log(), net_log.source()));
+-  DatagramClientSocket* socket_ptr = socket.get();
+-  CompletionOnceCallback connect_and_configure_callback = base::BindOnce(
++  auto operation =
++      std::make_unique<PendingSessionCreation>(this, key, std::move(socket));
++  auto* creation = operation.get();
++  auto live = creation->GetWeakPtr();
++  pending_session_creations_.emplace(creation, std::move(operation));
++  DatagramClientSocket* socket_ptr = creation->socket_.get();
++  creation->callback_ = base::BindOnce(
+       &QuicSessionPool::FinishCreateSession, weak_factory_.GetWeakPtr(),
+       std::move(callback), std::move(key), quic_version, cert_verify_flags,
+       require_confirmation, peer_address, std::move(metadata),
+@@ -2217,18 +2396,22 @@
+       // TODO(crbug.com/518753285): Stop setting the network that should be used
+       // due to connection migration via ConnectAndConfigureSocket. Instead,
+       // rely on the new parameter in `CreateSocket`.
+-      network, std::move(socket), session_creation_initiator,
++      network, base::Unretained(creation), session_creation_initiator,
+       quic_connection_reuse_details, connection_management_config);
+ 
+   // If migrate_sessions_on_network_change_v2 is on, passing in
+   // handles::kInvalidNetworkHandle will bind the socket to the default network.
+-  ConnectAndConfigureSocket(std::move(connect_and_configure_callback),
+-                            socket_ptr, std::move(peer_address),
+-                            // TODO(crbug.com/518753285): Stop setting the
+-                            // network that should be used due to connection
+-                            // migration via ConnectAndConfigureSocket. Instead,
+-                            // rely on the new parameter in `CreateSocket`.
+-                            network, key.session_key().socket_tag());
++  ConnectAndConfigureSocket(
++      base::BindOnce(&PendingSessionCreation::Complete, live), socket_ptr,
++      std::move(peer_address),
++      // TODO(crbug.com/518753285): Stop setting the
++      // network that should be used due to connection
++      // migration via ConnectAndConfigureSocket. Instead,
++      // rely on the new parameter in `CreateSocket`.
++      network, creation->key_.session_key().socket_tag(),
++      base::BindRepeating(
++          [](base::WeakPtr<PendingSessionCreation> live) { return !!live; },
++          live));
+   return ERR_IO_PENDING;
+ }
+ 
+@@ -2262,8 +2445,13 @@
+       url, key.session_key().proxy_chain(), user_agent, net_log,
+       proxy_delegate_);
+   QuicProxyDatagramClientSocket* socket_ptr = socket.get();
+-
+-  socket->ApplySocketTag(key.session_key().socket_tag());
++  auto operation =
++      std::make_unique<PendingSessionCreation>(this, key, std::move(socket));
++  auto* creation = operation.get();
++  auto live = creation->GetWeakPtr();
++  pending_session_creations_.emplace(creation, std::move(operation));
++
++  socket_ptr->ApplySocketTag(key.session_key().socket_tag());
+ 
+   // No host resolution took place, so pass an empty metadata,
+   // pretend resolution started and ended right now, and pass an
+@@ -2289,20 +2477,22 @@
+           ? guaranteed_largest_message_payload - overhead
+           : 0;
+ 
++  creation->callback_ = base::BindOnce(
++      &QuicSessionPool::FinishCreateSession, weak_factory_.GetWeakPtr(),
++      std::move(callback), std::move(key), quic_version, cert_verify_flags,
++      require_confirmation, proxy_peer_address, std::move(metadata),
++      dns_resolution_time, dns_resolution_time, std::nullopt,
++      session_max_packet_length, net_log,
++      // TODO(crbug.com/518753285): Stop setting the
++      // network that should be used due to connection
++      // migration via ConnectViaStream. Instead,
++      // rely on the new parameter in `CreateSocket`.
++      network, base::Unretained(creation), session_creation_initiator,
++      quic_connection_reuse_details,
++      /*connection_management_config=*/std::nullopt);
+   auto [on_connected_via_stream_async, on_connected_via_stream_sync] =
+-      base::SplitOnceCallback(base::BindOnce(
+-          &QuicSessionPool::FinishCreateSession, weak_factory_.GetWeakPtr(),
+-          std::move(callback), std::move(key), quic_version, cert_verify_flags,
+-          require_confirmation, proxy_peer_address, std::move(metadata),
+-          dns_resolution_time, dns_resolution_time, std::nullopt,
+-          session_max_packet_length, net_log,
+-          // TODO(crbug.com/518753285): Stop setting the
+-          // network that should be used due to connection
+-          // migration via ConnectViaStream. Instead,
+-          // rely on the new parameter in `CreateSocket`.
+-          network, std::move(socket), session_creation_initiator,
+-          quic_connection_reuse_details,
+-          /*connection_management_config=*/std::nullopt));
++      base::SplitOnceCallback(
++          base::BindOnce(&PendingSessionCreation::Complete, live));
+ 
+   int rv = socket_ptr->ConnectViaStream(
+       std::move(local_address), std::move(proxy_peer_address),
+@@ -2331,11 +2521,12 @@
+     quic::QuicPacketLength session_max_packet_length,
+     const NetLogWithSource& net_log,
+     handles::NetworkHandle network,
+-    std::unique_ptr<DatagramClientSocket> socket,
++    PendingSessionCreation* creation,
+     MultiplexedSessionCreationInitiator session_creation_initiator,
+     QuicConnectionReuseDetails quic_connection_reuse_details,
+     std::optional<ConnectionManagementConfig> connection_management_config,
+     int rv) {
++  auto socket = std::move(creation->socket_);
+   if (rv != OK) {
+     CHECK_NE(rv, ERR_IO_PENDING);
+     std::move(callback).Run(base::unexpected(rv));
+@@ -2766,7 +2957,7 @@
+     QuicChromiumClientSession* session,
+     const quic::QuicServerId& server_id,
+     bool session_was_active) {
+-  if (!http_server_properties_) {
++  if (session->network_retired() || !http_server_properties_) {
+     return;
+   }
+ 
+--- a/net/quic/quic_chromium_client_session.h
++++ b/net/quic/quic_chromium_client_session.h
+@@ -23,6 +23,7 @@
+ #include "base/containers/flat_map.h"
+ #include "base/feature_list.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ptr_exclusion.h"
+ #include "base/observer_list.h"
+@@ -846,6 +847,12 @@
+   // that this session has been closed, which will delete the session.
+   // |behavior| will suggest whether we should send connection close packets
+   // when closing the connection.
++  base::WeakPtr<QuicChromiumClientSession> NetworkRetirementView() {
++    return weak_factory_.GetWeakPtr();
++  }
++  bool network_retired() const { return network_retired_; }
++  void PrepareNetworkRetirement(const base::RepeatingClosure& drained);
++  void RevokeNetworkState();
+   void CloseSessionOnError(int net_error,
+                            quic::QuicErrorCode quic_error,
+                            quic::ConnectionCloseBehavior behavior);
+@@ -1179,6 +1186,10 @@
+   // registering a new payload replace the previously registered one.
+   virtual void UnregisterQuicConnectionClosePayload();
+ 
++  // Last derived state to drain, after native crypto/socket/handle teardown.
++  std::vector<base::ScopedClosureRunner> network_retirement_;
++  bool network_retired_ = false;
++  bool network_revoke_started_ = false;
+   const QuicSessionAliasKey session_alias_key_;
+   QuicSessionKey session_key_;
+   bool require_confirmation_;
+--- a/net/quic/quic_chromium_client_session.cc
++++ b/net/quic/quic_chromium_client_session.cc
+@@ -3193,6 +3193,24 @@
+   }
+ }
+ 
++void QuicChromiumClientSession::PrepareNetworkRetirement(
++    const base::RepeatingClosure& drained) {
++  network_retirement_.emplace_back(drained);
++  if (!network_retired_) {
++    network_retired_ = true;
++    NotifyFactoryOfSessionGoingAway();
++  }
++}
++
++void QuicChromiumClientSession::RevokeNetworkState() {
++  if (network_revoke_started_)
++    return;
++  network_revoke_started_ = true;
++  // Close transport/handles now; native asynchronous removal owns completion.
++  CloseSessionOnErrorLater(ERR_ABORTED, quic::QUIC_CONNECTION_CANCELLED,
++                           quic::ConnectionCloseBehavior::SILENT_CLOSE);
++}
++
+ void QuicChromiumClientSession::CloseSessionOnError(
+     int net_error,
+     quic::QuicErrorCode quic_error,
+--- a/net/quic/quic_session_attempt_request.h
++++ b/net/quic/quic_session_attempt_request.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/check.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "net/base/completion_once_callback.h"
+ #include "net/base/net_error_details.h"
+ #include "net/base/net_export.h"
+@@ -72,6 +73,8 @@
+   explicit QuicSessionAttemptRequest(QuicSessionAttemptManager* manager,
+                                      QuicSessionAliasKey key);
+ 
++  base::OnceClosure PrepareNetworkRetirement();
++
+   void Complete(int rv,
+                 QuicChromiumClientSession* session,
+                 NetErrorDetails error_details);
+@@ -80,10 +83,12 @@
+   const QuicSessionAliasKey key_;
+ 
+   bool completed_ = false;
++  bool network_retired_ = false;
+   CompletionOnceCallback callback_;
+ 
+   NetErrorDetails error_details_;
+   raw_ptr<QuicChromiumClientSession> session_;
++  base::WeakPtrFactory<QuicSessionAttemptRequest> weak_factory_{this};
+ };
+ 
+ }  // namespace net
+--- a/net/quic/quic_session_attempt_request.cc
++++ b/net/quic/quic_session_attempt_request.cc
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/check.h"
++#include "base/functional/bind.h"
+ #include "net/base/completion_once_callback.h"
+ #include "net/base/net_error_details.h"
+ #include "net/base/net_errors.h"
+@@ -23,6 +24,7 @@
+     : manager_(manager), key_(std::move(key)) {}
+ 
+ QuicSessionAttemptRequest::~QuicSessionAttemptRequest() {
++  weak_factory_.InvalidateWeakPtrs();
+   if (manager_ && callback_) {
+     manager_->RemoveRequest(this);
+   }
+@@ -40,6 +42,8 @@
+     std::optional<ConnectionManagementConfig> connection_management_config,
+     const NetLogWithSource& net_log,
+     CompletionOnceCallback callback) {
++  if (network_retired_)
++    return ERR_ABORTED;
+   int rv = manager_->RequestSession(
+       this, std::move(endpoint), cert_verify_flags, dns_resolution_start_time,
+       dns_resolution_end_time, std::move(dns_resolution_details),
+@@ -52,6 +56,21 @@
+     CHECK(completed_);
+   }
+   return rv;
++}
++
++base::OnceClosure QuicSessionAttemptRequest::PrepareNetworkRetirement() {
++  network_retired_ = true;
++  completed_ = true;
++  manager_ = nullptr;
++  session_ = nullptr;
++  error_details_ = NetErrorDetails();
++  return base::BindOnce(
++      [](base::WeakPtr<QuicSessionAttemptRequest> alive,
++         CompletionOnceCallback callback) {
++        if (alive && callback)
++          std::move(callback).Run(ERR_ABORTED);
++      },
++      weak_factory_.GetWeakPtr(), std::move(callback_));
+ }
+ 
+ void QuicSessionAttemptRequest::Complete(int rv,
+--- a/net/quic/quic_session_attempt_manager.h
++++ b/net/quic/quic_session_attempt_manager.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <set>
+ #include <string>
++#include <vector>
+ 
+ #include "base/containers/flat_map.h"
+ #include "base/memory/raw_ptr.h"
+@@ -79,6 +80,10 @@
+   // can be used to satisfy any active jobs. All jobs that can be satisfied by
+   // `session` are completed successfully.
+   void OnOriginFrame(QuicChromiumClientSession* session);
++  base::OnceClosure PrepareNetworkRetirement(
++      const QuicSessionPool::NetworkRecordMatcher& matches,
++      base::OnceClosure drained,
++      std::vector<base::OnceClosure>* notify);
+ 
+   bool HasActiveJobForTesting(const QuicSessionAliasKey& key) const {
+     return active_jobs_.find(key) != active_jobs_.end();
+--- a/net/quic/quic_session_attempt_manager.cc
++++ b/net/quic/quic_session_attempt_manager.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "net/quic/quic_session_attempt_manager.h"
++
++#include "base/functional/callback_helpers.h"
+ 
+ #include <memory>
+ #include <optional>
+@@ -117,6 +119,17 @@
+     }
+   }
+ 
++  std::vector<base::OnceClosure> DetachNetworkRetirementRequests() {
++    std::vector<base::OnceClosure> notify;
++    while (!requests_.empty()) {
++      auto* request = requests_.begin()->get();
++      notify.push_back(request->PrepareNetworkRetirement());
++      requests_.erase(requests_.begin());
++    }
++    return notify;
++  }
++  void RevokeNetworkState() { CancelAttempts(); }
++
+   void OnOriginFrameMatched(QuicChromiumClientSession* session) {
+     NotifyRequestsAndComplete(OK, session, NetErrorDetails());
+     // `this` is deleted.
+@@ -212,6 +225,33 @@
+ 
+ QuicSessionAttemptManager::QuicSessionAttemptManager(QuicSessionPool* pool)
+     : pool_(pool) {}
++
++base::OnceClosure QuicSessionAttemptManager::PrepareNetworkRetirement(
++    const QuicSessionPool::NetworkRecordMatcher& matches,
++    base::OnceClosure drained,
++    std::vector<base::OnceClosure>* notify) {
++  std::vector<std::unique_ptr<Job>> jobs;
++  for (auto it = active_jobs_.begin(); it != active_jobs_.end();) {
++    const auto& key = it->first.session_key();
++    if (matches.Run(key.network_anonymization_key(), key.server_id(),
++                    key.session_usage())) {
++      auto callbacks = it->second->DetachNetworkRetirementRequests();
++      for (auto& callback : callbacks)
++        notify->push_back(std::move(callback));
++      jobs.push_back(std::move(it->second));
++      it = active_jobs_.erase(it);
++    } else
++      ++it;
++  }
++  return base::BindOnce(
++      [](std::vector<std::unique_ptr<Job>> jobs, base::OnceClosure drained) {
++        base::ScopedClosureRunner finish(std::move(drained));
++        for (auto& job : jobs)
++          job->RevokeNetworkState();
++        jobs.clear();
++      },
++      std::move(jobs), std::move(drained));
++}
+ 
+ QuicSessionAttemptManager::~QuicSessionAttemptManager() {
+   // Clear the active jobs, first moving out of the instance variable so that

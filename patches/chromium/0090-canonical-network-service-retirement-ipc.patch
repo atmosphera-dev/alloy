@@ -1,0 +1,147 @@
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -1047,6 +1047,13 @@
+   uint16 port = 443;
+ };
+ 
++// A browser-owned prepared native snapshot. Dropping the endpoint revokes
++// these same originals; Commit replies only after native work has drained.
++[RequireContext=sandbox.mojom.Context.kBrowser]
++interface AlloyNetworkRetirement {
++  Commit() => (bool drained);
++};
++
+ // Represents a distinct context for making network requests, with its own
+ // storage (e.g. cookies and cache).
+ //
+@@ -1438,6 +1445,12 @@
+   // `network_anonymization_key`.
+   QueueSignedExchangeReport(SignedExchangeReport report,
+                             NetworkAnonymizationKey network_anonymization_key);
++
++  // The engine's canonical R16 record identity, never renderer policy input.
++  [AllowedContext=sandbox.mojom.Context.kBrowser]
++  PrepareAlloyNetworkServiceRetirement(
++      string record_domain, pending_receiver<AlloyNetworkRetirement> retirement)
++      => (bool prepared);
+ 
+   // Closes all open connections within this context.
+   CloseAllConnections() => ();
+--- a/services/network/network_context.h
++++ b/services/network/network_context.h
+@@ -355,6 +355,10 @@
+   void ClearDomainReliability(mojom::ClearDataFilterPtr filter,
+                               DomainReliabilityClearMode mode,
+                               ClearDomainReliabilityCallback callback) override;
++  void PrepareAlloyNetworkServiceRetirement(
++      const std::string& record_domain,
++      mojo::PendingReceiver<mojom::AlloyNetworkRetirement> retirement,
++      PrepareAlloyNetworkServiceRetirementCallback callback) override;
+   void CloseAllConnections(CloseAllConnectionsCallback callback) override;
+   void CloseIdleConnections(CloseIdleConnectionsCallback callback) override;
+   void SetNetworkConditions(
+@@ -1001,6 +1005,9 @@
+   // |url_request_context| when the NetworkContextImpl doesn't own its own
+   // URLRequestContext.
+   URLRequestContextOwner url_request_context_owner_;
++  // Own pending native operations, not a record/generation registry. Explicitly
++  // clear before backing contexts/services are destroyed.
++  mojo::UniqueReceiverSet<mojom::AlloyNetworkRetirement> network_retirements_;
+ 
+   raw_ptr<net::URLRequestContext> url_request_context_;
+ 
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -1029,6 +1029,7 @@
+ 
+ NetworkContext::~NetworkContext() {
+   is_destructing_ = true;
++  network_retirements_.Clear();
+ 
+   // Clear pending HttpCacheDataRemovers and counters explicitly to cancel
+   // any in-flight background operations and avoid callback races.
+@@ -1922,6 +1923,84 @@
+         dr_mode, BuildOriginFilter(std::move(filter)));
+   }
+   std::move(callback).Run();
++}
++
++namespace {
++class PreparedNetworkServiceRetirement final
++    : public mojom::AlloyNetworkRetirement {
++ public:
++  PreparedNetworkServiceRetirement(
++      NetworkContext& context,
++      const net::AlloyNetworkRecordTarget& target) {
++    auto matches = base::BindRepeating(
++        [](net::AlloyNetworkRecordTarget target,
++           const NativeNetworkOwner& owner) {
++          if (target.Owns(owner.initiator))
++            return true;
++          if (owner.isolation_info && owner.isolation_info->frame_origin() &&
++              target.Owns(*owner.isolation_info->frame_origin()))
++            return true;
++          return target.DependsOnTransport(owner.network_key,
++                                           owner.destination);
++        },
++        target);
++    auto drained = base::BarrierClosure(
++        3, base::BindOnce(&PreparedNetworkServiceRetirement::OnNativeDrained,
++                          weak_factory_.GetWeakPtr()));
++    prepared_.push_back(
++        context.PrepareURLLoaderServiceRetirement(matches, drained));
++    prepared_.push_back(
++        context.PrepareTransportServiceRetirement(matches, drained));
++    prepared_.push_back(CommitNetworkRetirementOnDrop(
++        base::BindOnce([](base::ScopedClosureRunner finish) {},
++                       base::ScopedClosureRunner(drained))));
++  }
++  ~PreparedNetworkServiceRetirement() override {
++    weak_factory_.InvalidateWeakPtrs();
++    // Each native action is commit-on-drop. Its actual native work/callbacks
++    // still own their drain even when the requesting endpoint has gone away.
++    auto originals = std::move(prepared_);
++  }
++  void Commit(CommitCallback callback) override {
++    if (committed_) {
++      std::move(callback).Run(false);
++      return;
++    }
++    committed_ = true;
++    reply_ = std::move(callback);
++    // Outgoing notifications can reenter and destroy this operation/context.
++    // Move the complete original batch off-object before invoking anything.
++    auto originals = std::move(prepared_);
++    for (auto& commit : originals)
++      std::move(commit).Run();
++  }
++
++ private:
++  void OnNativeDrained() {
++    CHECK(committed_);
++    std::move(reply_).Run(true);
++  }
++  std::vector<base::OnceClosure> prepared_;
++  CommitCallback reply_;
++  bool committed_ = false;
++  base::WeakPtrFactory<PreparedNetworkServiceRetirement> weak_factory_{this};
++};
++}  // namespace
++
++void NetworkContext::PrepareAlloyNetworkServiceRetirement(
++    const std::string& record_domain,
++    mojo::PendingReceiver<mojom::AlloyNetworkRetirement> retirement,
++    PrepareAlloyNetworkServiceRetirementCallback callback) {
++  auto target =
++      net::AlloyNetworkRecordTarget::FromCanonicalDomain(record_domain);
++  if (!target || !retirement.is_valid()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  network_retirements_.Add(
++      std::make_unique<PreparedNetworkServiceRetirement>(*this, *target),
++      std::move(retirement));
++  std::move(callback).Run(true);
+ }
+ 
+ base::OnceClosure NetworkContext::PrepareURLLoaderServiceRetirement(

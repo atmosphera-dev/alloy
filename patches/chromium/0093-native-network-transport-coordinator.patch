@@ -1,0 +1,282 @@
+--- a/net/socket/client_socket_pool_manager.h
++++ b/net/socket/client_socket_pool_manager.h
+@@ -24,6 +24,7 @@
+ 
+ namespace net {
+ 
++class AlloyNetworkRecordTarget;
+ class ClientSocketHandle;
+ class NetLogWithSource;
+ class NetworkAnonymizationKey;
+@@ -69,6 +70,11 @@
+   virtual void FlushSocketPoolsWithError(int net_error,
+                                          const char* net_log_reason_utf8) = 0;
+   virtual void CloseIdleSockets(const char* net_log_reason_utf8) = 0;
++  // Direct WebSocket channels are separately prepared by their native service
++  // owner. This operation covers owned normal/proxied TCP child pools.
++  virtual base::OnceClosure PrepareTransportPoolRetirement(
++      const AlloyNetworkRecordTarget& target,
++      base::OnceClosure done) = 0;
+ 
+   // Returns the socket pool for the specified ProxyChain (Which may be
+   // ProxyChain::Direct()).
+--- a/net/socket/client_socket_pool_manager_impl.h
++++ b/net/socket/client_socket_pool_manager_impl.h
+@@ -44,6 +44,9 @@
+   void FlushSocketPoolsWithError(int net_error,
+                                  const char* net_log_reason_utf8) override;
+   void CloseIdleSockets(const char* net_log_reason_utf8) override;
++  base::OnceClosure PrepareTransportPoolRetirement(
++      const AlloyNetworkRecordTarget& target,
++      base::OnceClosure done) override;
+ 
+   ClientSocketPool* GetSocketPool(const ProxyChain& proxy_chain) override;
+ 
+--- a/net/socket/client_socket_pool_manager_impl.cc
++++ b/net/socket/client_socket_pool_manager_impl.cc
+@@ -7,9 +7,12 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/barrier_closure.h"
+ #include "base/check_op.h"
+ #include "base/feature_list.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "base/values.h"
++#include "net/base/alloy_network_record_target.h"
+ #include "net/base/features.h"
+ #include "net/base/proxy_chain.h"
+ #include "net/base/proxy_server.h"
+@@ -58,6 +61,45 @@
+   for (const auto& it : socket_pools_) {
+     it.second->CloseIdleSockets(net_log_reason_utf8);
+   }
++}
++
++base::OnceClosure ClientSocketPoolManagerImpl::PrepareTransportPoolRetirement(
++    const AlloyNetworkRecordTarget& target,
++    base::OnceClosure done) {
++  std::vector<TransportClientSocketPool*> originals;
++  for (const auto& [proxy, pool] : socket_pools_) {
++    // This is the exact creation branch in GetSocketPool below. Native direct
++    // WebSocket lifetimes are in the context's prepared channel/factory batch.
++    if (pool_type_ == HttpNetworkSession::SocketPoolType::kWebSocket &&
++        proxy.is_direct())
++      continue;
++    originals.push_back(static_cast<TransportClientSocketPool*>(pool.get()));
++  }
++  auto drained = base::BarrierClosure(
++      originals.size() + 1,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  auto matches = base::BindRepeating(
++      [](AlloyNetworkRecordTarget target,
++         const ClientSocketPool::GroupId& key) {
++        return target.DependsOnTransport(key.network_anonymization_key(),
++                                         key.destination().GetURL());
++      },
++      target);
++  std::vector<base::OnceClosure> prepared;
++  for (auto* pool : originals)
++    prepared.push_back(pool->PrepareMatchingGroups(matches, drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::OnceClosure> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& commit : originals)
++          std::move(commit).Run();
++      },
++      std::move(prepared), base::ScopedClosureRunner(drained)));
+ }
+ 
+ ClientSocketPool* ClientSocketPoolManagerImpl::GetSocketPool(
+--- a/net/socket/mock_client_socket_pool_manager.h
++++ b/net/socket/mock_client_socket_pool_manager.h
+@@ -35,6 +35,9 @@
+   void FlushSocketPoolsWithError(int error,
+                                  const char* net_log_reason_utf8) override;
+   void CloseIdleSockets(const char* net_log_reason_utf8) override;
++  base::OnceClosure PrepareTransportPoolRetirement(
++      const AlloyNetworkRecordTarget& target,
++      base::OnceClosure done) override;
+   ClientSocketPool* GetSocketPool(const ProxyChain& proxy_chain) override;
+   base::Value SocketPoolInfoToValue() const override;
+ 
+--- a/net/socket/mock_client_socket_pool_manager.cc
++++ b/net/socket/mock_client_socket_pool_manager.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/check.h"
+ #include "base/notimplemented.h"
+ #include "base/values.h"
+ #include "net/socket/client_socket_pool.h"
+@@ -32,6 +33,15 @@
+   NOTIMPLEMENTED();
+ }
+ 
++base::OnceClosure MockClientSocketPoolManager::PrepareTransportPoolRetirement(
++    const AlloyNetworkRecordTarget&,
++    base::OnceClosure) {
++  // This fake does not model physical native transport retirement. Never make
++  // an unconfigured fake report successful retirement of resources it ignores.
++  CHECK(false);
++  return {};
++}
++
+ ClientSocketPool* MockClientSocketPoolManager::GetSocketPool(
+     const ProxyChain& proxy_chain) {
+   ClientSocketPoolMap::const_iterator it = socket_pools_.find(proxy_chain);
+--- a/net/http/http_network_session.h
++++ b/net/http/http_network_session.h
+@@ -39,6 +39,7 @@
+ namespace net {
+ 
+ class CertVerifier;
++class AlloyNetworkRecordTarget;
+ class ClientSocketFactory;
+ class ClientSocketPool;
+ class ClientSocketPoolManager;
+@@ -266,6 +267,9 @@
+   // configuration.
+   base::Value QuicInfoToValue() const;
+ 
++  base::OnceClosure PrepareRecordTransportRetirement(
++      const AlloyNetworkRecordTarget& target,
++      base::OnceClosure done);
+   void CloseAllConnections(int net_error, const char* net_log_reason_utf8);
+   void CloseIdleConnections(const char* net_log_reason_utf8);
+ 
+--- a/net/http/http_network_session.cc
++++ b/net/http/http_network_session.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "net/http/http_network_session.h"
++#include "base/barrier_closure.h"
++#include "base/task/single_thread_task_runner.h"
++#include "net/base/alloy_network_record_target.h"
++#include "net/http/http_stream_key.h"
+ 
+ #include <inttypes.h>
+ 
+@@ -350,6 +354,92 @@
+   return base::Value(std::move(dict));
+ }
+ 
++base::OnceClosure HttpNetworkSession::PrepareRecordTransportRetirement(
++    const AlloyNetworkRecordTarget& target,
++    base::OnceClosure done) {
++  // Cache/metadata admission closes before original job/socket cancellation can
++  // publish late state. Native user notifications stay in the commit actions.
++  ssl_client_session_cache_.FlushMatching(base::BindRepeating(
++      [](AlloyNetworkRecordTarget target,
++         const SSLClientSessionCache::Key& key) {
++        return target.DependsOnTransport(
++            key.network_anonymization_key,
++            url::SchemeHostPort(url::kHttpsScheme, key.server.host(),
++                                key.server.port())
++                .GetURL(),
++            key.session_usage);
++      },
++      target));
++  auto drained = base::BarrierClosure(
++      7, base::BindOnce(
++             [](base::OnceClosure done) {
++               base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                   FROM_HERE, std::move(done));
++             },
++             std::move(done)));
++  std::vector<base::OnceClosure> prepared;
++  prepared.push_back(quic_session_pool_.PrepareNetworkRetirement(
++      base::BindRepeating(
++          [](AlloyNetworkRecordTarget target,
++             const NetworkAnonymizationKey& key,
++             const quic::QuicServerId& server, SessionUsage usage) {
++            return target.DependsOnTransport(
++                key,
++                url::SchemeHostPort(url::kHttpsScheme, server.host(),
++                                    server.port())
++                    .GetURL(),
++                usage);
++          },
++          target),
++      drained));
++  prepared.push_back(spdy_session_pool_.PrepareMatchingSessions(
++      base::BindRepeating(
++          [](AlloyNetworkRecordTarget target, const SpdySessionKey& key) {
++            return target.DependsOnTransport(
++                key.network_anonymization_key(),
++                url::SchemeHostPort(url::kHttpsScheme,
++                                    key.host_port_pair().host(),
++                                    key.host_port_pair().port())
++                    .GetURL(),
++                key.session_usage());
++          },
++          target),
++      drained));
++  prepared.push_back(http_stream_factory_->PrepareNetworkRetirement(
++      base::BindRepeating(
++          [](AlloyNetworkRecordTarget target,
++             const NetworkAnonymizationKey& key,
++             const url::SchemeHostPort& destination) {
++            return target.DependsOnTransport(key, destination.GetURL());
++          },
++          target),
++      drained));
++  if (http_stream_pool_)
++    prepared.push_back(http_stream_pool_->PrepareMatchingStreams(
++        base::BindRepeating(
++            [](AlloyNetworkRecordTarget target, const HttpStreamKey& key) {
++              return target.DependsOnTransport(key.network_anonymization_key(),
++                                               key.destination().GetURL());
++            },
++            target),
++        drained));
++  else
++    drained.Run();
++  prepared.push_back(
++      normal_socket_pool_manager_->PrepareTransportPoolRetirement(target,
++                                                                  drained));
++  prepared.push_back(
++      websocket_socket_pool_manager_->PrepareTransportPoolRetirement(target,
++                                                                     drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::OnceClosure> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& commit : originals)
++          std::move(commit).Run();
++      },
++      std::move(prepared), base::ScopedClosureRunner(drained)));
++}
++
+ void HttpNetworkSession::CloseAllConnections(int net_error,
+                                              const char* net_log_reason_utf8) {
+   normal_socket_pool_manager_->FlushSocketPoolsWithError(net_error,
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -1945,12 +1945,19 @@
+         },
+         target);
+     auto drained = base::BarrierClosure(
+-        3, base::BindOnce(&PreparedNetworkServiceRetirement::OnNativeDrained,
++        4, base::BindOnce(&PreparedNetworkServiceRetirement::OnNativeDrained,
+                           weak_factory_.GetWeakPtr()));
+     prepared_.push_back(
+         context.PrepareURLLoaderServiceRetirement(matches, drained));
+     prepared_.push_back(
+         context.PrepareTransportServiceRetirement(matches, drained));
++    auto* factory = context.url_request_context()->http_transaction_factory();
++    auto* session = factory ? factory->GetSession() : nullptr;
++    if (session)
++      prepared_.push_back(
++          session->PrepareRecordTransportRetirement(target, drained));
++    else
++      drained.Run();
+     prepared_.push_back(CommitNetworkRetirementOnDrop(
+         base::BindOnce([](base::ScopedClosureRunner finish) {},
+                        base::ScopedClosureRunner(drained))));

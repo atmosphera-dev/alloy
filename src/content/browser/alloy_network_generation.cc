@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Alex Indigo
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "content/browser/alloy_network_generation.h"
+#include "content/public/browser/alloy_network_retirement.h"
 
 #include <utility>
+#include <vector>
 
 #include "base/check.h"
+#include "base/barrier_closure.h"
 #include "base/no_destructor.h"
 #include "base/functional/callback_helpers.h"
 #include "base/functional/bind.h"
@@ -12,9 +15,11 @@
 #include "content/browser/renderer_host/render_frame_host_impl.h"
 #include "content/browser/storage_partition_impl.h"
 #include "content/public/browser/browser_context.h"
+#include "content/public/browser/browser_thread.h"
 #include "content/public/browser/alloy_document_state.h"
 #include "content/public/browser/document_user_data.h"
 #include "mojo/public/cpp/bindings/remote.h"
+#include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "services/network/public/mojom/cert_verifier_service_updater.mojom.h"
 #include "services/network/public/mojom/network_context.mojom.h"
 
@@ -28,7 +33,7 @@ struct AlloyNetworkGeneration::Endpoints {
 };
 
 AlloyNetworkGeneration::AlloyNetworkGeneration()
-    : endpoints_(std::make_unique<Endpoints>()) {}
+    : endpoints_(std::make_shared<Endpoints>()) {}
 
 AlloyNetworkGeneration::~AlloyNetworkGeneration() {
   Shutdown();
@@ -39,9 +44,11 @@ void AlloyNetworkGeneration::Bind(
     mojo::PendingRemote<cert_verifier::mojom::CertVerifierServiceUpdater> verifier,
     base::OnceClosure remove_client, base::RepeatingClosure recreate) {
   if (closed_) return;
-  endpoints_->remove_client.RunAndReset();
-  endpoints_->context.reset();
-  endpoints_->verifier.reset();
+  endpoints_->recreate.Reset();
+  if (endpoints_->context.is_bound())
+    endpoints_->context.set_disconnect_handler(base::DoNothing());
+  // An older retirement owns its original physical endpoints, never this bind.
+  endpoints_ = std::make_shared<Endpoints>();
   endpoints_->context.Bind(std::move(context));
   endpoints_->verifier.Bind(std::move(verifier));
   endpoints_->remove_client.ReplaceClosure(std::move(remove_client));
@@ -74,21 +81,98 @@ base::WeakPtr<AlloyNetworkGeneration> AlloyNetworkGeneration::GetWeakPtr() {
                  : weak_factory_.GetWeakPtr();
 }
 
+base::OnceClosure AlloyNetworkGeneration::RetainNativeRetirementEndpoints() {
+  CHECK(!closed_);
+  return base::BindOnce([](std::shared_ptr<Endpoints>) {}, endpoints_);
+}
+
 void AlloyNetworkGeneration::Shutdown() {
   if (closed_) return;
   closed_ = true;
   weak_factory_.InvalidateWeakPtrs();
   endpoints_->recreate.Reset();
-  endpoints_->context.reset();
-  // Destroy the server endpoint immediately. Keep only a disconnected client
-  // proxy for already-issued native callbacks; this never opens a network store.
+  if (endpoints_->context.is_bound())
+    endpoints_->context.set_disconnect_handler(base::DoNothing());
+  // Physical old endpoints survive ONLY an already-entered retirement. The
+  // closed generation itself retains no live authority and cannot recreate it.
+  endpoints_ = std::make_shared<Endpoints>();
   auto disconnected = endpoints_->context.BindNewPipeAndPassReceiver();
   disconnected.reset();
-  endpoints_->verifier.reset();
-  endpoints_->remove_client.RunAndReset();
 }
 
 namespace {
+// One in-flight operation owns physical prepared endpoints. Context/generation
+// discovery remains exclusively StoragePartitionImpl::ForEachNetworkContext.
+class NetworkServiceRetirement final
+    : public base::RefCounted<NetworkServiceRetirement> {
+ public:
+  NetworkServiceRetirement(
+      base::OnceCallback<void(base::OnceClosure)> prepared,
+      base::OnceCallback<void(bool)> drained)
+      : prepared_(std::move(prepared)), drained_(std::move(drained)) {}
+  void Start(BrowserContext* context,
+             const net::AlloyNetworkRecordTarget& target) {
+    std::vector<network::mojom::NetworkContext*> originals;
+    context->ForEachLoadedStoragePartition([&](StoragePartition* partition) {
+      static_cast<StoragePartitionImpl*>(partition)->ForEachNetworkContext(
+          [&](network::mojom::NetworkContext* native,
+              cert_verifier::mojom::CertVerifierServiceUpdater*) {
+            originals.push_back(native);
+          },
+          [&](AlloyNetworkGeneration* generation) {
+            original_lifetimes_.push_back(
+                generation->RetainNativeRetirementEndpoints());
+          });
+    });
+    endpoints_.resize(originals.size());
+    auto all_prepared = base::BarrierClosure(
+        originals.size(), base::BindOnce(&NetworkServiceRetirement::Prepared,
+                                        base::WrapRefCounted(this)));
+    for (size_t i = 0; i < originals.size(); ++i) {
+      originals[i]->PrepareAlloyNetworkServiceRetirement(
+          target.domain(), endpoints_[i].BindNewPipeAndPassReceiver(),
+          mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+              base::BindOnce(&NetworkServiceRetirement::OnPrepared,
+                             base::WrapRefCounted(this), all_prepared),
+              false));
+    }
+  }
+
+ private:
+  friend class base::RefCounted<NetworkServiceRetirement>;
+  ~NetworkServiceRetirement() = default;
+  void OnPrepared(base::OnceClosure finish, bool ok) {
+    success_ = success_ && ok;
+    std::move(finish).Run();
+  }
+  void Prepared() {
+    std::move(prepared_).Run(net::CommitNetworkRetirementOnDrop(
+        base::BindOnce(&NetworkServiceRetirement::Commit,
+                       base::WrapRefCounted(this))));
+  }
+  void Commit() {
+    auto all_drained = base::BarrierClosure(
+        endpoints_.size(), base::BindOnce(&NetworkServiceRetirement::Finished,
+                                         base::WrapRefCounted(this)));
+    for (auto& endpoint : endpoints_) {
+      endpoint->Commit(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+          base::BindOnce(&NetworkServiceRetirement::OnPrepared,
+                         base::WrapRefCounted(this), all_drained),
+          false));
+    }
+  }
+  void Finished() {
+    endpoints_.clear();
+    original_lifetimes_.clear();
+    std::move(drained_).Run(success_);
+  }
+  std::vector<mojo::Remote<network::mojom::AlloyNetworkRetirement>> endpoints_;
+  std::vector<base::OnceClosure> original_lifetimes_;
+  base::OnceCallback<void(base::OnceClosure)> prepared_;
+  base::OnceCallback<void(bool)> drained_;
+  bool success_ = true;
+};
+
 network::mojom::NetworkContext* UnavailableNetworkContext() {
   // Closed document admission must not fall through to the shared partition.
   // This immutable disconnected endpoint has no Network Service/server state.
@@ -118,6 +202,20 @@ class AlloyDocumentNetworkData final
 };
 DOCUMENT_USER_DATA_KEY_IMPL(AlloyDocumentNetworkData);
 }  // namespace
+
+void PrepareAlloyNetworkServiceRetirement(
+    BrowserContext* context,
+    const net::AlloyNetworkRecordTarget& target,
+    base::OnceCallback<void(base::OnceClosure)> prepared,
+    base::OnceCallback<void(bool)> drained) {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  CHECK(context);
+  CHECK(prepared);
+  CHECK(drained);
+  auto retirement = base::MakeRefCounted<NetworkServiceRetirement>(
+      std::move(prepared), std::move(drained));
+  retirement->Start(context, target);
+}
 
 scoped_refptr<AlloyNetworkGeneration> GetAlloyNetworkGenerationForDocument(
     RenderFrameHostImpl* frame) {

@@ -5,7 +5,7 @@
 #include <utility>
 
 #include "base/check.h"
-#include "net/base/schemeful_site.h"
+#include "net/base/alloy_network_record_target.h"
 #include "url/gurl.h"
 #include "url/url_constants.h"
 
@@ -65,15 +65,7 @@ bool IsProfileStorePurpose(StorePurpose purpose) {
 
 std::string RecordDomainForPrincipal(const GURL& principal_url,
                                      const url::Origin& origin) {
-  if (!principal_url.is_valid() || principal_url.SchemeIs(url::kAboutScheme) ||
-      principal_url.SchemeIs(url::kFileScheme) ||
-      principal_url.SchemeIs(url::kDataScheme) || origin.opaque() ||
-      origin.scheme() == url::kFileScheme ||
-      origin.scheme() == url::kDataScheme ||
-      origin.scheme() == url::kAboutScheme) {
-    return {};
-  }
-  return net::SchemefulSite(origin).GetURL().GetHost();
+  return net::AlloyRecordDomainForPrincipal(principal_url, origin);
 }
 
 RecordGeneration::RecordGeneration(base::UnguessableToken profile,

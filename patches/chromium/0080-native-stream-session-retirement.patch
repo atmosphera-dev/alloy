@@ -1,0 +1,420 @@
+--- a/net/http/http_stream_pool.h
++++ b/net/http/http_stream_pool.h
+@@ -251,6 +251,9 @@
+                       StreamSocketCloseReason attempt_cancel_reason,
+                       std::string_view net_log_close_reason_utf8);
+ 
++  void RetireMatchingStreams(
++      const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches,
++      base::OnceClosure done);
+   void CloseIdleStreams(std::string_view net_log_close_reason_utf8);
+ 
+   bool ReachedMaxStreamLimit() const;
+--- a/net/http/http_stream_pool.cc
++++ b/net/http/http_stream_pool.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "net/http/http_stream_pool.h"
++
++#include "base/barrier_closure.h"
+ 
+ #include <algorithm>
+ #include <map>
+@@ -389,6 +391,39 @@
+   ResetExpandability();
+ }
+ 
++void HttpStreamPool::RetireMatchingStreams(
++    const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches,
++    base::OnceClosure done) {
++  std::vector<base::WeakPtr<Group>> groups;
++  std::vector<JobController*> preparing;
++  size_t pending = 1;
++  for (auto& [key, group] : groups_) {
++    if (matches.Run(key)) {
++      groups.push_back(group.GetWeakPtr());
++      pending += group.NativeRetirementCount();
++    }
++  }
++  for (auto& controller : job_controllers_) {
++    if (controller->MatchesNetworkRecord(matches)) {
++      preparing.push_back(controller.get());
++      ++pending;
++    }
++  }
++  auto drained = base::BarrierClosure(pending, base::BindOnce(
++      [](base::OnceClosure done) {
++        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++            FROM_HERE, std::move(done));
++      }, std::move(done)));
++  std::vector<base::WeakPtr<JobController>> controllers;
++  for (auto* controller : preparing)
++    controllers.push_back(controller->PrepareNetworkRetirement(drained));
++  for (auto& group : groups) group->PrepareNetworkRetirement(drained);
++  for (auto& group : groups) if (group) group->RevokeNetworkState();
++  for (auto& controller : controllers)
++    if (controller) controller->RevokeNetworkState();
++  drained.Run();
++}
++
+ void HttpStreamPool::CloseIdleStreams(
+     std::string_view net_log_close_reason_utf8) {
+   for (auto& group : groups_) {
+--- a/net/http/http_stream_pool_group.h
++++ b/net/http/http_stream_pool_group.h
+@@ -6,11 +6,13 @@
+ #define NET_HTTP_HTTP_STREAM_POOL_GROUP_H_
+ 
+ #include <list>
++#include <map>
+ #include <memory>
+ #include <string_view>
+ #include <vector>
+ 
+ #include "base/containers/unique_ptr_adapters.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
+@@ -143,7 +145,7 @@
+   bool CloseOneIdleStreamSocket();
+ 
+   // Returns the number of handed out streams.
+-  size_t HandedOutStreamSocketCount() const { return handed_out_stream_count_; }
++  size_t HandedOutStreamSocketCount() const { return handed_out_sockets_.size(); }
+ 
+   // Returns the number of idle streams.
+   size_t IdleStreamSocketCount() const { return idle_stream_sockets_.size(); }
+@@ -172,6 +174,10 @@
+   void Refresh(std::string_view net_log_close_reason_utf8,
+                StreamSocketCloseReason cancel_reason);
+ 
++  size_t NativeRetirementCount() const { return handed_out_sockets_.size(); }
++  base::WeakPtr<Group> GetWeakPtr() { return weak_ptr_factory_.GetWeakPtr(); }
++  void PrepareNetworkRetirement(const base::RepeatingClosure& drained);
++  void RevokeNetworkState();
+   void CloseIdleStreams(std::string_view net_log_close_reason_utf8);
+ 
+   // Cancels all on-going jobs.
+@@ -239,7 +245,8 @@
+   const perfetto::NamedTrack track_;
+   const perfetto::Flow flow_;
+ 
+-  size_t handed_out_stream_count_ = 0;
++  std::map<raw_ptr<StreamSocket, CtnExperimental>,
++           std::vector<base::ScopedClosureRunner>> handed_out_sockets_;
+   int64_t generation_ = 0;
+   std::list<IdleStreamSocket> idle_stream_sockets_;
+ 
+--- a/net/http/http_stream_pool_group.cc
++++ b/net/http/http_stream_pool_group.cc
+@@ -121,12 +121,12 @@
+     std::unique_ptr<StreamSocket> socket,
+     StreamSocketHandle::SocketReuseType reuse_type,
+     LoadTimingInfo::ConnectTiming connect_timing) {
+-  ++handed_out_stream_count_;
++  CHECK(handed_out_sockets_.try_emplace(socket.get()).second);
+   pool_->IncrementTotalHandedOutStreamCount();
+ 
+   TRACE_EVENT_INSTANT("net.stream", "Group::CreateHandle", track_, flow_,
+                       "negotiated_protocol", socket->GetNegotiatedProtocol(),
+-                      "handed_out_stream_count", handed_out_stream_count_);
++                      "handed_out_stream_count", handed_out_sockets_.size());
+   net_log_.AddEvent(NetLogEventType::HTTP_STREAM_POOL_GROUP_HANDLE_CREATED,
+                     [&] {
+                       base::DictValue dict;
+@@ -156,8 +156,7 @@
+ void HttpStreamPool::Group::ReleaseStreamSocket(
+     std::unique_ptr<StreamSocket> socket,
+     int64_t generation) {
+-  CHECK_GT(handed_out_stream_count_, 0u);
+-  --handed_out_stream_count_;
++  CHECK_EQ(handed_out_sockets_.erase(socket.get()), 1u);
+   pool_->DecrementTotalHandedOutStreamCount();
+ 
+   bool reusable = false;
+@@ -176,7 +175,7 @@
+ 
+   TRACE_EVENT_INSTANT("net.stream", "Group::ReleaseStreamSocket", track_, flow_,
+                       "reusable", reusable, "handed_out_stream_count",
+-                      handed_out_stream_count_);
++                      handed_out_sockets_.size());
+ 
+   if (reusable) {
+     AddIdleStreamSocket(std::move(socket));
+@@ -280,7 +279,7 @@
+ }
+ 
+ size_t HttpStreamPool::Group::ActiveStreamSocketCount() const {
+-  return handed_out_stream_count_ + idle_stream_sockets_.size() +
++  return handed_out_sockets_.size() + idle_stream_sockets_.size() +
+          ConnectingStreamSocketCount();
+ }
+ 
+@@ -317,6 +316,24 @@
+     attempt_manager_->CancelTcpBasedAttempts(cancel_reason);
+   }
+   CleanupIdleStreamSockets(CleanupMode::kForce, net_log_close_reason_utf8);
++}
++
++void HttpStreamPool::Group::PrepareNetworkRetirement(
++    const base::RepeatingClosure& drained) {
++  ++generation_;
++  for (auto& [socket, waiters] : handed_out_sockets_) {
++    waiters.emplace_back(drained);
++    socket->Disconnect();
++  }
++}
++
++void HttpStreamPool::Group::RevokeNetworkState() {
++  CloseIdleStreams("Site record retired");
++  if (attempt_manager_)
++    attempt_manager_->CancelJobs(ERR_ABORTED, StreamSocketCloseReason::kAbort);
++  if (alt_svc_quic_preconnect_attempt_manager_)
++    alt_svc_quic_preconnect_attempt_manager_->CancelJobs(
++        ERR_ABORTED, StreamSocketCloseReason::kAbort);
+ }
+ 
+ void HttpStreamPool::Group::CloseIdleStreams(
+--- a/net/http/http_stream_pool_job_controller.h
++++ b/net/http/http_stream_pool_job_controller.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <vector>
+ 
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
+@@ -93,6 +94,11 @@
+   int RestartTunnelWithProxyAuth() override;
+   void SetPriority(RequestPriority priority) override;
+ 
++  bool MatchesNetworkRecord(
++      const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches) const;
++  base::WeakPtr<JobController> PrepareNetworkRetirement(
++      const base::RepeatingClosure& drained);
++  void RevokeNetworkState();
+   base::DictValue GetInfoAsValue() const;
+ 
+  private:
+@@ -199,6 +205,10 @@
+   // error.
+   void MaybeMarkAlternativeServiceBroken();
+ 
++  // Last to drain, after jobs/pending streams and weak native callbacks die.
++  std::vector<base::ScopedClosureRunner> network_retirement_;
++  bool network_retired_ = false;
++  bool network_retirement_started_ = false;
+   const raw_ptr<HttpStreamPool> pool_;
+   RequestPriority priority_;
+   const std::vector<SSLConfig::CertAndStatus> allowed_bad_certs_;
+--- a/net/http/http_stream_pool_job_controller.cc
++++ b/net/http/http_stream_pool_job_controller.cc
+@@ -203,6 +203,46 @@
+   TRACE_EVENT("net.stream", "JobController::~JobController", flow_);
+ }
+ 
++bool HttpStreamPool::JobController::MatchesNetworkRecord(
++    const base::RepeatingCallback<bool(const HttpStreamKey&)>& matches) const {
++  return matches.Run(origin_stream_key_) ||
++         (alternative_ && matches.Run(alternative_->stream_key));
++}
++
++base::WeakPtr<HttpStreamPool::JobController>
++HttpStreamPool::JobController::PrepareNetworkRetirement(
++    const base::RepeatingClosure& drained) {
++  network_retirement_.emplace_back(drained);
++  if (!network_retired_) {
++    network_retired_ = true;
++    weak_ptr_factory_.InvalidateWeakPtrs();
++  }
++  return weak_ptr_factory_.GetWeakPtr();  // Cleanup view, not new admission.
++}
++
++void HttpStreamPool::JobController::RevokeNetworkState() {
++  if (network_retirement_started_) return;
++  network_retirement_started_ = true;
++  origin_job_.reset();
++  alternative_job_.reset();
++  pending_stream_.reset();
++  auto preconnect = std::move(preconnect_callback_);
++  if (stream_request_) {
++    if (!stream_request_->completed()) {
++      TaskRunner(priority_)->PostTask(FROM_HERE, base::BindOnce(
++          &JobController::CallOnStreamFailed, weak_ptr_factory_.GetWeakPtr(),
++          ERR_ABORTED, NetErrorDetails(), ResolveErrorInfo()));
++    }
++    // An Alt-Svc preconnect can coexist with a completed stream helper.
++    if (preconnect) std::move(preconnect).Run(ERR_ABORTED);
++  } else if (preconnect) {
++    auto retirement = std::move(network_retirement_);
++    // The existing pool callback destroys this controller. Hold drain through
++    // the caller's actual callback, including reentry, rather than its enqueue.
++    std::move(preconnect).Run(ERR_ABORTED);
++  }
++}
++
+ void HttpStreamPool::JobController::HandleStreamRequest(
+     HttpStreamRequest* stream_request,
+     HttpStreamRequest::Delegate* delegate) {
+@@ -372,6 +412,7 @@
+     std::optional<SessionSource> session_source) {
+   TRACE_EVENT("net.stream", "JobController::OnStreamReady", flow_);
+ 
++  if (network_retired_) return;
+   SetJobResult(job, OK);
+ 
+   // If there's already a `pending_stream_` or the callback has already been
+@@ -402,6 +443,7 @@
+   TRACE_EVENT("net.stream", "JobController::OnStreamFailed", flow_, "result",
+               status);
+ 
++  if (network_retired_) return;
+   stream_request_->AddConnectionAttempts(job->connection_attempts());
+   SetJobResult(job, status);
+   if (AllJobsFinished()) {
+@@ -420,6 +462,7 @@
+     Job* job,
+     int status,
+     const SSLInfo& ssl_info) {
++  if (network_retired_) return;
+   TRACE_EVENT("net.stream", "JobController::OnCertificateError", flow_,
+               "result", status);
+ 
+@@ -437,6 +480,7 @@
+ void HttpStreamPool::JobController::OnNeedsClientAuth(
+     Job* job,
+     SSLCertRequestInfo* cert_info) {
++  if (network_retired_) return;
+   TRACE_EVENT("net.stream", "JobController::OnNeedsClientAuth", flow_);
+ 
+   stream_request_->AddConnectionAttempts(job->connection_attempts());
+@@ -451,6 +495,7 @@
+ }
+ 
+ void HttpStreamPool::JobController::OnPreconnectComplete(Job* job, int status) {
++  if (network_retired_) return;
+   TRACE_EVENT("net.stream", "JobController::OnPreconnectComplete", flow_,
+               "result", status);
+   TaskRunner(priority_)->PostTask(
+@@ -745,6 +790,7 @@
+ }
+ 
+ void HttpStreamPool::JobController::MaybeMarkAlternativeServiceBroken() {
++  if (network_retired_) return;
+   // If alternative job succeeds or not completed, no brokenness to report.
+   if (!alternative_job_result_.has_value() || *alternative_job_result_ == OK) {
+     return;
+--- a/net/spdy/spdy_session.h
++++ b/net/spdy/spdy_session.h
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include "base/containers/circular_deque.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -538,6 +539,8 @@
+   // called on error.
+   // `description` indicates the reason for the error.
+   // `force_send_go_away` forces sending GOAWAY.
++  void PrepareNetworkRetirement(const base::RepeatingClosure& drained);
++  void RevokeNetworkState();
+   void CloseSessionOnError(Error err,
+                            const std::string& description,
+                            bool force_send_go_away = false);
+@@ -1060,6 +1063,8 @@
+   bool in_io_loop_ = false;
+ 
+   // The key used to identify this session.
++  // Destroy after the native socket handle/streams, not after scheduling close.
++  std::vector<base::ScopedClosureRunner> network_retirement_;
+   SpdySessionKey spdy_session_key_;
+ 
+   // Set set of SpdySessionKeys for which this session has serviced
+--- a/net/spdy/spdy_session.cc
++++ b/net/spdy/spdy_session.cc
+@@ -1347,6 +1347,28 @@
+   SendWindowUpdateFrame(stream_id, delta_window_size, it->second->priority());
+ }
+ 
++void SpdySession::PrepareNetworkRetirement(
++    const base::RepeatingClosure& drained) {
++  network_retirement_.emplace_back(drained);
++  MakeUnavailable(ERR_ABORTED);
++}
++
++void SpdySession::RevokeNetworkState() {
++  if (in_io_loop_) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++        base::BindOnce(&SpdySession::RevokeNetworkState, GetWeakPtr()));
++    return;
++  }
++  auto original = GetWeakPtr();
++  CloseSessionOnError(ERR_ABORTED, "Site record retired");
++  // Stream delegates may have destroyed this session/context during close.
++  if (!original) return;
++  socket_->Disconnect();
++  // No old write, including a blocked write, may retain transport authority.
++  // The native removal/destructor cancels I/O and releases the socket handle.
++  pool_->RemoveUnavailableSession(original);
++}
++
+ void SpdySession::CloseSessionOnError(Error err,
+                                       const std::string& description,
+                                       bool force_send_go_away) {
+--- a/net/spdy/spdy_session_pool.h
++++ b/net/spdy/spdy_session_pool.h
+@@ -319,6 +319,9 @@
+   // Let any new ones created while this method is running continue to
+   // live.
+   void CloseCurrentSessions(Error error);
++  void RetireMatchingSessions(
++      const base::RepeatingCallback<bool(const SpdySessionKey&)>& matches,
++      base::OnceClosure done);
+ 
+   // Close only the currently existing SpdySessions that are idle.
+   // Let any new ones created while this method is running continue to
+--- a/net/spdy/spdy_session_pool.cc
++++ b/net/spdy/spdy_session_pool.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "net/spdy/spdy_session_pool.h"
++
++#include "base/barrier_closure.h"
+ 
+ #include <algorithm>
+ #include <set>
+@@ -407,6 +409,28 @@
+ // handlers, it doesn't suffice to simply increment the iterator
+ // before closing.
+ 
++void SpdySessionPool::RetireMatchingSessions(
++    const base::RepeatingCallback<bool(const SpdySessionKey&)>& matches,
++    base::OnceClosure done) {
++  WeakSessionList selected;
++  for (auto& session : GetCurrentSessions()) {
++    if (!session) continue;
++    bool owned = matches.Run(session->spdy_session_key());
++    for (const auto& alias : session->pooled_aliases())
++      owned = owned || matches.Run(alias);
++    if (owned) selected.push_back(session);
++  }
++  auto drained = base::BarrierClosure(selected.size() + 1, base::BindOnce(
++      [](base::OnceClosure done) {
++        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++            FROM_HERE, std::move(done));
++      }, std::move(done)));
++  // Unmap every original owner before any stream close callback can reenter.
++  for (auto& session : selected) session->PrepareNetworkRetirement(drained);
++  for (auto& session : selected) if (session) session->RevokeNetworkState();
++  drained.Run();
++}
++
+ void SpdySessionPool::CloseCurrentSessions(Error error) {
+   CloseCurrentSessionsHelper(error, "Closing current sessions.",
+                              false /* idle_only */);

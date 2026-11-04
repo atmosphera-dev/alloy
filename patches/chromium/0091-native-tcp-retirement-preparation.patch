@@ -1,0 +1,425 @@
+--- a/net/socket/transport_client_socket_pool.h
++++ b/net/socket/transport_client_socket_pool.h
+@@ -223,6 +223,13 @@
+                      int64_t group_generation) override;
+   void FlushWithError(int error, const char* net_log_reason_utf8) override;
+ 
++  // Prepare original resources without delivering their user callbacks. The
++  // returned commit (also executed on drop) releases only that original
++  // snapshot.
++  base::OnceClosure PrepareMatchingGroups(
++      const base::RepeatingCallback<bool(const GroupId&)>& matches,
++      base::OnceClosure done);
++
+   // Engine-owned pure group selector. Revoke the selected original handouts,
+   // idle sockets and requests, then await their actual native release/error
+   // completion. Fresh handouts do not prolong this retirement.
+@@ -285,6 +292,28 @@
+   struct IdleSocket;
+ 
+   using RequestQueue = PriorityQueue<std::unique_ptr<Request>>;
++
++  // Physical original-request state, not a record/generation catalogue.
++  struct NetworkRetirementCommit {
++    bool released = false;
++  };
++  struct EnteredCallback {
++    EnteredCallback(const GroupId& group,
++                    std::vector<base::ScopedClosureRunner> waiters)
++        : network_retirement(std::move(waiters)), group_id(group) {}
++    std::vector<base::ScopedClosureRunner> network_retirement;
++    const GroupId group_id;
++  };
++  struct PendingPreconnect {
++    PendingPreconnect(const GroupId& group,
++                      PreconnectCompletionCallback completion)
++        : group_id(group), callback(std::move(completion)) {}
++    std::vector<base::ScopedClosureRunner> network_retirement;
++    std::shared_ptr<NetworkRetirementCommit> retirement_commit;
++    const GroupId group_id;
++    PreconnectCompletionCallback callback;
++    bool ready = false;
++  };
+ 
+   // A Group is allocated per GroupId when there are idle sockets, unbound
+   // request, or bound requests. Otherwise, the Group object is removed from the
+@@ -325,6 +354,7 @@
+ 
+       // Declared first so native request/job state is destroyed before drain.
+       std::vector<base::ScopedClosureRunner> network_retirement;
++      std::shared_ptr<NetworkRetirementCommit> retirement_commit;
+       std::unique_ptr<ConnectJob> connect_job;
+       std::unique_ptr<Request> request;
+ 
+@@ -468,7 +498,9 @@
+       return active_sockets_.size() + unbound_request_count() +
+              bound_requests_.size();
+     }
+-    void PrepareNetworkRetirement(const base::RepeatingClosure& drained);
++    void PrepareNetworkRetirement(
++        const base::RepeatingClosure& drained,
++        std::vector<std::shared_ptr<NetworkRetirementCommit>>* commits);
+ 
+     void IncrementGeneration() { generation_++; }
+ 
+@@ -597,6 +629,8 @@
+     ~CallbackResultPair();
+ 
+     std::vector<base::ScopedClosureRunner> network_retirement;
++    std::shared_ptr<const int> identity = std::make_shared<const int>(0);
++    std::shared_ptr<NetworkRetirementCommit> retirement_commit;
+     CompletionOnceCallback callback;
+     int result;
+   };
+@@ -744,10 +778,12 @@
+   // current message loop.  Inserts |callback| into |pending_callback_map_|,
+   // keyed by |handle|. Apply |socket_tag| to the socket if socket successfully
+   // created.
+-  void InvokeUserCallbackLater(ClientSocketHandle* handle,
+-                               CompletionOnceCallback callback,
+-                               int rv,
+-                               const SocketTag& socket_tag);
++  void InvokeUserCallbackLater(
++      ClientSocketHandle* handle,
++      CompletionOnceCallback callback,
++      int rv,
++      const SocketTag& socket_tag,
++      std::shared_ptr<NetworkRetirementCommit> retirement_commit = {});
+ 
+   // These correspond to ConnectJob::Delegate methods, and are invoked by the
+   // Group a ConnectJob belongs to.
+@@ -762,7 +798,13 @@
+   // it's possible that the request has been cancelled, so |handle| may not
+   // exist in |pending_callback_map_|.  We look up the callback and result code
+   // in |pending_callback_map_|.
+-  void InvokeUserCallback(MayBeDangling<ClientSocketHandle> handle);
++  void InvokeUserCallback(MayBeDangling<ClientSocketHandle> handle,
++                          std::weak_ptr<const int> original);
++  void ScheduleUserCallback(const ClientSocketHandle* handle,
++                            const CallbackResultPair& completion);
++  void OnPreconnectResult(std::shared_ptr<PendingPreconnect> original,
++                          bool success,
++                          std::unique_ptr<ClientSocketHandle> handle);
+ 
+   // Tries to close idle sockets in a higher level socket pool as long as this
+   // this pool is stalled.
+@@ -785,7 +827,7 @@
+ 
+   // Called when a preconnect connect job completes.
+   void OnPreconnectConnectJobComplete(
+-      PreconnectCompletionCallback callback,
++      std::shared_ptr<PendingPreconnect> original,
+       const GroupId& group_id,
+       scoped_refptr<SocketParams> socket_params,
+       const std::optional<NetworkTrafficAnnotationTag>& proxy_annotation_tag,
+@@ -798,6 +840,8 @@
+   // callback.  This is necessary since, before we invoke said callback, it's
+   // possible that the request is cancelled.
+   PendingCallbackMap pending_callback_map_;
++  std::vector<std::weak_ptr<EnteredCallback>> entered_callbacks_;
++  std::vector<std::weak_ptr<PendingPreconnect>> preconnect_callbacks_;
+ 
+   // The total number of idle sockets in the system.
+   size_t idle_socket_count_ = 0;
+--- a/net/socket/transport_client_socket_pool.cc
++++ b/net/socket/transport_client_socket_pool.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "net/socket/transport_client_socket_pool.h"
++#include "net/base/alloy_network_record_target.h"
+ 
+ #include "base/barrier_closure.h"
+ 
+@@ -329,6 +330,11 @@
+ 
+   int rv = OK;
+ 
++  std::erase_if(preconnect_callbacks_,
++                [](const auto& weak) { return weak.expired(); });
++  auto original =
++      std::make_shared<PendingPreconnect>(group_id, std::move(callback));
++  preconnect_callbacks_.push_back(original);
+   base::RepeatingCallback<void(int)> preconnect_done_closure =
+       base::BarrierCallback<int>(
+           num_sockets,
+@@ -343,7 +349,7 @@
+           // pass the closure to the task runner asynchronously.
+           base::BindPostTaskToCurrentDefault(base::BindOnce(
+               &TransportClientSocketPool::OnPreconnectConnectJobComplete,
+-              weak_factory_.GetWeakPtr(), std::move(callback), group_id, params,
++              weak_factory_.GetWeakPtr(), original, group_id, params,
+               proxy_annotation_tag, net_log)));
+   int pending_connect_job_count = 0;
+   for (int num_iterations_left = num_sockets;
+@@ -1175,35 +1181,68 @@
+ void TransportClientSocketPool::RetireMatchingGroups(
+     const base::RepeatingCallback<bool(const GroupId&)>& matches,
+     base::OnceClosure done) {
++  std::move(PrepareMatchingGroups(matches, std::move(done))).Run();
++}
++
++base::OnceClosure TransportClientSocketPool::PrepareMatchingGroups(
++    const base::RepeatingCallback<bool(const GroupId&)>& matches,
++    base::OnceClosure done) {
+   std::vector<GroupId> selected;
+-  size_t pending = 1;  // Keep completion closed through synchronous preparation.
+-  for (const auto& [id, group] : group_map_) {
++  std::vector<std::shared_ptr<PendingPreconnect>> preconnects;
++  std::vector<std::shared_ptr<EnteredCallback>> entered;
++  size_t pending = 1;
++  for (const auto& [id, group] : group_map_)
+     if (matches.Run(id)) {
+       selected.push_back(id);
+       pending += group.NativeRetirementCount();
+     }
+-  }
+-  for (const auto& [handle, callback] : pending_callback_map_) {
++  for (const auto& [handle, callback] : pending_callback_map_)
+     if (matches.Run(handle->group_id())) ++pending;
+-  }
+-  auto drained = base::BarrierClosure(pending, base::BindOnce(
+-      [](base::OnceClosure done) {
+-        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-            FROM_HERE, std::move(done));
+-      }, std::move(done)));
+-  // Prepare all selected original owners before cancelling any native work.
+-  for (const auto& id : selected) {
+-    group_map_.at(id).PrepareNetworkRetirement(drained);
+-  }
+-  for (auto& [handle, completion] : pending_callback_map_) {
++  for (const auto& weak : entered_callbacks_)
++    if (auto original = weak.lock())
++      if (matches.Run(original->group_id)) {
++        entered.push_back(std::move(original));
++        ++pending;
++      }
++  for (const auto& weak : preconnect_callbacks_)
++    if (auto original = weak.lock())
++      if (matches.Run(original->group_id)) {
++        preconnects.push_back(std::move(original));
++        ++pending;
++      }
++  auto drained = base::BarrierClosure(
++      pending,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<std::shared_ptr<NetworkRetirementCommit>> commits;
++  auto prepare = [&](auto& original) {
++    if (!original.retirement_commit)
++      original.retirement_commit = std::make_shared<NetworkRetirementCommit>();
++    commits.push_back(original.retirement_commit);
++    original.network_retirement.emplace_back(drained);
++  };
++  for (auto& original : preconnects)
++    prepare(*original);
++  for (auto& original : entered)
++    original->network_retirement.emplace_back(drained);
++  for (const auto& id : selected)
++    group_map_.at(id).PrepareNetworkRetirement(drained, &commits);
++  for (auto& [handle, completion] : pending_callback_map_)
+     if (matches.Run(handle->group_id())) {
+       completion.result = ERR_ABORTED;
+-      completion.network_retirement.emplace_back(drained);
+-    }
+-  }
++      prepare(completion);
++    }
++  // Disconnect/cancel only originals before yielding. Native user dispatch
++  // stays gated; a later commit never looks up a reusable group to cancel fresh
++  // work.
+   for (const auto& id : selected) {
+     auto it = group_map_.find(id);
+-    if (it == group_map_.end()) continue;
++    if (it == group_map_.end())
++      continue;
+     Group* group = &it->second;
+     connecting_socket_count_ -= group->jobs().size();
+     group->RemoveAllUnboundJobs();
+@@ -1211,14 +1250,39 @@
+                               "Site record retired");
+     while (auto request = group->PopNextUnboundRequest()) {
+       auto* handle = request->handle();
++      auto gate = std::make_shared<NetworkRetirementCommit>();
++      commits.push_back(gate);
+       InvokeUserCallbackLater(handle, request->release_callback(), ERR_ABORTED,
+-                              request->socket_tag());
++                              request->socket_tag(), gate);
+       pending_callback_map_.at(handle).network_retirement.emplace_back(drained);
+     }
+     if (group->IsEmpty()) RemoveGroup(id);
+   }
+-  CheckForStalledSocketGroups();
+-  drained.Run();
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](base::WeakPtr<TransportClientSocketPool> pool,
++         std::vector<std::shared_ptr<NetworkRetirementCommit>> commits,
++         std::vector<std::shared_ptr<PendingPreconnect>> preconnects,
++         base::ScopedClosureRunner finish) {
++        for (auto& original : commits)
++          original->released = true;
++        if (!pool)
++          return;
++        for (const auto& [handle, completion] : pool->pending_callback_map_)
++          if (completion.retirement_commit &&
++              std::ranges::find(commits, completion.retirement_commit) !=
++                  commits.end())
++            pool->ScheduleUserCallback(handle, completion);
++        for (auto& original : preconnects)
++          if (original->ready && original->callback)
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE,
++                base::BindOnce(&TransportClientSocketPool::OnPreconnectResult,
++                               pool, original, false,
++                               std::unique_ptr<ClientSocketHandle>()));
++        pool->CheckForStalledSocketGroups();
++      },
++      weak_factory_.GetWeakPtr(), std::move(commits), std::move(preconnects),
++      base::ScopedClosureRunner(drained)));
+ }
+ 
+ void TransportClientSocketPool::RemoveConnectJob(ConnectJob* job,
+@@ -1403,7 +1467,8 @@
+       InvokeUserCallbackLater(bound_request->request->handle(),
+                               bound_request->request->release_callback(),
+                               bound_request->pending_error,
+-                              bound_request->request->socket_tag());
++                              bound_request->request->socket_tag(),
++                              bound_request->retirement_commit);
+       auto& retirement = pending_callback_map_.at(
+           bound_request->request->handle()).network_retirement;
+       for (auto& waiter : bound_request->network_retirement)
+@@ -1499,32 +1564,49 @@
+     ClientSocketHandle* handle,
+     CompletionOnceCallback callback,
+     int rv,
+-    const SocketTag& socket_tag) {
++    const SocketTag& socket_tag,
++    std::shared_ptr<NetworkRetirementCommit> retirement_commit) {
+   CHECK(!pending_callback_map_.contains(handle));
+   pending_callback_map_[handle] = CallbackResultPair(std::move(callback), rv);
++  pending_callback_map_.at(handle).retirement_commit =
++      std::move(retirement_commit);
+   if (rv == OK) {
+     handle->socket()->ApplySocketTag(socket_tag);
+   }
++  ScheduleUserCallback(handle, pending_callback_map_.at(handle));
++}
++
++void TransportClientSocketPool::ScheduleUserCallback(
++    const ClientSocketHandle* handle,
++    const CallbackResultPair& completion) {
++  // Address reuse cannot let an older posted task consume a new callback. The
++  // weak physical identity is checked before dereferencing the borrowed handle.
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+       FROM_HERE, base::BindOnce(&TransportClientSocketPool::InvokeUserCallback,
+                                 weak_factory_.GetWeakPtr(),
+-                                // This is safe as `handle` is checked against a
+-                                // map to verify it's alive before dereference.
+-                                // This code path must only be reachable by
+-                                // `handle`s that have had Init called.
+-                                base::UnsafeDangling(handle)));
++                                base::UnsafeDangling(
++                                    const_cast<ClientSocketHandle*>(handle)),
++                                std::weak_ptr<const int>(completion.identity)));
+ }
+ 
+ void TransportClientSocketPool::InvokeUserCallback(
+-    MayBeDangling<ClientSocketHandle> handle) {
++    MayBeDangling<ClientSocketHandle> handle,
++    std::weak_ptr<const int> original) {
+   auto it = pending_callback_map_.find(handle);
+ 
+   // Exit if the request has already been cancelled.
+-  if (it == pending_callback_map_.end())
++  if (it == pending_callback_map_.end() ||
++      it->second.identity != original.lock())
+     return;
++  if (it->second.retirement_commit && !it->second.retirement_commit->released)
++    return;
+ 
+   CHECK(!handle->is_initialized());
+-  auto retirement = std::move(it->second.network_retirement);
++  std::erase_if(entered_callbacks_,
++                [](const auto& weak) { return weak.expired(); });
++  auto entered = std::make_shared<EnteredCallback>(
++      handle->group_id(), std::move(it->second.network_retirement));
++  entered_callbacks_.push_back(entered);
+   CompletionOnceCallback callback = std::move(it->second.callback);
+   int result = it->second.result;
+   pending_callback_map_.erase(it);
+@@ -1562,12 +1644,20 @@
+ }
+ 
+ void TransportClientSocketPool::OnPreconnectConnectJobComplete(
+-    PreconnectCompletionCallback callback,
++    std::shared_ptr<PendingPreconnect> original,
+     const GroupId& group_id,
+     scoped_refptr<SocketParams> socket_params,
+     const std::optional<NetworkTrafficAnnotationTag>& proxy_annotation_tag,
+     const NetLogWithSource& net_log,
+     std::vector<int> results) {
++  if (original->retirement_commit) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&TransportClientSocketPool::OnPreconnectResult,
++                       weak_factory_.GetWeakPtr(), std::move(original), false,
++                       std::unique_ptr<ClientSocketHandle>()));
++    return;
++  }
+   int result = OK;
+   std::unique_ptr<ClientSocketHandle> handle;
+   if (base::FeatureList::IsEnabled(
+@@ -1619,8 +1709,26 @@
+     }
+   }
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE,
+-      base::BindOnce(std::move(callback), result == OK, std::move(handle)));
++      FROM_HERE, base::BindOnce(&TransportClientSocketPool::OnPreconnectResult,
++                                weak_factory_.GetWeakPtr(), std::move(original),
++                                result == OK, std::move(handle)));
++}
++
++void TransportClientSocketPool::OnPreconnectResult(
++    std::shared_ptr<PendingPreconnect> original,
++    bool success,
++    std::unique_ptr<ClientSocketHandle> handle) {
++  original->ready = true;
++  if (original->retirement_commit) {
++    handle.reset();
++    if (!original->retirement_commit->released)
++      return;
++    success = false;
++  }
++  // The original operation remains borrowed through the caller's ACTUAL return.
++  auto callback = std::move(original->callback);
++  if (callback)
++    std::move(callback).Run(success, std::move(handle));
+ }
+ 
+ TransportClientSocketPool::Group::Group(
+@@ -1967,7 +2075,8 @@
+ }
+ 
+ void TransportClientSocketPool::Group::PrepareNetworkRetirement(
+-    const base::RepeatingClosure& drained) {
++    const base::RepeatingClosure& drained,
++    std::vector<std::shared_ptr<NetworkRetirementCommit>>* commits) {
+   IncrementGeneration();
+   for (auto& [socket, retirement] : active_sockets_) {
+     retirement.emplace_back(drained);
+@@ -1976,6 +2085,9 @@
+   SetPendingErrorForAllBoundRequests(ERR_ABORTED);
+   for (auto& bound : bound_requests_) {
+     bound.network_retirement.emplace_back(drained);
++    if (!bound.retirement_commit)
++      bound.retirement_commit = std::make_shared<NetworkRetirementCommit>();
++    commits->push_back(bound.retirement_commit);
+   }
+ }
+ 

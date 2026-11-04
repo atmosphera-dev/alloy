@@ -1,0 +1,912 @@
+--- a/services/network/websocket.h
++++ b/services/network/websocket.h
+@@ -29,6 +29,7 @@
+ #include "net/storage_access_api/status.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "net/websockets/websocket_event_interface.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/network_service.h"
+ #include "services/network/public/mojom/client_security_state.mojom.h"
+ #include "services/network/public/mojom/ip_address_space.mojom.h"
+@@ -89,6 +90,10 @@
+   WebSocket& operator=(const WebSocket&) = delete;
+ 
+   ~WebSocket() override;
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::WeakPtr<WebSocket> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done);
++  void RevokeNetworkState();
+ 
+   // mojom::WebSocket methods:
+   void SendMessage(mojom::WebSocketMessageType type,
+@@ -217,6 +222,7 @@
+   bool ReadAndSendFrameFromDataPipe(DataFrame* data_frame);
+   void ResumeDataPipeReading();
+ 
++  NativeNetworkRetirement native_retirement_;
+   // |factory_| owns |this|.
+   const raw_ptr<WebSocketFactory> factory_;
+   mojo::Receiver<mojom::WebSocket> receiver_{this};
+--- a/services/network/websocket.cc
++++ b/services/network/websocket.cc
+@@ -200,6 +200,10 @@
+ 
+ void WebSocket::WebSocketEventHandler::OnCreateURLRequest(
+     net::URLRequest* url_request) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   url_request->SetUserData(WebSocket::kUserDataKey,
+                            std::make_unique<UnownedPointer>(impl_));
+   impl_->net_log_source_id_ = url_request->net_log().source().id;
+@@ -267,6 +271,10 @@
+     net::URLRequest* request,
+     const net::TransportInfo& info,
+     net::CompletionOnceCallback callback) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   // Grab Metrics first, then do actual LNA checks.
+   if (impl_->url_loader_network_observer_ &&
+       impl_->required_ip_address_space_ == mojom::IPAddressSpace::kUnknown) {
+@@ -350,6 +358,10 @@
+     std::unique_ptr<net::WebSocketHandshakeResponseInfo> response,
+     const std::string& selected_protocol,
+     const std::string& extensions) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocketEventHandler::OnAddChannelResponse @"
+            << reinterpret_cast<void*>(this) << " selected_protocol=\""
+            << selected_protocol << "\""
+@@ -374,7 +386,8 @@
+   const MojoResult mojo_result = impl_->writable_watcher_.Watch(
+       impl_->writable_.get(), MOJO_HANDLE_SIGNAL_WRITABLE,
+       MOJO_WATCH_CONDITION_SATISFIED,
+-      base::BindRepeating(&WebSocket::OnWritable, base::Unretained(impl_)));
++      base::BindRepeating(&WebSocket::OnWritable,
++                          impl_->weak_ptr_factory_.GetWeakPtr()));
+   DCHECK_EQ(mojo_result, MOJO_RESULT_OK);
+ 
+   mojo::ScopedDataPipeProducerHandle writable;
+@@ -388,7 +401,8 @@
+   const MojoResult mojo_readable_result = impl_->readable_watcher_.Watch(
+       impl_->readable_.get(), MOJO_HANDLE_SIGNAL_READABLE,
+       MOJO_WATCH_CONDITION_SATISFIED,
+-      base::BindRepeating(&WebSocket::OnReadable, base::Unretained(impl_)));
++      base::BindRepeating(&WebSocket::OnReadable,
++                          impl_->weak_ptr_factory_.GetWeakPtr()));
+   DCHECK_EQ(mojo_readable_result, MOJO_RESULT_OK);
+ 
+   mojom::WebSocketHandshakeResponsePtr mojo_response =
+@@ -399,19 +413,25 @@
+       impl_->receiver_.BindNewPipeAndPassRemote(),
+       impl_->client_.BindNewPipeAndPassReceiver(), std::move(mojo_response),
+       std::move(readable), std::move(writable));
+-  impl_->receiver_.set_disconnect_handler(base::BindOnce(
+-      &WebSocket::OnConnectionError, base::Unretained(impl_), FROM_HERE));
++  impl_->receiver_.set_disconnect_handler(
++      base::BindOnce(&WebSocket::OnConnectionError,
++                     impl_->weak_ptr_factory_.GetWeakPtr(), FROM_HERE));
+   impl_->handshake_client_.reset();
+   impl_->auth_handler_.reset();
+   impl_->header_client_.reset();
+-  impl_->client_.set_disconnect_handler(base::BindOnce(
+-      &WebSocket::OnConnectionError, base::Unretained(impl_), FROM_HERE));
++  impl_->client_.set_disconnect_handler(
++      base::BindOnce(&WebSocket::OnConnectionError,
++                     impl_->weak_ptr_factory_.GetWeakPtr(), FROM_HERE));
+ }
+ 
+ void WebSocket::WebSocketEventHandler::OnDataFrame(
+     bool fin,
+     net::WebSocketFrameHeader::OpCode type,
+     base::span<const char> payload) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocketEventHandler::OnDataFrame @"
+            << reinterpret_cast<void*>(this) << " fin=" << fin
+            << " type=" << type << " data is " << payload.size() << " bytes";
+@@ -423,6 +443,10 @@
+ }
+ 
+ void WebSocket::WebSocketEventHandler::OnSendDataFrameDone() {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   impl_->ResumeDataPipeReading();
+   return;
+ }
+@@ -432,6 +456,10 @@
+ }
+ 
+ void WebSocket::WebSocketEventHandler::OnClosingHandshake() {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocketEventHandler::OnClosingHandshake @"
+            << reinterpret_cast<void*>(this);
+ 
+@@ -442,6 +470,10 @@
+     bool was_clean,
+     uint16_t code,
+     const std::string& reason) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocketEventHandler::OnDropChannel @"
+            << reinterpret_cast<void*>(this) << " was_clean=" << was_clean
+            << " code=" << code << " reason=\"" << reason << "\"";
+@@ -454,6 +486,10 @@
+     const std::string& message,
+     int net_error,
+     std::optional<int> response_code) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocketEventHandler::OnFailChannel @"
+            << reinterpret_cast<void*>(this) << " message=\"" << message << "\""
+            << " error=" << net_error
+@@ -473,6 +509,10 @@
+ 
+ void WebSocket::WebSocketEventHandler::OnStartOpeningHandshake(
+     std::unique_ptr<net::WebSocketHandshakeRequestInfo> request) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocketEventHandler::OnStartOpeningHandshake @"
+            << reinterpret_cast<void*>(this)
+            << " can_read_raw_cookies =" << impl_->has_raw_headers_access_;
+@@ -513,6 +553,12 @@
+     int net_error,
+     const net::SSLInfo& ssl_info,
+     bool fatal) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired()) {
++    callbacks->CancelSSLRequest(net::ERR_ABORTED, &ssl_info);
++    return;
++  }
++
+   DVLOG(3) << "WebSocketEventHandler::OnSSLCertificateError"
+            << reinterpret_cast<void*>(this) << " url=" << url.spec()
+            << " cert_status=" << ssl_info.cert_status << " fatal=" << fatal;
+@@ -534,6 +580,10 @@
+     const net::IPEndPoint& remote_endpoint,
+     base::OnceCallback<void(const net::AuthCredentials*)> callback,
+     std::optional<net::AuthCredentials>* credentials) {
++  auto callback_lifetime = impl_->native_retirement_.HoldCallback();
++  if (impl_->native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   DVLOG(3) << "WebSocketEventHandler::OnAuthRequired"
+            << reinterpret_cast<void*>(this);
+   if (!impl_->auth_handler_) {
+@@ -609,17 +659,20 @@
+   if (auth_handler_) {
+     // Make sure the request dies if |auth_handler_| has an error, otherwise
+     // requests can hang.
+-    auth_handler_.set_disconnect_handler(base::BindOnce(
+-        &WebSocket::OnConnectionError, base::Unretained(this), FROM_HERE));
++    auth_handler_.set_disconnect_handler(
++        base::BindOnce(&WebSocket::OnConnectionError,
++                       weak_ptr_factory_.GetWeakPtr(), FROM_HERE));
+   }
+   if (header_client_) {
+     // Make sure the request dies if |header_client_| has an error, otherwise
+     // requests can hang.
+-    header_client_.set_disconnect_handler(base::BindOnce(
+-        &WebSocket::OnConnectionError, base::Unretained(this), FROM_HERE));
+-  }
+-  handshake_client_.set_disconnect_handler(base::BindOnce(
+-      &WebSocket::OnConnectionError, base::Unretained(this), FROM_HERE));
++    header_client_.set_disconnect_handler(
++        base::BindOnce(&WebSocket::OnConnectionError,
++                       weak_ptr_factory_.GetWeakPtr(), FROM_HERE));
++  }
++  handshake_client_.set_disconnect_handler(
++      base::BindOnce(&WebSocket::OnConnectionError,
++                     weak_ptr_factory_.GetWeakPtr(), FROM_HERE));
+ 
+   if (delay_.is_positive()) {
+     base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+@@ -634,6 +687,30 @@
+              isolation_info, std::move(additional_headers));
+ }
+ 
++bool WebSocket::MatchesNetworkOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  return matches.Run({url_, isolation_info_.network_anonymization_key(),
++                      origin_, &isolation_info_});
++}
++base::WeakPtr<WebSocket> WebSocket::PrepareNetworkRetirement(
++    const base::RepeatingClosure& done) {
++  if (native_retirement_.Prepare(done))
++    weak_ptr_factory_.InvalidateWeakPtrs();
++  return weak_ptr_factory_.GetWeakPtr();
++}
++void WebSocket::RevokeNetworkState() {
++  if (!native_retirement_.BeginRevocation())
++    return;
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (handshake_client_)
++    handshake_client_->OnFailure("Site record retired", net::ERR_ABORTED, -1);
++  if (client_)
++    client_->OnDropChannel(false,
++                           static_cast<uint16_t>(net::kWebSocketErrorGoingAway),
++                           "Site record retired");
++  Reset();
++}
++
+ WebSocket::~WebSocket() {
+   if (channel_ && handshake_succeeded_) {
+     StartClosingHandshake(static_cast<uint16_t>(net::kWebSocketErrorGoingAway),
+@@ -646,6 +723,10 @@
+ 
+ void WebSocket::SendMessage(mojom::WebSocketMessageType type,
+                             uint64_t data_length) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocket::SendMessage @" << reinterpret_cast<void*>(this)
+            << " type=" << type << " data is " << data_length << " bytes";
+ 
+@@ -672,12 +753,20 @@
+ }
+ 
+ void WebSocket::StartReceiving() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(pending_data_frames_.empty());
+   std::ignore = channel_->ReadFrames();
+ }
+ 
+ void WebSocket::StartClosingHandshake(uint16_t code,
+                                       const std::string& reason) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocket::StartClosingHandshake @" << this << " code=" << code
+            << " reason=\"" << reason << "\"";
+ 
+@@ -711,6 +800,10 @@
+ int WebSocket::OnBeforeStartTransaction(
+     const net::HttpRequestHeaders& headers,
+     net::NetworkDelegate::OnBeforeStartTransactionCallback callback) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   if (header_client_) {
+     header_client_->OnBeforeSendHeaders(
+         url_, headers,
+@@ -727,6 +820,10 @@
+     scoped_refptr<net::HttpResponseHeaders>* override_response_headers,
+     std::optional<GURL>* preserve_fragment_on_redirect_url,
+     const std::optional<net::SSLInfo>& ssl_info) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   if (header_client_) {
+     header_client_->OnHeadersReceived(
+         original_response_headers->raw_headers(), net::IPEndPoint(), ssl_info,
+@@ -761,6 +858,10 @@
+     net::StorageAccessApiStatus storage_access_api_status,
+     const net::IsolationInfo& isolation_info,
+     std::vector<mojom::HttpHeaderPtr> additional_headers) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocket::AddChannel @" << reinterpret_cast<void*>(this)
+            << " socket_url=\"" << socket_url << "\" requested_protocols=\""
+            << base::JoinString(requested_protocols, ", ") << "\" origin=\""
+@@ -799,6 +900,10 @@
+ 
+ void WebSocket::OnWritable(MojoResult result,
+                            const mojo::HandleSignalsState& state) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (result != MOJO_RESULT_OK) {
+     // MOJO_RESULT_FAILED_PRECONDITION (=9) is common when the other end of the
+     // pipe is closed.
+@@ -811,6 +916,10 @@
+ }
+ 
+ void WebSocket::SendPendingDataFrames(InterruptionReason resume_reason) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DVLOG(3) << "WebSocket::SendPendingDataFrames @"
+            << reinterpret_cast<void*>(this)
+            << ", pending_data_frames_.size=" << pending_data_frames_.size()
+@@ -832,7 +941,7 @@
+       auto intercept_result = frame_interceptor_->Intercept(
+           WebSocketInterceptor::kIncoming, data_frame.size(),
+           base::BindOnce(&WebSocket::SendPendingDataFrames,
+-                         base::Unretained(this),
++                         weak_ptr_factory_.GetWeakPtr(),
+                          InterruptionReason::kInterceptor));
+       if (intercept_result == WebSocketInterceptor::kShouldWait) {
+         DCHECK_EQ(incoming_frames_interrupted_, InterruptionReason::kNone);
+@@ -885,6 +994,10 @@
+ 
+ void WebSocket::OnReadable(MojoResult result,
+                            const mojo::HandleSignalsState& state) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (result != MOJO_RESULT_OK) {
+     // MOJO_RESULT_FAILED_PRECONDITION (=9) is common when the other end of the
+     // pipe is closed.
+@@ -915,7 +1028,7 @@
+       auto intercept_result = frame_interceptor_->Intercept(
+           WebSocketInterceptor::kOutgoing, data_frame.data_length,
+           base::BindOnce(&WebSocket::ReadAndSendFromDataPipe,
+-                         base::Unretained(this),
++                         weak_ptr_factory_.GetWeakPtr(),
+                          InterruptionReason::kInterceptor));
+       if (intercept_result == WebSocketInterceptor::kShouldWait) {
+         CHECK_EQ(outgoing_frames_interrupted_, InterruptionReason::kNone);
+@@ -1033,6 +1146,10 @@
+ }
+ 
+ void WebSocket::ResumeDataPipeReading() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   blocked_on_websocket_channel_ = false;
+   readable_watcher_.ArmOrNotify();
+ }
+@@ -1041,6 +1158,12 @@
+     std::unique_ptr<net::WebSocketEventInterface::SSLErrorCallbacks> callbacks,
+     const net::SSLInfo& ssl_info,
+     int net_error) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired()) {
++    callbacks->CancelSSLRequest(net::ERR_ABORTED, &ssl_info);
++    return;
++  }
++
+   if (net_error == net::OK) {
+     callbacks->ContinueSSLRequest();
+     return;
+@@ -1052,6 +1175,10 @@
+ void WebSocket::OnAuthRequiredComplete(
+     base::OnceCallback<void(const net::AuthCredentials*)> callback,
+     const std::optional<net::AuthCredentials>& credentials) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(!handshake_succeeded_);
+   if (!channel_) {
+     // Something happened before the authentication response arrives.
+@@ -1066,6 +1193,10 @@
+     int result,
+     const std::optional<net::HttpRequestHeaders>& headers,
+     std::optional<base::DictValue> extended_net_log_events) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!channel_) {
+     // Something happened before the OnBeforeSendHeaders response arrives.
+     return;
+@@ -1080,6 +1211,10 @@
+     int result,
+     const std::optional<std::string>& headers,
+     const std::optional<GURL>& preserve_fragment_on_redirect_url) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!channel_) {
+     // Something happened before the OnHeadersReceived response arrives.
+     return;
+--- a/services/network/websocket_factory.h
++++ b/services/network/websocket_factory.h
+@@ -47,6 +47,9 @@
+   WebSocketFactory& operator=(const WebSocketFactory&) = delete;
+ 
+   ~WebSocketFactory();
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+ 
+   void CreateWebSocket(
+       const GURL& url,
+--- a/services/network/websocket_factory.cc
++++ b/services/network/websocket_factory.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/websocket_factory.h"
++
++#include "base/barrier_closure.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/task/single_thread_task_runner.h"
+ 
+ #include <algorithm>
+ 
+@@ -101,6 +106,34 @@
+       target_address_space, target_network));
+ }
+ 
++base::OnceClosure WebSocketFactory::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  std::vector<WebSocket*> selected;
++  for (const auto& socket : connections_)
++    if (socket->MatchesNetworkOwner(matches))
++      selected.push_back(socket.get());
++  auto drained = base::BarrierClosure(
++      selected.size() + 1,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::WeakPtr<WebSocket>> originals;
++  for (auto* socket : selected)
++    originals.push_back(socket->PrepareNetworkRetirement(drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<WebSocket>> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& socket : originals)
++          if (socket)
++            socket->RevokeNetworkState();
++      },
++      std::move(originals), base::ScopedClosureRunner(drained)));
++}
++
+ net::URLRequestContext* WebSocketFactory::GetURLRequestContext() {
+   return context_->url_request_context();
+ }
+--- a/services/network/web_transport.h
++++ b/services/network/web_transport.h
+@@ -25,6 +25,7 @@
+ #include "net/log/net_log_with_source.h"
+ #include "net/quic/web_transport_client.h"
+ #include "net/third_party/quiche/src/quiche/web_transport/web_transport.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/public/mojom/client_security_state.mojom.h"
+ #include "services/network/public/mojom/network_context.mojom.h"
+ #include "services/network/public/mojom/url_loader_network_service_observer.mojom.h"
+@@ -80,6 +81,10 @@
+       mojom::ClientSecurityStatePtr client_security_state,
+       int originating_annotation_hash = -1);
+   ~WebTransport() override;
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::WeakPtr<WebTransport> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done);
++  void RevokeNetworkState();
+ 
+   // mojom::WebTransport implementation:
+   void SendDatagram(base::span<const uint8_t> data,
+@@ -178,6 +183,8 @@
+   void TearDown();
+   void Dispose();
+ 
++  NativeNetworkRetirement native_retirement_;
++  const net::NetworkAnonymizationKey network_key_;
+   const std::unique_ptr<net::WebTransportClient> transport_;
+   const GURL url_;
+   const url::Origin origin_;
+--- a/services/network/web_transport.cc
++++ b/services/network/web_transport.cc
+@@ -610,7 +610,8 @@
+         url_loader_network_observer,
+     mojom::ClientSecurityStatePtr client_security_state,
+     int originating_annotation_hash)
+-    : transport_(net::CreateWebTransportClient(
++    : network_key_(key),
++      transport_(net::CreateWebTransportClient(
+           url,
+           origin,
+           this,
+@@ -641,6 +642,33 @@
+   transport_->Connect();
+ }
+ 
++bool WebTransport::MatchesNetworkOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  return matches.Run({url_, network_key_, origin_, nullptr});
++}
++base::WeakPtr<WebTransport> WebTransport::PrepareNetworkRetirement(
++    const base::RepeatingClosure& done) {
++  if (native_retirement_.Prepare(done)) {
++    closing_ = true;
++    torn_down_ = true;
++    weak_factory_.InvalidateWeakPtrs();
++  }
++  return weak_factory_.GetWeakPtr();
++}
++void WebTransport::RevokeNetworkState() {
++  if (!native_retirement_.BeginRevocation())
++    return;
++  auto callback_lifetime = native_retirement_.HoldCallback();
++  receiver_.reset();
++  if (handshake_client_)
++    handshake_client_->OnHandshakeFailed(
++        net::WebTransportError(net::ERR_ABORTED));
++  handshake_client_.reset();
++  client_.reset();
++  ClearDatagramState();
++  context_->Remove(this);
++}
++
+ WebTransport::~WebTransport() {
+   // Ensure that we ignore all callbacks while mid-destruction.
+   torn_down_ = true;
+@@ -648,6 +676,8 @@
+ 
+ void WebTransport::SendDatagram(base::span<const uint8_t> data,
+                                 base::OnceCallback<void(bool)> callback) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     std::move(callback).Run(false);
+     return;
+@@ -666,6 +696,8 @@
+ void WebTransport::CreateDatagramWritable(
+     mojo::PendingReceiver<mojom::WebTransportDatagramWritable> writable,
+     mojom::WebTransportStreamPriorityPtr priority) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -851,6 +883,8 @@
+ }
+ 
+ void WebTransport::CompleteNextDatagram(bool sent) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   CHECK(!datagram_callbacks_.empty());
+   in_flight_datagram_writable_ = nullptr;
+   base::OnceCallback<void(bool)> callback =
+@@ -1011,6 +1045,8 @@
+     mojo::ScopedDataPipeProducerHandle writable,
+     mojom::WebTransportStreamPriorityPtr priority,
+     base::OnceCallback<void(bool, uint32_t)> callback) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   // |readable| is non-nullable, |writable| is nullable.
+   DCHECK(readable);
+ 
+@@ -1067,6 +1103,8 @@
+ 
+ void WebTransport::AcceptBidirectionalStream(
+     BidirectionalStreamAcceptanceCallback acceptance) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   bidirectional_stream_acceptances_.push(std::move(acceptance));
+ 
+   OnIncomingBidirectionalStreamAvailable();
+@@ -1074,12 +1112,16 @@
+ 
+ void WebTransport::AcceptUnidirectionalStream(
+     UnidirectionalStreamAcceptanceCallback acceptance) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   unidirectional_stream_acceptances_.push(std::move(acceptance));
+ 
+   OnIncomingUnidirectionalStreamAvailable();
+ }
+ 
+ void WebTransport::SendFin(uint32_t stream) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   auto it = streams_.find(stream);
+   if (it == streams_.end()) {
+     return;
+@@ -1088,6 +1130,8 @@
+ }
+ 
+ void WebTransport::AbortStream(uint32_t stream, uint8_t code) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   auto it = streams_.find(stream);
+   if (it == streams_.end()) {
+     return;
+@@ -1096,6 +1140,8 @@
+ }
+ 
+ void WebTransport::StopSending(uint32_t stream, uint8_t code) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   auto it = streams_.find(stream);
+   if (it != streams_.end()) {
+     it->second->StopSending(code);
+@@ -1113,6 +1159,8 @@
+ void WebTransport::SetStreamPriority(
+     uint32_t stream,
+     mojom::WebTransportStreamPriorityPtr priority) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   auto it = streams_.find(stream);
+   if (it == streams_.end()) {
+     return;
+@@ -1122,6 +1170,8 @@
+ 
+ void WebTransport::SetOutgoingDatagramExpirationDuration(
+     base::TimeDelta duration) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1136,6 +1186,8 @@
+ }
+ 
+ void WebTransport::Close(mojom::WebTransportCloseInfoPtr close_info) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1172,6 +1224,14 @@
+     const net::IPEndPoint& server_address,
+     const net::NetLogWithSource& net_log,
+     net::CompletionOnceCallback callback) {
++  if (native_retirement_.retired()) {
++    auto retired_callback_lifetime = native_retirement_.HoldCallback();
++    std::move(callback).Run(net::ERR_ABORTED);
++    return;
++  }
++
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (!base::FeatureList::IsEnabled(
+           features::kLocalNetworkAccessChecksWebTransport)) {
+     std::move(callback).Run(net::OK);
+@@ -1244,6 +1304,8 @@
+ }
+ 
+ void WebTransport::OnBeforeConnect(const net::IPEndPoint& server_address) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1257,6 +1319,8 @@
+ 
+ void WebTransport::OnConnected(
+     scoped_refptr<net::HttpResponseHeaders> response_headers) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1300,6 +1364,8 @@
+ }
+ 
+ void WebTransport::OnConnectionFailed(const net::WebTransportError& error) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1315,6 +1381,8 @@
+ 
+ void WebTransport::OnClosed(
+     const std::optional<net::WebTransportCloseInfo>& close_info) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_) {
+     return;
+   }
+@@ -1340,6 +1408,8 @@
+ }
+ 
+ void WebTransport::OnError(const net::WebTransportError& error) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_) {
+     return;
+   }
+@@ -1354,6 +1424,8 @@
+ }
+ 
+ void WebTransport::OnDraining() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_ || draining_received_) {
+     return;
+   }
+@@ -1366,6 +1438,8 @@
+ }
+ 
+ void WebTransport::OnIncomingBidirectionalStreamAvailable() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1406,13 +1480,18 @@
+         stream->GetStreamId(),
+         std::make_unique<Stream>(this, stream, std::move(readable_for_outgoing),
+                                  std::move(writable_for_incoming))));
++    auto admitted = weak_factory_.GetWeakPtr();
+     std::move(acceptance)
+         .Run(stream->GetStreamId(), std::move(readable_for_incoming),
+              std::move(writable_for_outgoing));
++    if (!admitted || native_retirement_.retired())
++      return;
+   }
+ }
+ 
+ void WebTransport::OnIncomingUnidirectionalStreamAvailable() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1446,12 +1525,17 @@
+         std::make_pair(stream->GetStreamId(),
+                        std::make_unique<Stream>(
+                            this, stream, std::move(writable_for_incoming))));
++    auto admitted = weak_factory_.GetWeakPtr();
+     std::move(acceptance)
+         .Run(stream->GetStreamId(), std::move(readable_for_incoming));
++    if (!admitted || native_retirement_.retired())
++      return;
+   }
+ }
+ 
+ void WebTransport::OnDatagramReceived(std::string_view datagram) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_ || closing_) {
+     return;
+   }
+@@ -1460,15 +1544,21 @@
+ }
+ 
+ void WebTransport::OnCanCreateNewOutgoingBidirectionalStream() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   // TODO(yhirano): Implement this.
+ }
+ 
+ void WebTransport::OnCanCreateNewOutgoingUnidirectionalStream() {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   // TODO(yhirano): Implement this.
+ }
+ 
+ void WebTransport::OnDatagramProcessed(
+     std::optional<quic::DatagramStatus> status) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_) {
+     return;
+   }
+@@ -1492,6 +1582,8 @@
+ }
+ 
+ void WebTransport::GetStats(GetStatsCallback callback) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   webtransport::Session* const session = transport_->session();
+ 
+   if (torn_down_ || session == nullptr) {
+@@ -1506,6 +1598,8 @@
+ void WebTransport::GetReceiveStreamStats(
+     uint32_t stream_id,
+     GetReceiveStreamStatsCallback callback) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_) {
+     std::move(callback).Run(nullptr);
+     return;
+@@ -1537,6 +1631,8 @@
+ 
+ void WebTransport::GetSendStreamStats(uint32_t stream_id,
+                                       GetSendStreamStatsCallback callback) {
++  auto callback_lifetime = native_retirement_.HoldCallback();
++
+   if (torn_down_) {
+     std::move(callback).Run(nullptr);
+     return;
+--- a/services/network/network_context.h
++++ b/services/network/network_context.h
+@@ -57,6 +57,7 @@
+ #include "services/network/http_cache_data_counter.h"
+ #include "services/network/http_cache_data_remover.h"
+ #include "services/network/logical_invalidation_store.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/network_qualities_pref_delegate.h"
+ #include "services/network/oblivious_http_request_handler.h"
+ #include "services/network/public/cpp/cors/origin_access_list.h"
+@@ -215,6 +216,9 @@
+   static void SetCertVerifierForTesting(net::CertVerifier* cert_verifier);
+ 
+   net::URLRequestContext* url_request_context() { return url_request_context_; }
++  base::OnceClosure PrepareTransportServiceRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+ 
+ #if BUILDFLAG(ENABLE_WEBSOCKETS)
+   // Creates synthetic WEBSOCKET_ALIVE NetLog entries for pre-existing
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -1924,6 +1924,46 @@
+   std::move(callback).Run();
+ }
+ 
++base::OnceClosure NetworkContext::PrepareTransportServiceRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  std::vector<WebTransport*> selected;
++  for (const auto& transport : web_transports_)
++    if (transport->MatchesNetworkOwner(matches))
++      selected.push_back(transport.get());
++  auto drained = base::BarrierClosure(
++      selected.size() + 2,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::WeakPtr<WebTransport>> originals;
++  for (auto* transport : selected)
++    originals.push_back(transport->PrepareNetworkRetirement(drained));
++  base::OnceClosure sockets;
++#if BUILDFLAG(ENABLE_WEBSOCKETS)
++  if (websocket_factory_)
++    sockets = websocket_factory_->PrepareNetworkRetirement(matches, drained);
++  else
++    drained.Run();
++#else
++  drained.Run();
++#endif
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<WebTransport>> originals,
++         base::OnceClosure sockets, base::ScopedClosureRunner finish) {
++        for (auto& transport : originals)
++          if (transport)
++            transport->RevokeNetworkState();
++        if (sockets)
++          std::move(sockets).Run();
++      },
++      std::move(originals), std::move(sockets),
++      base::ScopedClosureRunner(drained)));
++}
++
+ void NetworkContext::CloseAllConnections(CloseAllConnectionsCallback callback) {
+   net::HttpNetworkSession* http_session =
+       url_request_context_->http_transaction_factory()->GetSession();
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -295,6 +295,7 @@
+     "web_bundle/web_bundle_url_loader_factory.h",
+     "web_transport.cc",
+     "web_transport.h",
++    "native_network_retirement.h",
+   ]
+ 
+   if (is_p2p_enabled) {

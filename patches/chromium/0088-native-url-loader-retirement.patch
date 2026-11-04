@@ -1,0 +1,1473 @@
+--- a/services/network/url_loader.h
++++ b/services/network/url_loader.h
+@@ -41,6 +41,7 @@
+ #include "services/network/devtools_durable_msg.h"
+ #include "services/network/keepalive_statistics_recorder.h"
+ #include "services/network/local_network_access_url_loader_interceptor.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/network_service.h"
+ #include "services/network/observer_wrapper.h"
+ #include "services/network/partial_decoder.h"
+@@ -191,6 +192,10 @@
+   URLLoader& operator=(const URLLoader&) = delete;
+ 
+   ~URLLoader() override;
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::WeakPtr<URLLoader> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done);
++  void RevokeNetworkState();
+ 
+   // mojom::URLLoader implementation:
+   void FollowRedirect(
+@@ -481,6 +486,7 @@
+   // message as complete.
+   void MaybeCollectDurableMessage(size_t new_data_offset, int num_bytes);
+ 
++  NativeNetworkRetirement native_retirement_;
+   const raw_ptr<net::URLRequestContext> url_request_context_;
+ 
+   const raw_ptr<mojom::NetworkContextClient> network_context_client_;
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -763,7 +763,31 @@
+     url_request_->Start();
+ }
+ 
++bool URLLoader::MatchesNetworkOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  const auto& isolation = url_request_->isolation_info();
++  return matches.Run(
++      {url_request_->url(), isolation.network_anonymization_key(),
++       url_request_->initiator().value_or(url::Origin()), &isolation});
++}
++base::WeakPtr<URLLoader> URLLoader::PrepareNetworkRetirement(
++    const base::RepeatingClosure& done) {
++  if (native_retirement_.Prepare(done))
++    weak_ptr_factory_.InvalidateWeakPtrs();
++  return weak_ptr_factory_.GetWeakPtr();
++}
++void URLLoader::RevokeNetworkState() {
++  if (!native_retirement_.BeginRevocation())
++    return;
++  auto lifetime = native_retirement_.HoldCallback();
++  auth_challenge_responder_receiver_.reset();
++  client_cert_responder_receiver_.reset();
++  url_request_->CancelWithError(net::ERR_ABORTED);
++  NotifyCompleted(net::ERR_ABORTED);
++}
++
+ URLLoader::~URLLoader() {
++  weak_ptr_factory_.InvalidateWeakPtrs();
+   TRACE_EVENT("loading", "URLLoader::~URLLoader",
+               net::NetLogWithSourceToFlow(url_request_->net_log()));
+   if (keepalive_ && keepalive_statistics_recorder_) {
+@@ -785,6 +809,10 @@
+ void URLLoader::FollowRedirect(
+     network::HttpRequestHeadersUpdateParams headers_update_params,
+     const std::optional<GURL>& new_url) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!deferred_redirect_url_) {
+     NOTREACHED();
+   }
+@@ -854,6 +882,10 @@
+ 
+ void URLLoader::SetPriority(net::RequestPriority priority,
+                             int32_t intra_priority_value) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (url_request_ && resource_scheduler_client_) {
+     resource_scheduler_client_->ReprioritizeRequest(
+         url_request_.get(), priority, intra_priority_value);
+@@ -863,6 +895,10 @@
+ int URLLoader::OnConnected(net::URLRequest* url_request,
+                            const net::TransportInfo& info,
+                            net::CompletionOnceCallback callback) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   DCHECK_EQ(url_request, url_request_.get());
+ 
+   // Delegate the LNA check to the interceptor.
+@@ -971,6 +1007,10 @@
+ void URLLoader::OnReceivedRedirect(net::URLRequest* url_request,
+                                    const net::RedirectInfo& redirect_info,
+                                    bool* defer_redirect) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(url_request == url_request_.get());
+ 
+   DCHECK(!deferred_redirect_url_);
+@@ -1062,6 +1102,10 @@
+ 
+ void URLLoader::OnAuthRequired(net::URLRequest* url_request,
+                                const net::AuthChallengeInfo& auth_info) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (has_fetch_streaming_upload_body_) {
+     NotifyCompleted(net::ERR_FAILED);
+     // |this| may have been deleted.
+@@ -1092,6 +1136,10 @@
+ 
+ void URLLoader::OnCertificateRequested(net::URLRequest* unused,
+                                        net::SSLCertRequestInfo* cert_info) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(!client_cert_responder_receiver_.is_bound());
+ 
+   if (!url_loader_network_observer_) {
+@@ -1111,6 +1159,10 @@
+ 
+ void URLLoader::OnPlatformLocalNetworkAccessPermissionRequired(
+     net::URLRequest* request) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   CHECK(!is_waiting_for_platform_local_network_permission_);
+   if (!url_loader_network_observer_) {
+     request->CancelWithError(net::ERR_LOCAL_NETWORK_PERMISSION_MISSING);
+@@ -1124,6 +1176,10 @@
+ }
+ 
+ void URLLoader::OnPlatformLocalNetworkPermissionRequiredResponse(bool granted) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   is_waiting_for_platform_local_network_permission_ = false;
+   if (granted) {
+     url_request_->SetPlatformLocalNetworkAccessGranted();
+@@ -1136,6 +1192,10 @@
+                                       int net_error,
+                                       const net::SSLInfo& ssl_info,
+                                       bool fatal) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!url_loader_network_observer_) {
+     OnSSLCertificateErrorResponse(ssl_info, net_error);
+     return;
+@@ -1148,6 +1208,10 @@
+ 
+ 
+ void URLLoader::OnResponseStarted(net::URLRequest* url_request, int net_error) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(url_request == url_request_.get());
+   has_received_response_ = true;
+ 
+@@ -1211,13 +1275,20 @@
+ }
+ 
+ void URLLoader::ContinueOnResponseStarted() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++  auto admitted = weak_ptr_factory_.GetWeakPtr();
++
+   // Do not account header bytes when reporting received body bytes to client.
+   reported_total_encoded_bytes_ =
+       url_request_->GetTotalReceivedBytes().InBytes();
+ 
+   if (upload_progress_tracker_) {
+-    upload_progress_tracker_->OnUploadCompleted();
+-    upload_progress_tracker_ = nullptr;
++    auto tracker = std::move(upload_progress_tracker_);
++    tracker->OnUploadCompleted();
++    if (!admitted)
++      return;
+   }
+ 
+   if (!(options_ & mojom::kURLLoadOptionReadAndDiscardBody)) {
+@@ -1786,6 +1857,10 @@
+ }
+ 
+ void URLLoader::OnReadCompleted(net::URLRequest* url_request, int bytes_read) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(url_request == url_request_.get());
+   if (partial_decoder_ && partial_decoder_->read_in_progress()) {
+     // When `partial_decoder_` is reading the body from `url_request`, pass the
+@@ -1807,6 +1882,10 @@
+ int URLLoader::OnBeforeStartTransaction(
+     const net::HttpRequestHeaders& headers,
+     net::NetworkDelegate::OnBeforeStartTransactionCallback callback) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   const net::HttpRequestHeaders* used_headers = &headers;
+   net::HttpRequestHeaders headers_with_bonus_cookies;
+   bool headers_modified = false;
+@@ -1870,6 +1949,10 @@
+     const net::IPEndPoint& endpoint,
+     std::optional<GURL>* preserve_fragment_on_redirect_url,
+     const std::optional<net::SSLInfo>& ssl_info) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return net::ERR_ABORTED;
++
+   if (header_client_) {
+     header_client_->OnHeadersReceived(
+         original_response_headers->raw_headers(), endpoint, ssl_info,
+@@ -1939,6 +2022,10 @@
+ 
+ void URLLoader::OnAuthCredentials(
+     const std::optional<net::AuthCredentials>& credentials) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   auth_challenge_responder_receiver_.reset();
+ 
+   if (!credentials.has_value()) {
+@@ -1956,6 +2043,10 @@
+     const std::string& provider_name,
+     const std::vector<uint16_t>& algorithm_preferences,
+     mojo::PendingRemote<mojom::SSLPrivateKey> ssl_private_key) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   client_cert_responder_receiver_.reset();
+   auto key = base::MakeRefCounted<SSLPrivateKeyProxy>(
+       provider_name, algorithm_preferences, std::move(ssl_private_key));
+@@ -1964,22 +2055,37 @@
+ }
+ 
+ void URLLoader::ContinueWithoutCertificate() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   client_cert_responder_receiver_.reset();
+   url_request_->ContinueWithCertificate(nullptr, nullptr);
+ }
+ 
+ void URLLoader::CancelRequest() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   client_cert_responder_receiver_.reset();
+   url_request_->CancelWithError(net::ERR_SSL_CLIENT_AUTH_CERT_NEEDED);
+ }
+ 
+ void URLLoader::NotifyCompleted(int error_code) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired() && error_code != net::ERR_ABORTED)
++    return;
++  auto admitted = weak_ptr_factory_.GetWeakPtr();
++
+   // Ensure sending the final upload progress message here, since
+   // OnResponseCompleted can be called without OnResponseStarted on cancellation
+   // or error cases.
+   if (upload_progress_tracker_) {
+-    upload_progress_tracker_->OnUploadCompleted();
+-    upload_progress_tracker_ = nullptr;
++    auto tracker = std::move(upload_progress_tracker_);
++    tracker->OnUploadCompleted();
++    if (!admitted)
++      return;
+   }
+ 
+   auto total_received = url_request_->GetTotalReceivedBytes();
+@@ -2031,6 +2137,8 @@
+   if (url_loader_client_.Get()) {
+     if (consumer_handle_.is_valid())
+       SendResponseToClient();
++    if (!admitted)
++      return;
+ 
+     URLLoaderCompletionStatus status;
+     status.error_code = error_code;
+@@ -2070,6 +2178,8 @@
+     }
+ 
+     url_loader_client_.Get()->OnComplete(status);
++    if (!admitted)
++      return;
+   }
+ 
+   DeleteSelf();
+@@ -2080,10 +2190,18 @@
+ }
+ 
+ void URLLoader::OnResponseBodyStreamConsumerClosed(MojoResult result) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   NotifyCompleted(net::ERR_FAILED);
+ }
+ 
+ void URLLoader::OnResponseBodyStreamReady(MojoResult result) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (result != MOJO_RESULT_OK) {
+     NotifyCompleted(net::ERR_FAILED);
+     return;
+--- a/services/network/cors/cors_url_loader.h
++++ b/services/network/cors/cors_url_loader.h
+@@ -22,6 +22,7 @@
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "net/url_request/redirect_info.h"
+ #include "services/network/cors/preflight_controller.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/public/cpp/cors/cors_error_status.h"
+ #include "services/network/public/cpp/cross_origin_embedder_policy.h"
+ #include "services/network/public/cpp/http_request_headers_update_params.h"
+@@ -103,6 +104,10 @@
+   CorsURLLoader& operator=(const CorsURLLoader&) = delete;
+ 
+   ~CorsURLLoader() override;
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::WeakPtr<CorsURLLoader> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done);
++  void RevokeNetworkState();
+ 
+   // Starts processing the request. This is expected to be called right after
+   // the constructor.
+@@ -244,6 +249,7 @@
+   disk_cache::Backend* GetCurrentBackend() const;
+ #endif  // BUILDFLAG(ENABLE_DISK_CACHE_SQL_BACKEND)
+ 
++  NativeNetworkRetirement native_retirement_;
+   mojo::Receiver<mojom::URLLoader> receiver_;
+ 
+   // We need to save these for redirect, and DevTools.
+--- a/services/network/cors/cors_url_loader.cc
++++ b/services/network/cors/cors_url_loader.cc
+@@ -515,6 +515,30 @@
+   }
+ }
+ 
++bool CorsURLLoader::MatchesNetworkOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  return matches.Run({request_.url, isolation_info_.network_anonymization_key(),
++                      request_.request_initiator.value_or(url::Origin()),
++                      &isolation_info_});
++}
++base::WeakPtr<CorsURLLoader> CorsURLLoader::PrepareNetworkRetirement(
++    const base::RepeatingClosure& done) {
++  if (native_retirement_.Prepare(done)) {
++    weak_factory_.InvalidateWeakPtrs();
++    sync_client_receiver_factory_.InvalidateWeakPtrs();
++  }
++  return weak_factory_.GetWeakPtr();
++}
++void CorsURLLoader::RevokeNetworkState() {
++  if (!native_retirement_.BeginRevocation())
++    return;
++  auto lifetime = native_retirement_.HoldCallback();
++  network_loader_.reset();
++  network_client_receiver_.reset();
++  sync_client_receiver_factory_.InvalidateWeakPtrs();
++  HandleComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++}
++
+ CorsURLLoader::~CorsURLLoader() {
+   TRACE_EVENT("loading", "CorsURLLoader::~CorsURLLoader",
+               net::NetLogWithSourceToFlow(net_log_));
+@@ -524,6 +548,10 @@
+ }
+ 
+ void CorsURLLoader::Start() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   TRACE_EVENT("loading", "CorsURLLoader::Start",
+               net::NetLogWithSourceToFlow(net_log_));
+   if (fetch_cors_flag_ && IsCorsEnabledRequestMode(request_.mode)) {
+@@ -549,6 +577,10 @@
+ void CorsURLLoader::FollowRedirect(
+     network::HttpRequestHeadersUpdateParams headers_update_params,
+     const std::optional<GURL>& new_url) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   // If this is a navigation from a renderer, then its a service worker
+   // passthrough of a navigation request.  Since this case uses manual
+   // redirect mode FollowRedirect() should never be called.
+@@ -798,11 +830,19 @@
+ 
+ void CorsURLLoader::SetPriority(net::RequestPriority priority,
+                                 int32_t intra_priority_value) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (network_loader_)
+     network_loader_->SetPriority(priority, intra_priority_value);
+ }
+ 
+ void CorsURLLoader::OnReceiveEarlyHints(mojom::EarlyHintsPtr early_hints) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(network_loader_);
+   DCHECK(forwarding_client_);
+ 
+@@ -815,6 +855,10 @@
+     mojom::URLResponseHeadPtr response_head,
+     mojo::ScopedDataPipeConsumerHandle body,
+     std::optional<mojo_base::BigBuffer> cached_metadata) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(network_loader_);
+   DCHECK(forwarding_client_);
+   DCHECK(!deferred_redirect_url_);
+@@ -943,6 +987,10 @@
+ 
+ void CorsURLLoader::OnReceiveRedirect(const net::RedirectInfo& redirect_info,
+                                       mojom::URLResponseHeadPtr response_head) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(network_loader_);
+   DCHECK(forwarding_client_);
+   DCHECK(!deferred_redirect_url_);
+@@ -1091,6 +1139,10 @@
+ void CorsURLLoader::OnUploadProgress(int64_t current_position,
+                                      int64_t total_size,
+                                      OnUploadProgressCallback ack_callback) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(network_loader_);
+   DCHECK(forwarding_client_);
+   forwarding_client_->OnUploadProgress(current_position, total_size,
+@@ -1098,6 +1150,10 @@
+ }
+ 
+ void CorsURLLoader::OnTransferSizeUpdated(int32_t transfer_size_diff) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(network_loader_);
+   DCHECK(forwarding_client_);
+   DCHECK(!deferred_redirect_url_);
+@@ -1107,6 +1163,10 @@
+ }
+ 
+ void CorsURLLoader::OnComplete(const URLLoaderCompletionStatus& status) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(network_loader_);
+   DCHECK(forwarding_client_);
+ 
+@@ -1243,6 +1303,10 @@
+ }
+ 
+ void CorsURLLoader::StartRequest() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   TRACE_EVENT("loading", "CorsURLLoader::StartRequest",
+               net::NetLogWithSourceToFlow(net_log_));
+   if (fetch_cors_flag_ && !skip_cors_enabled_scheme_check_ &&
+@@ -1301,6 +1365,10 @@
+ }
+ 
+ void CorsURLLoader::StartPreflightCheck() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   mojo::PendingRemote<mojom::URLLoaderNetworkServiceObserver> remote_observer;
+ 
+   context_->cors_preflight_controller()->PerformPreflightCheck(
+@@ -1371,6 +1439,10 @@
+     int net_error,
+     std::optional<CorsErrorStatus> status,
+     bool has_authorization_covered_by_wildcard) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   has_authorization_covered_by_wildcard_ =
+       has_authorization_covered_by_wildcard;
+ 
+@@ -1396,6 +1468,10 @@
+ }
+ 
+ void CorsURLLoader::StartNetworkRequest() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   TRACE_EVENT("loading", "CorsURLLoader::StartNetworkRequest",
+               net::NetLogWithSourceToFlow(net_log_));
+   // When `kAvoidCorsURLLoaderRestartOnRedirect` is disabled (legacy behavior),
+@@ -1429,6 +1505,7 @@
+     }
+   }
+ 
++  auto admitted = weak_factory_.GetWeakPtr();
+   if (sync_network_loader_factory_) {
+     sync_network_loader_factory_->CreateLoaderAndStartWithSyncClient(
+         network_loader_.BindNewPipeAndPassReceiver(), request_id_, options_,
+@@ -1440,6 +1517,8 @@
+         request_, network_client_receiver_.BindNewPipeAndPassRemote(),
+         traffic_annotation_);
+   }
++  if (!admitted)
++    return;
+   network_client_receiver_.set_disconnect_handler(base::BindOnce(
+       &CorsURLLoader::OnNetworkClientMojoDisconnect, base::Unretained(this)));
+ 
+@@ -1447,6 +1526,10 @@
+ }
+ 
+ void CorsURLLoader::HandleComplete(URLLoaderCompletionStatus status) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired() && status.error_code != net::ERR_ABORTED)
++    return;
++
+   TRACE_EVENT("loading", "CorsURLLoader::HandleComplete",
+               net::NetLogWithSourceToFlow(net_log_), "error_code",
+               status.error_code);
+@@ -1650,6 +1733,10 @@
+ }
+ 
+ void CorsURLLoader::OnSharedDictionaryWritten(bool success) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   shared_dictionary_data_pipe_writer_.reset();
+   if (!success) {
+     MaybeReportSharedDictionaryErrorToDevTools(
+--- a/services/network/cors/cors_url_loader_factory.h
++++ b/services/network/cors/cors_url_loader_factory.h
+@@ -17,6 +17,7 @@
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "net/cookies/cookie_setting_override.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/network_context.h"
+ #include "services/network/public/cpp/cors/origin_access_list.h"
+ #include "services/network/public/cpp/cross_origin_embedder_policy.h"
+@@ -68,6 +69,11 @@
+   CorsURLLoaderFactory& operator=(const CorsURLLoaderFactory&) = delete;
+ 
+   ~CorsURLLoaderFactory() override;
++  bool MatchesFactoryOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      bool retire_factory,
++      base::OnceClosure done);
+ 
+   mojom::URLLoaderNetworkServiceObserver* url_loader_network_service_observer()
+       const;
+@@ -185,6 +191,7 @@
+ 
+   // The NetworkContext owns `this`. Initialized in the construct and must be
+   // non-null.
++  NativeNetworkRetirement native_retirement_;
+   const raw_ptr<NetworkContext> context_ = nullptr;
+ 
+   // If false, ResourceRequests cannot have their `trusted_params` fields set.
+@@ -255,6 +262,7 @@
+   bool prevent_self_deletion_ = false;
+ 
+   std::optional<base::UnguessableToken> network_restrictions_id_;
++  base::WeakPtrFactory<CorsURLLoaderFactory> weak_factory_{this};
+ };
+ 
+ }  // namespace cors
+--- a/services/network/cors/cors_url_loader_factory.cc
++++ b/services/network/cors/cors_url_loader_factory.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/cors/cors_url_loader_factory.h"
++
++#include "base/barrier_closure.h"
++#include "base/functional/callback_helpers.h"
++#include "base/task/single_thread_task_runner.h"
+ 
+ #include <optional>
+ #include <utility>
+@@ -328,6 +332,72 @@
+   }
+ }
+ 
++bool CorsURLLoaderFactory::MatchesFactoryOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  if (!request_initiator_origin_lock_ && process_id_.is_browser())
++    return false;
++  auto origin = request_initiator_origin_lock_.value_or(
++      isolation_info_.frame_origin().value_or(url::Origin()));
++  return matches.Run({origin.GetURL(),
++                      isolation_info_.network_anonymization_key(), origin,
++                      &isolation_info_});
++}
++base::OnceClosure CorsURLLoaderFactory::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    bool retire_factory,
++    base::OnceClosure done) {
++  std::vector<URLLoader*> concrete;
++  std::vector<CorsURLLoader*> cors;
++  for (const auto& loader : url_loaders_)
++    if (retire_factory || loader->MatchesNetworkOwner(matches))
++      concrete.push_back(loader.get());
++  for (const auto& loader : cors_url_loaders_)
++    if (retire_factory || loader->MatchesNetworkOwner(matches))
++      cors.push_back(loader.get());
++  auto drained = base::BarrierClosure(
++      concrete.size() + cors.size() + 1 + (retire_factory ? 1 : 0),
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  if (retire_factory) {
++    native_retirement_.Prepare(drained);
++    if (network_loader_factory_)
++      network_loader_factory_->RetireNetworkAdmission();
++  }
++  std::vector<base::WeakPtr<URLLoader>> concrete_views;
++  std::vector<base::WeakPtr<CorsURLLoader>> cors_views;
++  for (auto* loader : concrete)
++    concrete_views.push_back(loader->PrepareNetworkRetirement(drained));
++  for (auto* loader : cors)
++    cors_views.push_back(loader->PrepareNetworkRetirement(drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](base::WeakPtr<CorsURLLoaderFactory> factory,
++         std::vector<base::WeakPtr<URLLoader>> concrete,
++         std::vector<base::WeakPtr<CorsURLLoader>> cors,
++         base::ScopedClosureRunner finish) {
++        bool previous = false;
++        if (factory) {
++          previous = factory->prevent_self_deletion_;
++          factory->prevent_self_deletion_ = true;
++        }
++        for (auto& loader : concrete)
++          if (loader)
++            loader->RevokeNetworkState();
++        for (auto& loader : cors)
++          if (loader)
++            loader->RevokeNetworkState();
++        if (factory) {
++          factory->prevent_self_deletion_ = previous;
++          factory->DeleteIfNeeded();
++        }
++      },
++      weak_factory_.GetWeakPtr(), std::move(concrete_views),
++      std::move(cors_views), base::ScopedClosureRunner(drained)));
++}
++
+ CorsURLLoaderFactory::~CorsURLLoaderFactory() {
+   // Delete loaders one at a time, since deleting one loader can cause another
+   // loader waiting on it to fail synchronously, which could result in the other
+@@ -381,6 +451,13 @@
+     const ResourceRequest& resource_request,
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired()) {
++    mojo::Remote<mojom::URLLoaderClient>(std::move(client))
++        ->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++    return;
++  }
++
+   if (!context_->alloy_guard()
+            .DecideRequest(
+                traffic_annotation.unique_id_hash_code,
+@@ -407,6 +484,13 @@
+     ResourceRequest& resource_request,
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired()) {
++    mojo::Remote<mojom::URLLoaderClient>(std::move(client))
++        ->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++    return;
++  }
++
+   if (!context_->alloy_guard()
+            .DecideRequest(
+                traffic_annotation.unique_id_hash_code,
+--- a/services/network/prefetch_matching_url_loader_factory.h
++++ b/services/network/prefetch_matching_url_loader_factory.h
+@@ -17,6 +17,7 @@
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/receiver_set.h"
+ #include "net/base/network_handle.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/public/mojom/network_context.mojom-forward.h"
+ #include "services/network/public/mojom/url_loader.mojom-forward.h"
+ #include "services/network/public/mojom/url_loader_factory.mojom.h"
+@@ -61,6 +62,9 @@
+       const PrefetchMatchingURLLoaderFactory&) = delete;
+ 
+   ~PrefetchMatchingURLLoaderFactory() final;
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+ 
+   // Implementation of mojom::URLLoaderFactory.
+   void CreateLoaderAndStart(
+@@ -104,12 +108,14 @@
+   void OnDisconnect();
+   bool IsRequestSafeForMatching(const ResourceRequest& request);
+ 
++  NativeNetworkRetirement native_retirement_;
+   const bool ignore_factory_reset_;
+   const std::unique_ptr<cors::CorsURLLoaderFactory> next_;
+   const raw_ptr<NetworkContext> context_;
+   const raw_ptr<PrefetchCache> cache_;
+   mojo::ReceiverSet<mojom::URLLoaderFactory> receivers_;
+   const bool use_matches_;
++  base::WeakPtrFactory<PrefetchMatchingURLLoaderFactory> weak_factory_{this};
+ };
+ 
+ }  // namespace network
+--- a/services/network/prefetch_matching_url_loader_factory.cc
++++ b/services/network/prefetch_matching_url_loader_factory.cc
+@@ -6,8 +6,10 @@
+ 
+ #include <memory>
+ 
++#include "base/barrier_closure.h"
+ #include "base/check_op.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/strings/strcat.h"
+ #include "base/task/common/task_annotator.h"
+@@ -18,6 +20,7 @@
+ #include "services/network/prefetch_url_loader_client.h"
+ #include "services/network/public/cpp/features.h"
+ #include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/url_loader_completion_status.h"
+ #include "services/network/resource_scheduler/resource_scheduler_client.h"
+ 
+ namespace network {
+@@ -83,6 +86,13 @@
+     const ResourceRequest& request,
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired()) {
++    mojo::Remote<mojom::URLLoaderClient>(std::move(client))
++        ->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++    return;
++  }
++
+   // TODO: crbug.com/332706093 - This path was getting hit by the
+   // iphone-simulator bot in unittests. See if this can be turned into a
+   // NOTREACHED().
+@@ -98,6 +108,13 @@
+     ResourceRequest& request,
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired()) {
++    mojo::Remote<mojom::URLLoaderClient>(std::move(client))
++        ->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++    return;
++  }
++
+   LogCreateLoaderAndStartQueueTimeHistogram(request.is_outermost_main_frame);
+   // If we don't think the request should be permitted from a render process, we
+   // don't try to match it and instead let CorsURLLoaderFactory deal with the
+@@ -141,7 +158,36 @@
+ 
+ void PrefetchMatchingURLLoaderFactory::Clone(
+     mojo::PendingReceiver<URLLoaderFactory> receiver) {
++  if (native_retirement_.retired())
++    return;
++
+   receivers_.Add(this, std::move(receiver), GetFactoryTaskRunner());
++}
++
++base::OnceClosure PrefetchMatchingURLLoaderFactory::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  bool selected = next_->MatchesFactoryOwner(matches);
++  auto drained = base::BarrierClosure(
++      selected ? 3 : 2,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  if (selected)
++    native_retirement_.Prepare(drained);
++  auto child = next_->PrepareNetworkRetirement(matches, selected, drained);
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](base::WeakPtr<PrefetchMatchingURLLoaderFactory> owner, bool selected,
++         base::OnceClosure child, base::ScopedClosureRunner finish) {
++        std::move(child).Run();
++        if (owner && selected)
++          owner->ClearBindings();
++      },
++      weak_factory_.GetWeakPtr(), selected, std::move(child),
++      base::ScopedClosureRunner(drained)));
+ }
+ 
+ void PrefetchMatchingURLLoaderFactory::ClearBindings() {
+--- a/services/network/prefetch_url_loader_client.h
++++ b/services/network/prefetch_url_loader_client.h
+@@ -14,6 +14,7 @@
+ #include "mojo/public/cpp/bindings/receiver.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "net/base/network_isolation_key.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/mojom/url_loader.mojom.h"
+ #include "url/gurl.h"
+@@ -42,6 +43,13 @@
+   // PrefetchURLLoaderClient is owned by the PrefetchCache. This destructor
+   // should never be called directly.
+   ~PrefetchURLLoaderClient() final;
++  base::WeakPtr<PrefetchURLLoaderClient> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::WeakPtr<PrefetchURLLoaderClient> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done);
++  void RevokeNetworkState();
+ 
+   // Accessors used by NetworkContext::PrefetchCache.
+   const net::NetworkIsolationKey& network_isolation_key() const {
+@@ -102,6 +110,7 @@
+   template <typename Method, typename... Args>
+   void ForwardToRealClient(Method method, Args... args);
+ 
++  NativeNetworkRetirement native_retirement_;
+   const ResourceRequest request_;
+   const net::NetworkIsolationKey network_isolation_key_;
+   const base::TimeTicks expiry_time_;
+@@ -125,6 +134,7 @@
+ 
+   // Set to true when we lose a mojo connection.
+   bool disconnected_ = false;
++  base::WeakPtrFactory<PrefetchURLLoaderClient> weak_factory_{this};
+ };
+ 
+ }  // namespace network
+--- a/services/network/prefetch_url_loader_client.cc
++++ b/services/network/prefetch_url_loader_client.cc
+@@ -56,6 +56,32 @@
+   CHECK(prefetch_cache_);
+ }
+ 
++bool PrefetchURLLoaderClient::MatchesNetworkOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  const auto& info = request_.trusted_params->isolation_info;
++  return matches.Run({request_.url, info.network_anonymization_key(),
++                      request_.request_initiator.value_or(url::Origin()),
++                      &info});
++}
++base::WeakPtr<PrefetchURLLoaderClient>
++PrefetchURLLoaderClient::PrepareNetworkRetirement(
++    const base::RepeatingClosure& done) {
++  if (native_retirement_.Prepare(done))
++    weak_factory_.InvalidateWeakPtrs();
++  return weak_factory_.GetWeakPtr();
++}
++void PrefetchURLLoaderClient::RevokeNetworkState() {
++  if (!native_retirement_.BeginRevocation())
++    return;
++  auto lifetime = native_retirement_.HoldCallback();
++  if (real_client_)
++    real_client_->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++  receiver_.reset();
++  url_loader_.reset();
++  real_client_.reset();
++  pending_callbacks_.clear();
++  prefetch_cache_->Erase(this);
++}
+ PrefetchURLLoaderClient::~PrefetchURLLoaderClient() = default;
+ 
+ mojo::PendingReceiver<mojom::URLLoader>
+@@ -65,7 +91,7 @@
+   // This use of base::Unretained() is safe because the callback will not be
+   // called after `url_loader_` is destroyed.
+   url_loader_.set_disconnect_handler(base::BindOnce(
+-      &PrefetchURLLoaderClient::OnDisconnect, base::Unretained(this)));
++      &PrefetchURLLoaderClient::OnDisconnect, weak_factory_.GetWeakPtr()));
+   return pending_receiver;
+ }
+ 
+@@ -76,18 +102,23 @@
+   // This use of base::Unretained() is safe because the callback will not be
+   // called after `receiver_` is destroyed.
+   receiver_.set_disconnect_handler(base::BindOnce(
+-      &PrefetchURLLoaderClient::OnDisconnect, base::Unretained(this)));
++      &PrefetchURLLoaderClient::OnDisconnect, weak_factory_.GetWeakPtr()));
+   return pending_remote;
+ }
+ 
+ bool PrefetchURLLoaderClient::Matches(
+     const ResourceRequest& real_request) const {
+-  return PrefetchMatches(request_, real_request);
++  return !native_retirement_.retired() &&
++         PrefetchMatches(request_, real_request);
+ }
+ 
+ void PrefetchURLLoaderClient::Consume(
+     mojo::PendingReceiver<mojom::URLLoader> loader,
+     mojo::PendingRemote<mojom::URLLoaderClient> client) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   // Remove ourselves from the PrefetchCache.
+   prefetch_cache_->Consume(this);
+ 
+@@ -102,15 +133,18 @@
+   // This use of base::Unretained is safe because the disconnect handler will
+   // not be called after `real_client_` is destroyed.
+   real_client_.set_disconnect_handler(base::BindOnce(
+-      &PrefetchURLLoaderClient::OnDisconnect, base::Unretained(this)));
++      &PrefetchURLLoaderClient::OnDisconnect, weak_factory_.GetWeakPtr()));
+   // Move the vector to a local just to be safe against re-entrancy.
+   std::vector<base::OnceClosure> pending_callbacks =
+       std::move(pending_callbacks_);
+   // `pending_callbacks_` shouldn't be used again, but if it is, avoid undefined
+   // behavior.
+   pending_callbacks_.clear();
++  auto admitted = weak_factory_.GetWeakPtr();
+   for (auto&& callback : pending_callbacks) {
+     std::move(callback).Run();
++    if (!admitted || native_retirement_.retired())
++      return;
+   }
+   if (disconnected_) {
+     OnDisconnect();
+@@ -120,6 +154,10 @@
+ 
+ void PrefetchURLLoaderClient::OnReceiveEarlyHints(
+     mojom::EarlyHintsPtr early_hints) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   ForwardOrRecord(&mojom::URLLoaderClient::OnReceiveEarlyHints,
+                   std::move(early_hints));
+ }
+@@ -128,6 +166,10 @@
+     mojom::URLResponseHeadPtr head,
+     mojo::ScopedDataPipeConsumerHandle body,
+     std::optional<mojo_base::BigBuffer> cached_metadata) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   // If a render process is already consuming this prefetch, it is too late to
+   // decide we can't use it.
+   if (!real_client_.is_bound() && ShouldAbandonPrefetch(*head)) {
+@@ -142,6 +184,10 @@
+ void PrefetchURLLoaderClient::OnReceiveRedirect(
+     const net::RedirectInfo& redirect_info,
+     mojom::URLResponseHeadPtr head) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   ForwardOrRecord(&mojom::URLLoaderClient::OnReceiveRedirect, redirect_info,
+                   std::move(head));
+ }
+@@ -150,18 +196,30 @@
+     int64_t current_position,
+     int64_t total_size,
+     OnUploadProgressCallback callback) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   ForwardOrRecord(&mojom::URLLoaderClient::OnUploadProgress, current_position,
+                   total_size, std::move(callback));
+ }
+ 
+ void PrefetchURLLoaderClient::OnTransferSizeUpdated(
+     int32_t transfer_size_diff) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   ForwardOrRecord(&mojom::URLLoaderClient::OnTransferSizeUpdated,
+                   transfer_size_diff);
+ }
+ 
+ void PrefetchURLLoaderClient::OnComplete(
+     const URLLoaderCompletionStatus& status) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   ForwardOrRecord(&mojom::URLLoaderClient::OnComplete, status);
+ }
+ 
+@@ -184,7 +242,7 @@
+     // this object.
+     pending_callbacks_.push_back(base::BindOnce(
+         &PrefetchURLLoaderClient::ForwardToRealClient<Method, Args...>,
+-        base::Unretained(this), method, std::forward<Args>(args)...));
++        weak_factory_.GetWeakPtr(), method, std::forward<Args>(args)...));
+   }
+ }
+ 
+--- a/services/network/prefetch_cache.h
++++ b/services/network/prefetch_cache.h
+@@ -17,6 +17,7 @@
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "net/base/network_isolation_key.h"
++#include "services/network/native_network_retirement.h"
+ #include "url/gurl.h"
+ 
+ namespace net {
+@@ -51,6 +52,9 @@
+   PrefetchCache& operator=(const PrefetchCache&) = delete;
+ 
+   ~PrefetchCache();
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+ 
+   // Instantiates and inserts a new PrefetchURLLoaderClient. If a matching
+   // request (same NIK and URL) already exists in the cache, returns nullptr.
+@@ -107,8 +111,7 @@
+   struct PendingErasure {
+     // The client is referred to by its key rather than a pointer, so that there
+     // is no dangling reference if something else erases the client first.
+-    net::NetworkIsolationKey nik;
+-    GURL url;
++    base::WeakPtr<PrefetchURLLoaderClient> original;
+     base::TimeTicks erase_time;
+   };
+ 
+--- a/services/network/prefetch_cache.cc
++++ b/services/network/prefetch_cache.cc
+@@ -6,11 +6,14 @@
+ 
+ #include <ostream>
+ 
++#include "base/barrier_closure.h"
+ #include "base/check.h"
+ #include "base/check_op.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "base/types/pass_key.h"
+ #include "net/base/network_isolation_key.h"
+ #include "services/network/prefetch_url_loader_client.h"
+@@ -56,6 +59,41 @@
+ PrefetchCache::PrefetchCache()
+     : max_size_(GetMaxSize()), erase_grace_time_(GetEraseGraceTime()) {}
+ 
++base::OnceClosure PrefetchCache::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  std::vector<PrefetchURLLoaderClient*> selected;
++  for (const auto& client : client_storage_)
++    if (client->MatchesNetworkOwner(matches))
++      selected.push_back(client.get());
++  auto drained = base::BarrierClosure(
++      selected.size() + 1,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::WeakPtr<PrefetchURLLoaderClient>> originals;
++  for (auto* client : selected) {
++    auto it = FindInMap(client->network_isolation_key(), client->url());
++    if (it != map_.end() && it->second == client)
++      RemoveFromCache(client);
++    originals.push_back(client->PrepareNetworkRetirement(drained));
++  }
++  if (list_.empty())
++    expiry_timer_.Stop();
++  else
++    StartTimer();
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<PrefetchURLLoaderClient>> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& client : originals)
++          if (client)
++            client->RevokeNetworkState();
++      },
++      std::move(originals), base::ScopedClosureRunner(drained)));
++}
+ PrefetchCache::~PrefetchCache() = default;
+ 
+ PrefetchURLLoaderClient* PrefetchCache::Emplace(
+@@ -132,8 +170,7 @@
+ 
+ void PrefetchCache::Erase(PrefetchURLLoaderClient* client) {
+   const auto it = FindInMap(client->network_isolation_key(), client->url());
+-  if (it != map_.end()) {
+-    CHECK_EQ(it->second, client);
++  if (it != map_.end() && it->second == client) {
+     map_.erase(it);
+     client->RemoveFromList();
+   }
+@@ -142,9 +179,9 @@
+ 
+ void PrefetchCache::DelayedErase(PrefetchURLLoaderClient* client) {
+   const auto now = base::TimeTicks::Now();
+-  PendingErasure pending_erasure = {client->network_isolation_key(),
+-                                    client->url(), now + erase_grace_time_};
+-  CHECK(Lookup(pending_erasure.nik, pending_erasure.url));
++  CHECK_EQ(Lookup(client->network_isolation_key(), client->url()), client);
++  PendingErasure pending_erasure = {client->GetWeakPtr(),
++                                    now + erase_grace_time_};
+   delayed_erase_queue_.push(std::move(pending_erasure));
+   SchedulePendingErases(now);
+ }
+@@ -166,11 +203,8 @@
+          delayed_erase_queue_.front().erase_time <= now) {
+     PendingErasure pending = std::move(delayed_erase_queue_.front());
+     delayed_erase_queue_.pop();
+-    PrefetchURLLoaderClient* to_erase = Lookup(pending.nik, pending.url);
+-    if (to_erase) {
+-      RemoveFromCache(to_erase);
+-      EraseFromStorage(to_erase);
+-    }
++    if (pending.original)
++      Erase(pending.original.get());
+   }
+   if (!delayed_erase_queue_.empty()) {
+     SchedulePendingErases(now);
+--- a/services/network/url_loader_factory.h
++++ b/services/network/url_loader_factory.h
+@@ -61,6 +61,7 @@
+   URLLoaderFactory& operator=(const URLLoaderFactory&) = delete;
+ 
+   ~URLLoaderFactory() override;
++  void RetireNetworkAdmission() { network_retired_ = true; }
+ 
+   // mojom::URLLoaderFactory implementation.
+   void CreateLoaderAndStart(mojo::PendingReceiver<mojom::URLLoader> receiver,
+@@ -117,6 +118,7 @@
+       const;
+ 
+   // The NetworkContext that indirectly owns |this|.
++  bool network_retired_ = false;
+   const raw_ptr<NetworkContext> context_;
+   mojom::URLLoaderFactoryParamsPtr params_;
+   scoped_refptr<ResourceSchedulerClient> resource_scheduler_client_;
+--- a/services/network/url_loader_factory.cc
++++ b/services/network/url_loader_factory.cc
+@@ -205,6 +205,16 @@
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     base::WeakPtr<mojom::URLLoaderClient> sync_client,
+     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  if (network_retired_) {
++    URLLoaderCompletionStatus status(net::ERR_ABORTED);
++    if (sync_client)
++      sync_client->OnComplete(status);
++    else
++      mojo::Remote<mojom::URLLoaderClient>(std::move(client))
++          ->OnComplete(status);
++    return;
++  }
++
+   if (!context_->alloy_guard()
+            .DecideRequest(
+                traffic_annotation.unique_id_hash_code,
+--- a/services/network/cors/preflight_controller.h
++++ b/services/network/cors/preflight_controller.h
+@@ -20,6 +20,7 @@
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/cors/preflight_cache.h"
+ #include "services/network/cors/preflight_result.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/public/cpp/cors/cors_error_status.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/mojom/clear_data_filter.mojom-forward.h"
+@@ -91,6 +92,9 @@
+   PreflightController& operator=(const PreflightController&) = delete;
+ 
+   ~PreflightController();
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+ 
+   // Determines if a CORS-preflight request is needed, and checks the cache, or
+   // makes a preflight request if it is needed. A result will be notified
+--- a/services/network/cors/preflight_controller.cc
++++ b/services/network/cors/preflight_controller.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/cors/preflight_controller.h"
++
++#include "base/barrier_closure.h"
++#include "base/functional/callback_helpers.h"
++#include "base/task/single_thread_task_runner.h"
+ 
+ #include <algorithm>
+ #include <optional>
+@@ -388,6 +392,29 @@
+     loader_->SetURLLoaderFactoryOptions(options);
+   }
+ 
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const {
++    auto key = net::NetworkAnonymizationKey::CreateFromNetworkIsolationKey(
++        network_isolation_key_);
++    return matches.Run(
++        {original_request_.url, key,
++         original_request_.request_initiator.value_or(url::Origin()), nullptr});
++  }
++  base::WeakPtr<PreflightLoader> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done) {
++    if (native_retirement_.Prepare(done))
++      weak_factory_.InvalidateWeakPtrs();
++    return weak_factory_.GetWeakPtr();
++  }
++  void RevokeNetworkState() {
++    if (!native_retirement_.BeginRevocation())
++      return;
++    auto lifetime = native_retirement_.HoldCallback();
++    loader_.reset();
++    auto completion = std::move(completion_callback_);
++    RemoveFromController();
++    if (completion)
++      std::move(completion).Run(net::ERR_ABORTED, std::nullopt, false);
++  }
+   PreflightLoader(const PreflightLoader&) = delete;
+   PreflightLoader& operator=(const PreflightLoader&) = delete;
+ 
+@@ -395,14 +422,14 @@
+     DCHECK(loader_);
+ 
+     loader_->SetOnRedirectCallback(base::BindRepeating(
+-        &PreflightLoader::HandleRedirect, base::Unretained(this)));
++        &PreflightLoader::HandleRedirect, weak_factory_.GetWeakPtr()));
+     loader_->SetOnResponseStartedCallback(base::BindOnce(
+-        &PreflightLoader::HandleResponseHeader, base::Unretained(this)));
++        &PreflightLoader::HandleResponseHeader, weak_factory_.GetWeakPtr()));
+ 
+     loader_->DownloadToString(
+         loader_factory,
+         base::BindOnce(&PreflightLoader::HandleResponseBody,
+-                       base::Unretained(this)),
++                       weak_factory_.GetWeakPtr()),
+         0);
+   }
+ 
+@@ -411,6 +438,10 @@
+                       const net::RedirectInfo& redirect_info,
+                       const network::mojom::URLResponseHead& response_head,
+                       std::vector<std::string>* to_be_removed_headers) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     if (devtools_observer_ && *devtools_observer_) {
+       DCHECK(devtools_request_id_);
+       (*devtools_observer_)
+@@ -430,6 +461,10 @@
+ 
+   void HandleResponseHeader(const GURL& final_url,
+                             const mojom::URLResponseHead& head) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     if (devtools_observer_ && *devtools_observer_) {
+       DCHECK(devtools_request_id_);
+       mojom::URLResponseHeadDevToolsInfoPtr head_info =
+@@ -474,6 +509,10 @@
+       net::Error net_error,
+       std::optional<CorsErrorStatus> detected_error_status,
+       std::unique_ptr<PreflightResult> result) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     bool has_authorization_covered_by_wildcard =
+         result->HasAuthorizationCoveredByWildcard(original_request_.headers);
+ 
+@@ -495,6 +534,10 @@
+   }
+ 
+   void HandleResponseBody(std::optional<std::string> response_body) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     const int error = loader_->NetError();
+     const std::optional<URLLoaderCompletionStatus>& status =
+         loader_->CompletionStatus();
+@@ -527,6 +570,7 @@
+   void RemoveFromController() { controller_->RemoveLoader(this); }
+ 
+   // PreflightController owns all PreflightLoader instances, and should outlive.
++  NativeNetworkRetirement native_retirement_;
+   const raw_ptr<PreflightController> controller_;
+ 
+   // Holds SimpleURLLoader instance for the CORS-preflight request.
+@@ -545,6 +589,7 @@
+   const bool acam_preflight_spec_conformant_;
+   mojo::Remote<mojom::URLLoaderNetworkServiceObserver>
+       url_loader_network_service_observer_;
++  base::WeakPtrFactory<PreflightLoader> weak_factory_{this};
+ };
+ 
+ // static
+@@ -591,6 +636,34 @@
+ PreflightController::PreflightController(NetworkService* network_service)
+     : network_service_(network_service) {}
+ 
++base::OnceClosure PreflightController::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  cache_.RetireMatching(matches);
++  std::vector<PreflightLoader*> selected;
++  for (const auto& loader : loaders_)
++    if (loader->MatchesNetworkOwner(matches))
++      selected.push_back(loader.get());
++  auto drained = base::BarrierClosure(
++      selected.size() + 1,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::WeakPtr<PreflightLoader>> originals;
++  for (auto* loader : selected)
++    originals.push_back(loader->PrepareNetworkRetirement(drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::WeakPtr<PreflightLoader>> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& loader : originals)
++          if (loader)
++            loader->RevokeNetworkState();
++      },
++      std::move(originals), base::ScopedClosureRunner(drained)));
++}
+ PreflightController::~PreflightController() = default;
+ 
+ void PreflightController::PerformPreflightCheck(
+--- a/services/network/cors/preflight_cache.h
++++ b/services/network/cors/preflight_cache.h
+@@ -14,6 +14,7 @@
+ #include "net/base/network_isolation_key.h"
+ #include "net/http/http_request_headers.h"
+ #include "services/network/cors/preflight_result.h"
++#include "services/network/native_network_retirement.h"
+ #include "services/network/public/mojom/clear_data_filter.mojom-forward.h"
+ #include "services/network/public/mojom/fetch_api.mojom-shared.h"
+ #include "url/origin.h"
+@@ -63,6 +64,7 @@
+       bool is_ad_auction_trusted_signals_request);
+ 
+   void ClearCache(mojom::ClearDataFilterPtr url_filter);
++  void RetireMatching(const NativeNetworkOwnerMatcher& matches);
+ 
+   // Counts cached entries for testing.
+   size_t CountEntriesForTesting() const;
+--- a/services/network/cors/preflight_cache.cc
++++ b/services/network/cors/preflight_cache.cc
+@@ -67,6 +67,16 @@
+ }  // namespace
+ 
+ PreflightCache::PreflightCache() = default;
++void PreflightCache::RetireMatching(const NativeNetworkOwnerMatcher& matches) {
++  for (auto it = cache_.begin(); it != cache_.end();) {
++    const auto& [origin, url, nik] = it->first;
++    auto key = net::NetworkAnonymizationKey::CreateFromNetworkIsolationKey(nik);
++    if (matches.Run({GURL(url), key, origin, nullptr}))
++      it = cache_.erase(it);
++    else
++      ++it;
++  }
++}
+ PreflightCache::~PreflightCache() = default;
+ 
+ void PreflightCache::AppendEntry(
+--- a/services/network/network_context.h
++++ b/services/network/network_context.h
+@@ -216,6 +216,9 @@
+   static void SetCertVerifierForTesting(net::CertVerifier* cert_verifier);
+ 
+   net::URLRequestContext* url_request_context() { return url_request_context_; }
++  base::OnceClosure PrepareURLLoaderServiceRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+   base::OnceClosure PrepareTransportServiceRetirement(
+       const NativeNetworkOwnerMatcher& matches,
+       base::OnceClosure done);
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -1924,6 +1924,36 @@
+   std::move(callback).Run();
+ }
+ 
++base::OnceClosure NetworkContext::PrepareURLLoaderServiceRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  auto drained = base::BarrierClosure(
++      url_loader_factories_.size() + 3,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::OnceClosure> prepared;
++  for (const auto& factory : url_loader_factories_)
++    prepared.push_back(factory->PrepareNetworkRetirement(matches, drained));
++  prepared.push_back(
++      cors_preflight_controller_.PrepareNetworkRetirement(matches, drained));
++  if (prefetch_cache_)
++    prepared.push_back(
++        prefetch_cache_->PrepareNetworkRetirement(matches, drained));
++  else
++    drained.Run();
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](std::vector<base::OnceClosure> prepared,
++         base::ScopedClosureRunner finish) {
++        for (auto& commit : prepared)
++          std::move(commit).Run();
++      },
++      std::move(prepared), base::ScopedClosureRunner(drained)));
++}
++
+ base::OnceClosure NetworkContext::PrepareTransportServiceRetirement(
+     const NativeNetworkOwnerMatcher& matches,
+     base::OnceClosure done) {

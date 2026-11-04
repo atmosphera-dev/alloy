@@ -1,0 +1,232 @@
+--- a/net/socket/transport_client_socket_pool.h
++++ b/net/socket/transport_client_socket_pool.h
+@@ -17,6 +17,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/advanced_memory_safety_checks.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -221,6 +222,13 @@
+                      std::unique_ptr<StreamSocket> socket,
+                      int64_t group_generation) override;
+   void FlushWithError(int error, const char* net_log_reason_utf8) override;
++
++  // Engine-owned pure group selector. Revoke the selected original handouts,
++  // idle sockets and requests, then await their actual native release/error
++  // completion. Fresh handouts do not prolong this retirement.
++  void RetireMatchingGroups(
++      const base::RepeatingCallback<bool(const GroupId&)>& matches,
++      base::OnceClosure done);
+   void CloseIdleSockets(const char* net_log_reason_utf8) override;
+   void CloseIdleSocketsInGroup(const GroupId& group_id,
+                                const char* net_log_reason_utf8) override;
+@@ -315,6 +323,8 @@
+       BoundRequest& operator=(BoundRequest&& other);
+       ~BoundRequest();
+ 
++      // Declared first so native request/job state is destroyed before drain.
++      std::vector<base::ScopedClosureRunner> network_retirement;
+       std::unique_ptr<ConnectJob> connect_job;
+       std::unique_ptr<Request> request;
+ 
+@@ -348,7 +358,7 @@
+                           ConnectJob* job) override;
+ 
+     bool IsEmpty() const {
+-      return active_socket_count_ == 0 && idle_sockets_.empty() &&
++      return active_sockets_.empty() && idle_sockets_.empty() &&
+              jobs_.empty() && unbound_requests_.empty() &&
+              bound_requests_.empty();
+     }
+@@ -358,7 +368,7 @@
+     }
+ 
+     size_t NumActiveSocketSlots() const {
+-      return active_socket_count_ + jobs_.size() + idle_sockets_.size() +
++      return active_sockets_.size() + jobs_.size() + idle_sockets_.size() +
+              bound_requests_.size();
+     }
+ 
+@@ -452,8 +462,13 @@
+     // is the same as the current priority of the request, this is a no-op.
+     void SetPriority(ClientSocketHandle* handle, RequestPriority priority);
+ 
+-    void IncrementActiveSocketCount() { active_socket_count_++; }
+-    void DecrementActiveSocketCount() { active_socket_count_--; }
++    void IncrementActiveSocketCount(StreamSocket* socket);
++    void DecrementActiveSocketCount(StreamSocket* socket);
++    size_t NativeRetirementCount() const {
++      return active_sockets_.size() + unbound_request_count() +
++             bound_requests_.size();
++    }
++    void PrepareNetworkRetirement(const base::RepeatingClosure& drained);
+ 
+     void IncrementGeneration() { generation_++; }
+ 
+@@ -465,7 +480,7 @@
+     size_t unassigned_job_count() const { return unassigned_jobs_.size(); }
+     const JobList& jobs() const { return jobs_; }
+     const std::list<IdleSocket>& idle_sockets() const { return idle_sockets_; }
+-    size_t active_socket_count() const { return active_socket_count_; }
++    size_t active_socket_count() const { return active_sockets_.size(); }
+     std::list<IdleSocket>* mutable_idle_sockets() { return &idle_sockets_; }
+     size_t never_assigned_job_count() const {
+       return never_assigned_job_count_;
+@@ -550,7 +565,11 @@
+                     // element of |unbound_requests_|.
+     std::list<raw_ptr<ConnectJob, CtnExperimental>> unassigned_jobs_;
+     RequestQueue unbound_requests_;
+-    size_t active_socket_count_ = 0;  // number of active client sockets
++    // The native handout registrations are the active count, not a parallel
++    // counter. Waiters belong to the original borrowed socket, never its next
++    // user or a newly admitted socket in this group.
++    std::map<raw_ptr<StreamSocket, CtnExperimental>,
++             std::vector<base::ScopedClosureRunner>> active_sockets_;
+     // A timer for when to start the backup job.
+     base::OneShotTimer backup_job_timer_;
+ 
+@@ -577,6 +596,7 @@
+     CallbackResultPair& operator=(CallbackResultPair&& other);
+     ~CallbackResultPair();
+ 
++    std::vector<base::ScopedClosureRunner> network_retirement;
+     CompletionOnceCallback callback;
+     int result;
+   };
+--- a/net/socket/transport_client_socket_pool.cc
++++ b/net/socket/transport_client_socket_pool.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "net/socket/transport_client_socket_pool.h"
++
++#include "base/barrier_closure.h"
+ 
+ #include <algorithm>
+ #include <string_view>
+@@ -1046,7 +1048,7 @@
+   handed_out_socket_count_--;
+ 
+   CHECK_GT(group->active_socket_count(), 0u);
+-  group->DecrementActiveSocketCount();
++  group->DecrementActiveSocketCount(socket.get());
+ 
+   UpdateExpandabilityAfterRelease();
+ 
+@@ -1170,6 +1172,55 @@
+   ResetExpandability();
+ }
+ 
++void TransportClientSocketPool::RetireMatchingGroups(
++    const base::RepeatingCallback<bool(const GroupId&)>& matches,
++    base::OnceClosure done) {
++  std::vector<GroupId> selected;
++  size_t pending = 1;  // Keep completion closed through synchronous preparation.
++  for (const auto& [id, group] : group_map_) {
++    if (matches.Run(id)) {
++      selected.push_back(id);
++      pending += group.NativeRetirementCount();
++    }
++  }
++  for (const auto& [handle, callback] : pending_callback_map_) {
++    if (matches.Run(handle->group_id())) ++pending;
++  }
++  auto drained = base::BarrierClosure(pending, base::BindOnce(
++      [](base::OnceClosure done) {
++        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++            FROM_HERE, std::move(done));
++      }, std::move(done)));
++  // Prepare all selected original owners before cancelling any native work.
++  for (const auto& id : selected) {
++    group_map_.at(id).PrepareNetworkRetirement(drained);
++  }
++  for (auto& [handle, completion] : pending_callback_map_) {
++    if (matches.Run(handle->group_id())) {
++      completion.result = ERR_ABORTED;
++      completion.network_retirement.emplace_back(drained);
++    }
++  }
++  for (const auto& id : selected) {
++    auto it = group_map_.find(id);
++    if (it == group_map_.end()) continue;
++    Group* group = &it->second;
++    connecting_socket_count_ -= group->jobs().size();
++    group->RemoveAllUnboundJobs();
++    CleanupIdleSocketsInGroup(true, group, base::TimeTicks::Now(),
++                              "Site record retired");
++    while (auto request = group->PopNextUnboundRequest()) {
++      auto* handle = request->handle();
++      InvokeUserCallbackLater(handle, request->release_callback(), ERR_ABORTED,
++                              request->socket_tag());
++      pending_callback_map_.at(handle).network_retirement.emplace_back(drained);
++    }
++    if (group->IsEmpty()) RemoveGroup(id);
++  }
++  CheckForStalledSocketGroups();
++  drained.Run();
++}
++
+ void TransportClientSocketPool::RemoveConnectJob(ConnectJob* job,
+                                                  Group* group) {
+   CHECK_GT(connecting_socket_count_, 0u);
+@@ -1246,7 +1297,7 @@
+       handle->socket()->NetLog().source());
+ 
+   handed_out_socket_count_++;
+-  group->IncrementActiveSocketCount();
++  group->IncrementActiveSocketCount(handle->socket());
+ }
+ 
+ void TransportClientSocketPool::AddIdleSocket(
+@@ -1353,6 +1404,11 @@
+                               bound_request->request->release_callback(),
+                               bound_request->pending_error,
+                               bound_request->request->socket_tag());
++      auto& retirement = pending_callback_map_.at(
++          bound_request->request->handle()).network_retirement;
++      for (auto& waiter : bound_request->network_retirement)
++        retirement.push_back(std::move(waiter));
++      bound_request->network_retirement.clear();
+       bound_request->request->net_log().EndEventWithNetErrorCode(
+           NetLogEventType::SOCKET_POOL, bound_request->pending_error);
+       UpdateExpandabilityAfterRelease();
+@@ -1468,6 +1524,7 @@
+     return;
+ 
+   CHECK(!handle->is_initialized());
++  auto retirement = std::move(it->second.network_retirement);
+   CompletionOnceCallback callback = std::move(it->second.callback);
+   int result = it->second.result;
+   pending_callback_map_.erase(it);
+@@ -1899,6 +1956,29 @@
+   return nullptr;
+ }
+ 
++void TransportClientSocketPool::Group::IncrementActiveSocketCount(
++    StreamSocket* socket) {
++  CHECK(active_sockets_.try_emplace(socket).second);
++}
++
++void TransportClientSocketPool::Group::DecrementActiveSocketCount(
++    StreamSocket* socket) {
++  CHECK_EQ(active_sockets_.erase(socket), 1u);
++}
++
++void TransportClientSocketPool::Group::PrepareNetworkRetirement(
++    const base::RepeatingClosure& drained) {
++  IncrementGeneration();
++  for (auto& [socket, retirement] : active_sockets_) {
++    retirement.emplace_back(drained);
++    socket->Disconnect();
++  }
++  SetPendingErrorForAllBoundRequests(ERR_ABORTED);
++  for (auto& bound : bound_requests_) {
++    bound.network_retirement.emplace_back(drained);
++  }
++}
++
+ void TransportClientSocketPool::Group::SetPendingErrorForAllBoundRequests(
+     int pending_error) {
+   for (auto& bound_request : bound_requests_) {

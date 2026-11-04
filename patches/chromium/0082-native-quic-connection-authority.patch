@@ -1,0 +1,296 @@
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.h
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.h
+@@ -65,6 +65,26 @@
+ class QUICHE_EXPORT SessionCache {
+  public:
+   virtual ~SessionCache() {}
++
++  // One original connection's cache access, bound to its native server once.
++  // The root cache must outlive a legacy forwarding view. Native revocable
++  // caches additionally close retained views when their root is destroyed.
++  class QUICHE_EXPORT ConnectionState {
++   public:
++    ConnectionState() = default;
++    ConnectionState(const ConnectionState&) = delete;
++    ConnectionState& operator=(const ConnectionState&) = delete;
++    virtual ~ConnectionState() = default;
++    virtual void Insert(bssl::UniquePtr<SSL_SESSION> session,
++                        const TransportParameters& params,
++                        const ApplicationState* application_state = nullptr) = 0;
++    virtual std::unique_ptr<QuicResumptionState> Lookup(
++        QuicWallTime now, const SSL_CTX* ctx) = 0;
++    virtual void ClearEarlyData() = 0;
++    virtual void OnNewTokenReceived(absl::string_view token) = 0;
++  };
++  virtual std::unique_ptr<ConnectionState> CreateConnectionState(
++      const QuicServerId& server_id);
+ 
+   // Inserts |session|, |params|, and |application_states| into the cache, keyed
+   // by |server_id|. Insert is first called after all three values are present.
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_crypto_client_config.cc
+@@ -72,6 +72,35 @@
+ 
+ }  // namespace
+ 
++namespace {
++class ForwardingConnectionState final : public SessionCache::ConnectionState {
++ public:
++  ForwardingConnectionState(SessionCache* cache, const QuicServerId& server)
++      : cache_(cache), server_(server) {}
++  void Insert(bssl::UniquePtr<SSL_SESSION> session,
++              const TransportParameters& params,
++              const ApplicationState* application_state) override {
++    cache_->Insert(server_, std::move(session), params, application_state);
++  }
++  std::unique_ptr<QuicResumptionState> Lookup(
++      QuicWallTime now, const SSL_CTX* ctx) override {
++    return cache_->Lookup(server_, now, ctx);
++  }
++  void ClearEarlyData() override { cache_->ClearEarlyData(server_); }
++  void OnNewTokenReceived(absl::string_view token) override {
++    cache_->OnNewTokenReceived(server_, token);
++  }
++ private:
++  SessionCache* const cache_;
++  const QuicServerId server_;
++};
++}  // namespace
++
++std::unique_ptr<SessionCache::ConnectionState> SessionCache::CreateConnectionState(
++    const QuicServerId& server_id) {
++  return std::make_unique<ForwardingConnectionState>(this, server_id);
++}
++
+ QuicCryptoClientConfig::QuicCryptoClientConfig(
+     std::unique_ptr<ProofVerifier> proof_verifier)
+     : QuicCryptoClientConfig(std::move(proof_verifier), nullptr) {}
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache.h
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache.h
+@@ -5,6 +5,7 @@
+ #ifndef QUICHE_QUIC_CORE_CRYPTO_QUIC_CLIENT_SESSION_CACHE_H_
+ #define QUICHE_QUIC_CORE_CRYPTO_QUIC_CLIENT_SESSION_CACHE_H_
+ 
++#include <map>
+ #include <memory>
+ #include <string>
+ 
+@@ -26,6 +27,10 @@
+   QuicClientSessionCache();
+   explicit QuicClientSessionCache(size_t max_entries);
+   ~QuicClientSessionCache() override;
++  std::unique_ptr<ConnectionState> CreateConnectionState(
++      const QuicServerId& server_id) override;
++  // Revokes original connection access as well as all matching cached state.
++  void RetireMatching(const QuicCryptoClientConfig::ServerIdFilter& filter);
+ 
+   void Insert(const QuicServerId& server_id,
+               bssl::UniquePtr<SSL_SESSION> session,
+@@ -55,7 +60,7 @@
+   friend class test::QuicClientSessionCachePeer;
+ 
+   struct QUICHE_EXPORT Entry {
+-    Entry();
++    explicit Entry(const QuicServerId& server);
+     Entry(Entry&&);
+     ~Entry();
+ 
+@@ -68,6 +73,7 @@
+ 
+     SSL_SESSION* PeekSession();
+ 
++    const QuicServerId server_id;
+     bssl::UniquePtr<SSL_SESSION> sessions[2];
+     std::unique_ptr<TransportParameters> params;
+     std::unique_ptr<ApplicationState> application_state;
+@@ -80,6 +86,9 @@
+                             const TransportParameters& params,
+                             const ApplicationState* application_state);
+ 
++  struct Admission;
++  class ConnectionView;
++  std::map<std::string, std::weak_ptr<Admission>> connections_;
+   QuicLRUCache<std::string, Entry, absl::Hash<std::string>> cache_;
+ };
+ 
+--- a/net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache.cc
+@@ -42,7 +42,80 @@
+ QuicClientSessionCache::QuicClientSessionCache(size_t max_entries)
+     : cache_(max_entries) {}
+ 
+-QuicClientSessionCache::~QuicClientSessionCache() { Clear(); }
++struct QuicClientSessionCache::Admission {
++  Admission(QuicClientSessionCache* owner, const QuicServerId& id)
++      : cache(owner), server(id) {}
++  Admission(const Admission&) = delete;
++  Admission& operator=(const Admission&) = delete;
++  QuicClientSessionCache* cache;
++  const QuicServerId server;
++};
++
++class QuicClientSessionCache::ConnectionView final
++    : public SessionCache::ConnectionState {
++ public:
++  explicit ConnectionView(std::shared_ptr<Admission> admission)
++      : admission_(std::move(admission)) {}
++  void Insert(bssl::UniquePtr<SSL_SESSION> session,
++              const TransportParameters& params,
++              const ApplicationState* application_state) override {
++    if (admission_->cache)
++      admission_->cache->Insert(admission_->server, std::move(session), params,
++                                application_state);
++  }
++  std::unique_ptr<QuicResumptionState> Lookup(
++      QuicWallTime now, const SSL_CTX* ctx) override {
++    return admission_->cache
++        ? admission_->cache->Lookup(admission_->server, now, ctx) : nullptr;
++  }
++  void ClearEarlyData() override {
++    if (admission_->cache)
++      admission_->cache->ClearEarlyData(admission_->server);
++  }
++  void OnNewTokenReceived(absl::string_view token) override {
++    if (admission_->cache)
++      admission_->cache->OnNewTokenReceived(admission_->server, token);
++  }
++ private:
++  const std::shared_ptr<Admission> admission_;
++};
++
++std::unique_ptr<SessionCache::ConnectionState>
++QuicClientSessionCache::CreateConnectionState(const QuicServerId& server_id) {
++  for (auto it=connections_.begin();it!=connections_.end();) {
++    if (it->second.expired()) it=connections_.erase(it); else ++it;
++  }
++  auto& registered=connections_[server_id.cache_key()];
++  auto admission=registered.lock();
++  if (!admission || !admission->cache) {
++    admission=std::make_shared<Admission>(this,server_id);
++    registered=admission;
++  }
++  return std::make_unique<ConnectionView>(std::move(admission));
++}
++
++void QuicClientSessionCache::RetireMatching(
++    const QuicCryptoClientConfig::ServerIdFilter& filter) {
++  // Close original access before releasing tickets or their associated state.
++  for (auto it=connections_.begin();it!=connections_.end();) {
++    auto admission=it->second.lock();
++    if (!admission || filter.Matches(admission->server)) {
++      if (admission) admission->cache=nullptr;
++      it=connections_.erase(it);
++    } else ++it;
++  }
++  for (auto it=cache_.begin();it!=cache_.end();) {
++    if (filter.Matches(it->second->server_id)) it=cache_.Erase(it); else ++it;
++  }
++}
++
++QuicClientSessionCache::~QuicClientSessionCache() {
++  for (auto& [key,registered] : connections_) {
++    if (auto admission=registered.lock()) admission->cache=nullptr;
++  }
++  connections_.clear();
++  Clear();
++}
+ 
+ void QuicClientSessionCache::Insert(const QuicServerId& server_id,
+                                     bssl::UniquePtr<SSL_SESSION> session,
+@@ -148,7 +221,7 @@
+     const QuicServerId& server_id, bssl::UniquePtr<SSL_SESSION> session,
+     const TransportParameters& params,
+     const ApplicationState* application_state) {
+-  auto entry = std::make_unique<Entry>();
++  auto entry = std::make_unique<Entry>(server_id);
+   entry->PushSession(std::move(session));
+   entry->params = std::make_unique<TransportParameters>(params);
+   if (application_state) {
+@@ -158,7 +231,8 @@
+   cache_.Insert(server_id.cache_key(), std::move(entry));
+ }
+ 
+-QuicClientSessionCache::Entry::Entry() = default;
++QuicClientSessionCache::Entry::Entry(const QuicServerId& server)
++    : server_id(server) {}
+ QuicClientSessionCache::Entry::Entry(Entry&&) = default;
+ QuicClientSessionCache::Entry::~Entry() = default;
+ 
+--- a/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker.h
++++ b/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker.h
+@@ -147,9 +147,9 @@
+   // certificate verification.
+   QuicCryptoClientStream::ProofHandler* proof_handler_;
+ 
+-  // Used for session resumption. |session_cache_| is owned by the
+-  // QuicCryptoClientConfig passed into TlsClientHandshaker's constructor.
+-  SessionCache* session_cache_;
++  // Original connection access. The root cache belongs to the crypto config;
++  // native retirement revokes this view, including delayed ticket/token work.
++  std::unique_ptr<SessionCache::ConnectionState> session_cache_;
+ 
+   std::string user_agent_id_;
+ 
+--- a/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker.cc
+@@ -56,7 +56,9 @@
+       proof_verifier_(crypto_config->proof_verifier()),
+       verify_context_(std::move(verify_context)),
+       proof_handler_(proof_handler),
+-      session_cache_(crypto_config->session_cache()),
++      session_cache_(crypto_config->session_cache()
++          ? crypto_config->session_cache()->CreateConnectionState(server_id)
++          : nullptr),
+       user_agent_id_(crypto_config->user_agent_id()),
+       pre_shared_key_(crypto_config->pre_shared_key()),
+       crypto_negotiated_params_(new QuicCryptoNegotiatedParameters),
+@@ -150,7 +152,7 @@
+   // Set a session to resume, if there is one.
+   if (session_cache_) {
+     cached_state_ = session_cache_->Lookup(
+-        server_id_, session()->GetClock()->WallNow(), SSL_get_SSL_CTX(ssl()));
++        session()->GetClock()->WallNow(), SSL_get_SSL_CTX(ssl()));
+   }
+   session_cache_lookup_done_ = true;
+   if (cached_state_) {
+@@ -545,7 +547,7 @@
+     return;
+   }
+   if (session_cache_ != nullptr) {
+-    session_cache_->OnNewTokenReceived(server_id_, token);
++    session_cache_->OnNewTokenReceived(token);
+   }
+ }
+ 
+@@ -715,7 +717,7 @@
+   encryption_established_ = false;
+   handshaker_delegate()->OnZeroRttRejected(EarlyDataReason());
+   SSL_reset_early_data_reject(ssl());
+-  session_cache_->ClearEarlyData(server_id_);
++  session_cache_->ClearEarlyData();
+   AdvanceHandshake();
+ }
+ 
+@@ -736,7 +738,7 @@
+     cached_tls_sessions_[0] = std::move(session);
+     return;
+   }
+-  session_cache_->Insert(server_id_, std::move(session),
++  session_cache_->Insert( std::move(session),
+                          *received_transport_params_,
+                          received_application_state_.get());
+ }
+@@ -784,11 +786,11 @@
+   if (session_cache_ != nullptr && cached_tls_sessions_[0] != nullptr) {
+     if (cached_tls_sessions_[1] != nullptr) {
+       // Insert the older session first.
+-      session_cache_->Insert(server_id_, std::move(cached_tls_sessions_[1]),
++      session_cache_->Insert( std::move(cached_tls_sessions_[1]),
+                              *received_transport_params_,
+                              received_application_state_.get());
+     }
+-    session_cache_->Insert(server_id_, std::move(cached_tls_sessions_[0]),
++    session_cache_->Insert( std::move(cached_tls_sessions_[0]),
+                            *received_transport_params_,
+                            received_application_state_.get());
+   }

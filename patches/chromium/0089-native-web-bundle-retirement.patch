@@ -1,0 +1,1101 @@
+--- a/services/network/web_bundle/web_bundle_manager.h
++++ b/services/network/web_bundle/web_bundle_manager.h
+@@ -7,6 +7,8 @@
+ 
+ #include <map>
+ #include <optional>
++#include <set>
++#include "base/containers/unique_ptr_adapters.h"
+ 
+ #include "base/component_export.h"
+ #include "base/memory/weak_ptr.h"
+@@ -29,6 +31,9 @@
+  public:
+   WebBundleManager();
+   ~WebBundleManager();
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      base::OnceClosure done);
+ 
+   WebBundleManager(const WebBundleManager&) = delete;
+   WebBundleManager& operator=(const WebBundleManager&) = delete;
+@@ -39,14 +44,16 @@
+       int32_t process_id,
+       const CrossOriginEmbedderPolicy& cross_origin_embedder_policy,
+       mojo::PendingRemote<mojom::CrossOriginEmbedderPolicyReporter>
+-          coep_reporter);
++          coep_reporter,
++      const net::IsolationInfo& isolation_info = net::IsolationInfo());
+ 
+   void StartSubresourceRequest(
+       mojo::PendingReceiver<mojom::URLLoader> receiver,
+       const ResourceRequest& url_request,
+       mojo::PendingRemote<mojom::URLLoaderClient> client,
+       int32_t process_id,
+-      mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client);
++      mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client,
++      const net::IsolationInfo& isolation_info = net::IsolationInfo());
+ 
+  private:
+   friend class WebBundleManagerTest;
+@@ -61,7 +68,9 @@
+   base::WeakPtr<WebBundleURLLoaderFactory> GetWebBundleURLLoaderFactory(
+       const Key& key);
+ 
+-  void DisconnectHandler(Key key);
++  void DisconnectHandler(Key key,
++                         base::WeakPtr<WebBundleURLLoaderFactory> expected);
++  void DestroyRetiringFactory(WebBundleURLLoaderFactory* expected);
+ 
+   bool AllocateMemoryForProcess(int32_t process_id, uint64_t num_bytes);
+   void ReleaseMemoryForProcess(int32_t process_id, uint64_t num_bytes);
+@@ -78,6 +87,9 @@
+   }
+ 
+   std::map<Key, std::unique_ptr<WebBundleURLLoaderFactory>> factories_;
++  std::set<std::unique_ptr<WebBundleURLLoaderFactory>,
++           base::UniquePtrComparator>
++      retiring_factories_;
+   // Pending subresource loaders for each key, which should be processed when
+   // a request for the bundle arrives later.
+   std::map<Key,
+--- a/services/network/web_bundle/web_bundle_manager.cc
++++ b/services/network/web_bundle/web_bundle_manager.cc
+@@ -6,9 +6,11 @@
+ 
+ #include <algorithm>
+ 
++#include "base/barrier_closure.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/metrics/histogram_functions.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "components/web_package/web_bundle_utils.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -52,7 +54,78 @@
+ WebBundleManager::WebBundleManager()
+     : max_memory_per_process_(web_package::kDefaultMaxMemoryPerProcess) {}
+ 
+-WebBundleManager::~WebBundleManager() = default;
++WebBundleManager::~WebBundleManager() {
++  weak_ptr_factory_.InvalidateWeakPtrs();
++  auto pending = std::move(pending_loaders_);
++  pending_loaders_.clear();
++  for (auto& [key, loaders] : pending)
++    for (auto& loader : loaders)
++      WebBundleURLLoaderFactory::CancelLoader(loader, net::ERR_FAILED);
++  factories_.clear();
++  retiring_factories_.clear();
++}
++base::OnceClosure WebBundleManager::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    base::OnceClosure done) {
++  for (auto it = factories_.begin(); it != factories_.end();) {
++    if (it->second->MatchesNetworkOwner(matches)) {
++      retiring_factories_.insert(std::move(it->second));
++      it = factories_.erase(it);
++    } else
++      ++it;
++  }
++  std::vector<base::WeakPtr<WebBundleURLLoaderFactory::URLLoader>> pending;
++  for (const auto& [key, loaders] : pending_loaders_)
++    for (const auto& loader : loaders)
++      if (WebBundleURLLoaderFactory::LoaderMatchesNetworkOwner(loader, matches))
++        pending.push_back(loader);
++  auto drained = base::BarrierClosure(
++      factories_.size() + retiring_factories_.size() + pending.size() + 1,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::OnceClosure> prepared;
++  for (const auto& [key, factory] : factories_)
++    prepared.push_back(
++        factory->PrepareNetworkRetirement(matches, false, drained));
++  std::vector<base::WeakPtr<WebBundleURLLoaderFactory>> retiring;
++  for (const auto& factory : retiring_factories_) {
++    prepared.push_back(
++        factory->PrepareNetworkRetirement(matches, true, drained));
++    retiring.push_back(factory->GetLifetimeView());
++  }
++  std::vector<base::WeakPtr<WebBundleURLLoaderFactory::URLLoader>> originals;
++  for (const auto& loader : pending)
++    originals.push_back(
++        WebBundleURLLoaderFactory::PrepareLoaderNetworkRetirement(loader,
++                                                                  drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](base::WeakPtr<WebBundleManager> manager,
++         std::vector<base::OnceClosure> prepared,
++         std::vector<base::WeakPtr<WebBundleURLLoaderFactory::URLLoader>>
++             originals,
++         std::vector<base::WeakPtr<WebBundleURLLoaderFactory>> retiring,
++         base::ScopedClosureRunner finish) {
++        for (auto& loader : originals)
++          WebBundleURLLoaderFactory::CancelLoader(loader, net::ERR_ABORTED);
++        for (auto& commit : prepared)
++          std::move(commit).Run();
++        for (auto& factory : retiring)
++          if (factory && manager)
++            manager->DestroyRetiringFactory(factory.get());
++      },
++      weak_ptr_factory_.GetWeakPtr(), std::move(prepared), std::move(originals),
++      std::move(retiring), base::ScopedClosureRunner(drained)));
++}
++void WebBundleManager::DestroyRetiringFactory(
++    WebBundleURLLoaderFactory* expected) {
++  auto it = retiring_factories_.find(expected);
++  if (it != retiring_factories_.end())
++    retiring_factories_.erase(it);
++}
+ 
+ base::WeakPtr<WebBundleURLLoaderFactory>
+ WebBundleManager::CreateWebBundleURLLoaderFactory(
+@@ -60,8 +133,8 @@
+     const ResourceRequest::WebBundleTokenParams& web_bundle_token_params,
+     int32_t process_id,
+     const CrossOriginEmbedderPolicy& cross_origin_embedder_policy,
+-    mojo::PendingRemote<mojom::CrossOriginEmbedderPolicyReporter>
+-        coep_reporter) {
++    mojo::PendingRemote<mojom::CrossOriginEmbedderPolicyReporter> coep_reporter,
++    const net::IsolationInfo& isolation_info) {
+   Key key = GetKey(web_bundle_token_params, process_id);
+   DCHECK(factories_.find(key) == factories_.end());
+   DCHECK(web_bundle_token_params.handle.is_valid());
+@@ -73,16 +146,16 @@
+   // Set a disconnect handler to remove a WebBundleURLLoaderFactory from this
+   // WebBundleManager when the corresponding endpoint in the renderer is
+   // removed.
+-  remote.set_disconnect_handler(
+-      base::BindOnce(&WebBundleManager::DisconnectHandler,
+-                     // |this| outlives |remote|.
+-                     base::Unretained(this), key));
++  // Install identity-bound cleanup after constructing the native factory.
+ 
+   auto factory = std::make_unique<WebBundleURLLoaderFactory>(
+       bundle_url, web_bundle_token_params, std::move(remote),
+       std::make_unique<MemoryQuotaConsumer>(weak_ptr_factory_.GetWeakPtr(),
+                                             process_id),
+-      cross_origin_embedder_policy, std::move(coep_reporter));
++      cross_origin_embedder_policy, std::move(coep_reporter), isolation_info);
++  factory->SetDisconnectHandler(base::BindOnce(
++      &WebBundleManager::DisconnectHandler, weak_ptr_factory_.GetWeakPtr(), key,
++      factory->GetLifetimeView()));
+ 
+   // Process pending subresource loaders if there are.
+   // These subresource requests arrived earlier than the request for the bundle.
+@@ -130,7 +203,8 @@
+     const ResourceRequest& url_request,
+     mojo::PendingRemote<mojom::URLLoaderClient> client,
+     int32_t process_id,
+-    mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client) {
++    mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client,
++    const net::IsolationInfo& isolation_info) {
+   DCHECK(url_request.web_bundle_token_params.has_value());
+   DCHECK(!url_request.web_bundle_token_params->handle.is_valid());
+ 
+@@ -143,7 +217,7 @@
+     auto loader = WebBundleURLLoaderFactory::CreateURLLoader(
+         std::move(receiver), url_request, std::move(client),
+         std::move(trusted_header_client), request_start_time,
+-        request_start_time_ticks, base::DoNothing());
++        request_start_time_ticks, base::DoNothing(), isolation_info);
+     web_bundle_url_loader_factory->StartLoader(loader);
+     return;
+   }
+@@ -154,7 +228,8 @@
+       std::move(trusted_header_client), request_start_time,
+       request_start_time_ticks,
+       base::BindOnce(&WebBundleManager::CleanUpWillBeDeletedURLLoader,
+-                     weak_ptr_factory_.GetWeakPtr(), key)));
++                     weak_ptr_factory_.GetWeakPtr(), key),
++      isolation_info));
+ }
+ 
+ void WebBundleManager::CleanUpWillBeDeletedURLLoader(
+@@ -182,9 +257,13 @@
+   }
+ }
+ 
+-void WebBundleManager::DisconnectHandler(Key key) {
+-  factories_.erase(key);
+-  DCHECK(!pending_loaders_.contains(key));
++void WebBundleManager::DisconnectHandler(
++    Key key,
++    base::WeakPtr<WebBundleURLLoaderFactory> expected) {
++  auto it = factories_.find(key);
++  if (!expected || it == factories_.end() || it->second.get() != expected.get())
++    return;
++  factories_.erase(it);
+ }
+ 
+ bool WebBundleManager::AllocateMemoryForProcess(int32_t process_id,
+--- a/services/network/web_bundle/web_bundle_url_loader_factory.h
++++ b/services/network/web_bundle/web_bundle_url_loader_factory.h
+@@ -5,8 +5,11 @@
+ #ifndef SERVICES_NETWORK_WEB_BUNDLE_WEB_BUNDLE_URL_LOADER_FACTORY_H_
+ #define SERVICES_NETWORK_WEB_BUNDLE_WEB_BUNDLE_URL_LOADER_FACTORY_H_
+ 
++#include <map>
+ #include <optional>
+ #include <vector>
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "services/network/native_network_retirement.h"
+ 
+ #include "base/component_export.h"
+ #include "base/memory/weak_ptr.h"
+@@ -46,13 +49,34 @@
+           web_bundle_memory_quota_consumer,
+       const CrossOriginEmbedderPolicy& cross_origin_embedder_policy,
+       mojo::PendingRemote<mojom::CrossOriginEmbedderPolicyReporter>
+-          coep_reporter);
++          coep_reporter,
++      const net::IsolationInfo& isolation_info = net::IsolationInfo());
+   ~WebBundleURLLoaderFactory();
+   WebBundleURLLoaderFactory(const WebBundleURLLoaderFactory&) = delete;
+   WebBundleURLLoaderFactory& operator=(const WebBundleURLLoaderFactory&) =
+       delete;
+ 
+   base::WeakPtr<WebBundleURLLoaderFactory> GetWeakPtr();
++  base::WeakPtr<WebBundleURLLoaderFactory> GetLifetimeView() {
++    return retirement_weak_factory_.GetWeakPtr();
++  }
++  void SetDisconnectHandler(base::OnceClosure handler) {
++    web_bundle_handle_.set_disconnect_handler(std::move(handler));
++  }
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const;
++  base::OnceClosure PrepareNetworkRetirement(
++      const NativeNetworkOwnerMatcher& matches,
++      bool retire_factory,
++      base::OnceClosure done);
++  void RevokeNetworkState();
++  static bool LoaderMatchesNetworkOwner(
++      const base::WeakPtr<URLLoader>& loader,
++      const NativeNetworkOwnerMatcher& matches);
++  static base::WeakPtr<URLLoader> PrepareLoaderNetworkRetirement(
++      const base::WeakPtr<URLLoader>& loader,
++      const base::RepeatingClosure& done);
++  static void CancelLoader(const base::WeakPtr<URLLoader>& loader,
++                           net::Error error);
+ 
+   void SetBundleStream(mojo::ScopedDataPipeConsumerHandle body);
+   void ReportErrorAndCancelPendingLoaders(SubresourceWebBundleLoadResult result,
+@@ -68,7 +92,8 @@
+       mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client,
+       base::Time request_start_time,
+       base::TimeTicks request_start_time_ticks,
+-      base::OnceCallback<void(URLLoader*)> will_be_deleted_callback);
++      base::OnceCallback<void(URLLoader*)> will_be_deleted_callback,
++      const net::IsolationInfo& isolation_info = net::IsolationInfo());
+ 
+   void StartLoader(base::WeakPtr<URLLoader> loader);
+   void OnWebBundleFetchFailed();
+@@ -109,6 +134,14 @@
+   void OnDataCompleted();
+   void MaybeReportLoadResult(SubresourceWebBundleLoadResult result);
+ 
++  NativeNetworkRetirement native_retirement_;
++  const net::IsolationInfo isolation_info_;
++  std::map<URLLoader*, base::WeakPtr<URLLoader>> active_loaders_;
++  mojo::SelfOwnedReceiverRef<web_package::mojom::WebBundleParser>
++      parser_receiver_;
++  std::vector<mojo::SelfOwnedReceiverRef<mojom::URLLoaderClient>>
++      client_receivers_;
++  void CloseParserAndClients();
+   GURL bundle_url_;
+   mojo::Remote<mojom::WebBundleHandle> web_bundle_handle_;
+   const std::optional<::url::Origin> request_initiator_origin_lock_;
+@@ -125,6 +158,8 @@
+   std::vector<base::WeakPtr<URLLoader>> pending_loaders_;
+   orb::PerFactoryState orb_state_;
+   base::WeakPtrFactory<WebBundleURLLoaderFactory> weak_ptr_factory_{this};
++  base::WeakPtrFactory<WebBundleURLLoaderFactory> retirement_weak_factory_{
++      this};
+ };
+ 
+ }  // namespace network
+--- a/services/network/web_bundle/web_bundle_url_loader_factory.cc
++++ b/services/network/web_bundle/web_bundle_url_loader_factory.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/web_bundle/web_bundle_url_loader_factory.h"
++
++#include "base/barrier_closure.h"
++#include "base/task/single_thread_task_runner.h"
+ 
+ #include <algorithm>
+ #include <optional>
+@@ -44,13 +47,6 @@
+ 
+ constexpr size_t kBlockedBodyAllocationSize = 1;
+ 
+-void DeleteProducerAndRunCallback(
+-    std::unique_ptr<mojo::DataPipeProducer> producer,
+-    base::OnceCallback<void(MojoResult result)> callback,
+-    MojoResult result) {
+-  std::move(callback).Run(result);
+-}
+-
+ // Verify the serving constraints of Web Bundle HTTP responses.
+ // https://wicg.github.io/webpackage/draft-yasskin-wpack-bundled-exchanges.html#name-serving-constraints
+ bool CheckWebBundleServingConstraints(
+@@ -80,8 +76,9 @@
+  public:
+   WebBundleURLLoaderClient(
+       base::WeakPtr<WebBundleURLLoaderFactory> factory,
+-      mojo::PendingRemote<network::mojom::URLLoaderClient> wrapped)
+-      : factory_(factory), wrapped_(std::move(wrapped)) {}
++      mojo::PendingRemote<network::mojom::URLLoaderClient> wrapped,
++      NativeNetworkRetirement::Lifetime lifetime)
++      : factory_(factory), lifetime_(lifetime), wrapped_(std::move(wrapped)) {}
+ 
+  private:
+   mojo::ScopedDataPipeConsumerHandle HandleReceiveBody(
+@@ -110,6 +107,10 @@
+ 
+   // network::mojom::URLLoaderClient implementation:
+   void OnReceiveEarlyHints(network::mojom::EarlyHintsPtr early_hints) override {
++    auto lifetime = lifetime_.lock();
++    if (!AllowOriginal())
++      return;
++
+     wrapped_->OnReceiveEarlyHints(std::move(early_hints));
+   }
+ 
+@@ -117,6 +118,10 @@
+       network::mojom::URLResponseHeadPtr response_head,
+       mojo::ScopedDataPipeConsumerHandle body,
+       std::optional<mojo_base::BigBuffer> cached_metadata) override {
++    auto lifetime = lifetime_.lock();
++    if (!AllowOriginal())
++      return;
++
+     std::string error_message;
+     if (!CheckWebBundleServingConstraints(*response_head, error_message)) {
+       if (factory_) {
+@@ -142,6 +147,10 @@
+   void OnReceiveRedirect(
+       const net::RedirectInfo& redirect_info,
+       network::mojom::URLResponseHeadPtr response_head) override {
++    auto lifetime = lifetime_.lock();
++    if (!AllowOriginal())
++      return;
++
+     // TODO(crbug.com/40786524): Support redirection for WebBundle requests.
+     if (factory_) {
+       factory_->ReportErrorAndCancelPendingLoaders(
+@@ -159,11 +168,19 @@
+   void OnUploadProgress(int64_t current_position,
+                         int64_t total_size,
+                         OnUploadProgressCallback ack_callback) override {
++    auto lifetime = lifetime_.lock();
++    if (!AllowOriginal())
++      return;
++
+     wrapped_->OnUploadProgress(current_position, total_size,
+                                std::move(ack_callback));
+   }
+ 
+   void OnTransferSizeUpdated(int32_t transfer_size_diff) override {
++    auto lifetime = lifetime_.lock();
++    if (!AllowOriginal())
++      return;
++
+     network::RecordOnTransferSizeUpdatedUMA(
+         network::OnTransferSizeUpdatedFrom::kWebBundleURLLoaderClient);
+ 
+@@ -171,6 +188,10 @@
+   }
+ 
+   void OnComplete(const network::URLLoaderCompletionStatus& status) override {
++    auto lifetime = lifetime_.lock();
++    if (!AllowOriginal())
++      return;
++
+     if (status.error_code != net::OK) {
+       if (factory_)
+         factory_->OnWebBundleFetchFailed();
+@@ -183,6 +204,16 @@
+   }
+ 
+   base::WeakPtr<WebBundleURLLoaderFactory> factory_;
++  std::weak_ptr<std::vector<base::ScopedClosureRunner>> lifetime_;
++  bool AllowOriginal() {
++    if (factory_)
++      return true;
++    if (!completed_ && wrapped_)
++      wrapped_->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++    completed_ = true;
++    wrapped_.reset();
++    return false;
++  }
+   mojo::Remote<network::mojom::URLLoaderClient> wrapped_;
+   bool completed_ = false;
+ };
+@@ -197,8 +228,10 @@
+             mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client,
+             base::Time request_start_time,
+             base::TimeTicks request_start_time_ticks,
+-            base::OnceCallback<void(URLLoader*)> disconnected_callback)
+-      : url_(request.url),
++            base::OnceCallback<void(URLLoader*)> disconnected_callback,
++            const net::IsolationInfo& isolation_info)
++      : isolation_info_(isolation_info),
++        url_(request.url),
+         bundle_url_(request.web_bundle_token_params->bundle_url),
+         request_mode_(request.mode),
+         request_initiator_(request.request_initiator),
+@@ -224,6 +257,24 @@
+   URLLoader(const URLLoader&) = delete;
+   URLLoader& operator=(const URLLoader&) = delete;
+ 
++  bool MatchesNetworkOwner(const NativeNetworkOwnerMatcher& matches) const {
++    return matches.Run({url_, isolation_info_.network_anonymization_key(),
++                        request_initiator_.value_or(url::Origin()),
++                        &isolation_info_});
++  }
++  bool retired() const { return native_retirement_.retired(); }
++  NativeNetworkRetirement::Lifetime HoldNativeCallback() const {
++    return native_retirement_.HoldCallback();
++  }
++  base::WeakPtr<URLLoader> GetLifetimeView() {
++    return retirement_weak_factory_.GetWeakPtr();
++  }
++  base::WeakPtr<URLLoader> PrepareNetworkRetirement(
++      const base::RepeatingClosure& done) {
++    if (native_retirement_.Prepare(done))
++      weak_ptr_factory_.InvalidateWeakPtrs();
++    return retirement_weak_factory_.GetWeakPtr();
++  }
+   const GURL& url() const { return url_; }
+   const GURL& bundle_url() const { return bundle_url_; }
+   const mojom::RequestMode& request_mode() const { return request_mode_; }
+@@ -244,22 +295,34 @@
+   }
+ 
+   void deleteThis() {
++    auto lifetime = native_retirement_.HoldCallback();
+     std::move(will_be_deleted_callback_).Run(this);
+     delete this;
+   }
+ 
+   void OnResponse(mojom::URLResponseHeadPtr response,
+                   mojo::ScopedDataPipeConsumerHandle consumer) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     client_->OnReceiveResponse(std::move(response), std::move(consumer),
+                                std::nullopt);
+   }
+ 
+   void OnFail(net::Error error) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      error = net::ERR_ABORTED;
+     client_->OnComplete(URLLoaderCompletionStatus(error));
+     deleteThis();
+   }
+ 
+   void OnWriteCompleted(MojoResult result) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     URLLoaderCompletionStatus status(
+         result == MOJO_RESULT_OK ? net::OK : net::ERR_INVALID_WEB_BUNDLE);
+     status.encoded_data_length =
+@@ -273,6 +336,10 @@
+   }
+ 
+   void BlockResponseForOrb(mojom::URLResponseHeadPtr response_head) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     // A minimum implementation to block ORB-protected resources.
+     //
+     // TODO(crbug.com/40130781): Re-use
+@@ -301,6 +368,10 @@
+   void CompleteBlockedResponse(
+       int error_code,
+       std::optional<mojom::BlockedByResponseReason> reason) {
++    auto lifetime = native_retirement_.HoldCallback();
++    if (native_retirement_.retired())
++      return;
++
+     URLLoaderCompletionStatus status;
+     status.error_code = error_code;
+     status.completion_time = base::TimeTicks::Now();
+@@ -321,6 +392,9 @@
+   }
+ 
+   net::LoadTimingInfo load_timing() { return load_timing_; }
++  void SetBodyCancellation(base::OnceClosure cancel) {
++    cancel_body_.ReplaceClosure(std::move(cancel));
++  }
+   void SetBodyLength(uint64_t body_length) { body_length_ = body_length; }
+   void SetHeadersBytes(size_t headers_bytes) { headers_bytes_ = headers_bytes; }
+   void SetResponseStartTime(base::TimeTicks response_start_time) {
+@@ -343,6 +417,9 @@
+ 
+   void OnMojoDisconnect() { deleteThis(); }
+ 
++  NativeNetworkRetirement native_retirement_;
++  base::ScopedClosureRunner cancel_body_;
++  const net::IsolationInfo isolation_info_;
+   const GURL url_;
+   const GURL bundle_url_;
+   mojom::RequestMode request_mode_;
+@@ -361,6 +438,7 @@
+   base::TimeTicks response_start_time_;
+   base::OnceCallback<void(URLLoader*)> will_be_deleted_callback_;
+   base::WeakPtrFactory<URLLoader> weak_ptr_factory_{this};
++  base::WeakPtrFactory<URLLoader> retirement_weak_factory_{this};
+ };
+ 
+ class WebBundleURLLoaderFactory::BundleDataSource
+@@ -375,8 +453,10 @@
+                    std::unique_ptr<WebBundleMemoryQuotaConsumer>
+                        web_bundle_memory_quota_consumer,
+                    base::OnceClosure memory_quota_exceeded_closure,
+-                   base::OnceClosure data_completed_closure)
+-      : data_source_receiver_(this, std::move(data_source_receiver)),
++                   base::OnceClosure data_completed_closure,
++                   NativeNetworkRetirement::Lifetime lifetime)
++      : retirement_lifetime_(std::move(lifetime)),
++        data_source_receiver_(this, std::move(data_source_receiver)),
+         pipe_drainer_(
+             std::make_unique<mojo::DataPipeDrainer>(this,
+                                                     std::move(bundle_body))),
+@@ -395,15 +475,28 @@
+   BundleDataSource(const BundleDataSource&) = delete;
+   BundleDataSource& operator=(const BundleDataSource&) = delete;
+ 
+-  void ReadToDataPipe(mojo::ScopedDataPipeProducerHandle producer,
++  void ReadToDataPipe(base::WeakPtr<URLLoader> loader,
++                      mojo::ScopedDataPipeProducerHandle producer,
+                       uint64_t offset,
+                       uint64_t length,
+                       ReadToDataPipeCallback callback) {
++    auto id = next_writer_++;
++    loader->SetBodyCancellation(base::BindOnce(&BundleDataSource::CancelWrite,
++                                               weak_factory_.GetWeakPtr(), id));
++    StartReadToDataPipe(id, std::move(producer), offset, length,
++                        std::move(callback));
++  }
++  void StartReadToDataPipe(uint64_t id,
++                           mojo::ScopedDataPipeProducerHandle producer,
++                           uint64_t offset,
++                           uint64_t length,
++                           ReadToDataPipeCallback callback) {
+     TRACE_EVENT0("loading", "BundleDataSource::ReadToDataPipe");
+     if (!finished_loading_ && !buffer_.ContainsAll(offset, length)) {
+       // Current implementation does not support progressive loading of inner
+       // response body.
+       PendingReadToDataPipe pending;
++      pending.id = id;
+       pending.producer = std::move(producer);
+       pending.offset = offset;
+       pending.length = length;
+@@ -421,10 +514,19 @@
+     }
+ 
+     auto writer = std::make_unique<mojo::DataPipeProducer>(std::move(producer));
+-    mojo::DataPipeProducer* raw_writer = writer.get();
+-    raw_writer->Write(std::move(data_source),
+-                      base::BindOnce(&DeleteProducerAndRunCallback,
+-                                     std::move(writer), std::move(callback)));
++    auto* raw = writer.get();
++    writers_.emplace(id, std::move(writer));
++    raw->Write(std::move(data_source),
++               base::BindOnce(
++                   [](NativeNetworkRetirement::Lifetime lifetime,
++                      base::WeakPtr<BundleDataSource> source, uint64_t id,
++                      ReadToDataPipeCallback callback, MojoResult result) {
++                     if (source)
++                       source->OnWriterComplete(id, std::move(callback),
++                                                result);
++                   },
++                   retirement_lifetime_, weak_factory_.GetWeakPtr(), id,
++                   std::move(callback)));
+   }
+ 
+   // Implements mojom::BundleDataSource.
+@@ -488,6 +590,20 @@
+   }
+ 
+  private:
++  void OnWriterComplete(uint64_t id,
++                        ReadToDataPipeCallback callback,
++                        MojoResult result) {
++    auto lifetime = retirement_lifetime_;
++    auto node = writers_.extract(id);
++    CHECK(!node.empty());
++    auto writer = std::move(node.mapped());
++    std::move(callback).Run(result);
++  }
++  void CancelWrite(uint64_t id) {
++    writers_.erase(id);
++    std::erase_if(pending_reads_to_data_pipe_,
++                  [id](const auto& pending) { return pending.id == id; });
++  }
+   void ProcessPendingReads() {
+     std::vector<PendingRead> pendings(std::move(pending_reads_));
+     std::vector<PendingReadToDataPipe> pipe_pendings(
+@@ -498,8 +614,9 @@
+     }
+ 
+     for (auto& pending : pipe_pendings) {
+-      ReadToDataPipe(std::move(pending.producer), pending.offset,
+-                     pending.length, std::move(pending.callback));
++      StartReadToDataPipe(pending.id, std::move(pending.producer),
++                          pending.offset, pending.length,
++                          std::move(pending.callback));
+     }
+   }
+ 
+@@ -522,12 +639,16 @@
+     ReadCallback callback;
+   };
+   struct PendingReadToDataPipe {
++    uint64_t id;
+     mojo::ScopedDataPipeProducerHandle producer;
+     uint64_t offset;
+     uint64_t length;
+     ReadToDataPipeCallback callback;
+   };
+ 
++  NativeNetworkRetirement::Lifetime retirement_lifetime_;
++  std::map<uint64_t, std::unique_ptr<mojo::DataPipeProducer>> writers_;
++  uint64_t next_writer_ = 0;
+   mojo::Receiver<web_package::mojom::BundleDataSource> data_source_receiver_;
+   WebBundleChunkedBuffer buffer_;
+   std::vector<PendingRead> pending_reads_;
+@@ -538,6 +659,7 @@
+       web_bundle_memory_quota_consumer_;
+   base::OnceClosure memory_quota_exceeded_closure_;
+   base::OnceClosure data_completed_closure_;
++  base::WeakPtrFactory<BundleDataSource> weak_factory_{this};
+ };
+ 
+ WebBundleURLLoaderFactory::WebBundleURLLoaderFactory(
+@@ -547,8 +669,10 @@
+     std::unique_ptr<WebBundleMemoryQuotaConsumer>
+         web_bundle_memory_quota_consumer,
+     const CrossOriginEmbedderPolicy& cross_origin_embedder_policy,
+-    mojo::PendingRemote<mojom::CrossOriginEmbedderPolicyReporter> coep_reporter)
+-    : bundle_url_(bundle_url),
++    mojo::PendingRemote<mojom::CrossOriginEmbedderPolicyReporter> coep_reporter,
++    const net::IsolationInfo& isolation_info)
++    : isolation_info_(isolation_info),
++      bundle_url_(bundle_url),
+       web_bundle_handle_(std::move(web_bundle_handle)),
+       web_bundle_memory_quota_consumer_(
+           std::move(web_bundle_memory_quota_consumer)),
+@@ -568,6 +692,13 @@
+ }
+ 
+ WebBundleURLLoaderFactory::~WebBundleURLLoaderFactory() {
++  weak_ptr_factory_.InvalidateWeakPtrs();
++  retirement_weak_factory_.InvalidateWeakPtrs();
++  auto originals = std::move(active_loaders_);
++  for (auto& [pointer, loader] : originals)
++    if (loader)
++      loader->OnFail(net::ERR_FAILED);
++  CloseParserAndClients();
+   for (auto loader : pending_loaders_) {
+     if (loader)
+       loader->OnFail(net::ERR_FAILED);
+@@ -579,6 +710,87 @@
+   return weak_ptr_factory_.GetWeakPtr();
+ }
+ 
++bool WebBundleURLLoaderFactory::MatchesNetworkOwner(
++    const NativeNetworkOwnerMatcher& matches) const {
++  return matches.Run({bundle_url_, isolation_info_.network_anonymization_key(),
++                      isolation_info_.frame_origin().value_or(url::Origin()),
++                      &isolation_info_});
++}
++bool WebBundleURLLoaderFactory::LoaderMatchesNetworkOwner(
++    const base::WeakPtr<URLLoader>& loader,
++    const NativeNetworkOwnerMatcher& matches) {
++  return loader && loader->MatchesNetworkOwner(matches);
++}
++base::WeakPtr<WebBundleURLLoaderFactory::URLLoader>
++WebBundleURLLoaderFactory::PrepareLoaderNetworkRetirement(
++    const base::WeakPtr<URLLoader>& loader,
++    const base::RepeatingClosure& done) {
++  return loader->PrepareNetworkRetirement(done);
++}
++void WebBundleURLLoaderFactory::CancelLoader(
++    const base::WeakPtr<URLLoader>& loader,
++    net::Error error) {
++  if (loader)
++    loader->OnFail(error);
++}
++base::OnceClosure WebBundleURLLoaderFactory::PrepareNetworkRetirement(
++    const NativeNetworkOwnerMatcher& matches,
++    bool retire_factory,
++    base::OnceClosure done) {
++  std::erase_if(active_loaders_, [](const auto& item) { return !item.second; });
++  std::vector<base::WeakPtr<URLLoader>> selected;
++  for (const auto& [pointer, loader] : active_loaders_)
++    if (loader && (retire_factory || loader->MatchesNetworkOwner(matches)))
++      selected.push_back(loader);
++  auto drained = base::BarrierClosure(
++      selected.size() + 1 + (retire_factory ? 1 : 0),
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  if (retire_factory && native_retirement_.Prepare(drained))
++    weak_ptr_factory_.InvalidateWeakPtrs();
++  std::vector<base::WeakPtr<URLLoader>> originals;
++  for (auto& loader : selected)
++    originals.push_back(loader->PrepareNetworkRetirement(drained));
++  return CommitNetworkRetirementOnDrop(base::BindOnce(
++      [](base::WeakPtr<WebBundleURLLoaderFactory> factory, bool retire_factory,
++         std::vector<base::WeakPtr<URLLoader>> originals,
++         base::ScopedClosureRunner finish) {
++        for (auto& loader : originals)
++          if (loader)
++            loader->OnFail(net::ERR_ABORTED);
++        if (factory && retire_factory)
++          factory->RevokeNetworkState();
++      },
++      GetLifetimeView(), retire_factory, std::move(originals),
++      base::ScopedClosureRunner(drained)));
++}
++void WebBundleURLLoaderFactory::RevokeNetworkState() {
++  if (!native_retirement_.BeginRevocation())
++    return;
++  auto lifetime = native_retirement_.HoldCallback();
++  CloseParserAndClients();
++  source_.reset();
++  metadata_.reset();
++  pending_loaders_.clear();
++  web_bundle_handle_.reset();
++}
++void WebBundleURLLoaderFactory::CloseParserAndClients() {
++  if (parser_receiver_)
++    parser_receiver_->Close();
++  parser_.reset();
++  auto clients = std::move(client_receivers_);
++  for (auto& client : clients)
++    if (client) {
++      client->impl()->OnComplete(URLLoaderCompletionStatus(net::ERR_ABORTED));
++      if (client)
++        client->Close();
++    }
++}
++
+ bool WebBundleURLLoaderFactory::HasError() const {
+   return load_result_.has_value() &&
+          *load_result_ != SubresourceWebBundleLoadResult::kSuccess;
+@@ -586,6 +798,10 @@
+ 
+ void WebBundleURLLoaderFactory::SetBundleStream(
+     mojo::ScopedDataPipeConsumerHandle body) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (HasError())
+     return;
+   mojo::PendingRemote<web_package::mojom::BundleDataSource> data_source;
+@@ -595,11 +811,13 @@
+       base::BindOnce(&WebBundleURLLoaderFactory::OnMemoryQuotaExceeded,
+                      weak_ptr_factory_.GetWeakPtr()),
+       base::BindOnce(&WebBundleURLLoaderFactory::OnDataCompleted,
+-                     weak_ptr_factory_.GetWeakPtr()));
+-
+-  mojo::MakeSelfOwnedReceiver(std::make_unique<web_package::WebBundleParser>(
+-                                  std::move(data_source), bundle_url_),
+-                              parser_.BindNewPipeAndPassReceiver());
++                     weak_ptr_factory_.GetWeakPtr()),
++      native_retirement_.HoldCallback());
++
++  parser_receiver_ = mojo::MakeSelfOwnedReceiver(
++      std::make_unique<web_package::WebBundleParser>(std::move(data_source),
++                                                     bundle_url_),
++      parser_.BindNewPipeAndPassReceiver());
+ 
+   parser_->ParseMetadata(
+       /*offset=*/std::nullopt,
+@@ -617,9 +835,12 @@
+   }
+   mojo::PendingRemote<mojom::URLLoaderClient> client;
+   auto client_impl = std::make_unique<WebBundleURLLoaderClient>(
+-      weak_ptr_factory_.GetWeakPtr(), std::move(wrapped));
+-  mojo::MakeSelfOwnedReceiver(std::move(client_impl),
+-                              client.InitWithNewPipeAndPassReceiver());
++      weak_ptr_factory_.GetWeakPtr(), std::move(wrapped),
++      native_retirement_.HoldCallback());
++  std::erase_if(client_receivers_,
++                [](const auto& receiver) { return !receiver; });
++  client_receivers_.push_back(mojo::MakeSelfOwnedReceiver(
++      std::move(client_impl), client.InitWithNewPipeAndPassReceiver()));
+   return client;
+ }
+ 
+@@ -632,15 +853,26 @@
+     mojo::Remote<mojom::TrustedHeaderClient> trusted_header_client,
+     base::Time request_start_time,
+     base::TimeTicks request_start_time_ticks,
+-    base::OnceCallback<void(URLLoader*)> delete_me_cleanup) {
+-  URLLoader* loader =
+-      new URLLoader(std::move(receiver), url_request, std::move(client),
+-                    std::move(trusted_header_client), request_start_time,
+-                    request_start_time_ticks, std::move(delete_me_cleanup));
+-  return loader->GetWeakPtr();
++    base::OnceCallback<void(URLLoader*)> delete_me_cleanup,
++    const net::IsolationInfo& isolation_info) {
++  URLLoader* loader = new URLLoader(
++      std::move(receiver), url_request, std::move(client),
++      std::move(trusted_header_client), request_start_time,
++      request_start_time_ticks, std::move(delete_me_cleanup), isolation_info);
++  return loader->GetLifetimeView();
+ }
+ 
+ void WebBundleURLLoaderFactory::StartLoader(base::WeakPtr<URLLoader> loader) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (!loader)
++    return;
++  if (native_retirement_.retired() || loader->retired()) {
++    loader->OnFail(net::ERR_ABORTED);
++    return;
++  }
++  std::erase_if(active_loaders_, [](const auto& item) { return !item.second; });
++  active_loaders_.insert_or_assign(loader.get(), loader->GetLifetimeView());
++
+   TRACE_EVENT0("loading", "WebBundleURLLoaderFactory::StartLoader");
+ 
+   if (!loader)
+@@ -673,6 +905,10 @@
+     int result,
+     const std::optional<net::HttpRequestHeaders>& headers,
+     std::optional<base::DictValue> extended_net_log_events) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!loader)
+     return;
+   QueueOrStartLoader(loader);
+@@ -680,6 +916,10 @@
+ 
+ void WebBundleURLLoaderFactory::QueueOrStartLoader(
+     base::WeakPtr<URLLoader> loader) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!loader)
+     return;
+   if (HasError()) {
+@@ -694,6 +934,10 @@
+ }
+ 
+ void WebBundleURLLoaderFactory::StartLoad(base::WeakPtr<URLLoader> loader) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(metadata_);
+   if (!loader)
+     return;
+@@ -720,11 +964,12 @@
+   DCHECK_NE(SubresourceWebBundleLoadResult::kSuccess, result);
+   web_bundle_handle_->OnWebBundleError(error, message);
+   MaybeReportLoadResult(result);
+-  auto pending_loaders = std::move(pending_loaders_);
+-  for (auto loader : pending_loaders) {
++  pending_loaders_.clear();
++  auto originals = std::move(active_loaders_);
++  active_loaders_.clear();
++  for (auto& [pointer, loader] : originals)
+     if (loader)
+       loader->OnFail(net::ERR_INVALID_WEB_BUNDLE);
+-  }
+ 
+   source_.reset();
+   parser_.reset();
+@@ -733,6 +978,10 @@
+ void WebBundleURLLoaderFactory::OnMetadataParsed(
+     web_package::mojom::BundleMetadataPtr metadata,
+     web_package::mojom::BundleMetadataParseErrorPtr error) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   TRACE_EVENT0("loading", "WebBundleURLLoaderFactory::OnMetadataParsed");
+   if (error) {
+     ReportErrorAndCancelPendingLoaders(
+@@ -778,6 +1027,10 @@
+     base::WeakPtr<URLLoader> loader,
+     web_package::mojom::BundleResponsePtr response,
+     web_package::mojom::BundleResponseParseErrorPtr error) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   TRACE_EVENT0("loading", "WebBundleURLLoaderFactory::OnResponseParsed");
+   if (!loader)
+     return;
+@@ -816,6 +1069,10 @@
+     int result,
+     const std::optional<std::string>& headers,
+     const std::optional<GURL>& preserve_fragment_on_redirect_url) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!loader)
+     return;
+   SendResponseToLoader(loader, headers ? *headers : original_header,
+@@ -827,6 +1084,10 @@
+     const std::string& headers,
+     uint64_t payload_offset,
+     uint64_t payload_length) {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   if (!loader)
+     return;
+   mojom::URLResponseHeadPtr response_head =
+@@ -908,11 +1169,22 @@
+   }
+   loader->OnResponse(std::move(response_head), std::move(consumer));
+   source_->ReadToDataPipe(
+-      std::move(producer), payload_offset, payload_length,
+-      base::BindOnce(&URLLoader::OnWriteCompleted, loader->GetWeakPtr()));
++      loader->GetLifetimeView(), std::move(producer), payload_offset,
++      payload_length,
++      base::BindOnce(
++          [](NativeNetworkRetirement::Lifetime lifetime,
++             base::WeakPtr<URLLoader> loader, MojoResult result) {
++            if (loader)
++              loader->OnWriteCompleted(result);
++          },
++          loader->HoldNativeCallback(), loader->GetWeakPtr()));
+ }
+ 
+ void WebBundleURLLoaderFactory::OnMemoryQuotaExceeded() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   TRACE_EVENT0("loading", "WebBundleURLLoaderFactory::OnMemoryQuotaExceeded");
+   ReportErrorAndCancelPendingLoaders(
+       SubresourceWebBundleLoadResult::kMemoryQuotaExceeded,
+@@ -923,6 +1195,10 @@
+ }
+ 
+ void WebBundleURLLoaderFactory::OnDataCompleted() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   DCHECK(!data_completed_);
+   data_completed_ = true;
+   if (metadata_)
+@@ -940,6 +1216,10 @@
+ }
+ 
+ void WebBundleURLLoaderFactory::OnWebBundleFetchFailed() {
++  auto lifetime = native_retirement_.HoldCallback();
++  if (native_retirement_.retired())
++    return;
++
+   ReportErrorAndCancelPendingLoaders(
+       SubresourceWebBundleLoadResult::kWebBundleFetchFailed,
+       mojom::WebBundleErrorType::kWebBundleFetchFailed,
+--- a/services/network/cors/cors_url_loader_factory.cc
++++ b/services/network/cors/cors_url_loader_factory.cc
+@@ -537,6 +537,13 @@
+         net::LOAD_IS_MAIN_FRAME_ORIGIN_RECENTLY_ACCESSED;
+   }
+ 
++  const net::IsolationInfo* isolation_info_ptr = &isolation_info_;
++  auto isolation_info = url_loader_util::GetIsolationInfo(
++      isolation_info_, automatically_assign_isolation_info_, resource_request);
++  if (isolation_info.has_value()) {
++    isolation_info_ptr = &isolation_info.value();
++  }
++
+   if (resource_request.destination ==
+       network::mojom::RequestDestination::kWebBundle) {
+     DCHECK(resource_request.web_bundle_token_params.has_value());
+@@ -555,7 +562,7 @@
+         context_->GetWebBundleManager().CreateWebBundleURLLoaderFactory(
+             resource_request.url, *resource_request.web_bundle_token_params,
+             process_id_.GetUnsafeValue(), cross_origin_embedder_policy_,
+-            std::move(coep_reporter_remote));
++            std::move(coep_reporter_remote), *isolation_info_ptr);
+     client = web_bundle_url_loader_factory->MaybeWrapURLLoaderClient(
+         std::move(client));
+     if (!client) {
+@@ -567,13 +574,6 @@
+       factory_override_ ? factory_override_->get()
+                         : network_loader_factory_.get();
+   DCHECK(inner_url_loader_factory);
+-
+-  const net::IsolationInfo* isolation_info_ptr = &isolation_info_;
+-  auto isolation_info = url_loader_util::GetIsolationInfo(
+-      isolation_info_, automatically_assign_isolation_info_, resource_request);
+-  if (isolation_info.has_value()) {
+-    isolation_info_ptr = &isolation_info.value();
+-  }
+ 
+   // Check if the initiator's network access has been restricted.
+   if (network_restrictions_id_.has_value() &&
+--- a/services/network/url_loader_factory.cc
++++ b/services/network/url_loader_factory.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/url_loader_factory.h"
++#include "services/network/url_loader_util.h"
+ 
+ #include <memory>
+ #include <optional>
+@@ -266,7 +267,11 @@
+     // TODO(crbug.com/379869738) Remove GetUnsafeValue.
+     context_->GetWebBundleManager().StartSubresourceRequest(
+         std::move(receiver), resource_request, std::move(client),
+-        params_->process_id.GetUnsafeValue(), std::move(trusted_header_client));
++        params_->process_id.GetUnsafeValue(), std::move(trusted_header_client),
++        url_loader_util::GetIsolationInfo(
++            params_->isolation_info,
++            params_->automatically_assign_isolation_info, resource_request)
++            .value_or(params_->isolation_info));
+     return;
+   }
+ 
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -1928,7 +1928,7 @@
+     const NativeNetworkOwnerMatcher& matches,
+     base::OnceClosure done) {
+   auto drained = base::BarrierClosure(
+-      url_loader_factories_.size() + 3,
++      url_loader_factories_.size() + 4,
+       base::BindOnce(
+           [](base::OnceClosure done) {
+             base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+@@ -1940,6 +1940,8 @@
+     prepared.push_back(factory->PrepareNetworkRetirement(matches, drained));
+   prepared.push_back(
+       cors_preflight_controller_.PrepareNetworkRetirement(matches, drained));
++  prepared.push_back(
++      web_bundle_manager_.PrepareNetworkRetirement(matches, drained));
+   if (prefetch_cache_)
+     prepared.push_back(
+         prefetch_cache_->PrepareNetworkRetirement(matches, drained));

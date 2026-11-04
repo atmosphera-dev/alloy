@@ -1,0 +1,58 @@
+--- a/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker_test.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker_test.cc
+@@ -14,6 +14,9 @@
+ 
+ #include "absl/base/macros.h"
+ #include "absl/strings/string_view.h"
++
++#include "base/alloy/buildflags.h"
++#include "base/test/mock_log.h"
+ #include "openssl/aead.h"
+ #include "openssl/hpke.h"
+ #include "openssl/ssl.h"
+@@ -813,22 +816,29 @@
+ 
+ TEST_P(TlsClientHandshakerTest, ClientSendingTooManyALPNs) {
+   std::string long_alpn(250, 'A');
+-  EXPECT_QUIC_BUG(
+-      {
+-        EXPECT_CALL(*session_, GetAlpnsToOffer())
+-            .WillOnce(testing::Return(std::vector<std::string>({
+-                long_alpn + "1",
+-                long_alpn + "2",
+-                long_alpn + "3",
+-                long_alpn + "4",
+-                long_alpn + "5",
+-                long_alpn + "6",
+-                long_alpn + "7",
+-                long_alpn + "8",
+-            })));
+-        stream()->CryptoConnect();
+-      },
+-      "Failed to set ALPN");
++  EXPECT_CALL(
++      *connection_,
++      CloseConnection(QUIC_HANDSHAKE_FAILED, "Client failed to set ALPN",
++                      ConnectionCloseBehavior::SEND_CONNECTION_CLOSE_PACKET))
++      .Times(1);
++  auto connect = [&] {
++    EXPECT_CALL(*session_, GetAlpnsToOffer())
++        .WillOnce(testing::Return(std::vector<std::string>(
++            {long_alpn + "1", long_alpn + "2", long_alpn + "3", long_alpn + "4",
++             long_alpn + "5", long_alpn + "6", long_alpn + "7",
++             long_alpn + "8"})));
++    EXPECT_FALSE(stream()->CryptoConnect());
++  };
++#if BUILDFLAG(ALLOY_ENABLE_DIAGNOSTIC_LOGGING)
++  EXPECT_QUIC_BUG(connect(), "Failed to set ALPN");
++#else
++  base::test::MockLog log;
++  EXPECT_CALL(log, Log(_, _, _, _, _)).Times(0);
++  log.StartCapturingLogs();
++  connect();
++#endif
++  EXPECT_FALSE(stream()->encryption_established());
++  EXPECT_FALSE(stream()->one_rtt_keys_available());
+ }
+ 
+ TEST_P(TlsClientHandshakerTest, ServerRequiresCustomALPN) {

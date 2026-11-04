@@ -557,6 +557,101 @@
       "patch": "chromium/0068-memory-native-owners.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0077-network-record-insertion-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0078-native-network-socket-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0079-native-socket-consumer-count-types.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0080-native-stream-session-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0081-native-quic-cache-consumers.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0082-native-quic-connection-authority.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0083-native-quic-owner-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0084-native-quic-async-tls-consumer.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0085-native-quic-log-contract.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0086-native-http-factory-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0087-native-transport-service-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0088-native-url-loader-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0089-native-web-bundle-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0090-canonical-network-service-retirement-ipc.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0091-native-tcp-retirement-preparation.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0092-native-session-retirement-preparation.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0093-native-network-transport-coordinator.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0094-network-retirement-test-provider-contract.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0095-native-network-retirement-endpoint-lifetime.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

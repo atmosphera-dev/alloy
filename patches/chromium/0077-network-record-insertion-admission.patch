@@ -1,0 +1,186 @@
+--- a/net/ssl/ssl_client_session_cache.h
++++ b/net/ssl/ssl_client_session_cache.h
+@@ -8,6 +8,7 @@
+ #include <stddef.h>
+ #include <time.h>
+ 
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -15,7 +16,9 @@
+ #include "base/containers/flat_set.h"
+ #include "base/containers/lru_cache.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/memory_coordinator/async_memory_consumer_registration.h"
+ #include "base/memory_coordinator/memory_consumer.h"
+ #include "net/base/host_port_pair.h"
+@@ -61,6 +64,34 @@
+     ProxyChain proxy_chain = ProxyChain::Direct();
+     size_t proxy_chain_index = 0;
+   };
++
++  // Original native socket admission for a TLS session callback. The cache's
++  // global configuration fence still applies; selective retirement additionally
++  // revokes only matching live admissions, including uncached handshakes.
++  class NET_EXPORT Insertion {
++   public:
++    ~Insertion();
++    Insertion(const Insertion&) = delete;
++    Insertion& operator=(const Insertion&) = delete;
++
++   private:
++    friend class SSLClientSessionCache;
++    Insertion(base::WeakPtr<SSLClientSessionCache> owner,
++              Key key,
++              uint64_t configuration_generation);
++    base::WeakPtr<SSLClientSessionCache> owner_;
++    const Key key_;
++    const uint64_t configuration_generation_;
++    bool admitted_ = true;
++  };
++
++  std::shared_ptr<const Insertion> CaptureInsertion(const Key& cache_key);
++  void Insert(const Insertion& original,
++              const Key& cache_key,
++              bssl::UniquePtr<SSL_SESSION> session);
++  // Engine-owned, nonreentrant key matcher. Clears matching cached sessions and
++  // their original insertion authority without disturbing unrelated handshakes.
++  void FlushMatching(const base::RepeatingCallback<bool(const Key&)>& matches);
+ 
+   explicit SSLClientSessionCache(const Config& config);
+ 
+@@ -141,6 +172,10 @@
+   base::LRUCache<Key, Entry> cache_;
+   size_t lookups_since_flush_ = 0;
+   base::AsyncMemoryConsumerRegistration memory_consumer_registration_;
++  // Weak registrations cannot retain a handshake. Selected keys are erased at
++  // retirement; expired entries are pruned before capturing new admission.
++  std::map<Key, std::weak_ptr<Insertion>> insertion_admissions_;
++  base::WeakPtrFactory<SSLClientSessionCache> weak_factory_{this};
+ };
+ 
+ }  // namespace net
+--- a/net/ssl/ssl_client_session_cache.cc
++++ b/net/ssl/ssl_client_session_cache.cc
+@@ -120,6 +120,71 @@
+     return;
+   }
+   iter->second.Push(std::move(session));
++}
++
++SSLClientSessionCache::Insertion::Insertion(
++    base::WeakPtr<SSLClientSessionCache> owner,
++    Key key,
++    uint64_t configuration_generation)
++    : owner_(std::move(owner)),
++      key_(std::move(key)),
++      configuration_generation_(configuration_generation) {}
++
++SSLClientSessionCache::Insertion::~Insertion() = default;
++
++std::shared_ptr<const SSLClientSessionCache::Insertion>
++SSLClientSessionCache::CaptureInsertion(const Key& cache_key) {
++  std::erase_if(insertion_admissions_,
++               [](const auto& entry) { return entry.second.expired(); });
++  // RSA sessions can additionally be cached with the resolved address. Both
++  // representations belong to the same original native socket admission.
++  Key key = cache_key;
++  key.dest_ip_addr.reset();
++  auto& registered = insertion_admissions_[key];
++  auto admission = registered.lock();
++  if (!admission || !admission->admitted_ ||
++      admission->configuration_generation_ != generation_number_) {
++    admission = std::shared_ptr<Insertion>(new Insertion(
++        weak_factory_.GetWeakPtr(), std::move(key), generation_number_));
++    registered = admission;
++  }
++  return admission;
++}
++
++void SSLClientSessionCache::Insert(
++    const Insertion& original,
++    const Key& cache_key,
++    bssl::UniquePtr<SSL_SESSION> session) {
++  Key key = cache_key;
++  key.dest_ip_addr.reset();
++  if (original.owner_.get() != this || !original.admitted_ ||
++      original.configuration_generation_ != generation_number_ ||
++      original.key_ != key) {
++    return;
++  }
++  Insert(original.configuration_generation_, cache_key, std::move(session));
++}
++
++void SSLClientSessionCache::FlushMatching(
++    const base::RepeatingCallback<bool(const Key&)>& matches) {
++  // Admission must close before any cached SSL_SESSION is freed.
++  for (auto it = insertion_admissions_.begin();
++       it != insertion_admissions_.end();) {
++    auto admission = it->second.lock();
++    if (!admission || matches.Run(it->first)) {
++      if (admission) admission->admitted_ = false;
++      it = insertion_admissions_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++  for (auto it = cache_.begin(); it != cache_.end();) {
++    if (matches.Run(it->first)) {
++      it = cache_.Erase(it);
++    } else {
++      ++it;
++    }
++  }
+ }
+ 
+ void SSLClientSessionCache::ClearEarlyData(const Key& cache_key) {
+@@ -156,6 +221,7 @@
+ 
+ void SSLClientSessionCache::Flush() {
+   ++generation_number_;
++  insertion_admissions_.clear();
+   cache_.Clear();
+ }
+ 
+--- a/net/socket/ssl_client_socket_impl.h
++++ b/net/socket/ssl_client_socket_impl.h
+@@ -261,9 +261,9 @@
+ 
+   const raw_ptr<SSLClientContext> context_;
+ 
+-  // Stores the value of SSLClientSessionCache's generation number at the time
+-  // this socket was initialized.
+-  uint64_t initial_session_cache_generation_number_ = 0;
++  // Retain original admission through asynchronous TLS session callbacks.
++  std::shared_ptr<const SSLClientSessionCache::Insertion>
++      initial_session_cache_admission_;
+ 
+   std::unique_ptr<CertVerifier::Request> cert_verifier_request_;
+ 
+--- a/net/socket/ssl_client_socket_impl.cc
++++ b/net/socket/ssl_client_socket_impl.cc
+@@ -716,8 +716,9 @@
+   }
+ 
+   if (IsCachingEnabled()) {
+-    initial_session_cache_generation_number_ =
+-        context_->ssl_client_session_cache()->generation_number();
++    initial_session_cache_admission_ =
++        context_->ssl_client_session_cache()->CaptureInsertion(
++            GetSessionCacheKey(/*dest_ip_addr=*/std::nullopt));
+ 
+     bssl::UniquePtr<SSL_SESSION> session =
+         context_->ssl_client_session_cache()->Lookup(
+@@ -1623,7 +1624,7 @@
+   // OpenSSL optionally passes ownership of |session|. Returning one signals
+   // that this function has claimed it.
+   context_->ssl_client_session_cache()->Insert(
+-      initial_session_cache_generation_number_, GetSessionCacheKey(ip_addr),
++      *initial_session_cache_admission_, GetSessionCacheKey(ip_addr),
+       bssl::UniquePtr<SSL_SESSION>(session));
+   return 1;
+ }

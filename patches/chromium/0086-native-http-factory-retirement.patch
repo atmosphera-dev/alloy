@@ -1,0 +1,523 @@
+--- a/net/http/http_stream_factory.h
++++ b/net/http/http_stream_factory.h
+@@ -129,6 +129,11 @@
+   HttpStreamFactory& operator=(const HttpStreamFactory&) = delete;
+ 
+   virtual ~HttpStreamFactory();
++  using NetworkRecordMatcher =
++      base::RepeatingCallback<bool(const NetworkAnonymizationKey&,
++                                   const url::SchemeHostPort&)>;
++  void RetireNetworkState(const NetworkRecordMatcher& matches,
++                          base::OnceClosure done);
+ 
+   void ProcessAlternativeServices(
+       HttpNetworkSession* session,
+--- a/net/http/http_stream_factory.cc
++++ b/net/http/http_stream_factory.cc
+@@ -9,11 +9,14 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/barrier_closure.h"
+ #include "base/check.h"
++#include "base/functional/bind.h"
+ #include "base/notreached.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "net/base/host_port_pair.h"
+ #include "net/base/load_flags.h"
+@@ -128,6 +131,29 @@
+ 
+ HttpStreamFactory::~HttpStreamFactory() = default;
+ 
++void HttpStreamFactory::RetireNetworkState(const NetworkRecordMatcher& matches,
++                                           base::OnceClosure done) {
++  std::vector<JobController*> selected;
++  for (const auto& controller : job_controller_set_)
++    if (controller->MatchesNetworkRecord(matches))
++      selected.push_back(controller.get());
++  auto drained = base::BarrierClosure(
++      selected.size() + 1,
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, std::move(done));
++          },
++          std::move(done)));
++  std::vector<base::WeakPtr<JobController>> originals;
++  for (auto* controller : selected)
++    originals.push_back(controller->PrepareNetworkRetirement(drained));
++  for (auto& controller : originals)
++    if (controller)
++      controller->RevokeNetworkState();
++  drained.Run();
++}
++
+ void HttpStreamFactory::ProcessAlternativeServices(
+     HttpNetworkSession* session,
+     const NetworkAnonymizationKey& network_anonymization_key,
+--- a/net/http/http_stream_factory_job.h
++++ b/net/http/http_stream_factory_job.h
+@@ -221,6 +221,7 @@
+   ResolveErrorInfo resolve_error_info() const;
+ 
+   JobType job_type() const { return job_type_; }
++  bool MatchesNetworkRecord(const NetworkRecordMatcher& matches) const;
+ 
+   // Indicates whether this job used an existing SPDY session. Only valid after
+   // this created an HttpStream with SPDY.
+--- a/net/http/http_stream_factory_job.cc
++++ b/net/http/http_stream_factory_job.cc
+@@ -205,6 +205,13 @@
+   }
+ }
+ 
++bool HttpStreamFactory::Job::MatchesNetworkRecord(
++    const NetworkRecordMatcher& matches) const {
++  return matches.Run(request_info_.network_anonymization_key,
++                     url::SchemeHostPort(request_info_.url)) ||
++         matches.Run(request_info_.network_anonymization_key, destination_);
++}
++
+ HttpStreamFactory::Job::~Job() {
+   if (started_) {
+     net_log_.EndEvent(NetLogEventType::HTTP_STREAM_JOB);
+--- a/net/http/http_stream_factory_job_controller.h
++++ b/net/http/http_stream_factory_job_controller.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/cancelable_callback.h"
+ #include "base/functional/callback_forward.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
+ #include "base/types/optional_ref.h"
+@@ -71,6 +72,10 @@
+       RequestPriority priority);
+ 
+   void Preconnect(int num_streams, base::OnceClosure callback);
++  bool MatchesNetworkRecord(const NetworkRecordMatcher& matches) const;
++  base::WeakPtr<JobController> PrepareNetworkRetirement(
++      const base::RepeatingClosure& drained);
++  void RevokeNetworkState();
+ 
+   // From HttpStreamRequest::Helper.
+   // Returns the LoadState for Request.
+@@ -302,6 +307,11 @@
+ 
+   bool disable_cert_verification_network_fetches() const;
+ 
++  // Last to drain, after native jobs, proxy requests and weak callbacks die.
++  std::shared_ptr<std::vector<base::ScopedClosureRunner>> network_retirement_ =
++      std::make_shared<std::vector<base::ScopedClosureRunner>>();
++  bool network_retired_ = false;
++  bool network_revoke_started_ = false;
+   const raw_ptr<HttpStreamFactory> factory_;
+   const raw_ptr<HttpNetworkSession> session_;
+   const raw_ptr<JobFactory> job_factory_;
+--- a/net/http/http_stream_factory_job_controller.cc
++++ b/net/http/http_stream_factory_job_controller.cc
+@@ -201,6 +201,59 @@
+   net_log_.EndEvent(NetLogEventType::HTTP_STREAM_JOB_CONTROLLER);
+ }
+ 
++bool HttpStreamFactory::JobController::MatchesNetworkRecord(
++    const NetworkRecordMatcher& matches) const {
++  if (matches.Run(request_info_.network_anonymization_key,
++                  url::SchemeHostPort(request_info_.url)))
++    return true;
++  for (const auto* job :
++       {main_job_.get(), alternative_job_.get(), dns_alpn_h3_job_.get(),
++        ws_over_h3_job_.get(), preconnect_backup_job_.get()})
++    if (job && job->MatchesNetworkRecord(matches))
++      return true;
++  return false;
++}
++
++base::WeakPtr<HttpStreamFactory::JobController>
++HttpStreamFactory::JobController::PrepareNetworkRetirement(
++    const base::RepeatingClosure& drained) {
++  network_retirement_->emplace_back(drained);
++  if (!network_retired_) {
++    network_retired_ = true;
++    ptr_factory_.InvalidateWeakPtrs();
++  }
++  return ptr_factory_.GetWeakPtr();
++}
++
++void HttpStreamFactory::JobController::RevokeNetworkState() {
++  if (network_revoke_started_)
++    return;
++  network_revoke_started_ = true;
++  resume_main_job_callback_.Cancel();
++  proxy_resolve_request_.reset();
++  next_state_ = STATE_NONE;
++  bound_job_ = nullptr;
++  job_bound_ = false;
++  main_job_.reset();
++  alternative_job_.reset();
++  dns_alpn_h3_job_.reset();
++  ws_over_h3_job_.reset();
++  preconnect_backup_job_.reset();
++  if (!request_) {
++    auto retirement = std::move(network_retirement_);
++    auto preconnect = std::move(preconnect_callback_);
++    factory_->OnJobControllerComplete(this);
++    // The native factory destroyed this controller. Drain includes reentry.
++    if (preconnect)
++      std::move(preconnect).Run();
++    return;
++  }
++  if (!request_->completed())
++    TaskRunner(priority_)->PostTask(
++        FROM_HERE, base::BindOnce(&JobController::NotifyRequestFailed,
++                                  ptr_factory_.GetWeakPtr(), ERR_ABORTED));
++}
++
+ std::unique_ptr<HttpStreamRequest> HttpStreamFactory::JobController::Start(
+     HttpStreamRequest::Delegate* delegate,
+     WebSocketHandshakeStreamBase::CreateHelper*
+@@ -247,6 +300,9 @@
+ }
+ 
+ LoadState HttpStreamFactory::JobController::GetLoadState() const {
++  if (network_retired_)
++    return LOAD_STATE_IDLE;
++
+   DCHECK(request_);
+   if (next_state_ == STATE_RESOLVE_PROXY_COMPLETE) {
+     return proxy_resolve_request_->GetLoadState();
+@@ -270,6 +326,14 @@
+ }
+ 
+ void HttpStreamFactory::JobController::OnRequestComplete() {
++  if (network_retired_) {
++    DCHECK(request_);
++    request_ = nullptr;
++    delegate_ = nullptr;
++    MaybeNotifyFactoryOfCompletion();
++    return;
++  }
++
+   DCHECK(request_);
+   CHECK(!switched_to_http_stream_pool_);
+ 
+@@ -303,6 +367,9 @@
+ }
+ 
+ int HttpStreamFactory::JobController::RestartTunnelWithProxyAuth() {
++  if (network_retired_)
++    return ERR_ABORTED;
++
+   DCHECK(bound_job_);
+   return bound_job_->RestartTunnelWithProxyAuth();
+ }
+@@ -326,6 +393,11 @@
+ }
+ 
+ void HttpStreamFactory::JobController::OnStreamReady(Job* job) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   DCHECK(job);
+ 
+   if (IsJobOrphaned(job)) {
+@@ -335,7 +407,10 @@
+     return;
+   }
+ 
++  auto admitted = ptr_factory_.GetWeakPtr();
+   NotifyOnStreamCreationAttempted(std::nullopt);
++  if (!admitted || network_retired_)
++    return;
+   std::unique_ptr<HttpStream> stream = job->ReleaseStream();
+   DCHECK(stream);
+ 
+@@ -360,6 +435,11 @@
+ void HttpStreamFactory::JobController::OnBidirectionalStreamImplReady(
+     Job* job,
+     const ProxyInfo& used_proxy_info) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   DCHECK(job);
+ 
+   if (IsJobOrphaned(job)) {
+@@ -389,6 +469,11 @@
+     Job* job,
+     const ProxyInfo& used_proxy_info,
+     std::unique_ptr<WebSocketHandshakeStreamBase> stream) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   DCHECK(job);
+   MarkRequestComplete(job);
+ 
+@@ -409,6 +494,9 @@
+     const url::SchemeHostPort& destination,
+     base::TimeTicks dns_resolution_start_time,
+     base::TimeTicks dns_resolution_end_time) {
++  if (network_retired_)
++    return;
++
+   if (!request_) {
+     return;
+   }
+@@ -424,6 +512,11 @@
+ }
+ 
+ void HttpStreamFactory::JobController::OnStreamFailed(Job* job, int status) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   DCHECK_NE(OK, status);
+   if (job->job_type() == MAIN) {
+     DCHECK_EQ(main_job_.get(), job);
+@@ -479,7 +572,10 @@
+     }
+   }
+ 
++  auto admitted = ptr_factory_.GetWeakPtr();
+   NotifyOnStreamCreationAttempted(status);
++  if (!admitted || network_retired_)
++    return;
+   status = ReconsiderProxyAfterError(job, status);
+   if (next_state_ == STATE_RESOLVE_PROXY_COMPLETE) {
+     if (status == ERR_IO_PENDING) {
+@@ -497,6 +593,9 @@
+ }
+ 
+ void HttpStreamFactory::JobController::OnFailedOnDefaultNetwork(Job* job) {
++  if (network_retired_)
++    return;
++
+   if (job->job_type() == ALTERNATIVE) {
+     DCHECK_EQ(alternative_job_.get(), job);
+     alternative_job_failed_on_default_network_ = true;
+@@ -511,6 +610,11 @@
+     Job* job,
+     int status,
+     const SSLInfo& ssl_info) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   MaybeResumeMainJob(job, base::TimeDelta());
+ 
+   if (IsJobOrphaned(job)) {
+@@ -534,6 +638,11 @@
+ void HttpStreamFactory::JobController::OnNeedsClientAuth(
+     Job* job,
+     SSLCertRequestInfo* cert_info) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   MaybeResumeMainJob(job, base::TimeDelta());
+ 
+   if (IsJobOrphaned(job)) {
+@@ -557,6 +666,11 @@
+     const HttpResponseInfo& proxy_response,
+     const ProxyInfo& used_proxy_info,
+     HttpAuthController* auth_controller) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   MaybeResumeMainJob(job, base::TimeDelta());
+ 
+   if (IsJobOrphaned(job)) {
+@@ -577,6 +691,11 @@
+ 
+ void HttpStreamFactory::JobController::OnPreconnectsComplete(Job* job,
+                                                              int result) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   // Preconnects only run as `main_job_`, never `alternative_job_` or
+   // `dns_alpn_h3_job_`.
+   DCHECK_EQ(main_job_.get(), job);
+@@ -593,9 +712,12 @@
+   main_job_.reset();
+   preconnect_backup_job_.reset();
+   ResetErrorStatusForJobs();
++  auto admitted = ptr_factory_.GetWeakPtr();
+   if (preconnect_callback_) {
+     std::move(preconnect_callback_).Run();
+   }
++  if (!admitted || network_retired_)
++    return;
+   MaybeNotifyFactoryOfCompletion();
+ }
+ 
+@@ -621,6 +743,9 @@
+ void HttpStreamFactory::JobController::AddConnectionAttemptsToRequest(
+     Job* job,
+     const ConnectionAttempts& attempts) {
++  if (network_retired_)
++    return;
++
+   if (is_preconnect_ || IsJobOrphaned(job)) {
+     return;
+   }
+@@ -640,6 +765,9 @@
+ }
+ 
+ void HttpStreamFactory::JobController::ResumeMainJob() {
++  if (network_retired_)
++    return;
++
+   DCHECK(main_job_);
+ 
+   if (main_job_is_resumed_) {
+@@ -702,6 +830,9 @@
+ 
+ void HttpStreamFactory::JobController::OnConnectionInitialized(Job* job,
+                                                                int rv) {
++  if (network_retired_)
++    return;
++
+   if (rv != OK) {
+     // `rv` is either `ERR_IO_PENDING` (the QUIC crypto handshake is in flight,
+     // so unblock the main job and start its delayed-TCP wait timer) or an
+@@ -717,6 +848,9 @@
+ }
+ 
+ bool HttpStreamFactory::JobController::ShouldWait(Job* job) {
++  if (network_retired_)
++    return true;
++
+   // The `alternative_job_`, `dns_alpn_h3_job_`, and `ws_over_h3_job_` never
+   // wait.
+   if (job == alternative_job_.get() || job == dns_alpn_h3_job_.get() ||
+@@ -742,6 +876,9 @@
+ 
+ void HttpStreamFactory::JobController::MaybeSetWaitTimeForMainJob(
+     const base::TimeDelta& delay) {
++  if (network_retired_)
++    return;
++
+   if (main_job_is_blocked_) {
+     const bool has_available_spdy_session =
+         main_job_->HasAvailableSpdySession();
+@@ -778,12 +915,21 @@
+ }
+ 
+ void HttpStreamFactory::JobController::OnIOComplete(int result) {
++  if (network_retired_)
++    return;
++
+   RunLoop(result);
+   // `this` may be deleted at this point.
+ }
+ 
+ void HttpStreamFactory::JobController::RunLoop(int result) {
++  if (network_retired_)
++    return;
++
++  auto admitted = ptr_factory_.GetWeakPtr();
+   int rv = DoLoop(result);
++  if (!admitted || network_retired_)
++    return;
+   if (rv == ERR_IO_PENDING) {
+     return;
+   }
+@@ -812,6 +958,7 @@
+ 
+ int HttpStreamFactory::JobController::DoLoop(int rv) {
+   DCHECK_NE(next_state_, STATE_NONE);
++  auto admitted = ptr_factory_.GetWeakPtr();
+   do {
+     State state = next_state_;
+     next_state_ = STATE_NONE;
+@@ -830,6 +977,8 @@
+       default:
+         NOTREACHED() << "bad state";
+     }
++    if (!admitted || network_retired_)
++      return ERR_ABORTED;
+   } while (next_state_ != STATE_NONE && rv != ERR_IO_PENDING);
+   return rv;
+ }
+@@ -902,8 +1051,12 @@
+ 
+   // Create an alternative job if alternative service is set up for this domain.
+   // This is applicable even if the connection will be made via a proxy.
+-  advertised_alt_svc_ =
++  auto admitted = ptr_factory_.GetWeakPtr();
++  auto advertised =
+       GetAdvertisedAltSvcFor(request_info_, delegate_, stream_type_);
++  if (!admitted || network_retired_)
++    return ERR_ABORTED;
++  advertised_alt_svc_ = std::move(advertised);
+ 
+   if (session_->host_resolver()->IsHappyEyeballsV3Enabled() &&
+       proxy_info_.is_direct() && !is_websocket_ &&
+@@ -1263,6 +1416,9 @@
+     int alt_job_net_error,
+     bool alt_job_failed_on_default_network,
+     const std::string& histogram_name_for_failure) {
++  if (network_retired_)
++    return;
++
+   // If alternative job succeeds on the default network, no brokenness to
+   // report.
+   if (alt_job_net_error == OK && !alt_job_failed_on_default_network) {
+@@ -1340,6 +1496,8 @@
+ }
+ 
+ void HttpStreamFactory::JobController::NotifyRequestFailed(int rv) {
++  auto callback_lifetime = network_retirement_;
++
+   if (!request_) {
+     return;
+   }
+@@ -1356,8 +1514,11 @@
+     return AdvertisedAlternativeService();
+   }
+ 
++  auto admitted = ptr_factory_.GetWeakPtr();
+   AdvertisedAlternativeService alternative_service_info =
+       GetAdvertisedAltSvcInternal(request_info, delegate, stream_type);
++  if (!admitted || network_retired_)
++    return AdvertisedAlternativeService();
+   AlternativeServiceType type;
+   if (alternative_service_info.info.protocol() == NextProto::kProtoUnknown) {
+     type = NO_ALTERNATIVE_SERVICE;
+@@ -1387,6 +1548,8 @@
+     const StreamRequestInfo& request_info,
+     HttpStreamRequest::Delegate* delegate,
+     HttpStreamRequest::StreamType stream_type) {
++  auto callback_lifetime = network_retirement_;
++
+   if (!request_info.url.SchemeIs(url::kHttpsScheme)) {
+     return AdvertisedAlternativeService();
+   }
+@@ -1670,6 +1833,11 @@
+ 
+ void HttpStreamFactory::JobController::NotifyOnStreamCreationAttempted(
+     base::optional_ref<int> net_error) {
++  auto callback_lifetime = network_retirement_;
++
++  if (network_retired_)
++    return;
++
+   auto* proxy_delegate = session_->context().proxy_delegate.get();
+   if (!proxy_delegate || proxy_info_.is_empty()) {
+     return;

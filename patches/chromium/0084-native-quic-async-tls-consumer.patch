@@ -1,0 +1,65 @@
+--- a/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker_test.cc
++++ b/net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker_test.cc
+@@ -21,6 +21,7 @@
+ #include "quiche/quic/core/crypto/crypto_handshake_message.h"
+ #include "quiche/quic/core/crypto/crypto_protocol.h"
+ #include "quiche/quic/core/crypto/proof_verifier.h"
++#include "quiche/quic/core/crypto/quic_client_session_cache.h"
+ #include "quiche/quic/core/crypto/quic_compressed_certs_cache.h"
+ #include "quiche/quic/core/crypto/quic_crypto_client_config.h"
+ #include "quiche/quic/core/crypto/transport_parameters.h"
+@@ -427,6 +428,54 @@
+   EXPECT_TRUE(stream()->one_rtt_keys_available());
+ }
+ 
++TEST_P(TlsClientHandshakerTest,
++       RecordRetirementFencesAsyncProofTicketProducer) {
++  auto cache = std::make_shared<QuicClientSessionCache>();
++  session_.reset();
++  crypto_config_->set_session_cache(cache);
++  CreateConnection();
++  CompleteCryptoHandshake();
++  ASSERT_TRUE(stream()->one_rtt_keys_available());
++  ASSERT_GT(cache->GetSize(),
++            0u);  // Actual TLS producer positively cached tickets.
++
++  cache->Clear();  // Ordinary eviction forces a new full certificate handshake.
++  CreateConnection();
++  InitializeFakeServer();
++  auto* verifier =
++      static_cast<TestProofVerifier*>(crypto_config_->proof_verifier());
++  verifier->Activate();
++  EXPECT_CALL(*connection_, SendCryptoData(_, _, _))
++      .Times(testing::AnyNumber());
++  stream()->CryptoConnect();
++  auto moved = crypto_test_utils::AdvanceHandshake(
++      connection_, stream(), 0, server_connection_, server_stream(), 0);
++  ASSERT_EQ(1u, verifier->NumPendingCallbacks());
++  EXPECT_FALSE(stream()->one_rtt_keys_available());
++  class RetiredServer final : public QuicCryptoClientConfig::ServerIdFilter {
++   public:
++    explicit RetiredServer(const QuicServerId& server) : server_(server) {}
++    bool Matches(const QuicServerId& server) const override {
++      return server == server_;
++    }
++
++   private:
++    const QuicServerId server_;
++  };
++  cache->RetireMatching(RetiredServer(server_id_));
++  verifier->InvokePendingCallback(0);
++  crypto_test_utils::AdvanceHandshake(connection_, stream(), moved.first,
++                                      server_connection_, server_stream(),
++                                      moved.second);
++  ASSERT_TRUE(stream()->one_rtt_keys_available());
++  // The asynchronous native proof/ticket producer used its original view,
++  // not a fresh cache admission after the selective retirement.
++  EXPECT_EQ(0u, cache->GetSize());
++  EXPECT_EQ(nullptr,
++            cache->Lookup(server_id_, client_helper_.GetClock()->WallNow(),
++                          crypto_config_->ssl_ctx()));
++}
++
+ TEST_P(TlsClientHandshakerTest, HandshakeWithTrustAnchorIds) {
+   const std::string kTestTrustAnchorId = {0x03, 0x01, 0x02, 0x03};
+   const std::string kTestServerTrustAnchorId = {0x01, 0x02, 0x03};

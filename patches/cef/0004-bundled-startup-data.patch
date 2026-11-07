@@ -4,7 +4,27 @@
  
      sources = libcef_sources_common
  
-+    data_deps = [ "//brave/alloy:bundled_data" ]
      deps = libcef_deps_common
++    deps += [ "//brave/alloy:data_paths" ]
  
      configs += [
+--- a/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -23,2 +23,4 @@
+ #include "cef/libcef/common/resource_util.h"
++#include "base/files/file_util.h"
++#include "brave/alloy/bundled_data.h"
+ #include "cef/libcef/renderer/chrome/chrome_content_renderer_client_cef.h"
+@@ -435,2 +437,12 @@
++  // Validate the embedder's final browser command line, including changes from
++  // OnBeforeCommandLineProcessing, before browser initialization loads pages.
++  if (process_type.empty()) {
++    const auto data_dir = alloy::DataDirectory();
++    if (data_dir && (!data_dir->IsAbsolute() ||
++                     !base::DirectoryExists(*data_dir) ||
++                     !base::PathIsReadable(*data_dir))) {
++      return 1;
++    }
++  }
+   // Call as early as possible.
+   InitLogging(command_line);

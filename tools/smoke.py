@@ -143,6 +143,7 @@ def main():
     parser.add_argument('--port', type=int, default=9229)
     parser.add_argument('--timeout', type=int, default=90)
     parser.add_argument('--probe-blocking', action='store_true')
+    parser.add_argument('--alloy-data-dir', type=Path)
     args = parser.parse_args()
     out = args.out.resolve()
     try:
@@ -151,7 +152,8 @@ def main():
         parser.error(str(error))
     if args.probe_blocking:
         return subprocess.run([sys.executable, str(Path(__file__).with_name('probe_blocking.py')),
-                               '--out', str(out)], timeout=180).returncode
+                               '--out', str(out), *(['--alloy-data-dir', str(args.alloy_data_dir)]
+                               if args.alloy_data_dir is not None else [])], timeout=180).returncode
     if not 1024 <= args.port <= 65535 or not 10 <= args.timeout <= 300:
         parser.error('Port must be unprivileged and timeout 10..300 seconds')
     with socket.socket() as check:
@@ -170,6 +172,8 @@ def main():
                    '--ozone-platform=x11', '--disable-gpu', f'--url={URL}',
                    f'--root-cache-path={profile}', f'--cache-path={profile}/Default',
                    f'--log-file={logdir}/debug.log']
+        if args.alloy_data_dir is not None:
+            command.append('--alloy-data-dir='+str(args.alloy_data_dir))
         (logdir / 'command.json').write_text(json.dumps(command, indent=2) + '\n')
         with (logdir / 'stdio.log').open('w') as log:
             process = subprocess.Popen(command, cwd=out, stdout=log, stderr=subprocess.STDOUT,

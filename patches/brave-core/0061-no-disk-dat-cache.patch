@@ -1,10 +1,11 @@
 --- a/components/brave_shields/core/browser/ad_block_dat_cache_manager.cc
 +++ b/components/brave_shields/core/browser/ad_block_dat_cache_manager.cc
-@@ -4,6 +4,7 @@
+@@ -4,6 +4,8 @@
  // You can obtain one at https://mozilla.org/MPL/2.0/.
  
  #include "brave/components/brave_shields/core/browser/ad_block_dat_cache_manager.h"
 +#include "base/alloy/storage_policy.h"
++#include "brave/alloy/bundled_data.h"
  
  #include <optional>
  #include <string_view>
@@ -32,7 +33,7 @@
      base::OnceCallback<void(std::optional<DATFileDataBuffer>,
                              std::optional<DATFileDataBuffer>)> on_complete) {
    CHECK(base::FeatureList::IsEnabled(features::kAdblockDATCache));
-+  if (base::alloy::IsNoDiskProcess()) {
++  if (base::alloy::IsNoDiskProcess() || !alloy::DataDirectory()) {
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +        FROM_HERE,
 +        base::BindOnce(std::move(on_complete), std::nullopt, std::nullopt));

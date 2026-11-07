@@ -146,8 +146,6 @@ def publish(state, state_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
-    parser.add_argument('--lists', type=Path, default=WORK / 'lists',
-                        help='Pinned wakaba-lists delivery (default: %(default)s)')
     parser.add_argument('--cef-only', action='store_true')
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
@@ -158,14 +156,6 @@ def main():
     if args.report and args.report.resolve().is_relative_to(ROOT):
         parser.error('Report must be outside src, to preserve no-touch reapplication')
     pins = json.loads((REPO / 'pins.json').read_text())
-    lists_data = args.lists / 'data'
-    if not args.cef_only:
-        marker = args.lists / 'wakaba-lists.commit'
-        revision = marker.read_text().strip()
-        if revision != pins['wakaba_lists']:
-            raise RuntimeError(f'wakaba-lists pin mismatch: {revision}; expected {pins["wakaba_lists"]}')
-        if not lists_data.is_dir():
-            raise RuntimeError(f'Missing wakaba-lists data directory: {lists_data}')
     STATE.mkdir(exist_ok=True)
     (STATE / 'blobs').mkdir(exist_ok=True)
     with (WORK / 'source.lock').open('a') as lock:
@@ -229,16 +219,6 @@ def main():
                     overlays[name] = p
                     paths.add(name)
                     inputs['src/' + name] = dict(sha256=digest(p.read_bytes()), mode=p.stat().st_mode & 0o777)
-        # Release data participates in the same incremental, local-edit-safe
-        # publication contract as source overlays; builds never fetch it.
-        if not args.cef_only:
-            for p in sorted(lists_data.rglob('*')):
-                if p.is_file():
-                    rel = relative(str(p.relative_to(lists_data)))
-                    name = 'brave/alloy/data/' + rel
-                    overlays[name] = p
-                    paths.add(name)
-                    inputs['data/' + rel] = dict(sha256=digest(p.read_bytes()), mode=p.stat().st_mode & 0o777)
         mode = 'cef-only' if args.cef_only else 'full'
         fingerprint = digest(json.dumps(dict(inputs=inputs, mode=mode), sort_keys=True).encode())
         # Refuse external edits even when the patch set has not changed.

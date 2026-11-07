@@ -136,7 +136,7 @@
 -  BraveOnDemandUpdater::GetInstance()->OnDemandUpdate(
 -      component_id, component_updater::OnDemandUpdater::Priority::FOREGROUND);
 +// Preserve asynchronous component delivery. Each consumer gets an immutable
-+// app-resource directory, including on a fresh profile with no updater cache.
++// embedder directory, including on a fresh profile with no updater cache.
 +void Deliver(OnComponentReadyCallback callback, const base::FilePath& path) {
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(callback, path));
@@ -151,8 +151,8 @@
 -  if (!cus ||
 -      BraveOnDemandUpdater::GetInstance()->is_component_update_disabled()) {
 -    return;
-+  if (cus) {
-+    Deliver(callback, alloy::BundledDataDirectory().AppendASCII("lists/resources"));
++  if (const auto data_dir = alloy::DataDirectory(); cus && data_dir) {
++    Deliver(callback, data_dir->AppendASCII("lists/resources"));
    }
 -
 -  const std::string component_id = crx_file::id_util::GenerateIdFromHash(
@@ -171,8 +171,8 @@
 -  if (!cus ||
 -      BraveOnDemandUpdater::GetInstance()->is_component_update_disabled()) {
 -    return;
-+  if (cus) {
-+    Deliver(callback, alloy::BundledDataDirectory().AppendASCII("lists/catalog"));
++  if (const auto data_dir = alloy::DataDirectory(); cus && data_dir) {
++    Deliver(callback, data_dir->AppendASCII("lists/catalog"));
    }
 -
 -  const std::string component_id = crx_file::id_util::GenerateIdFromHash(
@@ -195,9 +195,9 @@
 -  if (!cus ||
 -      BraveOnDemandUpdater::GetInstance()->is_component_update_disabled()) {
 -    return;
-+  if (cus) {
++  if (const auto data_dir = alloy::DataDirectory(); cus && data_dir) {
 +    Deliver(callback,
-+            alloy::BundledDataDirectory().AppendASCII("lists/components").AppendASCII(
++            data_dir->AppendASCII("lists/components").AppendASCII(
 +                crx_file::id_util::GenerateIdFromHash(component_public_key_sha256)));
    }
 -
@@ -243,16 +243,18 @@
  
  using brave_component_updater::BraveComponent;
  
-@@ -23,9 +28,10 @@
+@@ -23,9 +28,12 @@
  bool LocalDataFilesService::Start() {
    if (initialized_)
      return true;
 -  Register(kLocalDataFilesComponentName,
 -           kLocalDataFilesComponentPublicKeySHA256);
    initialized_ = true;
-+  OnComponentReady(
-+      crx_file::id_util::GenerateIdFromHash(kLocalDataFilesComponentPublicKeySHA256),
-+      alloy::BundledDataDirectory().AppendASCII("lists/local-data"), "{}");
++  if (const auto data_dir = alloy::DataDirectory()) {
++    OnComponentReady(
++        crx_file::id_util::GenerateIdFromHash(kLocalDataFilesComponentPublicKeySHA256),
++        data_dir->AppendASCII("lists/local-data"), "{}");
++  }
    return true;
  }
  
@@ -348,11 +350,11 @@
    }
    data->UpdateVersion(version);
 +  VLOG(1) << "Loaded " << data->rules().size()
-+          << " bundled QueryFilter rules, version " << version.GetString();
++          << " embedder QueryFilter rules, version " << version.GetString();
  }
  
  }  // namespace
-@@ -163,13 +166,14 @@
+@@ -163,13 +166,18 @@
      return;
    }
  
@@ -365,11 +367,15 @@
 -      }));
 +  // This default-enabled privacy component has a separate native installer,
 +  // rather than a LocalDataFilesObserver. Feed its existing asynchronous
-+  // read/parser from the same immutable release bundle.
++  // read/parser from the same immutable embedder directory.
++  const auto data_dir = alloy::DataDirectory();
++  if (!data_dir) {
++    return;
++  }
 +  QueryFilterComponentInstallerPolicy policy;
 +  policy.ComponentReady(
 +      base::Version(version_info::GetVersionNumber()),
-+      alloy::BundledDataDirectory().AppendASCII("lists/local-data/1"),
++      data_dir->AppendASCII("lists/local-data/1"),
 +      base::DictValue());
  }
  

@@ -37,12 +37,12 @@ code delivered in B into A (or vice versa). This check also covers run snapshots
 | 7 | Tools | Python 3.11+ and `websocket-client`; systemd user manager; passwordless `sudo` for owned namespace/system-unit operations; nft, iproute2, tcpdump, dnsmasq, mitmdump, certutil, curl, Xvfb, nvme-cli, rg. No package installation is performed by the harness |
 | 8 | Analysis source | Composed Chromium/Brave tree inferred from `<build>/../..`; retained annotation definitions and XML catalog |
 
-Release data comes from the separate `wakaba-lists` commit pinned by
-`pins.json`'s `wakaba_lists`, delivered to `lists/` with its
-`wakaba-lists.commit` marker. Apply with `tools/alloy_apply.py --root src
---lists lists` before building; see [`../tools/README.md`](../tools/README.md).
-The harness uses the resulting packaged `alloy-data/` beside `libcef.so`;
-this code repository contains neither the upstream data nor its update tools.
+Alloy ships no lists or dictionaries. The launcher snapshots
+`tools/testdata/alloy-data/` into the run-owned source directory and records its
+path as `data_directory` in `config.json`; lanes pass that path through
+`--alloy-data-dir`. These small fixtures test the engine's offline consumers,
+not Wakaba's production policy. See
+[`../docs/data-directory.md`](../docs/data-directory.md) for the embedder contract.
 
 The original seeded walker, human-paced active/idle rhythm, local trigger suite,
 daily renderer-crash attempt, page canary and startup guard canary are retained

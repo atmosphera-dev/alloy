@@ -2,8 +2,7 @@
 
 Run these commands on the dedicated `wakaba-build` NUC, from
 `/home/builder/work/alloy`, with this repository delivered to `repo/`.
-`pins.json` fixes the source revisions, the `wakaba_lists` data commit and the
-Node/pnpm versions. Brave's
+`pins.json` fixes the source revisions and Node/pnpm versions. Brave's
 own frozen pnpm install, no-history init, pinned depot_tools, DEPS and hooks
 provision the remaining build tools. The machine needs the distribution build
 prerequisites for Brave, plus `libcurl-gnutls` (the bundled Cargo runtime),
@@ -12,7 +11,7 @@ Xvfb / `xvfb-run`, and the cefclient runtime libraries.
 ```sh
 export TMPDIR=/home/builder/work/tmp
 python3 repo/tools/alloy_checkout.py --root /home/builder/work/alloy/src
-python3 repo/tools/alloy_apply.py --root src --lists lists --report evidence/apply.json
+python3 repo/tools/alloy_apply.py --root src --report evidence/apply.json
 python3 repo/tools/alloy_build.py --config release
 python3 repo/tools/smoke.py --out src/out/Release_Alloy
 # Verification-only startup canary and denial log:
@@ -20,26 +19,11 @@ python3 repo/tools/alloy_build.py --config verify
 python3 repo/tools/smoke.py --out src/out/Verify_Alloy
 ```
 
-Deliver the separate `wakaba-lists` repository at exactly the `wakaba_lists`
-commit in `pins.json` to `/home/builder/work/alloy/lists/`, using a checkout or
-`git archive` of that commit. Delivery writes the full commit hash followed by a
-newline to `lists/wakaba-lists.commit` (outside `data/`). This marker records the
-archive's source identity; the delivery must come from the pinned commit.
-Full apply refuses a missing/mismatched marker or missing `data/` before
-publishing source changes. `--lists` defaults to that NUC `lists/` directory,
-including when `prune_origin.py` delegates to the applier. `--cef-only` does not
-consume list data.
-
-The list update tools and upstream data live in `wakaba-lists`, not this code
-repository. The applier installs `lists/data/**` at `src/brave/alloy/data/`
-through the same local-edit-safe publication journal as source overlays.
-Builds package the files selected by `data/files.gni`, with their exact bytes,
-beside `libcef.so` in `alloy-data/`; they never fetch lists. All assembled
-`lists/components/*/list.txt` files are shipped. Their original `lists/sources/`
-copies remain in `wakaba-lists` as build inputs and are excluded from packaging.
-To refresh release data, run `tools/update_lists.sh` in the lists
-repository, review and commit its changes, then bump Alloy's `wakaba_lists` pin
-and deliver the new archive and matching marker.
+Alloy ships no lists or dictionaries. Apply and build consume only this repo
+and the pinned engine sources. The embedder passes `--alloy-data-dir` at startup;
+see [`../docs/data-directory.md`](../docs/data-directory.md) for the read-only
+directory contract. Without the switch the engine starts without this data and
+downloads none. `wakaba-lists` is Wakaba's input and is independent of Alloy.
 
 Checkout and full builds take long enough to require a durable owner. For
 example, launch the build with a fresh unit/log name and inspect that same unit
@@ -164,10 +148,10 @@ proof are retained under `logs/smoke-*/`; startup and all protocol waits are
 bounded. This proves page loading/CDP, not default filter readiness or a
 no-phone-home outcome.
 
-## Offline bundled-data consumers
+## Offline embedder-data consumers
 
 On the same NUC, build the native spelling observer from this repository against
-the current CEF headers/library, beside the release `libcef.so` and `alloy-data/`:
+the current CEF headers/library, beside the release `libcef.so`:
 
 ```sh
 timeout 70 gcc -std=c11 -D_GNU_SOURCE -DUSING_CEF_SHARED \
@@ -176,21 +160,33 @@ timeout 70 gcc -std=c11 -D_GNU_SOURCE -DUSING_CEF_SHARED \
   repo/tools/spell_consumer.c -L /home/builder/work/alloy/src/out/Release_Alloy \
   -Wl,-rpath,/home/builder/work/alloy/src/out/Release_Alloy -lcef \
   -o src/out/Release_Alloy/alloy_spell_consumer
-python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy
 python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy \
+  --alloy-data-dir="$PWD/repo/tools/testdata/alloy-data"
+python3 repo/tools/probe_blocking.py --out src/out/Release_Alloy \
+  --alloy-data-dir="$PWD/repo/tools/testdata/alloy-data" \
   --spell-consumer src/out/Release_Alloy/alloy_spell_consumer
 ```
 
 Both probes use a loopback-only network namespace, fresh profiles, the actual
-bundled QueryFilter parser, tracker failures and a neutral local script.
+QueryFilter parser, tracker failures and a neutral local script.
 QueryFilter readiness is observed through a bounded navigation whose actual
 URL loses `fbclid` and retains `keep=1`, without depending on product logs.
 The probe also accepts `--out src/out/Verify_Alloy`; verification additionally
-checks the parser's diagnostic rule count against the bundled JSON. The
+checks the parser's diagnostic rule count against the supplied JSON. The
 native observer additionally reports real CEF accessibility spelling markers.
 Its startup URL and profile settings are copied before CEF initialization;
 callbacks never retain borrowed environment storage across Chromium startup.
 The observer is test-only and writes no instrumentation into the product.
+
+Without `--alloy-data-dir`, the blocking probe checks that tracker requests are
+not blocked by lists and `fbclid` stays in the URL. `smoke.py` also defaults to
+no data; it accepts the switch when testing an embedder input. The native spell
+consumer forwards the supplied command line to CEF unchanged. To check startup
+rejection, use `probe_blocking.py --out src/out/Verify_Alloy
+--alloy-data-dir=relative-data --expect-startup-failure`, then repeat with an
+absolute missing directory. Each must exit nonzero before requesting a page.
+`--profile=<absolute evidence path>` retains and reuses a profile for the
+with-data then no-switch warm-profile check; both runs require normal exit.
 
 ## Store inventory (NUC only)
 
@@ -409,9 +405,8 @@ foreign roots and the spike checkout are refused before taking locks or writing.
 `--root` and `--out` must select that repository's own source/output tree.
 All pin, local-edit, full-apply and publication-journal checks remain in force.
 
-The second workspace owns its `repo/`, `src/`, `lists/`, `apply-state/`, `logs/`,
-`evidence/`, `support/` and `tmp/`. Deliver the same pinned lists archive and
-`wakaba-lists.commit` marker there. Its temporary directory is
+The second workspace owns its `repo/`, `src/`, `apply-state/`, `logs/`,
+`evidence/`, `support/` and `tmp/`. Its temporary directory is
 `/home/builder/work/alloy-b/tmp`; the original workspace keeps
 `/home/builder/work/tmp` for compatibility. For example, on the NUC:
 

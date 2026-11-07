@@ -81,6 +81,10 @@ def main():
     table=snapshot/'src/net/base/alloy_traffic_classes.inc'
     table.parent.mkdir(parents=True)
     shutil.copy2(SCRIPTS.parent/'src/net/base/alloy_traffic_classes.inc',table)
+    data=snapshot/'tools/testdata/alloy-data'
+    shutil.copytree(SCRIPTS.parent/'tools/testdata/alloy-data',data)
+    config['data_directory']=str(data)
+    save(d / 'config.json', config)
     SCRIPTS=snapshot/'harness'
     sys.path.insert(0,str(SCRIPTS))
     run(['chown', '-R', 'builder:builder', d])

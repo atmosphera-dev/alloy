@@ -1,25 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-import("//brave/alloy/data/files.gni")
-
 source_set("data_paths") {
   sources = [ "bundled_data.h" ]
   public_deps = [ "//base" ]
-}
-
-alloy_data_targets = []
-foreach(source, alloy_data_files) {
-  relative = rebase_path(source, "//brave/alloy/data")
-  name = "data_" + string_replace(relative, "/", "_")
-  copy(name) {
-    sources = [ source ]
-    outputs = [ "$root_out_dir/alloy-data/$relative" ]
-  }
-  alloy_data_targets += [ ":$name" ]
-}
-
-group("bundled_data") {
-  deps = alloy_data_targets
 }
 
 group("site_records_tests") {

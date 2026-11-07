@@ -198,6 +198,7 @@ try:
     profile=D/'profiles'/f'day-{day:03d}';profile.mkdir(parents=True,exist_ok=True)
     (D/'downloads').mkdir(exist_ok=True)
     args=[lane['binary'],'--url=about:blank','--ozone-platform=x11','--disable-gpu','--remote-debugging-port=9222','--remote-allow-origins=*','--cache-path='+str(profile),'--log-net-log='+str(RUN/'netlog.json'),'--net-log-capture-mode=Default','--alloy-guard-canary-url=https://example.com/alloy-guard-canary','--log-file='+str(RUN/'debug.log'),'--log-severity=verbose']
+    args+=['--alloy-data-dir='+CONFIG['data_directory']]
     if lane['build'].endswith('osr'):args+=['--off-screen-rendering-enabled']
     save(RUN/'command.json',dict(argv=args,env={k:os.environ.get(k) for k in ['HOME','TMPDIR','DISPLAY','DBUS_SESSION_BUS_ADDRESS']},profile=str(profile),sandbox_disabled=False))
     stdio=(RUN/'browser-stdio.log').open('xb')

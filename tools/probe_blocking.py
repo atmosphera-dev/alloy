@@ -27,7 +27,7 @@ TRACKERS={
     'fb':'https://connect.facebook.net/en_US/fbevents.js',
 }
 CDP=r'''
-const [port, url, resultPath, holdSeconds, spell] = process.argv.slice(1);
+const [port, url, resultPath, holdSeconds, spell, withData] = process.argv.slice(1);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const fs=await import('node:fs');
 const readinessStarted=Date.now();
@@ -58,9 +58,10 @@ while(Date.now()<readinessDeadline){
   await sleep(100);
   const observed=await call('Runtime.evaluate',{expression:'location.href',returnByValue:true});
   readiness.push(observed.result.value);
-  if(observed.result.value===readinessURL+'?keep=1'){queryReady=true;break;}
+  const expected=readinessURL+(withData==='yes'?'?keep=1':'?fbclid=alloy-query-ready&keep=1');
+  if(observed.result.value===expected){queryReady=true;break;}
 }
-if(!queryReady)throw Error('Bundled QueryFilter did not clean the readiness URL: '+JSON.stringify(readiness));
+if(!queryReady)throw Error('Unexpected QueryFilter readiness URL: '+JSON.stringify(readiness));
 const queryReadyMs=Date.now()-readinessStarted;
 await call('Page.navigate',{url:'about:blank'});
 await call('Page.navigate',{url:url+'?fbclid=alloy-query-probe&keep=1'});
@@ -86,6 +87,11 @@ def main():
     p.add_argument('--inside',action='store_true')
     p.add_argument('--hold-seconds',type=int,default=0)
     p.add_argument('--spell-consumer',type=Path)
+    p.add_argument('--alloy-data-dir',type=Path,
+                   help='Embedder input; absent means verify without lists')
+    p.add_argument('--expect-startup-failure',action='store_true')
+    p.add_argument('--profile',type=Path,
+                   help='Retained profile beneath workspace evidence/; supports warm restart')
     a=p.parse_args()
     out=a.out.resolve()
     try:
@@ -93,6 +99,12 @@ def main():
     except RuntimeError as error:
         p.error(str(error))
     if not 0<=a.hold_seconds<=900:p.error('Hold duration 0..900 seconds')
+    if a.expect_startup_failure and a.alloy_data_dir is None:
+        p.error('--expect-startup-failure requires --alloy-data-dir')
+    if a.spell_consumer and a.alloy_data_dir is None:
+        p.error('Spelling requires --alloy-data-dir')
+    if a.profile is not None and not a.profile.resolve().is_relative_to(WORK/'evidence'):
+        p.error('--profile must be beneath the selected workspace evidence/')
     if not a.inside:
         command=namespace_prefix(WORK)+['unshare','--net','--fork','/bin/sh','-c',
                  'ip link set lo up && exec runuser -u builder -- "$@"','alloy-offline',
@@ -117,36 +129,59 @@ def main():
     (site/'neutral.js').write_text('window.neutralExecuted=true;')
     page=(site/'index.html').read_text()+ '<script>setTimeout(()=>{for(const [name,url] of Object.entries('+json.dumps(dict(TRACKERS,neutral='/neutral.js'))+')){let s=document.createElement("script");s.src=url;s.onload=()=>outcomes[name]="loaded";s.onerror=()=>outcomes[name]="error";document.head.append(s)}},1000)</script>'
     (site/'index.html').write_text(page)
-    handler=functools.partial(http.server.SimpleHTTPRequestHandler,directory=site)
+    requests=[]
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            super().do_GET()
+    handler=functools.partial(Handler,directory=site)
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),handler)
     threading.Thread(target=server.serve_forever,daemon=True).start()
     url=f'http://127.0.0.1:{server.server_port}/index.html'
-    profile=log/'profile';profile.mkdir()
+    profile=a.profile.resolve() if a.profile is not None else log/'profile'
+    profile.mkdir(parents=True,exist_ok=True)
     port=9237
     executable=a.spell_consumer.resolve() if a.spell_consumer else out/'cefclient'
     argv=['xvfb-run','-a','-s','-screen 0 1280x720x24',str(executable),'--off-screen-rendering-enabled',f'--remote-debugging-port={port}','--ozone-platform=x11','--disable-gpu',f'--cache-path={profile}',f'--url=about:blank',f'--log-file={log}/debug.log',f'--log-net-log={log}/netlog.json','--net-log-capture-mode=Everything','--enable-logging=stderr','--vmodule=query_filter_component_installer=1']
+    if a.alloy_data_dir is not None:
+        argv.append('--alloy-data-dir='+str(a.alloy_data_dir))
+    if a.expect_startup_failure:
+        argv[argv.index('--url=about:blank')]='--url='+url
     (log/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
     print('OFFLINE_PROBE_EVIDENCE',log,flush=True)
     with (log/'stdio.log').open('w') as stream:
         process=subprocess.Popen(argv,cwd=out,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR=TMP))
         try:
-            result=subprocess.run(['node','--input-type=module','-e',CDP,str(port),url,str(log/'cdp.json'),str(a.hold_seconds),'yes' if a.spell_consumer else 'no'],capture_output=True,text=True,timeout=a.hold_seconds+110)
+            if a.expect_startup_failure:
+                process.wait(timeout=20)
+                proof=dict(exit=process.returncode,requests=requests)
+                (log/'startup-failure.json').write_text(json.dumps(proof,indent=2)+'\n')
+                assert process.returncode!=0,proof
+                assert not requests,proof
+                print('ALLOY_DATA_DIR_STARTUP_REJECTED',json.dumps(proof),flush=True)
+                return 0
+            result=subprocess.run(['node','--input-type=module','-e',CDP,str(port),url,str(log/'cdp.json'),str(a.hold_seconds),'yes' if a.spell_consumer else 'no','yes' if a.alloy_data_dir is not None else 'no'],capture_output=True,text=True,timeout=a.hold_seconds+110)
             (log/'cdp.stdout').write_text(result.stdout);(log/'cdp.stderr').write_text(result.stderr)
             assert result.returncode==0,result.stderr
             proof=json.loads((log/'cdp.json').read_text())
             assert proof['consumer']['neutral'] is True,proof['consumer']
-            assert proof['consumer']['url']==url+'?keep=1',proof['consumer']
-            assert proof['readiness'][-1]==proof['readinessURL']+'?keep=1',proof['readiness']
-            if out.name=='Verify_Alloy':
-                expected_rules=len(json.loads((out/'alloy-data/lists/local-data/1/query-filter.json').read_text()))
+            with_data=a.alloy_data_dir is not None
+            suffix='?keep=1' if with_data else '?fbclid=alloy-query-probe&keep=1'
+            assert proof['consumer']['url']==url+suffix,proof['consumer']
+            ready_suffix='?keep=1' if with_data else '?fbclid=alloy-query-ready&keep=1'
+            assert proof['readiness'][-1]==proof['readinessURL']+ready_suffix,proof['readiness']
+            if out.name=='Verify_Alloy' and with_data:
+                expected_rules=len(json.loads((a.alloy_data_dir/'lists/local-data/1/query-filter.json').read_text()))
                 query_log=(log/'stdio.log').read_text()
-                assert f'Loaded {expected_rules} bundled QueryFilter rules' in query_log,query_log[-3000:]
-            print('ALLOY_BUNDLED_QUERY_FILTER_PASS',proof['consumer']['url'],flush=True)
+                assert f'Loaded {expected_rules} embedder QueryFilter rules' in query_log,query_log[-3000:]
+            print('ALLOY_QUERY_FILTER_PASS',proof['consumer']['url'],flush=True)
             for name,url in TRACKERS.items():
-                assert any(f.get('url')==url and f['errorText']=='net::ERR_BLOCKED_BY_CLIENT' for f in proof['failures']),(name,proof['failures'])
+                failures=[f for f in proof['failures'] if f.get('url')==url]
+                assert failures,(name,proof['failures'])
+                assert all((f['errorText']=='net::ERR_BLOCKED_BY_CLIENT')==with_data for f in failures),(name,failures)
+            process.wait(timeout=15)
+            assert process.returncode==0,process.returncode
             if a.spell_consumer:
-                process.wait(timeout=15)
-                assert process.returncode==0,process.returncode
                 trees=[json.loads(line[3:]) for line in (log/'stdio.log').read_text().splitlines() if line.startswith('AX ')]
                 markers=[]
                 def visit(x):
@@ -158,7 +193,10 @@ def main():
                 for tree in trees:visit(tree)
                 (log/'spell-markers.json').write_text(json.dumps(markers,indent=2)+'\n')
                 assert markers,'No native spelling marker delivered to CEF consumer'
-                print('ALLOY_BUNDLED_DICTIONARY_NATIVE_MARKER_PASS',json.dumps(markers),flush=True)
+                assert any(m.get('name','')[start:end]=='qzxqzxqzx'
+                           for m in markers
+                           for start,end in zip(m.get('markerStarts',[]),m.get('markerEnds',[]))),markers
+                print('ALLOY_EMBEDDER_DICTIONARY_NATIVE_MARKER_PASS',json.dumps(markers),flush=True)
             print('ALLOY_OFFLINE_TRACKER_PROBE_PASS',json.dumps(proof['consumer']),flush=True)
         finally:
             server.shutdown()

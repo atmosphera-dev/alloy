@@ -43,7 +43,7 @@ def validate_workspace(work, repo=None):
         raise RuntimeError('Tools must come from the selected workspace repo/')
     for path in (work, work / 'repo', work / 'src', work / 'src/out',
                  work / 'src/out/Release_Alloy', work / 'src/out/Verify_Alloy', work / 'apply-state',
-                 work / 'lists', work / 'logs', work / 'evidence', work / 'support',
+                 work / 'logs', work / 'evidence', work / 'support',
                  temp_path(work)):
         if path.resolve() != path or (path.exists() and
                 (not path.is_dir() or path.stat().st_uid != owner)):

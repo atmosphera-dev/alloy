@@ -17,8 +17,9 @@ provides the mechanisms, and the embedding application chooses the policy.
 - **No logging in product builds.** A blocked request fails with an error the
   embedder can show at that moment; nothing is recorded. Request logs exist
   only in verification builds, for the test harness.
-- **Bundled blocking lists.** Filter lists from `wakaba-lists` ship inside the
-  build at a pinned commit. Nothing is downloaded at runtime.
+- **Embedder-selected blocking lists.** The application supplies its own
+  [data directory](docs/data-directory.md) with `--alloy-data-dir`. Alloy ships
+  no lists or dictionaries and downloads none at runtime.
 - **Three profile modes** per request context:
   - *stateless*: nothing is stored, not even in memory;
   - *memory-only*: nothing is written to disk;
@@ -35,7 +36,7 @@ change.
 
 | # | Area | State |
 |---|---|---|
-| 1 | Network guard, no-logging product builds, bundled lists | Done |
+| 1 | Network guard, no-logging product builds, offline list consumers | Done |
 | 2 | Stateless, memory-only and encrypted contexts; password and OS-keyring key sources | Done |
 | 3 | Site records: site settings, embedded-frame state | In progress |
 | 4 | Decay, auto-lock, complete API and docs | Planned |
@@ -62,13 +63,12 @@ Upstream versions are pinned in [`pins.json`](pins.json).
 
 See [`tools/README.md`](tools/README.md). The tools currently accept only the
 project's own build workspace: `/home/builder/work/alloy` on the host
-`wakaba-build`, with this repository delivered to `repo/` and the pinned
-`wakaba-lists` commit to `lists/`. From that workspace:
+`wakaba-build`, with this repository delivered to `repo/`. From that workspace:
 
 ```sh
 export TMPDIR=/home/builder/work/tmp
 python3 repo/tools/alloy_checkout.py --root /home/builder/work/alloy/src
-python3 repo/tools/alloy_apply.py --root src --lists lists --report evidence/apply.json
+python3 repo/tools/alloy_apply.py --root src --report evidence/apply.json
 python3 repo/tools/alloy_build.py --config release   # product build
 python3 repo/tools/smoke.py --out src/out/Release_Alloy
 python3 repo/tools/alloy_build.py --config verify    # verification build

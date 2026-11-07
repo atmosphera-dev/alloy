@@ -1,0 +1,4 @@
+! Synthetic Alloy boundary-test rules, not a production blocking policy.
+||www.googletagmanager.com/gtag/js$script
+||securepubads.g.doubleclick.net/tag/js/gpt.js$script
+||connect.facebook.net/en_US/fbevents.js$script

@@ -24,12 +24,16 @@
    }
  
    return dictionary;
-@@ -400,7 +399,7 @@
+@@ -400,7 +399,11 @@
    // sequence because it checks if there is a "Dictionaries" directory and
    // create it.
    base::FilePath dict_dir;
 -  base::PathService::Get(chrome::DIR_APP_DICTIONARIES, &dict_dir);
-+  dict_dir = alloy::BundledDataDirectory().AppendASCII("dictionaries");
++  const auto data_dir = alloy::DataDirectory();
++  if (!data_dir) {
++    return DictionaryFile(task_runner);
++  }
++  dict_dir = data_dir->AppendASCII("dictionaries");
    base::FilePath dict_path =
        spellcheck::GetVersionedFileName(language, dict_dir);
  

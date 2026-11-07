@@ -12,6 +12,18 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 SPDX-FileCopyrightText = "Alex Indigo"
 
 [[annotations]]
+path = "tools/testdata/alloy-data/dictionaries/en-US-10-2.bdic"
+precedence = "override"
+SPDX-License-Identifier = "LicenseRef-Chromium-English-Hunspell"
+SPDX-FileCopyrightText = ["Kevin Atkinson and contributors", "Geoff Kuenning", "Princeton University"]
+
+[[annotations]]
+path = "tools/testdata/alloy-data/lists/catalog/list_catalog.json"
+precedence = "override"
+SPDX-License-Identifier = "MPL-2.0"
+SPDX-FileCopyrightText = ["The Brave Authors", "Alex Indigo"]
+
+[[annotations]]
 path = ["src/brave/third_party/argon2/BUILD.gn", "src/brave/third_party/argon2/README.chromium"]
 precedence = "override"
 SPDX-License-Identifier = "MPL-2.0"

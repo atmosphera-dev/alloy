@@ -83,6 +83,33 @@ TEST_F(ProfileSubscriptionFetchTest, OriginalAdmissionAndCancellationRetirePendi
   EXPECT_FALSE(factory.IsPending(url.spec()));
 }
 
+TEST_F(ProfileSubscriptionFetchTest, StreamAcceptsExactly64MiB) {
+  const GURL url("https://subscription.invalid/maximum");
+  const std::string text(64u * 1024 * 1024, '!');
+  base::test::TestFuture<Result, DATFileDataBuffer> done;
+  auto cancel = Fetcher().Run(url, false, done.GetCallback());
+  ASSERT_TRUE(factory.SimulateResponseForPendingRequest(url.spec(), text));
+  task_environment()->RunUntilIdle();
+  ASSERT_TRUE(done.IsReady());
+  EXPECT_EQ(Result::kOk, done.Get<0>());
+  EXPECT_EQ(text, std::string(done.Get<1>().begin(), done.Get<1>().end()));
+  std::move(cancel).Run();
+}
+
+TEST_F(ProfileSubscriptionFetchTest, StreamRejectsOneByteAbove64MiBWithoutReturningBytes) {
+  const GURL url("https://subscription.invalid/oversized");
+  const std::string text(64u * 1024 * 1024 + 1, '!');
+  base::test::TestFuture<Result, DATFileDataBuffer> done;
+  auto cancel = Fetcher().Run(url, false, done.GetCallback());
+  ASSERT_TRUE(factory.SimulateResponseForPendingRequest(url.spec(), text));
+  task_environment()->RunUntilIdle();
+  ASSERT_TRUE(done.IsReady());
+  EXPECT_EQ(Result::kError, done.Get<0>());
+  EXPECT_TRUE(done.Get<1>().empty());
+  EXPECT_FALSE(factory.IsPending(url.spec()));
+  std::move(cancel).Run();
+}
+
 TEST_F(ProfileSubscriptionFetchTest, HttpFailureAndNonNetworkSourceCannotReturnSuccessfulPrivateBytes) {
   auto fetch = Fetcher();
   const GURL url("https://subscription.invalid/failure");

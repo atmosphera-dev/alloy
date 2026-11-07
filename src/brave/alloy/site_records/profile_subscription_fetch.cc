@@ -16,6 +16,7 @@ namespace alloy::site_records {
 namespace {
 using Provider = brave_shields::AdBlockSubscriptionFiltersProvider;
 using Result = Provider::SourceResult;
+constexpr size_t kMaxSubscriptionBytes = 64u * 1024 * 1024;
 
 class Fetch final : public base::RefCounted<Fetch>,
                     public network::SimpleURLLoaderStreamConsumer {
@@ -43,7 +44,7 @@ class Fetch final : public base::RefCounted<Fetch>,
         brave_shields::AdBlockSubscriptionDownloadManager::TrafficAnnotation());
     loader_->SetOnRedirectCallback(base::BindRepeating(
         &Fetch::Redirect, base::Unretained(this)));
-    // Stream rather than impose DownloadToString's unrelated 5 MiB ceiling.
+    // Stream with a 64 MiB budget rather than DownloadToString's 5 MiB ceiling.
     // Native list parsing already requires the complete byte vector. Chunks
     // avoid reallocating private payload buffers while receiving the response.
     loader_->DownloadAsStream(factory, this);
@@ -97,7 +98,7 @@ class Fetch final : public base::RefCounted<Fetch>,
       Finish(Result::kCancelled);
       return;
     }
-    if (bytes.size() > DATFileDataBuffer().max_size() - size_) {
+    if (bytes.size() > kMaxSubscriptionBytes - size_) {
       Finish(Result::kError);
       return;
     }

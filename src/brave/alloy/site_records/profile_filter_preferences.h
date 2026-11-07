@@ -3,6 +3,7 @@
 #ifndef BRAVE_ALLOY_SITE_RECORDS_PROFILE_FILTER_PREFERENCES_H_
 #define BRAVE_ALLOY_SITE_RECORDS_PROFILE_FILTER_PREFERENCES_H_
 
+#include <atomic>
 #include <set>
 #include <vector>
 
@@ -71,8 +72,10 @@ class ProfileFilterPreferences final : public InMemoryPrefStore, public base::Su
   const base::RepeatingCallback<bool()> admitted_;
   std::set<std::string, std::less<>> keys_;
   std::vector<Closed> closed_callbacks_;
-  FileStatus status_ = FileStatus::kOk;
-  bool closing_ = false;
+  // Admission is also queried by subscription parsers on the engine sequence.
+  // The preference cache and all lifecycle mutations remain UI-owned.
+  std::atomic<FileStatus> status_{FileStatus::kOk};
+  std::atomic<bool> closing_{false};
   bool closed_ = false;
   scoped_refptr<ProfileFilterResources> resources_;
   base::RepeatingClosureList consumers_closed_;

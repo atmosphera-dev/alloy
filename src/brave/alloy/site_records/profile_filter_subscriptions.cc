@@ -140,7 +140,7 @@ class Subscriptions final : public base::RefCountedDeleteOnSequence<Subscription
   std::shared_ptr<ProfileFilterStorage> storage_;scoped_refptr<base::SequencedTaskRunner> io_;
   ProfileFilterPreferences::SubscriptionFetch fetch_;base::RepeatingCallback<void(FileStatus)> error_;
   const base::RepeatingCallback<bool()> admitted_;
-  std::map<GURL,std::shared_ptr<Entry>> entries_;bool closed_=false;
+  std::map<GURL,std::shared_ptr<Entry>> entries_;std::atomic<bool> closed_{false};
   base::CallbackListSubscription retirement_;
   base::WeakPtrFactory<Subscriptions> weak_{this};
 };

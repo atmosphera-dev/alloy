@@ -3,6 +3,7 @@
 #include "brave/alloy/site_records/profile_filter_preferences.h"
 #include "base/files/scoped_temp_dir.h"
 #include "base/functional/callback_helpers.h"
+#include "base/task/thread_pool.h"
 #include "base/test/bind.h"
 #include "base/test/test_future.h"
 #include "brave/components/brave_shields/content/browser/ad_block_service.h"
@@ -72,6 +73,43 @@ TEST_F(ProfileFilterSubscriptionsTest, SupersededAndDeletedDownloadsCannotPublis
   base::test::TestFuture<Result,DATFileDataBuffer> missing;backend.source.Run(url).read.Run(missing.GetCallback());task_environment()->RunUntilIdle();
   ASSERT_TRUE(missing.IsReady());EXPECT_EQ(Result::kMissing,missing.Get<0>());EXPECT_TRUE(missing.Get<1>().empty());
   std::move(pending[3]).Run(Result::kOk,DATFileDataBuffer({'f','r','e','s','h'}));task_environment()->RunUntilIdle();EXPECT_TRUE(errors.empty());
+}
+TEST_F(ProfileFilterSubscriptionsTest, EngineAdmissionObservesDeletionFailureAndClose) {
+  RecordCapabilityIssuer issuer(base::UnguessableToken::Create(),base::UnguessableToken::Create(),base::UnguessableToken::Create(),StorageMode::kMemory);
+  std::shared_ptr<ProfileFilterStorage> storage;
+  ASSERT_EQ(FileStatus::kOk,ProfileFilterStorage::Create(nullptr,issuer.Issue(StorePurpose::kProfileCustomFilters),&storage));
+  auto owner=Load(storage);ASSERT_TRUE(owner);
+  auto backend=owner->SubscriptionBackend(base::BindRepeating(
+      [](const GURL&,bool,Provider::SourceReply)->base::OnceClosure{return base::DoNothing();}));
+  auto engine=base::ThreadPool::CreateSequencedTaskRunner({});
+  auto admitted=[&](const Provider::Source& source) {
+    base::test::TestFuture<bool> done;
+    EXPECT_TRUE(engine->PostTaskAndReplyWithResult(FROM_HERE,base::BindOnce(
+        [](base::RepeatingCallback<bool()> admitted){return admitted.Run();},source.admitted),done.GetCallback()));
+    return done.Get();
+  };
+  const GURL url("https://engine-admission.invalid/list");
+  auto deleted=backend.source.Run(url);
+  EXPECT_TRUE(admitted(deleted));
+  backend.cancel.Run(url);
+  EXPECT_FALSE(admitted(deleted));
+  auto current=backend.source.Run(url);
+  EXPECT_TRUE(admitted(current));
+  owner->ConsumerFailed(FileStatus::kIo);
+  EXPECT_FALSE(admitted(current));
+  EXPECT_EQ(std::vector<FileStatus>({FileStatus::kIo}),errors);
+
+  auto closing=Load(storage);ASSERT_TRUE(closing);
+  auto closing_backend=closing->SubscriptionBackend(base::BindRepeating(
+      [](const GURL&,bool,Provider::SourceReply)->base::OnceClosure{return base::DoNothing();}));
+  auto source=closing_backend.source.Run(url);
+  EXPECT_TRUE(admitted(source));
+  base::test::TestFuture<FileStatus> closed;
+  closing->Close(closed.GetCallback());
+  // Exercise the cut before the queued storage close has drained as well.
+  EXPECT_FALSE(admitted(source));
+  EXPECT_EQ(FileStatus::kOk,closed.Get());
+  EXPECT_FALSE(admitted(source));
 }
 }  // namespace
 }  // namespace alloy::site_records

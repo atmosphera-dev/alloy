@@ -1,0 +1,28 @@
+--- a/browser/brave_shields/BUILD.gn
++++ b/browser/brave_shields/BUILD.gn
+@@ -14,6 +14,7 @@
+     "brave_shields_tab_helper.h",
+     "brave_shields_web_contents_observer.h",
+     "filter_list_service_factory.h",
++    "profile_adblock_service_factory.h",
+   ]
+ 
+   public_deps = [
+@@ -42,6 +43,7 @@
+     "brave_shields_tab_helper.cc",
+     "brave_shields_web_contents_observer.cc",
+     "filter_list_service_factory.cc",
++    "profile_adblock_service_factory.cc",
+   ]
+ 
+   public_deps = [ ":brave_shields" ]
+@@ -48,6 +50,9 @@
+ 
+   deps = [
+     "//brave/alloy/site_records:capabilities",
++    "//brave/alloy/site_records:native_profile_configuration",
++    "//brave/alloy/site_records:profile_adblock_service",
++    "//brave/alloy/site_records:profile_subscription_fetch",
+     "//base:i18n",
+     "//brave/browser:browser_process",
+     "//brave/components/brave_perf_predictor/browser",

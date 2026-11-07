@@ -1,0 +1,42 @@
+--- a/content/browser/renderer_host/document_associated_data.h
++++ b/content/browser/renderer_host/document_associated_data.h
+@@ -65,6 +65,7 @@
+   // Native weak/safe references remain valid for teardown. New Alloy state
+   // must stop being admitted before any service/user-data destructor runs.
+   bool IsAlloyStateAdmissionOpen() const { return alloy_state_admission_open_; }
++  void RetireAlloyState();
+ 
+   // The Page object associated with the main document. It is nullptr for
+   // subframes.
+--- a/content/browser/renderer_host/document_associated_data.cc
++++ b/content/browser/renderer_host/document_associated_data.cc
+@@ -64,12 +64,15 @@
+   }
+ }
+ 
+-DocumentAssociatedData::~DocumentAssociatedData() {
++void DocumentAssociatedData::RetireAlloyState() {
++  if (!alloy_state_admission_open_) return;
+   alloy_state_admission_open_ = false;
+   RetireAlloyNetworkGenerationForDocument(GetWeakPtr().get());
+-  if (navigation_or_document_handle_) {
+-    navigation_or_document_handle_->RetireAlloyState();
+-  }
++  if (navigation_or_document_handle_) navigation_or_document_handle_->RetireAlloyState();
++}
++
++DocumentAssociatedData::~DocumentAssociatedData() {
++  RetireAlloyState();
+   TRACE_EVENT0("navigation", "DocumentAssociatedData::~DocumentAssociatedData");
+   base::ScopedUmaHistogramTimer histogram_timer(
+       "Navigation.DocumentAssociatedDataDestructor");
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -132,6 +132,7 @@
+   ldflags = []
+ 
+   deps = [
++    "//components/keyed_service/core",
+     ":child_process_security_policy_impl",
+     "//base",
+     "//base:base_static",

@@ -1,0 +1,190 @@
+--- a/components/keyed_service/core/BUILD.gn
++++ b/components/keyed_service/core/BUILD.gn
+@@ -26,6 +26,8 @@
+     "refcounted_keyed_service.h",
+     "refcounted_keyed_service_factory.h",
+     "service_access_type.h",
++    "service_creation_gate.cc",
++    "service_creation_gate.h",
+     "simple_dependency_manager.cc",
+     "simple_dependency_manager.h",
+     "simple_factory_key.cc",
+--- a/components/keyed_service/core/keyed_service_base_factory.h
++++ b/components/keyed_service/core/keyed_service_base_factory.h
+@@ -102,6 +102,11 @@
+   // Finds which context (if any) to use.
+   virtual void* GetContextToUse(void* context) const = 0;
+ 
++  // A separate creation fence: cached services may still be needed to finish
++  // teardown. Typed adapters make this final, so concrete factories cannot
++  // bypass owner admission by overriding context selection or using tests.
++  virtual bool IsContextAdmittedForCreation(void* context) const { return true; }
++
+   // By default, instance of a service can only be created once the context
+   // has been fully initialized. Some embedders uses services as part of
+   // their initialisation. Those factories needs to override this method to
+--- a/components/keyed_service/core/simple_factory_key.h
++++ b/components/keyed_service/core/simple_factory_key.h
+@@ -6,6 +6,7 @@
+ #define COMPONENTS_KEYED_SERVICE_CORE_SIMPLE_FACTORY_KEY_H_
+ 
+ #include "base/files/file_path.h"
++#include "components/keyed_service/core/service_creation_gate.h"
+ #include "components/keyed_service/core/keyed_service_export.h"
+ 
+ // A key used by SimpleKeyedServiceFactory is used to associated the
+@@ -27,13 +28,17 @@
+ 
+   bool IsOffTheRecord() const { return is_off_the_record_; }
+ 
++  void SetServiceCreationGate(ServiceCreationGate::Callback callback);
++  bool CanCreateServices() const;
++
+   // Identity and service-sharing authority are separate. A key whose immutable
+   // owner policy forbids sharing must not be redirected by a factory selector.
+   virtual bool AllowsServiceRedirection() const { return true; }
+ 
+  private:
+   base::FilePath path_;
+   bool is_off_the_record_;
++  ServiceCreationGate::Callback service_creation_gate_;
+ };
+ 
+ #endif  // COMPONENTS_KEYED_SERVICE_CORE_SIMPLE_FACTORY_KEY_H_
+--- a/components/keyed_service/core/simple_factory_key.cc
++++ b/components/keyed_service/core/simple_factory_key.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/keyed_service/core/simple_factory_key.h"
++
++#include "base/check.h"
+ 
+ #include "components/keyed_service/core/simple_dependency_manager.h"
+ 
+@@ -13,3 +15,11 @@
+ }
+ 
+ SimpleFactoryKey::~SimpleFactoryKey() = default;
++
++void SimpleFactoryKey::SetServiceCreationGate(ServiceCreationGate::Callback callback) {
++  CHECK(callback); CHECK(!service_creation_gate_);
++  service_creation_gate_ = std::move(callback);
++}
++bool SimpleFactoryKey::CanCreateServices() const {
++  return ServiceCreationGate::Allows(service_creation_gate_);
++}
+--- a/components/keyed_service/content/browser_context_keyed_service_factory.h
++++ b/components/keyed_service/content/browser_context_keyed_service_factory.h
+@@ -194,6 +194,7 @@
+ 
+   // KeyedServiceBaseFactory:
+   void* GetContextToUse(void* context) const final;
++  bool IsContextAdmittedForCreation(void* context) const final;
+   bool ServiceIsCreatedWithContext() const final;
+   void ContextShutdown(void* context) final;
+   void ContextDestroyed(void* context) final;
+--- a/components/keyed_service/content/browser_context_keyed_service_factory.cc
++++ b/components/keyed_service/content/browser_context_keyed_service_factory.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/keyed_service/content/browser_context_keyed_service_factory.h"
++
++#include "components/keyed_service/core/service_creation_gate.h"
+ 
+ #include <utility>
+ 
+@@ -127,3 +129,8 @@
+ void BrowserContextKeyedServiceFactory::CreateServiceNow(void* context) {
+   KeyedServiceFactory::GetServiceForContext(context, true);
+ }
++
++bool BrowserContextKeyedServiceFactory::IsContextAdmittedForCreation(void* context) const {
++  const auto* typed = static_cast<const content::BrowserContext*>(context);
++  return ServiceCreationGate::Allows(*typed);
++}
+--- a/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.h
++++ b/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.h
+@@ -142,6 +142,7 @@
+ 
+   // KeyedServiceBaseFactory:
+   void* GetContextToUse(void* context) const final;
++  bool IsContextAdmittedForCreation(void* context) const final;
+   bool ServiceIsCreatedWithContext() const final;
+   void ContextShutdown(void* context) final;
+   void ContextDestroyed(void* context) final;
+--- a/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.cc
++++ b/components/keyed_service/content/refcounted_browser_context_keyed_service_factory.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/keyed_service/content/refcounted_browser_context_keyed_service_factory.h"
++
++#include "components/keyed_service/core/service_creation_gate.h"
+ 
+ #include "base/check_op.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+@@ -128,3 +130,8 @@
+     user_prefs::PrefRegistrySyncable* registry) {
+   RegisterProfilePrefs(registry);
+ }
++
++bool RefcountedBrowserContextKeyedServiceFactory::IsContextAdmittedForCreation(void* context) const {
++  const auto* typed = static_cast<const content::BrowserContext*>(context);
++  return ServiceCreationGate::Allows(*typed);
++}
+--- a/components/keyed_service/core/simple_keyed_service_factory.h
++++ b/components/keyed_service/core/simple_keyed_service_factory.h
+@@ -135,6 +135,7 @@
+ 
+   // KeyedServiceBaseFactory:
+   void* GetContextToUse(void* context) const final;
++  bool IsContextAdmittedForCreation(void* context) const final;
+   bool ServiceIsCreatedWithContext() const final;
+   void ContextShutdown(void* context) final;
+   void ContextDestroyed(void* context) final;
+--- a/components/keyed_service/core/simple_keyed_service_factory.cc
++++ b/components/keyed_service/core/simple_keyed_service_factory.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/keyed_service/core/simple_keyed_service_factory.h"
++
++#include "components/keyed_service/core/service_creation_gate.h"
+ 
+ #include "base/check_op.h"
+ #include "base/functional/bind.h"
+@@ -108,3 +110,8 @@
+ }
+ 
+ void SimpleKeyedServiceFactory::CreateServiceNow(void* context) {}
++
++bool SimpleKeyedServiceFactory::IsContextAdmittedForCreation(void* context) const {
++  const auto* typed = static_cast<const SimpleFactoryKey*>(context);
++  return typed->CanCreateServices();
++}
+--- a/components/keyed_service/core/keyed_service_templated_factory.cc
++++ b/components/keyed_service/core/keyed_service_templated_factory.cc
+@@ -110,8 +110,9 @@
+                 ctx.event()->set_chrome_keyed_service()->set_name(name());
+               });
+   AssertContextWasntDestroyed(context);
+-  const void* requested = context;
+-  context = GetContextToUse(context);
++  void* requested = context;
++  if (IsContextAdmittedForCreation(requested)) context = GetContextToUse(context);
++  else create = false;  // Only original-context cached services may finish teardown.
+   NotifyContextAccessForTesting(requested, context);
+   if (!context) {
+     return nullptr;
+@@ -127,7 +128,8 @@
+     CHECK(!info.service);
+ 
+     // Object not found. Is creation allowed?
+-    if (!create) {
++    if (!create || !IsContextAdmittedForCreation(requested) ||
++        !IsContextAdmittedForCreation(context)) {
+       return nullptr;
+     }
+ 

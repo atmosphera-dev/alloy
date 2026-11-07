@@ -1,0 +1,108 @@
+--- a/browser/cosmetic_filters/sources.gni
++++ b/browser/cosmetic_filters/sources.gni
+@@ -6,4 +6,6 @@
+ brave_browser_cosmetic_filters_sources = [
++  "//brave/browser/cosmetic_filters/profile_cosmetic_filters_resources.cc",
++  "//brave/browser/cosmetic_filters/profile_cosmetic_filters_resources.h",
+   "//brave/browser/cosmetic_filters/cosmetic_filters_tab_helper.cc",
+   "//brave/browser/cosmetic_filters/cosmetic_filters_tab_helper.h",
+ ]
+--- a/browser/brave_content_browser_client.cc
++++ b/browser/brave_content_browser_client.cc
+@@ -31,3 +31,4 @@
+ #include "brave/browser/cosmetic_filters/cosmetic_filters_tab_helper.h"
++#include "brave/browser/cosmetic_filters/profile_cosmetic_filters_resources.h"
+ #include "brave/browser/debounce/debounce_service_factory.h"
+ #include "brave/browser/ephemeral_storage/ephemeral_storage_service_factory.h"
+@@ -238,18 +239,7 @@
+-void BindCosmeticFiltersResourcesOnTaskRunner(
+-    mojo::PendingReceiver<cosmetic_filters::mojom::CosmeticFiltersResources>
+-        receiver,
+-    brave_shields::AdBlockEngineWrapper* engine_wrapper) {
+-  mojo::MakeSelfOwnedReceiver(
+-      std::make_unique<cosmetic_filters::CosmeticFiltersResources>(
+-          engine_wrapper),
+-      std::move(receiver));
+-}
+-
+ void BindCosmeticFiltersResources(
+     content::RenderFrameHost* const frame_host,
+     mojo::PendingReceiver<cosmetic_filters::mojom::CosmeticFiltersResources>
+         receiver) {
+-  g_brave_browser_process->ad_block_service()->AsyncCall(base::BindOnce(
+-      &BindCosmeticFiltersResourcesOnTaskRunner, std::move(receiver)));
++  if(frame_host)cosmetic_filters::BindProfileCosmeticFiltersResources(*frame_host,std::move(receiver));
+ }
+ 
+--- a/components/brave_shields/content/browser/ad_block_service.h
++++ b/components/brave_shields/content/browser/ad_block_service.h
+@@ -15,3 +15,4 @@
+ #include <utility>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+@@ -168,3 +169,7 @@
+   bool IsClosed() const { return closed_; }
++  base::CallbackListSubscription ObserveClose(base::RepeatingClosure callback) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);CHECK(!closed_);
++    return closing_observers_.Add(std::move(callback));
++  }
+   base::WeakPtr<AdBlockService> GetWeakPtr() { return weak_factory_.GetWeakPtr(); }
+   explicit AdBlockService(
+@@ -253,6 +258,8 @@
+   bool closed_ = false;
++  bool closing_in_progress_ = false;
++  base::RepeatingClosureList closing_observers_;
++  std::vector<base::OnceClosure> close_callbacks_;
+   base::CallbackListSubscription retirement_;
+   base::RepeatingClosure close_failed_;
+-  static std::string g_ad_block_dat_file_version_;
+ 
+   void OnResourcesLoaded(
+--- a/components/brave_shields/content/browser/ad_block_service.cc
++++ b/components/brave_shields/content/browser/ad_block_service.cc
+@@ -367,5 +367,7 @@
+ }
+ 
+-AdBlockService::~AdBlockService() = default;
++AdBlockService::~AdBlockService() {
++  if(!closed_)Close(base::DoNothing());
++}
+ 
+ void AdBlockService::OnProfileClosing() {
+@@ -376,5 +378,9 @@
+ bool AdBlockService::Close(base::OnceClosure done) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  close_callbacks_.push_back(std::move(done));
++  if(closing_in_progress_)return true;
+   if (!closed_) {
++    closing_in_progress_=true;
+     closed_ = true;
++    closing_observers_.Notify();
+     weak_factory_.InvalidateWeakPtrs();
+@@ -413,7 +419,10 @@
+     engine_wrapper_.Reset();
++    closing_in_progress_=false;
+   }
+   // Reset posts destruction. This original FIFO fence acknowledges only after
+   // both native engines and their accepted tasks have actually retired.
+-  return task_runner_->PostTaskAndReply(FROM_HERE, base::DoNothing(), std::move(done));
++  return task_runner_->PostTaskAndReply(FROM_HERE, base::DoNothing(),base::BindOnce(
++      [](std::vector<base::OnceClosure> callbacks){for(auto& callback:callbacks)if(callback)std::move(callback).Run();},
++      std::exchange(close_callbacks_,{})));
+ }
+ 
+--- a/components/cosmetic_filters/browser/cosmetic_filters_resources.h
++++ b/components/cosmetic_filters/browser/cosmetic_filters_resources.h
+@@ -50,8 +50,5 @@
+-  // DanglingPtrDetection is disabled because the AdBlockService is owned by
+-  // the BrowserProcess and is guaranteed to be alive for the lifetime of the
+-  // browser process. This class however is a self-owned mojo receiver.
+-  const raw_ptr<brave_shields::AdBlockEngineWrapper,
+-                DisableDanglingPtrDetection>
+-      engine_wrapper_ = nullptr;
++  // Synchronous engine-task adapter. Mojo ownership belongs to the original
++  // document; no receiver may retain this engine view across tasks.
++  const raw_ptr<brave_shields::AdBlockEngineWrapper> engine_wrapper_ = nullptr;
+ };
+ 

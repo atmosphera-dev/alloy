@@ -71,8 +71,10 @@ std::string RecordDomainForPrincipal(const GURL& principal_url,
 RecordGeneration::RecordGeneration(base::UnguessableToken profile,
                                    base::UnguessableToken record,
                                    base::UnguessableToken generation,
-                                   StorageMode mode)
-    : profile_(profile), record_(record), generation_(generation), mode_(mode) {
+                                   StorageMode mode,
+                                   scoped_refptr<RecordGeneration> parent)
+    : profile_(profile), record_(record), generation_(generation), mode_(mode),
+      parent_(std::move(parent)) {
   CHECK(!profile_.is_empty());
   CHECK(!record_.is_empty());
   CHECK(!generation_.is_empty());
@@ -149,6 +151,15 @@ RecordCapabilityIssuer::RecordCapabilityIssuer(
 
 RecordCapabilityIssuer::~RecordCapabilityIssuer() {
   Revoke();
+}
+
+RecordCapabilityIssuer::RecordCapabilityIssuer(
+    const RecordCapability& profile_settings, base::UnguessableToken record,
+    base::UnguessableToken generation, StorageMode mode)
+    : generation_(new RecordGeneration(profile_settings.profile(), record,
+          generation, mode, profile_settings.generation_)) {
+  CHECK(profile_settings.purpose_ == StorePurpose::kProfileSettings);
+  CHECK(profile_settings.mode() == StorageMode::kEncrypted);
 }
 
 RecordCapability RecordCapabilityIssuer::Issue(StorePurpose purpose) const {

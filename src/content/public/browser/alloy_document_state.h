@@ -18,6 +18,9 @@ class BrowserContext;
 // Admission belongs to the canonical document, not the lifetime of a weak RFH
 // or an outstanding callback. This query never creates document user data.
 CONTENT_EXPORT bool AlloyDocumentStateAdmitted(RenderFrameHost* frame);
+// Key retirement can precede native frame destruction. Close the same canonical
+// owner used by all native grants/callbacks before initiating that destruction.
+CONTENT_EXPORT void RetireAlloyDocumentState(RenderFrameHost* frame);
 // These are weak views of content's existing NavigationOrDocumentHandle. They
 // transfer with native commit and are revoked before teardown callbacks.
 CONTENT_EXPORT base::WeakPtr<base::SupportsUserData> AlloyDocumentStateOwner(

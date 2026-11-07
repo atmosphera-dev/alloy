@@ -1,0 +1,10 @@
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -183,6 +183,7 @@
+ 
+   deps = [
+     ":settings",
++    "//brave/browser/brave_shields",
+     "//chrome/app:command_ids",
+     "//chrome/app:generated_resources",
+     "//chrome/app/vector_icons",

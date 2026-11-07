@@ -1,0 +1,417 @@
+--- a/chrome/browser/profiles/profile.h
++++ b/chrome/browser/profiles/profile.h
+@@ -67,6 +67,10 @@
+ // Instead of adding more members to Profile, consider creating a
+ // KeyedService. See
+ // http://dev.chromium.org/developers/design-documents/profile-architecture
++namespace alloy::site_records {
++class NativeProfileConfiguration;
++}
++
+ class Profile : public content::BrowserContext {
+  public:
+   enum class CreateMode {
+@@ -217,6 +221,12 @@
+   static std::unique_ptr<Profile> CreateProfile(const base::FilePath& path,
+                                                 Delegate* delegate,
+                                                 CreateMode create_mode);
++  // The already-admitted engine input arrives before directory/prefs/service
++  // construction. It owns the native projection lifetime through destruction.
++  static std::unique_ptr<Profile> CreateProfile(
++      const base::FilePath& path, Delegate* delegate, CreateMode create_mode,
++      std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration);
++
+ 
+   // Returns the profile corresponding to the given browser context.
+   static Profile* FromBrowserContext(content::BrowserContext* browser_context);
+--- a/chrome/browser/profiles/profile_impl.h
++++ b/chrome/browser/profiles/profile_impl.h
+@@ -194,7 +194,8 @@
+               Delegate* delegate,
+               CreateMode create_mode,
+               base::Time path_creation_time,
+-              scoped_refptr<base::SequencedTaskRunner> io_task_runner);
++              scoped_refptr<base::SequencedTaskRunner> io_task_runner,
++              std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration);
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   // Takes the ownership of the pre-created PrefService and other objects if
+@@ -204,6 +205,7 @@
+ 
+   // Creates |prefs| from scratch in normal startup.
+   void LoadPrefsForNormalStartup(bool async_prefs);
++  bool HasManagedEnvelope() const;
+ 
+   // Does final initialization. Should be called after prefs were loaded.
+   void DoFinalInit(CreateMode create_mode);
+@@ -242,6 +244,9 @@
+ 
+   policy::ConfigurationPolicyProvider* configuration_policy_provider();
+ 
++  // First member: must outlive native PrefService, policy and keyed-service
++  // members. ProfileImpl may clear userdata before those members are destroyed.
++  std::unique_ptr<alloy::site_records::NativeProfileConfiguration> alloy_configuration_;
+   base::FilePath path_;
+ 
+   base::Time path_creation_time_;
+--- a/chrome/browser/profiles/profile_impl.cc
++++ b/chrome/browser/profiles/profile_impl.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/profiles/profile_impl.h"
++#include "brave/alloy/site_records/native_profile_configuration.h"
++#include "chrome/browser/supervised_user/family_link_settings_service_factory.h"
++#include "components/supervised_user/core/browser/family_link_settings_service.h"
+ 
+ #include "base/alloy/storage_policy.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+@@ -383,6 +384,14 @@
+ std::unique_ptr<Profile> Profile::CreateProfile(const base::FilePath& path,
+                                                 Delegate* delegate,
+                                                 CreateMode create_mode) {
++  return CreateProfile(path, delegate, create_mode, nullptr);
++}
++
++std::unique_ptr<Profile> Profile::CreateProfile(
++    const base::FilePath& path, Delegate* delegate, CreateMode create_mode,
++    std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration) {
++  // The CEF adapter reserves native construction before allocating its context.
++  // A lost original lease remains a cancelled in-flight input, never fallback.
+   TRACE_EVENT1("browser,startup", "Profile::CreateProfile", "profile_path",
+                path.AsUTF8Unsafe());
+ 
+@@ -393,7 +402,7 @@
+       base::ThreadPool::CreateSequencedTaskRunner(
+           {base::TaskShutdownBehavior::BLOCK_SHUTDOWN, base::MayBlock()});
+   base::Time creation_time = base::Time::Now();
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!base::alloy::IsNoDiskProcess() && !configuration) {
+     switch (create_mode) {
+     case CreateMode::kAsynchronous:
+       DCHECK(delegate);
+@@ -417,7 +426,7 @@
+   }
+ 
+   std::unique_ptr<Profile> profile = base::WrapUnique(new ProfileImpl(
+-      path, delegate, create_mode, creation_time, io_task_runner));
++      path, delegate, create_mode, creation_time, io_task_runner, std::move(configuration)));
+   return profile;
+ }
+ 
+@@ -499,15 +508,18 @@
+     Delegate* delegate,
+     CreateMode create_mode,
+     base::Time path_creation_time,
+-    scoped_refptr<base::SequencedTaskRunner> io_task_runner)
++    scoped_refptr<base::SequencedTaskRunner> io_task_runner,
++    std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration)
+     : Profile(nullptr),
++      alloy_configuration_(std::move(configuration)),
+       path_(path),
+       path_creation_time_(path_creation_time),
+       io_task_runner_(std::move(io_task_runner)),
+       start_time_(base::Time::Now()),
+       delegate_(delegate) {
+   TRACE_EVENT0("browser,startup", "ProfileImpl::ctor");
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (alloy_configuration_) alloy_configuration_->Attach(*this);
++  else if (HasManagedEnvelope()) {
+     alloy::site_records::RequestContextPolicy::AttachStateless(
+         *this, alloy::site_records::NetworkState::kKeep);
+   }
+@@ -639,9 +651,12 @@
+ 
+ void ProfileImpl::LoadPrefsForNormalStartup(bool async_prefs) {
+   key_ = std::make_unique<ProfileKey>(
+-      GetPath(), nullptr, base::alloy::IsNoDiskProcess()
+-          ? std::make_optional(alloy::site_records::StorageMode::kStateless)
+-          : std::nullopt);
++      GetPath(), nullptr, alloy_configuration_
++          ? std::make_optional(alloy_configuration_->mode())
++          : HasManagedEnvelope() ? std::make_optional(alloy::site_records::StorageMode::kStateless)
++                                 : std::nullopt);
++  if (alloy_configuration_)
++    key_->SetServiceCreationGate(alloy_configuration_->service_creation_gate());
+   pref_registry_ = base::MakeRefCounted<user_prefs::PrefRegistrySyncable>();
+ 
+   policy::ChromeBrowserPolicyConnector* connector =
+@@ -652,7 +667,7 @@
+       connector->GetSchemaRegistry());
+ 
+   // If we are creating the profile synchronously, then we should load the
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     // The primary profile is only a native lifecycle/bootstrap owner. Keep its
+     // identity intact, but give it no persistent state or storage admission.
+     // No disk pref store, cloud-policy cache or pref migration is constructed.
+@@ -663,7 +680,16 @@
+     ::RegisterProfilePrefs(false, g_browser_process->GetApplicationLocale(),
+                            pref_registry_.get());
+     sync_preferences::PrefServiceSyncableFactory factory;
++    if (alloy_configuration_) {
++      auto* family = supervised_user::FamilyLinkSettingsServiceFactory::GetForKey(key_.get());
++      if (family) {
++        family->Init(alloy::site_records::NativeProfilePrefsForNamespace(*alloy_configuration_, "alloy.family_link"));
++      }
++    }
+-    factory.set_user_prefs(base::MakeRefCounted<InMemoryPrefStore>());
++    factory.set_user_prefs(alloy_configuration_ ? alloy_configuration_->prefs()
++                                              : base::MakeRefCounted<InMemoryPrefStore>());
++    // Native encrypted input has already completed its one asynchronous read.
++    // This factory does no file I/O and keeps normal policy/default composition.
+     factory.SetAccountPrefStore(base::MakeRefCounted<InMemoryPrefStore>());
+     factory.set_command_line_prefs(
+         base::MakeRefCounted<ChromeCommandLinePrefStore>(
+@@ -790,7 +808,7 @@
+ void ProfileImpl::DoFinalInit(CreateMode create_mode) {
+   TRACE_EVENT0("browser", "ProfileImpl::DoFinalInit");
+ 
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     PrefService* prefs = GetPrefs();
+ 
+     // Do not override the existing pref in case a profile directory is copied,
+@@ -903,7 +921,7 @@
+   // Listen for bookmark model load, to bootstrap the sync service.
+   // Not necessary for profiles that don't have a BookmarkModel.
+   // On CrOS sync service will be initialized after sign in.
+-  BookmarkModel* model = base::alloy::IsNoDiskProcess()
++  BookmarkModel* model = HasManagedEnvelope()
+                              ? nullptr
+                              : BookmarkModelFactory::GetForBrowserContext(this);
+   if (model) {
+@@ -930,7 +948,7 @@
+ 
+   PushMessagingServiceImpl::InitializeForProfile(this);
+ 
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     site_isolation::SiteIsolationPolicy::ApplyPersistedIsolatedOrigins(this);
+   }
+ 
+@@ -967,7 +985,7 @@
+ 
+   NotifyProfileInitializationComplete();
+ 
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     RecordPrefValuesAfterProfileInitialization();
+   }
+ 
+@@ -976,7 +994,7 @@
+   HttpsFirstModeServiceFactory::GetForProfile(this);
+ 
+   // The Privacy Metrics service should start alongside each profile session.
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     PrivacyMetricsServiceFactory::GetForProfile(this);
+ 
+     // The Privacy Sandbox service must be created with the profile to ensure
+@@ -997,7 +1015,7 @@
+ 
+   // The announcement notification  service might not be available for some
+   // irregular profiles, like the System Profile.
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     if (AnnouncementNotificationService* announcement_notification =
+             AnnouncementNotificationServiceFactory::GetForProfile(this)) {
+       announcement_notification->MaybeShowNotification();
+@@ -1024,6 +1042,10 @@
+   GetPrefs()->SetFilePath(prefs::kSelectFileLastDirectory, path);
+ }
+ 
++bool ProfileImpl::HasManagedEnvelope() const {
++  return base::alloy::IsNoDiskProcess() || alloy_configuration_ != nullptr;
++}
++
+ ProfileImpl::~ProfileImpl() {
+   if (auto* policy = alloy::site_records::RequestContextPolicy::Get(*this)) {
+     policy->Revoke();
+@@ -1060,7 +1082,7 @@
+     ProfileDestroyer::DestroyOTRProfileImmediately(otr_profile);
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  if (!base::alloy::IsNoDiskProcess() && !primary_otr_available &&
++  if (!HasManagedEnvelope() && !primary_otr_available &&
+       !extensions::ChromeContentBrowserClientExtensionsPart::
+           AreExtensionsDisabledForProfile(this)) {
+     ExtensionPrefValueMap* pref_value_map =
+@@ -1113,7 +1135,7 @@
+ 
+ std::unique_ptr<content::ZoomLevelDelegate>
+ ProfileImpl::CreateZoomLevelDelegate(const base::FilePath& partition_path) {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     return std::make_unique<ChromeZoomLevelOTRDelegate>(
+         zoom::ZoomEventManager::GetForBrowserContext(this)->GetWeakPtr());
+   }
+@@ -1174,7 +1196,7 @@
+   otr_profiles_.erase(profile_id);
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   // Extensions are only supported on primary OTR profile.
+-  if (!base::alloy::IsNoDiskProcess() &&
++  if (!HasManagedEnvelope() &&
+       profile_id == OTRProfileID::PrimaryID() &&
+       !extensions::ChromeContentBrowserClientExtensionsPart::
+           AreExtensionsDisabledForProfile(this)) {
+@@ -1223,7 +1245,7 @@
+ 
+ void ProfileImpl::OnLocaleReady(CreateMode create_mode) {
+   TRACE_EVENT0("browser", "ProfileImpl::OnLocaleReady");
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     // There is no persisted user profile. Do not enter any regular-profile
+     // pref/extension/sync migration before native runtime initialization.
+     InitializeRuntime(create_mode);
+@@ -1302,9 +1324,13 @@
+   BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
+       this);
+ 
++  if (alloy_configuration_ && !alloy_configuration_->admitted()) {
++    if (delegate_) delegate_->OnProfileCreationFinished(this, create_mode, false, false);
++    return;
++  }
+   FullBrowserTransitionManager::Get()->OnProfileCreated(this);
+ 
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     ChromeVersionService::OnProfileLoaded(prefs_.get(), IsNewProfile());
+   }
+   DoFinalInit(create_mode);
+@@ -1312,6 +1338,7 @@
+ 
+ void ProfileImpl::OnPrefsLoaded(CreateMode create_mode, bool success) {
+   TRACE_EVENT0("browser", "ProfileImpl::OnPrefsLoaded");
++  if (alloy_configuration_ && !alloy_configuration_->admitted()) success = false;
+   if (!success) {
+     if (delegate_)
+       delegate_->OnProfileCreationFinished(this, create_mode, false, false);
+@@ -1348,7 +1375,7 @@
+   // SessionService depends on Profile::GetPrefs() and therefore shouldn't be
+   // forced initialized before prefs are loaded. Starting this Timer before
+   // that point resulted in a racy use-before-initialized in the past.
+-  if (!base::alloy::IsNoDiskProcess()) {
++  if (!HasManagedEnvelope()) {
+     create_session_service_timer_.Start(
+         FROM_HERE, kCreateSessionServiceDelay, this,
+         &ProfileImpl::EnsureSessionServiceCreated);
+@@ -1363,7 +1390,7 @@
+ }
+ 
+ bool ProfileImpl::ShouldRestoreOldSessionCookies() {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     return false;
+   }
+ #if BUILDFLAG(IS_ANDROID)
+@@ -1379,11 +1406,11 @@
+ }
+ 
+ bool ProfileImpl::ShouldPersistSessionCookies() const {
+-  return !base::alloy::IsNoDiskProcess();
++  return !HasManagedEnvelope();
+ }
+ 
+ bool ProfileImpl::ShouldClearSessionStorageOnStartup() {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     return false;
+   }
+ #if BUILDFLAG(IS_ANDROID)
+@@ -1417,7 +1444,7 @@
+ }
+ 
+ ChromeZoomLevelPrefs* ProfileImpl::GetZoomLevelPrefs() {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     return nullptr;
+   }
+   return static_cast<ChromeZoomLevelPrefs*>(
+@@ -1427,7 +1454,7 @@
+ // TODO(crbug.com/40526371): Remove this function.
+ PrefService* ProfileImpl::GetReadOnlyOffTheRecordPrefs() {
+   if (!dummy_otr_prefs_) {
+-    if (base::alloy::IsNoDiskProcess()) {
++    if (HasManagedEnvelope()) {
+       dummy_otr_prefs_ = prefs_->CreateIndependentPrefService(
+           profile_policy_connector_->policy_service(),
+           g_browser_process->browser_policy_connector(),
+@@ -1642,7 +1669,7 @@
+ }
+ 
+ void ProfileImpl::EnsureSessionServiceCreated() {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (HasManagedEnvelope()) {
+     return;
+   }
+   SessionServiceFactory::GetForProfile(this);
+--- a/chrome/browser/profiles/profile_manager.cc
++++ b/chrome/browser/profiles/profile_manager.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/profiles/profile_manager.h"
++#include "brave/alloy/site_records/native_profile_configuration.h"
+ #include "base/alloy/storage_policy.h"
+ 
+ #include <stdint.h>
+@@ -1189,7 +1190,7 @@
+ }
+ 
+ void ProfileManager::InitProfileUserPrefs(Profile* profile) {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (base::alloy::IsNoDiskProcess() || alloy::site_records::NativeProfileConfiguration::Get(*profile)) {
+     return;
+   }
+   TRACE_EVENT0("browser", "ProfileManager::InitProfileUserPrefs");
+--- a/content/public/browser/storage_partition_config.cc
++++ b/content/public/browser/storage_partition_config.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/public/browser/storage_partition_config.h"
+ #include "base/alloy/storage_policy.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <sstream>
+ 
+@@ -23,7 +24,8 @@
+ // static
+ StoragePartitionConfig StoragePartitionConfig::CreateDefault(
+     BrowserContext* browser_context) {
+-  return StoragePartitionConfig("", "", browser_context->IsOffTheRecord());
++  return StoragePartitionConfig("", "", browser_context->IsOffTheRecord() ||
++      alloy::site_records::RequestContextPolicy::Get(*browser_context) != nullptr);
+ }
+ 
+ // static
+@@ -37,7 +39,8 @@
+   // a default partition by calling CreateDefault().
+   CHECK(!partition_domain.empty());
+   return StoragePartitionConfig(partition_domain, partition_name,
+-                                in_memory || browser_context->IsOffTheRecord());
++                                in_memory || browser_context->IsOffTheRecord() ||
++                                alloy::site_records::RequestContextPolicy::Get(*browser_context) != nullptr);
+ }
+ 
+ StoragePartitionConfig::StoragePartitionConfig(
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -63,6 +63,9 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:native_profile_configuration",
++    "//chrome/browser/supervised_user",
++    "//components/supervised_user/core/browser",
+     "//chrome/browser/policy",
+     ":profile",
+     ":profile_downloader",
+@@ -484,6 +485,7 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:native_profile_configuration",
+     ":profile",
+     ":profile_manager",
+     ":profile_util",

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The two explicitly approved, builder-owned NUC workspaces.
+"""The explicitly approved, builder-owned NUC and DigitalOcean workspaces.
 
 Selection follows the delivered repository, not cwd or an arbitrary environment
 variable. Validation happens at entry points, before any locks or writes.
@@ -13,6 +13,7 @@ import socket
 PRIMARY = Path('/home/builder/work/alloy')
 SECONDARY = Path('/home/builder/work/alloy-b')
 APPROVED = (PRIMARY, SECONDARY)
+HOSTS = ('wakaba-build', 'alloy-do-build')
 
 
 def workspace_path(repo):
@@ -21,6 +22,11 @@ def workspace_path(repo):
 
 def temp_path(work):
     return work / 'tmp' if work == SECONDARY else Path('/home/builder/work/tmp')
+
+
+def workspace_owner(work):
+    """Resolve the account used for validation and unprivileged consumers."""
+    return pwd.getpwnam('builder')
 
 
 def namespace_prefix(work):
@@ -34,9 +40,9 @@ def namespace_prefix(work):
 
 def validate_workspace(work, repo=None):
     """Reject foreign roots, symlink escapes and roots not owned by builder."""
-    if socket.gethostname() != 'wakaba-build' or work not in APPROVED:
-        raise RuntimeError(f'Only the approved NUC workspaces {APPROVED} are supported')
-    owner = pwd.getpwnam('builder').pw_uid
+    if socket.gethostname() not in HOSTS or work not in APPROVED:
+        raise RuntimeError(f'Only the approved build workspaces {APPROVED} on {HOSTS} are supported')
+    owner = workspace_owner(work).pw_uid
     if os.geteuid() not in (0, owner):
         raise RuntimeError('Workspace tools must run as builder (or the network supervisor)')
     if repo is not None and repo != work / 'repo':

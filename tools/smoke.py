@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Bounded OSR/Kiwix consumer smoke; Node's built-in CDP WebSocket, no pip deps."""
+"""Bounded OSR page smoke; Node's built-in CDP WebSocket, no pip deps."""
 import argparse
+import functools
+import http.server
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from workspace import temp_path, validate_output, workspace_path
@@ -37,7 +40,7 @@ async function connect(url) {
     const request = pending.get(msg.id);
     if (!request) return;
     pending.delete(msg.id);
-    if (msg.error) request.reject(new Error(JSON.stringify(msg.error)));
+    if (msg.error) request.reject(Object.assign(new Error(msg.error.message), msg.error));
     else request.resolve(msg.result);
   });
   ws.addEventListener('close', () => {
@@ -75,22 +78,28 @@ while (Date.now() < deadline) {
   if (target) { page = await connect(target.webSocketDebuggerUrl); break; }
   await sleep();
 }
-if (!page) throw new Error('Expected Kiwix page target did not appear');
+if (!page) throw new Error('Expected smoke page target did not appear');
 let proof;
 while (Date.now() < deadline) {
-  const {root} = await page.call('DOM.getDocument', {depth: 1});
-  const {nodeId} = await page.call('DOM.querySelector', {nodeId: root.nodeId, selector: 'title'});
-  if (nodeId) {
-    const {outerHTML} = await page.call('DOM.getOuterHTML', {nodeId});
-    const location = await page.call('Runtime.evaluate', {expression: 'location.href', returnByValue: true});
-    if (outerHTML.includes('Internet') && location.result.value === expected) {
-      proof = {version, url: location.result.value, title_node: nodeId, title_html: outerHTML};
-      break;
+  try {
+    const {root} = await page.call('DOM.getDocument', {depth: 1});
+    const {nodeId} = await page.call('DOM.querySelector', {nodeId: root.nodeId, selector: 'title'});
+    if (nodeId) {
+      const {outerHTML} = await page.call('DOM.getOuterHTML', {nodeId});
+      const location = await page.call('Runtime.evaluate', {expression: 'location.href', returnByValue: true});
+      if (outerHTML.includes('Internet') && location.result.value === expected) {
+        proof = {version, url: location.result.value, title_node: nodeId, title_html: outerHTML};
+        break;
+      }
     }
+  } catch (error) {
+    // Navigation discards InspectorDOMAgent's node bindings between calls.
+    // Reacquire the whole document sample, within the original deadline.
+    if (error.code !== -32000 || error.message !== 'Could not find node with given id') throw error;
   }
   await sleep();
 }
-if (!proof) throw new Error('Kiwix Internet title node not observed in DOM.getDocument');
+if (!proof) throw new Error('Internet title node not observed in DOM.getDocument');
 await page.call('Page.close');
 page.close();
 console.log(JSON.stringify(proof));
@@ -142,8 +151,11 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--port', type=int, default=9229)
     parser.add_argument('--timeout', type=int, default=90)
-    parser.add_argument('--probe-blocking', action='store_true')
     parser.add_argument('--alloy-data-dir', type=Path)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--probe-blocking', action='store_true')
+    mode.add_argument('--local-fixture', action='store_true',
+                      help='Serve the repo fixture on loopback instead of the NUC Kiwix page')
     args = parser.parse_args()
     out = args.out.resolve()
     try:
@@ -165,11 +177,19 @@ def main():
     print('SMOKE_LOGS', logdir, flush=True)
     profile = Path(tempfile.mkdtemp(prefix='alloy-smoke-', dir=WORK))
     process = None
+    server = None
     shutdown = dict(profile=str(profile), normal_shutdown=False, profile_removed=False)
     try:
+        url = URL
+        if args.local_fixture:
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                        directory=REPO / 'tools/testdata/smoke')
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            url = f'http://127.0.0.1:{server.server_port}/index.html'
         command = ['xvfb-run', '-a', '-s', '-screen 0 1280x720x24', str(out / 'cefclient'),
                    '--off-screen-rendering-enabled', f'--remote-debugging-port={args.port}',
-                   '--ozone-platform=x11', '--disable-gpu', f'--url={URL}',
+                   '--ozone-platform=x11', '--disable-gpu', f'--url={url}',
                    f'--root-cache-path={profile}', f'--cache-path={profile}/Default',
                    f'--log-file={logdir}/debug.log']
         if args.alloy_data_dir is not None:
@@ -180,7 +200,7 @@ def main():
                                        env=dict(os.environ, TMPDIR=str(temp_path(WORK))),
                                        start_new_session=True)
             probe = subprocess.run(['node', '--input-type=module', '-e', CDP,
-                                    str(args.port), URL, str(args.timeout - 5)],
+                                    str(args.port), url, str(args.timeout - 5)],
                                     capture_output=True, text=True, timeout=args.timeout)
             (logdir / 'cdp.stdout').write_text(probe.stdout)
             (logdir / 'cdp.stderr').write_text(probe.stderr)
@@ -211,8 +231,11 @@ def main():
             shutil.rmtree(profile)
             shutdown['profile_removed'] = True
         finally:
+            if server:
+                server.shutdown()
+                server.server_close()
             (logdir / 'shutdown.json').write_text(json.dumps(shutdown, indent=2) + '\n')
-    print('ALLOY_KIWIX_SMOKE_PASS', flush=True)
+    print('ALLOY_LOCAL_SMOKE_PASS' if args.local_fixture else 'ALLOY_KIWIX_SMOKE_PASS', flush=True)
     return 0
 
 

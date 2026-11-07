@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""NUC-only workspace admission contract; no original-workspace writes."""
+"""Build workspace admission contract; no original-workspace writes."""
 import os
 import json
 from pathlib import Path
@@ -43,6 +43,21 @@ class Admission(unittest.TestCase):
         for root in (Path('/home/builder/work/brave'), Path('/home/builder/work/foreign')):
             with self.assertRaises(RuntimeError):
                 w.validate_workspace(root)
+
+    def test_approved_host_root_matrix(self):
+        for host in w.HOSTS:
+            with patch.object(w.socket, 'gethostname', return_value=host):
+                for root in w.APPROVED:
+                    w.validate_source(root, root/'src', root/'repo')
+                    w.validate_output(root, root/'src/out/Verify_Alloy', root/'repo')
+                    with patch.object(Path, 'stat', return_value=SimpleNamespace(st_uid=1234)):
+                        with self.assertRaises(RuntimeError):
+                            w.validate_workspace(root)
+                    with patch.object(Path, 'resolve', lambda p: Path('/foreign') if p == root else p):
+                        with self.assertRaises(RuntimeError):
+                            w.validate_workspace(root)
+                with self.assertRaises(RuntimeError):
+                    w.validate_workspace(Path('/home/builder/work/foreign'))
 
     def test_wrong_host_and_account(self):
         with patch.object(w.socket, 'gethostname', return_value='laptop'):
@@ -131,7 +146,7 @@ class EntryPoints(unittest.TestCase):
             self.assertEqual(values[variable], w.PRIMARY, name)
 
     def test_foreign_delivery_refused_before_side_effects(self):
-        self.assertEqual(w.socket.gethostname(), 'wakaba-build')
+        self.assertIn(w.socket.gethostname(), w.HOSTS)
         self.assertEqual(os.environ['TMPDIR'], str(w.temp_path(TOOLS.parents[1])))
         # Foreign delivery lives on B's scratch disk, never the spike or A.
         with tempfile.TemporaryDirectory(prefix='workspace-contract-') as scratch:
@@ -151,7 +166,7 @@ class EntryPoints(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(foreign/(name+'.py')), *args],
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 2, (name, result.stderr))
-                self.assertIn('Only the approved NUC workspaces', result.stderr)
+                self.assertIn('Only the approved build workspaces', result.stderr)
             self.assertEqual(sorted(p.name for p in Path(scratch).iterdir()), ['repo'])
 
 

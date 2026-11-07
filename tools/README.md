@@ -1,5 +1,18 @@
 # Pinned Linux build
 
+The same builder-owned roots are also admitted on the on-demand DigitalOcean
+guest `alloy-do-build`. Its persistent ext4 volume is mounted at
+`/home/builder/work`; source and build outputs stay on that volume. Use
+`smoke.py --out src/out/Verify_Alloy --local-fixture` there to serve the repo's
+small page on loopback instead of accessing the NUC's Kiwix server. The tracker
+probe uses only its existing loopback-only namespace and needs no home-network
+routes, interfaces or DNS. Durable user units below apply to both machines;
+the DigitalOcean guest needs linger enabled for `builder`.
+Its Ubuntu image carries Chromium's per-executable AppArmor `userns` allowance
+for `cefclient` and `alloy_*` consumers under `/home/builder/work/*/src/out/*/`.
+The global unprivileged-userns restriction remains enabled, and the browser
+keeps its sandbox.
+
 Run these commands on the dedicated `wakaba-build` NUC, from
 `/home/builder/work/alloy`, with this repository delivered to `repo/`.
 `pins.json` fixes the source revisions and Node/pnpm versions. Brave's

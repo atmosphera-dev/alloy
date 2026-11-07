@@ -185,6 +185,8 @@ consumer forwards the supplied command line to CEF unchanged. To check startup
 rejection, use `probe_blocking.py --out src/out/Verify_Alloy
 --alloy-data-dir=relative-data --expect-startup-failure`, then repeat with an
 absolute missing directory. Each must exit nonzero before requesting a page.
+Each rejection probe first renders the fixture successfully using the same
+executable, Xvfb server and network namespace, without the invalid switch.
 `--profile=<absolute evidence path>` retains and reuses a profile for the
 with-data then no-switch warm-profile check; both runs require normal exit.
 

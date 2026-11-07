@@ -81,6 +81,70 @@ fs.writeFileSync(resultPath,JSON.stringify({target,queryReadyMs,readinessURL,rea
 await call('Page.close');ws.close();
 '''
 
+STARTUP_CONTROL=r'''
+const [port,url,resultPath]=process.argv.slice(1);
+const fs=await import('node:fs');
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+let target;
+for(let i=0;i<150;i++){
+  try{target=(await(await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t=>t.type==='page');if(target)break;}catch{}
+  await sleep(200);
+}
+if(!target)throw Error('Startup control has no browser page');
+const ws=new WebSocket(target.webSocketDebuggerUrl);
+await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=reject;});
+let id=0;const pending=new Map();
+ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result);}};
+const call=(method,params={})=>new Promise((resolve,reject)=>{const n=++id;pending.set(n,{resolve,reject});ws.send(JSON.stringify({id:n,method,params}));});
+let proof;
+for(let i=0;i<100;i++){
+  const result=await call('Runtime.evaluate',{expression:'({url:location.href,title:document.title,neutral:window.neutralExecuted})',returnByValue:true});
+  const value=result.result.value;
+  if(value?.url===url&&value.title==='Alloy offline probe'&&value.neutral===true){proof=value;break;}
+  await sleep(100);
+}
+if(!proof)throw Error('Startup control did not render its fixture');
+fs.writeFileSync(resultPath,JSON.stringify(proof,null,2));
+await call('Page.close');ws.close();
+'''
+
+
+def startup_control(argv,out,log,url,port,requests):
+    # Both browsers inherit this invocation's single Xvfb and network namespace.
+    profile=log/'control-profile';profile.mkdir()
+    control=[arg for arg in argv if not arg.startswith('--alloy-data-dir=')]
+    replacements={'--cache-path=':str(profile),'--url=':url,
+                  '--log-file=':str(log/'control-debug.log'),
+                  '--log-net-log=':str(log/'control-netlog.json')}
+    control=[next((prefix+value for prefix,value in replacements.items()
+                   if arg.startswith(prefix)),arg) for arg in control]
+    env=dict(os.environ,ALLOY_SPELL_URL=url,ALLOY_SPELL_PROFILE=str(profile),TMPDIR=TMP)
+    with (log/'control-stdio.log').open('w') as stream:
+        process=subprocess.Popen(control,cwd=out,stdout=stream,stderr=subprocess.STDOUT,
+                                 start_new_session=True,env=env)
+        try:
+            result=subprocess.run(['node','--input-type=module','-e',STARTUP_CONTROL,
+                                   str(port),url,str(log/'control-page.json')],
+                                  capture_output=True,text=True,timeout=50)
+            (log/'control-cdp.stdout').write_text(result.stdout)
+            (log/'control-cdp.stderr').write_text(result.stderr)
+            assert result.returncode==0,result.stderr
+            process.wait(timeout=15)
+            proof=dict(argv=control,exit=process.returncode,
+                       display=os.environ['DISPLAY'],requests=list(requests),
+                       page=json.loads((log/'control-page.json').read_text()))
+            (log/'startup-control.json').write_text(json.dumps(proof,indent=2)+'\n')
+            assert process.returncode==0,proof
+            assert '/index.html' in requests,proof
+            print('ALLOY_STARTUP_CONTROL_PASS',json.dumps(proof['page']),flush=True)
+            return len(requests)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid,signal.SIGTERM)
+                try:process.wait(timeout=10)
+                except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out',type=Path,required=True)
@@ -107,9 +171,10 @@ def main():
         p.error('--profile must be beneath the selected workspace evidence/')
     if not a.inside:
         command=namespace_prefix(WORK)+['unshare','--net','--fork','/bin/sh','-c',
-                 'ip link set lo up && exec runuser -u builder -- "$@"','alloy-offline',
-                 'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
-                 'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
+                  'ip link set lo up && exec runuser -u builder -- "$@"','alloy-offline',
+                  'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
+                  'xvfb-run','-a','-s','-screen 0 1280x720x24',
+                  'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
         return subprocess.run(['timeout','--kill-after=20s',str(a.hold_seconds+150),*command],timeout=a.hold_seconds+180).returncode
     assert os.geteuid()!=0,'Browser must run as builder with its sandbox enabled'
     interfaces=json.loads(subprocess.check_output(['ip','-j','addr'],timeout=10))
@@ -142,7 +207,7 @@ def main():
     profile.mkdir(parents=True,exist_ok=True)
     port=9237
     executable=a.spell_consumer.resolve() if a.spell_consumer else out/'cefclient'
-    argv=['xvfb-run','-a','-s','-screen 0 1280x720x24',str(executable),'--off-screen-rendering-enabled',f'--remote-debugging-port={port}','--ozone-platform=x11','--disable-gpu',f'--cache-path={profile}',f'--url=about:blank',f'--log-file={log}/debug.log',f'--log-net-log={log}/netlog.json','--net-log-capture-mode=Everything','--enable-logging=stderr','--vmodule=query_filter_component_installer=1']
+    argv=[str(executable),'--off-screen-rendering-enabled',f'--remote-debugging-port={port}','--ozone-platform=x11','--disable-gpu',f'--cache-path={profile}',f'--url=about:blank',f'--log-file={log}/debug.log',f'--log-net-log={log}/netlog.json','--net-log-capture-mode=Everything','--enable-logging=stderr','--vmodule=query_filter_component_installer=1']
     if a.alloy_data_dir is not None:
         argv.append('--alloy-data-dir='+str(a.alloy_data_dir))
     if a.expect_startup_failure:
@@ -150,14 +215,17 @@ def main():
     (log/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
     print('OFFLINE_PROBE_EVIDENCE',log,flush=True)
     with (log/'stdio.log').open('w') as stream:
-        process=subprocess.Popen(argv,cwd=out,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR=TMP))
+        process=None
         try:
+            control_requests=startup_control(argv,out,log,url,port,requests) if a.expect_startup_failure else 0
+            process=subprocess.Popen(argv,cwd=out,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,env=dict(os.environ,ALLOY_SPELL_URL='about:blank',ALLOY_SPELL_PROFILE=str(profile),TMPDIR=TMP))
             if a.expect_startup_failure:
                 process.wait(timeout=20)
-                proof=dict(exit=process.returncode,requests=requests)
+                proof=dict(exit=process.returncode,requests=requests[control_requests:],
+                           display=os.environ['DISPLAY'],control='startup-control.json')
                 (log/'startup-failure.json').write_text(json.dumps(proof,indent=2)+'\n')
                 assert process.returncode!=0,proof
-                assert not requests,proof
+                assert not proof['requests'],proof
                 print('ALLOY_DATA_DIR_STARTUP_REJECTED',json.dumps(proof),flush=True)
                 return 0
             result=subprocess.run(['node','--input-type=module','-e',CDP,str(port),url,str(log/'cdp.json'),str(a.hold_seconds),'yes' if a.spell_consumer else 'no','yes' if a.alloy_data_dir is not None else 'no'],capture_output=True,text=True,timeout=a.hold_seconds+110)
@@ -200,7 +268,7 @@ def main():
             print('ALLOY_OFFLINE_TRACKER_PROBE_PASS',json.dumps(proof['consumer']),flush=True)
         finally:
             server.shutdown()
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 os.killpg(process.pid,signal.SIGTERM)
                 try:process.wait(timeout=10)
                 except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)

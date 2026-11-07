@@ -6,6 +6,7 @@
 #pragma once
 
 #include "include/cef_request_context.h"
+#include "include/alloy/alloy_profile.h"
 
 #if CEF_API_ADDED(CEF_EXPERIMENTAL)
 ///
@@ -39,6 +40,64 @@ CefRefPtr<CefRequestContext> AlloyCreateStatelessRequestContext(
 /*--cef(added=experimental,optional_param=handler)--*/
 CefRefPtr<CefRequestContext> AlloyCreateMemoryRequestContext(
     CefRefPtr<CefRequestContextHandler> handler);
+
+///
+/// EXPERIMENTAL: Completion of encrypted request-context creation on browser UI.
+/// Only OK supplies a context. Cancellation never selects another profile or a
+/// replacement unlock generation. The callback may reenter or release owners.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyRequestContextCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete creation with |result| and the admitted |request_context|, or NULL.
+  ///
+  /*--cef(optional_param=request_context)--*/
+  virtual void OnComplete(alloy_site_settings_result_t result,
+                         CefRefPtr<CefRequestContext> request_context) = 0;
+};
+
+///
+/// EXPERIMENTAL: Queue an encrypted context for the explicit unlocked |profile|.
+/// Call on browser UI after CefInitialize. The profile's existing asynchronous
+/// private input preparation supplies native inputs before Profile construction. The
+/// native context retains that original owner until teardown; locking retires
+/// its browsers and cancels access. CEF sharing retains the same native owner.
+/// Returns true if accepted; |callback| reports creation asynchronously on UI.
+/// A locked profile reports CANCELLED with NULL, never an OTR/global fallback.
+/// Returns false for invalid initialization/thread or missing required arguments.
+/// |handler| is optional.
+///
+/*--cef(added=experimental,optional_param=handler)--*/
+bool AlloyCreateEncryptedRequestContext(
+    CefRefPtr<AlloyProfile> profile,
+    CefRefPtr<CefRequestContextHandler> handler,
+    CefRefPtr<AlloyRequestContextCallback> callback);
+
+///
+/// EXPERIMENTAL: Read the original context's native AdBlock custom filters.
+/// Browser UI only, after context initialization. Returns false for stateless,
+/// missing, locked, closing or unavailable contexts and clears |filters|.
+/// True with empty |filters| is an admitted empty list. Memory contexts retain
+/// filters only in RAM; encrypted contexts use their original encrypted owner.
+/// No global or parent preference fallback is selected. The caller owns the
+/// returned plaintext string and its lifetime.
+///
+/*--cef(added=experimental,optional_param=context)--*/
+bool AlloyGetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
+                                CefString& filters);
+
+///
+/// EXPERIMENTAL: Replace the original context's native AdBlock custom filters.
+/// An empty string clears the complete list.
+/// Thread, context and refusal rules match AlloyGetAdBlockCustomFilters. True
+/// means the native mutation was admitted, not that encrypted I/O or the
+/// asynchronous engine rebuild has completed. Profile lock completion remains
+/// the durable flush/native retirement fence. The caller owns input plaintext.
+///
+/*--cef(added=experimental,optional_param=context,optional_param=filters)--*/
+bool AlloySetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
+                                const CefString& filters);
 #endif
 
 #endif  // ALLOY_INCLUDE_ALLOY_REQUEST_CONTEXT_H_

@@ -21,6 +21,11 @@ class ContextMode {
   static constexpr ContextMode Memory() {
     return ContextMode(StorageMode::kMemory, NetworkState::kKeep);
   }
+  // Metadata only. An encrypted owner must additionally supply its original
+  // profile capability and native preference view before native construction.
+  static constexpr ContextMode Encrypted() {
+    return ContextMode(StorageMode::kEncrypted, NetworkState::kKeep);
+  }
 
   constexpr StorageMode storage_mode() const { return storage_mode_; }
   constexpr NetworkState network_state() const { return network_state_; }

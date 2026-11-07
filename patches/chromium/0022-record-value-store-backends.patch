@@ -1,0 +1,271 @@
+--- a/components/value_store/lazy_leveldb.h
++++ b/components/value_store/lazy_leveldb.h
+@@ -10,6 +10,7 @@
+ #include <string>
+
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/metrics/histogram_base.h"
+ #include "base/values.h"
+@@ -29,6 +30,18 @@
+ // calling any other *protected* method.
+ class LazyLevelDb {
+  public:
++  // An injected backend owns its Env through DB/compaction teardown. Native
++  // readers must consult admission before cached DB access as well as I/O.
++  struct Backend {
++    Backend();
++    ~Backend();
++    leveldb_env::Options options;
++    std::unique_ptr<leveldb::Env> env;
++    base::RepeatingCallback<bool()> admitted;
++    bool allow_recovery = true;
++    bool sync_writes = false;
++  };
++
+   LazyLevelDb(const LazyLevelDb&) = delete;
+   LazyLevelDb& operator=(const LazyLevelDb&) = delete;
+
+@@ -46,9 +59,12 @@
+   ValueStore::Status Delete(const std::string& key);
+
+  protected:
+-  LazyLevelDb(const std::string& uma_client_name,
+-              const base::FilePath& path,
++  LazyLevelDb(const std::string& uma_client_name, const base::FilePath& path,
+               std::shared_ptr<leveldb::Env> memory_env = nullptr);
++  LazyLevelDb(const std::string& uma_client_name, const base::FilePath& path,
++              std::unique_ptr<Backend> backend,
++              std::shared_ptr<leveldb::Env> memory_env);
++  bool AccessAllowed() const;
+   ~LazyLevelDb();
+
+   // Closes, if necessary, and deletes the database directory.
+@@ -80,11 +96,13 @@
+   const leveldb::ReadOptions& read_options() const { return read_options_; }
+
+   const leveldb::WriteOptions& write_options() const { return write_options_; }
++  bool RecoveryAllowed() const { return !backend_ || backend_->allow_recovery; }
+
+  private:
+-  // Shared with the factory; must outlive the native database and its options.
++  // Declared before db_: the database is destroyed before its Env.
++  const std::unique_ptr<Backend> backend_;
++  // Factory-shared memory Env has the same DB-before-Env destruction order.
+   std::shared_ptr<leveldb::Env> memory_env_;
+-
+   // The leveldb to which this class reads/writes.
+   std::unique_ptr<leveldb::DB> db_;
+   // The path to the underlying leveldb.
+--- a/components/value_store/lazy_leveldb.cc
++++ b/components/value_store/lazy_leveldb.cc
+@@ -53,25 +53,42 @@
+   return ValueStore::OTHER_ERROR;
+ }
+
+-leveldb::Status DeleteValue(leveldb::DB* db, const std::string& key) {
++leveldb::Status DeleteValue(leveldb::DB* db, const std::string& key,
++                            const leveldb::WriteOptions& options) {
+   leveldb::WriteBatch batch;
+   batch.Delete(key);
+
+-  return db->Write(leveldb::WriteOptions(), &batch);
++  return db->Write(options, &batch);
+ }
+
+ }  // namespace
++
++LazyLevelDb::Backend::Backend() = default;
++LazyLevelDb::Backend::~Backend() = default;
+
+ LazyLevelDb::LazyLevelDb(const std::string& uma_client_name,
+                          const base::FilePath& path,
+                          std::shared_ptr<leveldb::Env> memory_env)
+-    : memory_env_(std::move(memory_env)), db_path_(path) {
+-  CHECK(!memory_env_ || leveldb_chrome::IsMemEnv(memory_env_.get()));
+-  if (!memory_env_ && base::alloy::IsNoDiskProcess()) {
+-    memory_env_ = leveldb_chrome::NewMemEnv("ValueStore");
+-  }
+-  if (memory_env_) {
+-    open_options_.env = memory_env_.get();
++    : LazyLevelDb(uma_client_name, path, nullptr, std::move(memory_env)) {}
++
++LazyLevelDb::LazyLevelDb(const std::string& uma_client_name,
++                         const base::FilePath& path,
++                         std::unique_ptr<Backend> backend,
++                         std::shared_ptr<leveldb::Env> memory_env)
++    : backend_(std::move(backend)), memory_env_(std::move(memory_env)), db_path_(path) {
++  CHECK(!backend_ || !memory_env_);
++  if (backend_) {
++    CHECK(backend_->env);
++    CHECK(backend_->admitted);
++    open_options_ = backend_->options;
++    open_options_.env = backend_->env.get();
++    write_options_.sync = backend_->sync_writes;
++  } else {
++    CHECK(!memory_env_ || leveldb_chrome::IsMemEnv(memory_env_.get()));
++    if (!memory_env_ && base::alloy::IsNoDiskProcess()) {
++      memory_env_ = leveldb_chrome::NewMemEnv("ValueStore");
++    }
++    if (memory_env_) open_options_.env = memory_env_.get();
+   }
+   open_options_.create_if_missing = true;
+   open_options_.paranoid_checks = true;
+@@ -89,6 +106,10 @@
+
+ LazyLevelDb::~LazyLevelDb() = default;
+
++bool LazyLevelDb::AccessAllowed() const {
++  return !backend_ || backend_->admitted.Run();
++}
++
+ ValueStore::Status LazyLevelDb::Read(const std::string& key,
+                                      std::optional<base::Value>* value) {
+   DCHECK(value);
+@@ -120,14 +141,18 @@
+   if (!status.ok())
+     return status;
+
+-  return ToValueStoreError(DeleteValue(db_.get(), key));
++  return ToValueStoreError(DeleteValue(db_.get(), key, write_options_));
+ }
+
+ ValueStore::BackingStoreRestoreStatus LazyLevelDb::FixCorruption(
+     const std::string* key) {
++  if (!RecoveryAllowed()) {
++    db_unrecoverable_ = true;
++    return ValueStore::RESTORE_NONE;
++  }
+   leveldb::Status s;
+   if (key && db_) {
+-    s = DeleteValue(db_.get(), *key);
++    s = DeleteValue(db_.get(), *key, write_options_);
+     // Deleting involves writing to the log, so it's possible to have a
+     // perfectly OK database but still have a delete fail.
+     if (s.ok())
+@@ -144,8 +169,7 @@
+   ValueStore::BackingStoreRestoreStatus restore_status =
+       ValueStore::RESTORE_NONE;
+
+-  leveldb_env::Options repair_options;
+-  repair_options.env = open_options_.env;
++  leveldb_env::Options repair_options = open_options_;
+   repair_options.reuse_logs = false;
+   repair_options.create_if_missing = true;
+   repair_options.paranoid_checks = true;
+@@ -176,7 +200,7 @@
+     db_unrecoverable_ = true;
+
+   if (s.ok() && key) {
+-    s = DeleteValue(db_.get(), *key);
++    s = DeleteValue(db_.get(), *key, write_options_);
+     if (s.ok()) {
+       restore_status = ValueStore::VALUE_RESTORE_DELETE_SUCCESS;
+     } else if (s.IsIOError()) {
+@@ -193,20 +217,30 @@
+ }
+
+ ValueStore::Status LazyLevelDb::EnsureDbIsOpen() {
++  if (!AccessAllowed()) {
++    db_.reset();
++    return ValueStore::Status(ValueStore::READ_ONLY, "Store unavailable");
++  }
++
++  if (db_unrecoverable_) {
++    db_.reset();
++    return ValueStore::Status(ValueStore::CORRUPTION,
++                              RecoveryAllowed() ? ValueStore::DB_RESTORE_DELETE_FAILURE
++                                                : ValueStore::RESTORE_NONE,
++                              "Database corrupted");
++  }
+   if (db_)
+     return ValueStore::Status();
+-
+-  if (db_unrecoverable_) {
+-    return ValueStore::Status(ValueStore::CORRUPTION,
+-                              ValueStore::DB_RESTORE_DELETE_FAILURE,
+-                              "Database corrupted");
+-  }
+
+   leveldb::Status ldb_status =
+       leveldb_env::OpenDB(open_options_, db_path_.AsUTF8Unsafe(), &db_);
+   open_histogram_->Add(leveldb_env::GetLevelDBStatusUMAValue(ldb_status));
+   ValueStore::Status status = ToValueStoreError(ldb_status);
+   if (ldb_status.IsCorruption()) {
++    if (!RecoveryAllowed()) {
++      db_unrecoverable_ = true;
++      return status;
++    }
+     status.restore_status = FixCorruption(nullptr);
+     if (status.restore_status != ValueStore::DB_RESTORE_DELETE_FAILURE) {
+       CHECK(db_);
+--- a/components/value_store/leveldb_value_store.h
++++ b/components/value_store/leveldb_value_store.h
+@@ -35,6 +35,10 @@
+   LeveldbValueStore(const std::string& uma_client_name,
+                     const base::FilePath& path,
+                     std::shared_ptr<leveldb::Env> memory_env = nullptr);
++  LeveldbValueStore(const std::string& uma_client_name,
++                    const base::FilePath& path,
++                    std::unique_ptr<LazyLevelDb::Backend> backend,
++                    std::shared_ptr<leveldb::Env> memory_env);
+
+   // Must be deleted on the FILE thread.
+   ~LeveldbValueStore() override;
+--- a/components/value_store/leveldb_value_store.cc
++++ b/components/value_store/leveldb_value_store.cc
+@@ -37,7 +37,13 @@
+ LeveldbValueStore::LeveldbValueStore(const std::string& uma_client_name,
+                                      const base::FilePath& db_path,
+                                      std::shared_ptr<leveldb::Env> memory_env)
+-    : LazyLevelDb(uma_client_name, db_path, std::move(memory_env)) {
++    : LeveldbValueStore(uma_client_name, db_path, nullptr, std::move(memory_env)) {}
++
++LeveldbValueStore::LeveldbValueStore(const std::string& uma_client_name,
++                                     const base::FilePath& db_path,
++                                     std::unique_ptr<LazyLevelDb::Backend> backend,
++                                     std::shared_ptr<leveldb::Env> memory_env)
++    : LazyLevelDb(uma_client_name, db_path, std::move(backend), std::move(memory_env)) {
+   base::trace_event::MemoryDumpManager::GetInstance()
+       ->RegisterDumpProviderWithSequencedTaskRunner(
+           this, "LeveldbValueStore",
+@@ -127,6 +133,9 @@
+         std::string_view(it->value().data(), it->value().size()),
+         base::JSON_PARSE_CHROMIUM_EXTENSIONS);
+     if (!value) {
++      if (!RecoveryAllowed()) {
++        return ReadResult(Status(CORRUPTION, FixCorruption(nullptr), kInvalidJson));
++      }
+       return ReadResult(Status(CORRUPTION,
+                                Delete(key).ok() ? VALUE_RESTORE_DELETE_SUCCESS
+                                                 : VALUE_RESTORE_DELETE_FAILURE,
+@@ -208,7 +217,7 @@
+   }
+
+   leveldb::Status ldb_status;
+-  ldb_status = db()->Write(leveldb::WriteOptions(), &batch);
++  ldb_status = db()->Write(write_options(), &batch);
+   if (!ldb_status.ok() && !ldb_status.IsNotFound()) {
+     status.Merge(ToValueStoreError(ldb_status));
+     return WriteResult(std::move(status));
+@@ -230,7 +239,9 @@
+     changes.emplace_back(next_key, std::move(*next_value), std::nullopt);
+   }
+
+-  DeleteDbFile();
++  if (!DeleteDbFile()) {
++    return WriteResult(Status(OTHER_ERROR, "Failed to clear backing store"));
++  }
+   return WriteResult(std::move(changes), read_result.PassStatus());
+ }
+
+@@ -245,7 +256,7 @@
+     const base::trace_event::MemoryDumpArgs& args,
+     base::trace_event::ProcessMemoryDump* pmd) {
+   // Return true so that the provider is not disabled.
+-  if (!db())
++  if (!AccessAllowed() || !db())
+     return true;
+
+   // All leveldb databases are already dumped by leveldb_env::DBTracker. Add

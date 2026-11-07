@@ -1,0 +1,196 @@
+--- a/components/brave_shields/content/browser/ad_block_service.h
++++ b/components/brave_shields/content/browser/ad_block_service.h
+@@ -151,6 +151,7 @@
+       ProfileBackends backends);
+   bool Close(base::OnceClosure done);
+   bool IsClosed() const { return closed_; }
++  base::WeakPtr<AdBlockService> GetWeakPtr() { return weak_factory_.GetWeakPtr(); }
+   explicit AdBlockService(
+       PrefService* local_state,
+       std::string locale,
+--- a/browser/net/url_context.h
++++ b/browser/net/url_context.h
+@@ -251,7 +251,7 @@
+   size_t next_url_request_index_ = 0;
+ 
+-  raw_ptr<content::BrowserContext, DanglingUntriaged> browser_context_ =
+-      nullptr;
++  base::WeakPtr<content::BrowserContext> browser_context_;
++  bool context_was_bound_ = false;
+   raw_ptr<net::HttpRequestHeaders> headers_ = nullptr;
+   // The following two sets are populated by |OnBeforeStartTransactionCallback|.
+   // |modified_headers| contains headers which values were added or modified.
+--- a/browser/net/url_context.cc
++++ b/browser/net/url_context.cc
+@@ -289,10 +289,12 @@
+ content::BrowserContext* BraveRequestInfo::browser_context() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return browser_context_;
++  return browser_context_.get();
+ }
+ 
+ void BraveRequestInfo::set_browser_context(content::BrowserContext* value) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  browser_context_ = value;
++  if(context_was_bound_){CHECK(value==browser_context_.get());return;}
++  context_was_bound_=true;
++  browser_context_=value?value->GetWeakPtr():base::WeakPtr<content::BrowserContext>();
+ }
+ 
+--- a/browser/net/brave_ad_block_tp_network_delegate_helper.cc
++++ b/browser/net/brave_ad_block_tp_network_delegate_helper.cc
+@@ -23,4 +23,5 @@
+ #include "brave/browser/brave_browser_process.h"
++#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
+ #include "brave/browser/brave_shields/ad_block_pref_service_factory.h"
+ #include "brave/browser/brave_shields/brave_shields_web_contents_observer.h"
+ #include "brave/browser/net/url_context.h"
+@@ -296,7 +297,8 @@
+ template <template <typename> class T>
+ void OnShouldBlockRequestResult(bool then_check_uncloaked,
+                                 const ResponseCallback& next_callback,
+                                 T<BraveRequestInfo> ctx,
++                                brave_shields::AdBlockServiceLease lease,
+                                 ShouldBlockRequestResult result) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   if (!ctx) {
+@@ -303,5 +305,8 @@
+     next_callback.Run();
+     return;
+   }
++  if(!lease.Get()) {
++    ctx->set_pending_error(net::ERR_ABORTED);next_callback.Run();return;
++  }
+   ctx->set_blocked_by(result.blocked_by);
+   ctx->set_mock_data_url(std::move(result.mock_data_url));
+@@ -329,3 +334,6 @@
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+ 
++  if(ctx&&!ctx->browser_context()) {
++    ctx->set_pending_error(net::ERR_ABORTED);next_callback.Run();return;
++  }
+   if (!ctx || !ctx->request_initiator()) {
+@@ -350,10 +361,12 @@
+-    auto* ad_block_service = g_brave_browser_process->ad_block_service();
+-    ad_block_service->AsyncCallAndReplyWithResult<ShouldBlockRequestResult>(
++    brave_shields::AdBlockServiceLease lease(*ctx->browser_context());
++    auto* ad_block_service=lease.Get();
++    if(!ad_block_service){ctx->set_pending_error(net::ERR_ABORTED);next_callback.Run();return;}
++    if(!ad_block_service->AsyncCallAndReplyWithResult<ShouldBlockRequestResult>(
+         base::BindOnce(&ShouldBlockRequestOnTaskRunner, std::move(input),
+                        previous_result, std::move(canonical_url)),
+         base::BindOnce(&OnShouldBlockRequestResult<T>, false, next_callback,
+-                       ctx));
++                        ctx,lease))) {ctx->set_pending_error(net::ERR_ABORTED);next_callback.Run();}
+   } else {
+     next_callback.Run();
+   }
+ }
+@@ -410,4 +424,4 @@
+ template <template <typename> class T>
+-void OnBeforeURLRequestAdBlockTP(const ResponseCallback& next_callback,
++int OnBeforeURLRequestAdBlockTP(const ResponseCallback& next_callback,
+                                  T<BraveRequestInfo> ctx) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+@@ -417,2 +431,5 @@
+ 
++  if(!ctx->browser_context())return net::ERR_ABORTED;
++  brave_shields::AdBlockServiceLease lease(*ctx->browser_context());
++  auto* ad_block_service=lease.Get();if(!ad_block_service)return net::ERR_ABORTED;
+   // DNS queries won't be routed through Tor or proxies, so we need to
+@@ -443,8 +461,8 @@
+-  auto* ad_block_service = g_brave_browser_process->ad_block_service();
+-  ad_block_service->AsyncCallAndReplyWithResult<ShouldBlockRequestResult>(
++  const bool accepted=ad_block_service->AsyncCallAndReplyWithResult<ShouldBlockRequestResult>(
+       base::BindOnce(&ShouldBlockRequestOnTaskRunner, std::move(input),
+                      EngineFlags(), std::nullopt),
+       base::BindOnce(&OnShouldBlockRequestResult<T>, should_check_uncloaked,
+-                     next_callback, ctx));
++                      next_callback, ctx,lease));
++  return accepted?net::ERR_IO_PENDING:net::ERR_ABORTED;
+ }
+ 
+@@ -487,6 +506,4 @@
+-  OnBeforeURLRequestAdBlockTP(next_callback, ctx);
+-
+-  return net::ERR_IO_PENDING;
++  return OnBeforeURLRequestAdBlockTP(next_callback, ctx);
+ }
+ 
+ template int OnBeforeURLRequest_AdBlockTPPreWork<std::shared_ptr>(
+--- a/browser/cosmetic_filters/cosmetic_filters_tab_helper.cc
++++ b/browser/cosmetic_filters/cosmetic_filters_tab_helper.cc
+@@ -6,3 +6,4 @@
+ #include "brave/browser/cosmetic_filters/cosmetic_filters_tab_helper.h"
++#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
+ 
+ #include <string_view>
+@@ -90,7 +91,7 @@
+-  const auto& sender_rfh = receivers_.CurrentTargetFrame();
++  auto& sender_rfh = receivers_.CurrentTargetFrame();
+   if (IsValidFilterText(filter)) {
+     const auto host = sender_rfh.GetLastCommittedOrigin().host();
+-    g_brave_browser_process->ad_block_service()->AddUserCosmeticFilter(
++    if(auto* service=brave_shields::AdBlockServiceForContext(*sender_rfh.GetBrowserContext()))service->AddUserCosmeticFilter(
+         host + "##" + filter);
+   }
+ }
+--- a/browser/ui/webui/brave_shields/shields_panel_data_handler.cc
++++ b/browser/ui/webui/brave_shields/shields_panel_data_handler.cc
+@@ -6,3 +6,4 @@
+ #include "brave/browser/ui/webui/brave_shields/shields_panel_data_handler.h"
++#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
+ 
+ #include <utility>
+@@ -239,4 +240,5 @@
+-  std::move(callback).Run(
+-      g_brave_browser_process->ad_block_service()->AreAnyBlockedElementsPresent(
+-          active_shields_data_controller_->web_contents()->GetURL().host()));
++  auto* service=brave_shields::AdBlockServiceForContext(
++      *active_shields_data_controller_->web_contents()->GetBrowserContext());
++  std::move(callback).Run(service&&service->AreAnyBlockedElementsPresent(
++      active_shields_data_controller_->web_contents()->GetURL().host()));
+ }
+@@ -272,4 +275,5 @@
+-  g_brave_browser_process->ad_block_service()->ResetCosmeticFilter(
+-      active_shields_data_controller_->web_contents()->GetURL().host());
++  auto* service=brave_shields::AdBlockServiceForContext(*active_shields_data_controller_->web_contents()->GetBrowserContext());
++  if(!service)return;
++  service->ResetCosmeticFilter(active_shields_data_controller_->web_contents()->GetURL().host());
+ 
+   active_shields_data_controller_->web_contents()->GetController().Reload(
+--- a/browser/brave_shields/filter_list_service_factory.cc
++++ b/browser/brave_shields/filter_list_service_factory.cc
+@@ -6,3 +6,6 @@
+ #include "brave/browser/brave_shields/filter_list_service_factory.h"
++#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "base/functional/bind.h"
+ 
+ #include <memory>
+@@ -68,8 +70,9 @@
+-  return std::make_unique<FilterListService>(
+-      g_brave_browser_process->ad_block_service());
++  AdBlockServiceLease lease(*context);if(!lease.Get())return nullptr;
++  return std::make_unique<FilterListService>(lease.Getter());
+ }
+ 
+ content::BrowserContext* FilterListServiceFactory::GetBrowserContextToUse(
+     content::BrowserContext* context) const {
++  if(alloy::site_records::RequestContextPolicy::Get(*context))return context;
+   return GetBrowserContextRedirectedInIncognito(context);
+ }
+--- a/browser/perf/brave_perf_features_processor.cc
++++ b/browser/perf/brave_perf_features_processor.cc
+@@ -6,3 +6,4 @@
+ #include "brave/browser/perf/brave_perf_features_processor.h"
++#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
+ 
+ #include "base/command_line.h"
+@@ -54,4 +55,5 @@
+   // Obtrusive cookie notices list in cosmetic filters.
++  auto* service=brave_shields::AdBlockServiceForContext(*profile);if(!service)return;
+   auto* component_service_manager =
+-      g_brave_browser_process->ad_block_service()->component_service_manager();
++      service->component_service_manager();
+   if (!component_service_manager ||

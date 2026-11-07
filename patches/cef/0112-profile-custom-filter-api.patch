@@ -1,0 +1,70 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1163,6 +1163,7 @@
+   sources += [ "libcef/browser/alloy/profile_store.cc" ]
+   deps += [
++    "//brave/browser/brave_shields",
+     "//brave/alloy/site_records:native_profile_configuration",
+     "//brave/alloy/site_records:native_profile_preferences",
+     "//brave/alloy/site_records:profile_filter_preferences",
+     "//brave/alloy/site_records:profiles",
+--- a/libcef/browser/request_context_impl.cc
++++ b/libcef/browser/request_context_impl.cc
+@@ -8,4 +8,8 @@
+ #include "cef/include/alloy/alloy_request_context.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
++#include "brave/components/brave_shields/content/browser/ad_block_custom_filters_provider.h"
++#include "brave/components/brave_shields/content/browser/ad_block_service.h"
+ #include "cef/libcef/browser/alloy/profile_configuration.h"
+ #include "base/atomic_sequence_num.h"
+ #include "base/logging.h"
+@@ -351,5 +355,48 @@
+   return true;
+ }
+ 
++namespace {
++content::BrowserContext* CustomFilterContext(
++    CefRefPtr<CefRequestContext> context) {
++  if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !context)
++    return nullptr;
++  auto* impl = static_cast<CefRequestContextImpl*>(context.get());
++  if (!impl->VerifyBrowserContext()) return nullptr;
++  auto* cef_context = impl->GetBrowserContext();
++  auto* native = cef_context ? cef_context->AsBrowserContext() : nullptr;
++  const auto* policy = native ? alloy::site_records::RequestContextPolicy::Get(*native) : nullptr;
++  if (!policy || policy->storage_mode() == alloy::site_records::StorageMode::kStateless)
++    return nullptr;
++  return native;
++}
++}  // namespace
++
++bool AlloyGetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
++                                CefString& filters) {
++  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
++  filters.clear();
++  auto* native = CustomFilterContext(context);
++  if (!native) return false;
++  brave_shields::AdBlockServiceLease original(*native);
++  auto* service = original.Get();
++  if (!service || !service->custom_filters_provider()) return false;
++  const auto value = service->custom_filters_provider()->GetCustomFilters();
++  if (!original.Get()) return false;
++  filters = value;
++  return true;
++}
++
++bool AlloySetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
++                                const CefString& filters) {
++  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
++  auto* native = CustomFilterContext(context);
++  if (!native) return false;
++  brave_shields::AdBlockServiceLease original(*native);
++  auto* service = original.Get();
++  if (!service || !service->custom_filters_provider()) return false;
++  const bool accepted = service->custom_filters_provider()->UpdateCustomFilters(filters.ToString());
++  return accepted && original.Get();
++}
++
+ CefRequestContextImpl::~CefRequestContextImpl() {
+   CEF_REQUIRE_UIT();

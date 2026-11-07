@@ -85,5 +85,31 @@ TEST(RequestContextPolicyTest, MemoryOwnerAdmitsOnlyItsOwnResidentStorage) {
                   .Allows(StorePurpose::kCookies, StorageAccess::kWriteMemory));
 }
 
+TEST(RequestContextPolicyTest, EncryptedNativeWorkingStorageFollowsTheOriginalProfileGeneration) {
+  RecordCapabilityIssuer profile(base::UnguessableToken::Create(),
+      base::UnguessableToken::Create(), base::UnguessableToken::Create(), StorageMode::kEncrypted);
+  const auto original = profile.Issue(StorePurpose::kProfileSettings);
+  BrowserOwner owner;
+  RequestContextPolicy::AttachEncrypted(owner, original);
+  const auto* policy = RequestContextPolicy::Get(owner);
+  EXPECT_EQ(StorageMode::kEncrypted, policy->storage_mode());
+  EXPECT_EQ(NetworkState::kKeep, policy->network_state());
+  EXPECT_EQ(original.profile(), policy->profile());
+  EXPECT_FALSE(RequestContextPolicy::IsStateless(owner));
+  EXPECT_FALSE(RequestContextPolicy::IsNoDisk(owner));
+  auto pending = policy->StorageCapability(StorePurpose::kSiteSettings);
+  EXPECT_TRUE(pending.Allows(StorePurpose::kSiteSettings, StorageAccess::kReadMemory));
+  // A context cannot grant a mixed native store arbitrary record-file access.
+  // Only the existing owner-sharded adapter has its real record capability.
+  EXPECT_FALSE(pending.Allows(StorePurpose::kSiteSettings, StorageAccess::kReadRecordFiles));
+  profile.Revoke();
+  EXPECT_FALSE(pending.active());
+  EXPECT_FALSE(policy->StorageCapability(StorePurpose::kDomStorage).active());
+  RecordCapabilityIssuer replacement(base::UnguessableToken::Create(),
+      base::UnguessableToken::Create(), base::UnguessableToken::Create(), StorageMode::kEncrypted);
+  EXPECT_TRUE(replacement.Issue(StorePurpose::kProfileSettings).active());
+  EXPECT_FALSE(pending.active());
+}
+
 }  // namespace
 }  // namespace alloy::site_records

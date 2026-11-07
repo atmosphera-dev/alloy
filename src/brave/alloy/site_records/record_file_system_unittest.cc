@@ -114,6 +114,57 @@ TEST_F(RecordFileSystemTest, NativeNamespaceAndDurableCloseRoundTrip) {
                             &file));
 }
 
+TEST_F(RecordFileSystemTest, FailedPublicationCannotReplayNativeNamespaceMutations) {
+  constexpr std::string_view marker = "acknowledged-before-publication-failure";
+  std::shared_ptr<RecordFile> original;
+  ASSERT_EQ(FileStatus::kOk, fs_->OpenFile(cap_, kPurpose, "original", RecordOpen::kCreate, &original));
+  ASSERT_EQ(FileStatus::kOk, original->Write(0, base::as_byte_span(marker)));
+  ASSERT_EQ(FileStatus::kOk, original->Close());
+  original.reset();
+  for (int operation = 0; operation < 7; ++operation) {
+    SCOPED_TRACE(operation);
+    std::shared_ptr<RecordFile> pending;
+    if (operation == 6) {
+      ASSERT_EQ(FileStatus::kOk, fs_->OpenFile(cap_, kPurpose, "original", RecordOpen::kOpen, &pending));
+      ASSERT_EQ(FileStatus::kOk, pending->Write(0, base::as_byte_span(std::string_view("unacknowledged"))));
+    }
+    fs_->SetFaultForTesting([](PublishFence fence, const base::FilePath&) {
+      return fence == PublishFence::kRootWritten ? FileStatus::kIo : FileStatus::kOk;
+    });
+    FileStatus status = FileStatus::kInvalid;
+    switch (operation) {
+      case 0: status = fs_->Remove(cap_, kPurpose, "original"); break;
+      case 1: status = fs_->Rename(cap_, kPurpose, "original", "moved"); break;
+      case 2: status = fs_->CreateDirectory(cap_, kPurpose, "new-directory"); break;
+      case 3: status = fs_->OpenFile(cap_, kPurpose, "new-file", RecordOpen::kCreate, &pending); break;
+      case 4: status = fs_->OpenFile(cap_, kPurpose, "original", RecordOpen::kCreateOrTruncate, &pending); break;
+      case 5: status = fs_->SetRecordMetadata(record_.id, base::as_byte_span(std::string_view("rejected"))); break;
+      case 6: status = pending->Sync(); break;
+    }
+    EXPECT_EQ(FileStatus::kIo, status);
+    EXPECT_FALSE(fs_->unlocked());
+    EXPECT_TRUE(fs_->KeysClearedForTesting());
+    fs_->SetFaultForTesting({});
+    EXPECT_EQ(FileStatus::kIo, fs_->Sync());
+    if (pending) EXPECT_EQ(FileStatus::kIo, pending->Close());
+    pending.reset();
+    EXPECT_EQ(FileStatus::kIo, fs_->Lock());
+    fs_.reset();
+    ASSERT_EQ(FileStatus::kOk, RecordFileSystem::Open(path_, TestProfileKey(), &fs_));
+    Resolve("https://wikipedia.org/", false, &record_);
+    cap_ = fs_->Capability(record_.id, kPurpose);
+    EXPECT_TRUE(record_.metadata.empty());
+    ASSERT_EQ(FileStatus::kOk, fs_->OpenFile(cap_, kPurpose, "original", RecordOpen::kOpen, &original));
+    EXPECT_EQ(marker, Read(original, 100));
+    ASSERT_EQ(FileStatus::kOk, original->Close());
+    original.reset();
+    for (const auto* name : {"moved", "new-directory", "new-file"}) {
+      RecordFileInfo info;
+      EXPECT_EQ(FileStatus::kNotFound, fs_->Stat(cap_, kPurpose, name, &info));
+    }
+  }
+}
+
 TEST_F(RecordFileSystemTest, RenameReplaceUnlinkPreserveOpenIdentity) {
   std::shared_ptr<RecordFile> old;
   std::shared_ptr<RecordFile> fresh;

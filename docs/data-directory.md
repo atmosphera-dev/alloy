@@ -42,11 +42,12 @@ The embedder owns licensing and distribution of its selected data.
 
 ## Compiled-filter cache
 
-Without the switch, Alloy does not read Brave's compiled DAT caches, including
-in a profile that previously used lists. Existing cache files are left intact.
+Without the switch, Alloy does not read Brave's legacy compiled DAT caches,
+including in a profile that previously used lists. Existing cache files are
+left intact.
 
-With a directory, Brave's existing DAT cache behavior is retained. When its
-default-enabled `AdblockDATCache` feature is on and the process permits disk
+With a directory, the legacy CEF service retains Brave's DAT cache behavior.
+When its default-enabled `AdblockDATCache` feature is on and the process permits disk
 storage, the service reads `adblock_cache/engine0.dat` and `engine1.dat` beneath
 the initial profile directory in its user-data root at startup. A nonempty
 cache accepted by adblock-rust's deserializer is loaded immediately, before
@@ -54,14 +55,22 @@ catalog/resource delivery. Missing
 or rejected caches fall back to the filter providers. Successful filter-set
 builds write new compiled caches; later provider changes can rebuild them.
 
-The pinned implementation does not bind those cache files to the supplied
+The legacy implementation does not bind those cache files to the supplied
 directory, component IDs/versions or hashes of `list.txt`. Reusing a user-data
 root can therefore reuse an older compiled list even if the input directory
 has changed. This switch adds no new cache-validity or invalidation scheme.
+Explicit Alloy profiles use the profile-owned snapshot backend instead:
+reuse requires the configuration digest (preferences, locale, engine choice
+and linked serializer fingerprint) and the ordered filter-source digest
+(rule bytes and permission masks) to match. Encrypted profiles keep that cache
+encrypted; memory-only profiles keep it in memory. The directory switch does
+not change these profile-owned cache-validity rules.
 Sources: `ad_block_dat_cache_manager.cc` (`MaybeReadCachedDATFiles`),
 `ad_block_service.cc` (`OnReadCachedDATFiles`, `OnDATLoaded`, `OnEngineLoaded`),
 `ad_block_engine.cc` (`OnDATLoaded`) and `ad_block_filters_provider_manager.cc`
 (`MaybeConsumeEngineStartupChangeNotification`) under Brave's shields component.
+Profile snapshot validation is in `ProfileFilterStorage` and the native
+service's `SourceProviderObserver::OnFilterSetCreated`.
 
 ## Test input
 

@@ -1,0 +1,49 @@
+--- a/components/cosmetic_filters/renderer/cosmetic_filters_js_handler.h
++++ b/components/cosmetic_filters/renderer/cosmetic_filters_js_handler.h
+@@ -130,4 +130,5 @@
+   base::WeakPtrFactory<CosmeticFiltersJSHandler> weak_ptr_factory_{this};
++  base::WeakPtrFactory<CosmeticFiltersJSHandler> request_weak_factory_{this};
+ };
+ 
+ // static
+--- a/components/cosmetic_filters/renderer/cosmetic_filters_js_handler.cc
++++ b/components/cosmetic_filters/renderer/cosmetic_filters_js_handler.cc
+@@ -308,5 +308,5 @@
+       input, exceptions_,
+       base::BindOnce(&CosmeticFiltersJSHandler::OnHiddenClassIdSelectors,
+-                     base::Unretained(this)));
++                     request_weak_factory_.GetWeakPtr()));
+ }
+ 
+@@ -552,5 +552,5 @@
+     cosmetic_filters_resources_.set_disconnect_handler(
+         base::BindOnce(&CosmeticFiltersJSHandler::OnRemoteDisconnect,
+-                       weak_ptr_factory_.GetWeakPtr()));
++                       request_weak_factory_.GetWeakPtr()));
+   }
+ 
+@@ -560,5 +560,9 @@
+ void CosmeticFiltersJSHandler::OnRemoteDisconnect() {
++  request_weak_factory_.InvalidateWeakPtrs();
+   cosmetic_filters_resources_.reset();
+-  EnsureConnected();
++  resources_dict_.reset();exceptions_.clear();generichide_=false;
++  enabled_1st_party_cf_=false;
++  // A retired/refusing owner must not trigger an automatic rebind loop.
++  // The next real request can acquire its current document's native receiver.
+ }
+ 
+@@ -587,4 +591,6 @@
+     std::optional<base::OnceClosure> callback) {
++  request_weak_factory_.InvalidateWeakPtrs();cosmetic_filters_resources_.reset();
++  exceptions_.clear();generichide_=false;
+   resources_dict_ = std::nullopt;
+   url_ = url;
+   enabled_1st_party_cf_ = false;
+@@ -622,5 +629,5 @@
+         url_.spec(), enabled_1st_party_cf_,
+         base::BindOnce(&CosmeticFiltersJSHandler::OnUrlCosmeticResources,
+-                       base::Unretained(this), std::move(callback.value())));
++                       request_weak_factory_.GetWeakPtr(), std::move(callback.value())));
+   } else {
+     TRACE_EVENT1("brave.adblock", "UrlCosmeticResourcesSync", "url",

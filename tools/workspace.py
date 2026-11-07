@@ -21,6 +21,7 @@ def workspace_path(repo):
 
 
 def temp_path(work):
+    """Keep scratch workspace-local, preserving the original NUC temp path."""
     return work / 'tmp' if work in (SECONDARY, CI) else Path('/home/builder/work/tmp')
 
 

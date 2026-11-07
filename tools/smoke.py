@@ -141,6 +141,7 @@ def terminate_session(session):
 
 
 def main():
+    """Check page loading and clean browser shutdown with the selected fixture."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--port', type=int, default=9229)

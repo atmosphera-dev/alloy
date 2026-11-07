@@ -156,6 +156,7 @@ def has_sentinel_spelling_marker(node):
 
 
 def main():
+    """Observe filtering or startup refusal in an isolated workspace-owned browser."""
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--inside',action='store_true')

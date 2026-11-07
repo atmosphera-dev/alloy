@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+name: Build and test on Blacksmith CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alloy-build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 720
+    env:
+      ALLOY_WORK: /home/runner/alloy
+      DEPOT_TOOLS_UPDATE: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out Alloy
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Mount pinned workspace
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+        with:
+          key: alloy-work-${{ hashFiles('pins.json') }}
+          path: /home/runner/alloy
+
+      - name: Mirror checkout and read tooling pins
+        id: pins
+        run: |
+          SECONDS=0
+          printf '## Alloy CI\n\n| Step | Seconds |\n| --- | ---: |\n' >> "$GITHUB_STEP_SUMMARY"
+          trap 'printf "| Mirror checkout | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          sudo chown "$(id -u):$(id -g)" "$ALLOY_WORK"
+          mkdir -p "$ALLOY_WORK"/{repo,tmp,logs,evidence,support}
+          export TMPDIR="$ALLOY_WORK/tmp"
+          printf 'TMPDIR=%s\n' "$TMPDIR" >> "$GITHUB_ENV"
+          rsync -a --delete --exclude='.git/' --exclude='__pycache__/' \
+            "$GITHUB_WORKSPACE/" "$ALLOY_WORK/repo/"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          from pathlib import Path
+          pins = json.loads((Path(os.environ['ALLOY_WORK']) / 'repo/pins.json').read_text())
+          for tool in ('node', 'pnpm'):
+              print(f'{tool}={pins["tooling"][tool]}')
+          PY
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ steps.pins.outputs.node }}
+          package-manager-cache: false
+
+      - name: Install checkout prerequisites and pinned pnpm
+        env:
+          PNPM_VERSION: ${{ steps.pins.outputs.pnpm }}
+        run: |
+          SECONDS=0
+          trap 'printf "| Checkout prerequisites | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential ca-certificates curl git iproute2 libcurl3t64-gnutls \
+            lsb-release pkg-config python3 rsync unzip xz-utils
+          npm install --global --prefix "$ALLOY_WORK/tooling" \
+            --cache "$ALLOY_WORK/tooling/npm-cache" "pnpm@$PNPM_VERSION"
+          printf '%s/tooling/bin\n' "$ALLOY_WORK" >> "$GITHUB_PATH"
+          # alloy_build.py and sudo/runuser use /usr/bin, not the action's tool-cache PATH.
+          sudo ln -sf "$(command -v node)" /usr/bin/node
+          sudo ln -sf "$ALLOY_WORK/tooling/bin/pnpm" /usr/bin/pnpm
+
+      - name: Check out pinned upstream sources
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Upstream checkout | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/alloy_checkout.py --root /home/runner/alloy/src
+
+      - name: Install Chromium build and cefclient runtime prerequisites
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Build prerequisites | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 src/build/install-build-deps.py --no-prompt --no-syms --no-arm --no-chromeos-fonts
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+            libcups2t64 libcurl3t64-gnutls libdrm2 libgbm1 libgtk-3-0t64 libnspr4 \
+            libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxfixes3 \
+            libxkbcommon0 libxrandr2 xauth xvfb
+
+      - name: Apply Alloy
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Apply Alloy | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/alloy_apply.py --root src --report evidence/apply.json
+
+      - name: Build Verify
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Verify build | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/alloy_build.py --config verify
+
+      - name: Smoke Verify
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Verify smoke | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/smoke.py --out src/out/Verify_Alloy --local-fixture
+
+      - name: Probe blocking
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Blocking probe | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/probe_blocking.py --out src/out/Verify_Alloy \
+            --alloy-data-dir="$ALLOY_WORK/repo/tools/testdata/alloy-data"
+
+      - name: Build Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Release build | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/alloy_build.py --config release
+
+      - name: Smoke Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: /home/runner/alloy
+        run: |
+          SECONDS=0
+          trap 'printf "| Release smoke | %s |\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          python3 repo/tools/smoke.py --out src/out/Release_Alloy --local-fixture
+
+      - name: Summarize disk sizes
+        if: always()
+        run: |
+          {
+            printf '\n### Disk sizes\n\n```text\n'
+            for path in "$ALLOY_WORK/src" "$ALLOY_WORK"/src/out/* "$ALLOY_WORK"; do
+              if [[ -d "$path" ]]; then
+                sudo du -sh "$path"
+              fi
+            done
+            printf '```\n'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

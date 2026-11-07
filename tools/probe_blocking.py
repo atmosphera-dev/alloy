@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-from workspace import namespace_prefix, temp_path, validate_output, workspace_path
+from workspace import namespace_prefix, temp_path, validate_output, workspace_owner, workspace_path
 
 REPO=Path(__file__).resolve().parents[1]
 WORK=workspace_path(REPO)
@@ -181,12 +181,14 @@ def main():
         p.error('--profile must be beneath the selected workspace evidence/')
     if not a.inside:
         command=namespace_prefix(WORK)+['unshare','--net','--fork','/bin/sh','-c',
-                  'ip link set lo up && exec runuser -u builder -- "$@"','alloy-offline',
-                  'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
-                  'xvfb-run','-a','-s','-screen 0 1280x720x24',
-                  'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
+                 'owner=$1; shift; ip link set lo up && exec runuser -u "$owner" -- "$@"','alloy-offline',
+                 workspace_owner(WORK).pw_name,
+                 'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
+                 'GITHUB_ACTIONS='+os.environ.get('GITHUB_ACTIONS','false'),
+                 'xvfb-run','-a','-s','-screen 0 1280x720x24',
+                 'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
         return subprocess.run(['timeout','--kill-after=20s',str(a.hold_seconds+150),*command],timeout=a.hold_seconds+180).returncode
-    assert os.geteuid()!=0,'Browser must run as builder with its sandbox enabled'
+    assert os.geteuid()!=0,'Browser must run as the workspace owner with its sandbox enabled'
     interfaces=json.loads(subprocess.check_output(['ip','-j','addr'],timeout=10))
     assert [i['ifname'] for i in interfaces]==['lo'],interfaces
     routes=subprocess.check_output(['ip','route'],text=True,timeout=10)

@@ -148,6 +148,32 @@ proof are retained under `logs/smoke-*/`; startup and all protocol waits are
 bounded. This proves page loading/CDP, not default filter readiness or a
 no-phone-home outcome.
 
+## Blacksmith CI
+
+`.github/workflows/build.yml` runs on Blacksmith's 32-vCPU Ubuntu 24.04 runners
+for PRs to `main`, pushes to `main`, and manual dispatches. Every run applies
+Alloy, builds Verify, checks page loading/CDP against a repo fixture served on
+loopback, and runs the blocking probe with `tools/testdata/alloy-data`. Only a
+push to `main` also builds and smokes Release. The NUC smoke default remains
+the Kiwix page; `smoke.py --local-fixture` selects the loopback fixture.
+
+The sticky disk at `/home/runner/alloy` keeps sources, apply state and outputs.
+Its key includes the hash of `pins.json`, so pin changes start fresh; same-pin
+checkouts skip initialization and builds are incremental. Blacksmith sticky-disk
+branch protection must stay enabled: PRs read the latest trusted snapshot but
+cannot save changes. Only default-branch push, dispatch or schedule jobs save
+the disk. The job summary records command-step times and disk sizes; no large
+artifacts are uploaded. First execution requires the embedder-data-dir change.
+
+To run CI by hand, select **Build and test on Blacksmith CI** in GitHub Actions
+and choose **Run workflow**, or use
+`direnv exec ~/Projects/alloy gh workflow run build.yml --ref main`.
+On a Blacksmith runner, the
+workflow's commands run from `/home/runner/alloy`, with the repo in `repo/` and
+`TMPDIR=/home/runner/alloy/tmp`. This third workspace is accepted only with
+`GITHUB_ACTIONS=true` and must be owned by the invoking user. The pinned NUC
+workspace checks are unchanged.
+
 ## Offline embedder-data consumers
 
 On the same NUC, build the native spelling observer from this repository against

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The two explicitly approved, builder-owned NUC workspaces.
+"""The approved NUC workspaces and the GitHub Actions sticky-disk workspace.
 
 Selection follows the delivered repository, not cwd or an arbitrary environment
 variable. Validation happens at entry points, before any locks or writes.
@@ -13,6 +13,7 @@ import socket
 PRIMARY = Path('/home/builder/work/alloy')
 SECONDARY = Path('/home/builder/work/alloy-b')
 APPROVED = (PRIMARY, SECONDARY)
+CI = Path('/home/runner/alloy')
 
 
 def workspace_path(repo):
@@ -20,7 +21,14 @@ def workspace_path(repo):
 
 
 def temp_path(work):
-    return work / 'tmp' if work == SECONDARY else Path('/home/builder/work/tmp')
+    return work / 'tmp' if work in (SECONDARY, CI) else Path('/home/builder/work/tmp')
+
+
+def workspace_owner(work):
+    """Resolve the account used for validation and unprivileged consumers."""
+    if work == CI and os.environ.get('GITHUB_ACTIONS') == 'true':
+        return pwd.getpwuid(os.geteuid())
+    return pwd.getpwnam('builder')
 
 
 def namespace_prefix(work):
@@ -33,12 +41,15 @@ def namespace_prefix(work):
 
 
 def validate_workspace(work, repo=None):
-    """Reject foreign roots, symlink escapes and roots not owned by builder."""
-    if socket.gethostname() != 'wakaba-build' or work not in APPROVED:
+    """Reject foreign roots, symlink escapes and directories not owned by the account."""
+    if work == CI:
+        if os.environ.get('GITHUB_ACTIONS') != 'true':
+            raise RuntimeError('The CI workspace requires GITHUB_ACTIONS=true')
+    elif socket.gethostname() != 'wakaba-build' or work not in APPROVED:
         raise RuntimeError(f'Only the approved NUC workspaces {APPROVED} are supported')
-    owner = pwd.getpwnam('builder').pw_uid
+    owner = workspace_owner(work).pw_uid
     if os.geteuid() not in (0, owner):
-        raise RuntimeError('Workspace tools must run as builder (or the network supervisor)')
+        raise RuntimeError('Workspace tools must run as the owner (or the network supervisor)')
     if repo is not None and repo != work / 'repo':
         raise RuntimeError('Tools must come from the selected workspace repo/')
     for path in (work, work / 'repo', work / 'src', work / 'src/out',

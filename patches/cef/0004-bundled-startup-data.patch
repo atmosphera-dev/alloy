@@ -10,12 +10,15 @@
      configs += [
 --- a/libcef/common/chrome/chrome_main_delegate_cef.cc
 +++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
-@@ -23,2 +23,4 @@
+@@ -23,2 +23,7 @@
  #include "cef/libcef/common/resource_util.h"
 +#include "base/files/file_util.h"
 +#include "brave/alloy/bundled_data.h"
++#if BUILDFLAG(IS_POSIX)
++#include <unistd.h>
++#endif
  #include "cef/libcef/renderer/chrome/chrome_content_renderer_client_cef.h"
-@@ -435,2 +437,12 @@
+@@ -435,2 +440,17 @@
 +  // Validate the embedder's final browser command line, including changes from
 +  // OnBeforeCommandLineProcessing, before browser initialization loads pages.
 +  if (process_type.empty()) {
@@ -25,6 +28,11 @@
 +                     !base::PathIsReadable(*data_dir))) {
 +      return 1;
 +    }
++#if BUILDFLAG(IS_POSIX)
++    if (data_dir && access(data_dir->value().c_str(), X_OK) != 0) {
++      return 1;
++    }
++#endif
 +  }
    // Call as early as possible.
    InitLogging(command_line);

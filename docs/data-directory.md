@@ -16,7 +16,7 @@ switch in the callback. Subprocesses do not need the switch.
 With no switch, Alloy starts without component filter lists, local data,
 QueryFilter or a Hunspell dictionary. There is no fallback beside `libcef.so`,
 in the profile, or in the working directory. An explicitly empty, relative,
-missing, non-directory or unreadable path stops startup with a nonzero result
+missing, non-directory, unreadable or unsearchable path stops startup with a nonzero result
 before any page loads. A supplied directory must stay readable and unchanged
 for the process lifetime. Alloy treats its files as read-only application data.
 

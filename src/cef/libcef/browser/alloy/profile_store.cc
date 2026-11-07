@@ -122,6 +122,9 @@ class SettingsOwner final : public CefBaseRefCounted {
   using FiltersReady = sr::ProfileFilterPreferences::Loaded;
   void PrepareFilters(FiltersReady ready) {
     CEF_REQUIRE_UIT();
+    // Enforce asynchronous delivery at the callback boundary, including storage
+    // creation failure and a refused Load task during shutdown.
+    ready = base::BindPostTask(CEF_TASK_RUNNER<CEF_UIT>(), std::move(ready));
     if (filters_ && filters_->available()) {
       CEF_POST_TASK(CEF_UIT, base::BindOnce(
           [](scoped_refptr<sr::ProfileFilterPreferences> filters, FiltersReady ready) {

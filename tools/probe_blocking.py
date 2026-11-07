@@ -145,6 +145,16 @@ def startup_control(argv,out,log,url,port,requests):
                 except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
 
 
+def has_sentinel_spelling_marker(node):
+    # CEF flattens marker type bitmasks. Only a single range with a single
+    # spelling type is unambiguous; never zip flattened types with ranges.
+    starts=node.get('markerStarts',[])
+    ends=node.get('markerEnds',[])
+    if node.get('markerTypes')!=['spelling'] or len(starts)!=1 or len(ends)!=1:
+        return False
+    return node.get('name','')[starts[0]:ends[0]]=='qzxqzxqzx'
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out',type=Path,required=True)
@@ -261,9 +271,7 @@ def main():
                 for tree in trees:visit(tree)
                 (log/'spell-markers.json').write_text(json.dumps(markers,indent=2)+'\n')
                 assert markers,'No native spelling marker delivered to CEF consumer'
-                assert any(m.get('name','')[start:end]=='qzxqzxqzx'
-                           for m in markers
-                           for start,end in zip(m.get('markerStarts',[]),m.get('markerEnds',[]))),markers
+                assert any(has_sentinel_spelling_marker(m) for m in markers),markers
                 print('ALLOY_EMBEDDER_DICTIONARY_NATIVE_MARKER_PASS',json.dumps(markers),flush=True)
             print('ALLOY_OFFLINE_TRACKER_PROBE_PASS',json.dumps(proof['consumer']),flush=True)
         finally:

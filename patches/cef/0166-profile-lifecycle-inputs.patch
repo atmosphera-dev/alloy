@@ -1,0 +1,28 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1165,3 +1165,6 @@
+   deps += [
++    "//brave/alloy/site_records:native_profile_configuration",
++    "//brave/alloy/site_records:native_profile_preferences",
++    "//brave/alloy/site_records:profile_filter_preferences",
+     "//brave/alloy/site_records:profiles",
+     "//third_party/icu:icuuc",
+--- a/include/internal/cef_types.h
++++ b/include/internal/cef_types.h
+@@ -4290,3 +4290,16 @@
+   ALLOY_KEYRING_FAILED = 4,
+ } alloy_keyring_result_t;
++
++///
++/// EXPERIMENTAL: Profile operation result.
++///
++typedef enum {
++  ALLOY_SETTINGS_OK = 0,
++  ALLOY_SETTINGS_CANCELLED = 1,
++  ALLOY_SETTINGS_INVALID = 2,
++  ALLOY_SETTINGS_CONFLICT = 3,
++  ALLOY_SETTINGS_IO = 4,
++  ALLOY_SETTINGS_INTEGRITY = 5,
++} alloy_site_settings_result_t;
++
+ #endif

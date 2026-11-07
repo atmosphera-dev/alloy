@@ -5,10 +5,26 @@
 #define ALLOY_INCLUDE_ALLOY_PROFILE_H_
 #pragma once
 
+#include <vector>
+
 #include "include/cef_base.h"
 #include "include/internal/cef_types.h"
 
 #if CEF_API_ADDED(CEF_EXPERIMENTAL)
+///
+/// EXPERIMENTAL: Lock completion on browser UI, after original-generation key
+/// revocation, native teardown, and destruction of the shared preference cache.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyProfileLockCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete the lock with |result|. Only OK acknowledges completed teardown.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result) = 0;
+};
+
 ///
 /// EXPERIMENTAL: Embedder-provided key-encryption-key source. The callback runs
 /// synchronously on the thread calling profile create/unlock, outside the
@@ -36,7 +52,7 @@ class AlloyKeySource : public virtual CefBaseRefCounted {
 
 ///
 /// EXPERIMENTAL: An encrypted profile lifecycle, usable before CefInitialize.
-/// These methods perform blocking crypto/filesystem work; call them on an
+/// Lifecycle methods perform blocking crypto/filesystem work; call them on an
 /// embedder background thread. The library uses one authenticated catalogue and
 /// encrypted file layer for all profile/record state. Store/browser-context
 /// binding is separate. Releasing the last reference locks and wipes the profile.
@@ -70,8 +86,11 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   virtual alloy_keyring_result_t UnlockWithKeyring() = 0;
 
   ///
-  /// Flush completed writes, lock and wipe keys. Returns true only when this
-  /// synchronous lock completed successfully. During an in-flight unlock it
+  /// Flush completed writes, revoke keys, retire native owners and destroy their
+  /// preference caches. Returns true only after all those steps complete. Once
+  /// native settings exist this background call waits for browser UI teardown;
+  /// the embedder must keep UI pumping. Browser UI uses LockAsync; the backing
+  /// I/O sequence never waits for UI. During an in-flight unlock it
   /// requests cancellation and returns false; state remains TRANSITION until
   /// that operation has wiped its keys. Retry after the operation completes.
   ///
@@ -79,11 +98,22 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   virtual bool Lock() = 0;
 
   ///
+  /// Queue lock from browser UI after CefInitialize. Completion is asynchronous
+  /// on UI after keys are revoked, native owners retire and preference caches
+  /// are destroyed. Until completion the state remains TRANSITION. Returns false
+  /// for a missing callback, wrong thread or another lifecycle transition.
+  ///
+  /*--cef()--*/
+  virtual bool LockAsync(CefRefPtr<AlloyProfileLockCallback> callback) = 0;
+
+  ///
   /// Return the current state. LOCKED means no profile keys or admitted record
   /// access remain; TRANSITION is not a successful lock acknowledgement.
   ///
   /*--cef(default_retval=ALLOY_PROFILE_ERROR)--*/
   virtual alloy_profile_state_t GetState() = 0;
+
+
 };
 
 ///

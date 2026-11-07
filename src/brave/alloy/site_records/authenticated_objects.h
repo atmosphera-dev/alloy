@@ -35,6 +35,8 @@ enum class FileStatus {
   // must close admission until reopen; retrying with an old in-memory root
   // could overwrite an actually committed transaction.
   kCommitUncertain,
+  // An asynchronous settings request lost its original admission before reply.
+  kCancelled,
 };
 
 constexpr size_t kRecordChunkSize = 4096;

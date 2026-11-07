@@ -110,6 +110,12 @@ the next collection. Unlock completes orphan/key-envelope cleanup before
 returning any record admission.
 
 Authentication/coverage failures latch an integrity error and clear keys. A
+failed coordinator publication also closes admission and clears keys, including
+an I/O failure before root rename: native namespace/file roots may already have
+been staged, and later Sync/Close/Lock must never publish a refused operation.
+The original pre-rename error is retained; authoritative reopen is required.
+Data-chunk COW failures before publication that leave logical roots unchanged
+remain retryable. A
 failure after root rename, or while retiring obsolete key-bearing pages, latches
 `kCommitUncertain`, clears keys and requires reopen. There is no old-root choice,
 silent raze, native plaintext fallback, parent-profile read or normal cache-miss

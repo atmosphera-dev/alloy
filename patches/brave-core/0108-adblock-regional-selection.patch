@@ -1,0 +1,153 @@
+--- a/components/brave_shields/core/browser/ad_block_component_service_manager.h
++++ b/components/brave_shields/core/browser/ad_block_component_service_manager.h
+@@ -55,5 +55,5 @@
+   bool NeedsLocaleListsMigration(
+       std::vector<std::reference_wrapper<FilterListCatalogEntry const>>
+-          locale_lists);
++          locale_lists) const;
+ 
+   void SetFilterListCatalog(std::vector<FilterListCatalogEntry> catalog);
+@@ -64,7 +64,7 @@
+   base::FilePath GetFilterSetPath(const std::string& uuid);
+   bool IsFilterListAvailable(const std::string& uuid) const;
+   bool IsFilterListEnabled(const std::string& uuid) const;
+-  void EnableFilterList(const std::string& uuid, bool enabled);
++  bool EnableFilterList(const std::string& uuid, bool enabled);
+ 
+   void UpdateFilterLists(base::OnceCallback<void(bool)> callback);
+ 
+@@ -77,5 +77,6 @@
+   friend class ::AdBlockServiceTest;
+ 
+   void StartRegionalServices();
++  bool ResolveFilterListEnabled(const std::string& uuid,bool locale_defaults) const;
+   void LoadComponentFiltersProviders();
+   void UpdateFilterListPrefs(const std::string& uuid, bool enabled);
+--- a/components/brave_shields/core/browser/ad_block_component_service_manager.cc
++++ b/components/brave_shields/core/browser/ad_block_component_service_manager.cc
+@@ -193,5 +193,5 @@
+ bool AdBlockComponentServiceManager::NeedsLocaleListsMigration(
+     std::vector<std::reference_wrapper<FilterListCatalogEntry const>>
+-        locale_lists) {
++        locale_lists) const {
+   // This can only apply to locales with more than one available list
+   if (locale_lists.size() <= 1) {
+@@ -198,9 +198,9 @@
+-  if (!IsFilterListEnabled(locale_lists[0].get().uuid)) {
++  if (!ResolveFilterListEnabled(locale_lists[0].get().uuid,false)) {
+     return false;
+   }
+ 
+   for (size_t i = 1; i < locale_lists.size(); i++) {
+-    if (IsFilterListEnabled(locale_lists[i].get().uuid)) {
++    if (ResolveFilterListEnabled(locale_lists[i].get().uuid,false)) {
+       return false;
+     }
+   }
+@@ -252,3 +252,3 @@
+-  if (!checked_all_default_regions) {
++  if (!checked_all_default_regions && !local_state_->ReadOnly()) {
+     bool checked_default_region =
+         local_state_->GetBoolean(prefs::kAdBlockCheckedDefaultRegion);
+@@ -297,5 +297,6 @@
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (!local_state_) {
++  if (!local_state_ || local_state_->ReadOnly()) {
+     return;
+   }
++  auto weak=weak_factory_.GetWeakPtr();
+   {
+@@ -305,6 +306,7 @@
+     update->Set(uuid, std::move(regional_filter_dict));
+   }
+ 
++  if(!weak)return;
+   RecordP3ACookieListEnabled();
+   list_p3a_->ReportFilterListUsage();
+ }
+@@ -338,3 +340,7 @@
+ bool AdBlockComponentServiceManager::IsFilterListEnabled(
+     const std::string& uuid) const {
++  return ResolveFilterListEnabled(uuid,true);
++}
++bool AdBlockComponentServiceManager::ResolveFilterListEnabled(
++    const std::string& uuid,bool locale_defaults) const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+@@ -392,6 +398,17 @@
+     return user_pref_dict->FindBool("enabled").value_or(false);
+   }
+ 
++  // Resolve the same startup locale selection without storing user choices or
++  // initialization flags in a readonly context. Explicit inputs above win.
++  if(locale_defaults&&local_state_->ReadOnly()&&
++      !local_state_->GetBoolean(prefs::kAdBlockCheckedAllDefaultRegions)) {
++    auto lists=FindAdBlockFilterListsByLocale(filter_list_catalog_,locale_);
++    if(!local_state_->GetBoolean(prefs::kAdBlockCheckedDefaultRegion)||
++        NeedsLocaleListsMigration(lists)) {
++      for(const auto& item:lists)if(item.get().uuid==uuid&&item.get().public_key_sha256&&
++          item.get().SupportsCurrentPlatform())return true;
++    }
++  }
+   // Otherwise the list is disabled
+   return false;
+ }
+@@ -399,41 +416,41 @@
+-void AdBlockComponentServiceManager::EnableFilterList(const std::string& uuid,
++bool AdBlockComponentServiceManager::EnableFilterList(const std::string& uuid,
+                                                       bool enabled) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(!uuid.empty());
++  if(!local_state_||local_state_->ReadOnly())return false;
+   auto catalog_entry =
+       brave_shields::FindAdBlockFilterListByUUID(filter_list_catalog_, uuid);
+ 
+   if (catalog_entry == filter_list_catalog_.end() ||
+       !catalog_entry->public_key_sha256) {
+-    return;
++    return false;
+   }
+ 
+   if (IsAdBlockOnlyModeSupportedAndFeatureEnabled(locale_) &&
+       local_state_->GetBoolean(prefs::kAdBlockOnlyModeEnabled)) {
+-    return;
++    return false;
+   }
+-
+-  // Enable or disable the specified filter list
++  auto weak=weak_factory_.GetWeakPtr();
++  UpdateFilterListPrefs(uuid,enabled);
++  if(!weak)return false;
++  if(local_state_->ReadOnly())return false;
++  catalog_entry=FindAdBlockFilterListByUUID(filter_list_catalog_,uuid);
++  if(catalog_entry==filter_list_catalog_.end()||!catalog_entry->public_key_sha256)return false;
++  const auto* saved=local_state_->GetDict(prefs::kAdBlockRegionalFilters).FindDict(uuid);
++  if(!saved||saved->FindBool("enabled")!=std::optional<bool>(enabled))return false;
++  // Project the currently resolved configuration, never an obsolete caller's
++  // intent. Public installed component inputs are not unregistered globally.
+   auto it = component_filters_providers_.find(uuid);
+-  if (enabled) {
+-    if (it != component_filters_providers_.end()) {
+-      return;
+-    }
++  if (IsFilterListEnabled(uuid)) {
++    if (it != component_filters_providers_.end())return true;
+     auto regional_filters_provider =
+         std::make_unique<AdBlockComponentFiltersProvider>(
+             component_update_service_, filters_provider_manager_,
+             *catalog_entry, catalog_entry->first_party_protections);
+     component_filters_providers_.insert(
+         {uuid, std::move(regional_filters_provider)});
+   } else {
+-    if (it == component_filters_providers_.end()) {
+-      return;
+-    }
+-    it->second->UnregisterComponent();
+-    component_filters_providers_.erase(it);
++    if(it!=component_filters_providers_.end())component_filters_providers_.erase(it);
+   }
+-
+-  // Update preferences to reflect enabled/disabled state of specified
+-  // filter list
+-  UpdateFilterListPrefs(uuid, enabled);
++  return true;
+ }

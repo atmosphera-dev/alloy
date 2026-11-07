@@ -1,0 +1,10 @@
+--- a/browser/ui/BUILD.gn
++++ b/browser/ui/BUILD.gn
+@@ -77,6 +77,7 @@
+   ]
+ 
+   deps = [
++    "//brave/alloy/site_records:profile_subscription_source",
+     "//brave/brave_domains",
+     "//brave/browser/brave_adaptive_captcha",
+ 

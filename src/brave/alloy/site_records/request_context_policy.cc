@@ -30,6 +30,7 @@ void RequestContextPolicy::AttachMemory(
 void RequestContextPolicy::Attach(base::SupportsUserData& browser_context,
                                   ContextMode context_mode) {
   CHECK(!Get(browser_context));
+  CHECK(context_mode.storage_mode() != StorageMode::kEncrypted);
   browser_context.SetUserData(&kRequestContextPolicyKey,
                               std::unique_ptr<RequestContextPolicy>(
                                   new RequestContextPolicy(context_mode)));
@@ -58,6 +59,24 @@ RequestContextPolicy::RequestContextPolicy(ContextMode context_mode)
                       context_mode.storage_mode()) {}
 
 RequestContextPolicy::~RequestContextPolicy() = default;
+
+void RequestContextPolicy::AttachEncrypted(
+    base::SupportsUserData& browser_context,
+    const RecordCapability& profile_settings) {
+  CHECK(!Get(browser_context));
+  // Original admission was reserved before this native construction began.
+  // Revocation racing an in-flight constructor must attach the dead original
+  // lease and finish into teardown, never assert or obtain fresh authority.
+  CHECK(profile_settings.mode() == StorageMode::kEncrypted);
+  browser_context.SetUserData(&kRequestContextPolicyKey,
+      std::unique_ptr<RequestContextPolicy>(new RequestContextPolicy(profile_settings)));
+}
+
+RequestContextPolicy::RequestContextPolicy(const RecordCapability& profile_settings)
+    : context_mode_(ContextMode::Encrypted()),
+      profile_(profile_settings.profile()),
+      storage_issuer_(profile_settings, base::UnguessableToken::Create(),
+                      base::UnguessableToken::Create(), StorageMode::kMemory) {}
 
 // static
 bool RequestContextPolicy::IsStateless(

@@ -80,7 +80,9 @@ class RecordCapabilityIssuer;
 class RecordGeneration final
     : public base::RefCountedThreadSafe<RecordGeneration> {
  public:
-  bool active() const { return active_.load(std::memory_order_acquire); }
+  bool active() const {
+    return active_.load(std::memory_order_acquire) && (!parent_ || parent_->active());
+  }
 
  private:
   friend class base::RefCountedThreadSafe<RecordGeneration>;
@@ -90,13 +92,15 @@ class RecordGeneration final
   RecordGeneration(base::UnguessableToken profile,
                    base::UnguessableToken record,
                    base::UnguessableToken generation,
-                   StorageMode mode);
+                   StorageMode mode,
+                   scoped_refptr<RecordGeneration> parent = {});
   ~RecordGeneration();
 
   const base::UnguessableToken profile_;
   const base::UnguessableToken record_;
   const base::UnguessableToken generation_;
   const StorageMode mode_;
+  const scoped_refptr<RecordGeneration> parent_;
   std::atomic<bool> active_{true};
 };
 
@@ -137,6 +141,13 @@ class RecordCapability {
 class RecordCapabilityIssuer {
  public:
   RecordCapabilityIssuer(base::UnguessableToken profile,
+                         base::UnguessableToken record,
+                         base::UnguessableToken generation,
+                          StorageMode mode);
+  // Native context working backends are children of one admitted encrypted
+  // profile generation. Parent revocation is immediate across sequences, even
+  // before UI has processed native context/document teardown.
+  RecordCapabilityIssuer(const RecordCapability& profile_settings,
                          base::UnguessableToken record,
                          base::UnguessableToken generation,
                          StorageMode mode);

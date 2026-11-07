@@ -1,0 +1,396 @@
+--- a/libcef/browser/chrome/chrome_browser_context.h
++++ b/libcef/browser/chrome/chrome_browser_context.h
+@@ -10,6 +10,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "brave/alloy/site_records/storage_mode.h"
++#include "brave/alloy/site_records/native_profile_configuration.h"
+ #include "cef/libcef/browser/browser_context.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile_observer.h"
+@@ -18,11 +19,13 @@
+ 
+ // See CefBrowserContext documentation for usage. Only accessed on the UI thread
+ // unless otherwise indicated.
+-class ChromeBrowserContext : public CefBrowserContext, public ProfileObserver {
++class ChromeBrowserContext : public CefBrowserContext, public ProfileObserver, public Profile::Delegate {
+  public:
+   explicit ChromeBrowserContext(const CefRequestContextSettings& settings,
+                                 std::optional<alloy::site_records::ContextMode>
+-                                    context_mode = std::nullopt);
++                                    context_mode = std::nullopt,
++                                std::unique_ptr<alloy::site_records::NativeProfileConfiguration>
++                                    configuration = nullptr);
+ 
+   ChromeBrowserContext(const ChromeBrowserContext&) = delete;
+   ChromeBrowserContext& operator=(const ChromeBrowserContext&) = delete;
+@@ -41,6 +44,9 @@
+ 
+   // ProfileObserver overrides.
+   void OnProfileWillBeDestroyed(Profile* profile) override;
++  void OnProfileCreationStarted(Profile* profile, Profile::CreateMode mode) override;
++  void OnProfileCreationFinished(Profile* profile, Profile::CreateMode mode,
++                                bool success, bool is_new_profile) override;
+ 
+  private:
+   ~ChromeBrowserContext() override;
+@@ -55,8 +61,16 @@
+   };
+ 
+   void ProfileCreated(CreateStatus status, Profile* profile);
++  void InitializeEncryptedProfile();
++  void RetireEncryptedProfile();
++  void CompleteEncryptedInitialization();
+ 
+   const std::optional<alloy::site_records::ContextMode> context_mode_;
++  std::unique_ptr<alloy::site_records::NativeProfileConfiguration> pending_configuration_;
++  std::unique_ptr<Profile> owned_profile_;
++  bool encrypted_creation_succeeded_ = false;
++  bool initialization_finished_ = false;
++  bool revoked_ = false;
+   base::OnceClosure initialized_cb_;
+   raw_ptr<Profile> profile_ = nullptr;
+   bool should_destroy_ = false;
+--- a/libcef/browser/chrome/chrome_browser_context.cc
++++ b/libcef/browser/chrome/chrome_browser_context.cc
+@@ -5,6 +5,11 @@
+ #include "cef/libcef/browser/chrome/chrome_browser_context.h"
+ 
+ #include <memory>
++#include <set>
++#include "base/unguessable_token.h"
++#include "cef/libcef/browser/browser_host_base.h"
++#include "cef/libcef/browser/browser_info_manager.h"
++#include "chrome/browser/profiles/profile_destroyer.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include "base/threading/thread_restrictions.h"
+@@ -31,13 +36,50 @@
+   return profile_manager->GetProfile(default_profile_dir);
+ }
+ 
++// Native profiles outlive browser close notifications and the call stack that
++// destroys WebContents. The existing ProfileDestroyer then owns renderer-host
++// retirement. No timer/poll, second context registry or retained plaintext owner.
++class EncryptedProfileRetirement final : public CefBrowserHostBase::Observer {
++ public:
++  static void Begin(std::unique_ptr<Profile> profile) {
++    auto* retirement = new EncryptedProfileRetirement(std::move(profile));
++    std::vector<CefRefPtr<CefBrowserHostBase>> browsers;
++    for (const auto& info : CefBrowserInfoManager::GetInstance()->GetBrowserInfoList()) {
++      auto browser = info->browser();
++      if (browser && browser->GetBrowserContext() == retirement->profile_.get()) {
++        retirement->pending_.insert(browser.get());
++        browser->AddObserver(retirement);
++        browsers.push_back(browser);
++      }
++    }
++    if (browsers.empty()) { retirement->Finish(); return; }
++    for (const auto& browser : browsers) browser->CloseBrowser(true);
++  }
++  void OnBrowserDestroyed(CefBrowserHostBase* browser) override {
++    browser->RemoveObserver(this);
++    pending_.erase(browser);
++    if (pending_.empty()) Finish();
++  }
++ private:
++  explicit EncryptedProfileRetirement(std::unique_ptr<Profile> profile)
++      : profile_(std::move(profile)) {}
++  void Finish() {
++    CEF_POST_TASK(CEF_UIT, base::BindOnce(
++        &ProfileDestroyer::DestroyOriginalProfileWhenAppropriate, std::move(profile_)));
++    delete this;
++  }
++  std::unique_ptr<Profile> profile_;
++  std::set<CefBrowserHostBase*> pending_;
++};
+ }  // namespace
+ 
+ ChromeBrowserContext::ChromeBrowserContext(
+     const CefRequestContextSettings& settings,
+-    std::optional<alloy::site_records::ContextMode> context_mode)
++    std::optional<alloy::site_records::ContextMode> context_mode,
++    std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration)
+     : CefBrowserContext(settings),
+       context_mode_(context_mode),
++      pending_configuration_(std::move(configuration)),
+       weak_ptr_factory_(this) {}
+ 
+ ChromeBrowserContext::~ChromeBrowserContext() = default;
+@@ -70,20 +112,20 @@
+ }
+ 
+ Profile* ChromeBrowserContext::AsProfile() {
+-  CHECK(!destroyed_);
+   return profile_;
+ }
+ 
+ bool ChromeBrowserContext::IsInitialized() const {
+   CEF_REQUIRE_UIT();
+-  CHECK(!destroyed_);
+-  return !!profile_;
++  if (destroyed_ || revoked_ || !profile_) return false;
++  const auto* configuration = alloy::site_records::NativeProfileConfiguration::Get(*profile_);
++  return !configuration || (initialization_finished_ && configuration->admitted());
+ }
+ 
+ void ChromeBrowserContext::StoreOrTriggerInitCallback(
+     base::OnceClosure callback) {
+   CEF_REQUIRE_UIT();
+-  if (IsInitialized()) {
++  if (IsInitialized() || initialization_finished_ || revoked_) {
+     std::move(callback).Run();
+   } else {
+     init_callbacks_.emplace_back(std::move(callback));
+@@ -95,6 +137,10 @@
+ 
+   CefBrowserContext::Initialize();
+ 
++  if (pending_configuration_) {
++    InitializeEncryptedProfile();
++    return;
++  }
+   if (!cache_path_.empty()) {
+     auto* profile_manager = g_browser_process->profile_manager();
+     const auto& user_data_dir = profile_manager->user_data_dir();
+@@ -128,6 +174,7 @@
+ }
+ 
+ void ChromeBrowserContext::Shutdown() {
++  if (owned_profile_) RetireEncryptedProfile();
+   if (profile_) {
+     if (auto* policy = alloy::site_records::RequestContextPolicy::Get(*profile_)) {
+       policy->Revoke();
+@@ -200,6 +247,7 @@
+   }
+ 
+   if (status == CreateStatus::kInitialized) {
++    initialization_finished_ = true;
+     // |profile_| may be nullptr if initialization failed.
+     // See ProfileManager::OnProfileCreationFinished.
+     if (profile_) {
+@@ -252,3 +300,45 @@
+   should_destroy_ = false;
+   destroyed_ = true;
+ }
++
++void ChromeBrowserContext::OnProfileCreationStarted(Profile* profile, Profile::CreateMode) {
++  CHECK(!profile_);
++  profile_ = profile;
++  profile_observation_.Observe(profile_);
++}
++void ChromeBrowserContext::OnProfileCreationFinished(Profile*, Profile::CreateMode,
++                                                   bool success, bool) {
++  encrypted_creation_succeeded_ = success;
++}
++void ChromeBrowserContext::InitializeEncryptedProfile() {
++  pending_configuration_->SetTeardownHandler(base::BindOnce(
++      &ChromeBrowserContext::RetireEncryptedProfile, weak_ptr_factory_.GetWeakPtr()));
++  // This opaque native identity is not a filesystem backing or catalogue key.
++  // The explicit configuration suppresses path intake before Profile allocation.
++  auto identity = g_browser_process->profile_manager()->user_data_dir().AppendASCII(
++      "AlloyEncrypted-"+base::UnguessableToken::Create().ToString());
++  owned_profile_ = Profile::CreateProfile(identity, this, Profile::CreateMode::kSynchronous,
++                                         std::move(pending_configuration_));
++  if (owned_profile_ && encrypted_creation_succeeded_) {
++    auto* configuration = alloy::site_records::NativeProfileConfiguration::Get(*profile_);
++    CHECK(configuration);
++    if (configuration->admitted()) browser_prefs::SetInitialProfilePrefs(profile_);
++    configuration->ConstructionFinished();
++  } else {
++    RetireEncryptedProfile();
++  }
++  // Unwind native construction and the existing CEF factory's assignment before
++  // delivering creation or a cancelled original-generation result.
++  CEF_POST_TASK(CEF_UIT, base::BindOnce(&ChromeBrowserContext::CompleteEncryptedInitialization,
++                                      weak_ptr_factory_.GetWeakPtr()));
++}
++void ChromeBrowserContext::CompleteEncryptedInitialization() {
++  initialization_finished_ = true;
++  auto callbacks = std::move(init_callbacks_);
++  for (auto& callback : callbacks) std::move(callback).Run();
++}
++void ChromeBrowserContext::RetireEncryptedProfile() {
++  revoked_ = true;
++  InvalidateContextGetters();
++  if (owned_profile_) EncryptedProfileRetirement::Begin(std::move(owned_profile_));
++}
+--- a/libcef/common/app_manager.h
++++ b/libcef/common/app_manager.h
+@@ -10,6 +10,7 @@
+ #include <optional>
+ 
+ #include "brave/alloy/site_records/storage_mode.h"
++#include "brave/alloy/site_records/native_profile_configuration.h"
+ 
+ #include "base/functional/callback.h"
+ #include "build/build_config.h"
+@@ -60,7 +61,9 @@
+       const CefRequestContextSettings& settings,
+       base::OnceClosure initialized_cb,
+       std::optional<alloy::site_records::ContextMode> context_mode =
+-          std::nullopt) = 0;
++           std::nullopt,
++      std::unique_ptr<alloy::site_records::NativeProfileConfiguration>
++          configuration = nullptr) = 0;
+ 
+ #if BUILDFLAG(IS_WIN)
+   // Returns the module name (usually libcef.dll).
+--- a/libcef/common/chrome/chrome_main_delegate_cef.h
++++ b/libcef/common/chrome/chrome_main_delegate_cef.h
+@@ -65,7 +65,8 @@
+   CefBrowserContext* CreateNewBrowserContext(
+       const CefRequestContextSettings& settings,
+       base::OnceClosure initialized_cb,
+-      std::optional<alloy::site_records::ContextMode> context_mode) override;
++      std::optional<alloy::site_records::ContextMode> context_mode,
++      std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration) override;
+ 
+   // CefTaskRunnerManager overrides.
+   scoped_refptr<base::SingleThreadTaskRunner> GetBackgroundTaskRunner()
+--- a/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ b/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -626,8 +626,9 @@
+ CefBrowserContext* ChromeMainDelegateCef::CreateNewBrowserContext(
+     const CefRequestContextSettings& settings,
+     base::OnceClosure initialized_cb,
+-    std::optional<alloy::site_records::ContextMode> context_mode) {
+-  auto context = new ChromeBrowserContext(settings, context_mode);
++    std::optional<alloy::site_records::ContextMode> context_mode,
++    std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration) {
++  auto context = new ChromeBrowserContext(settings, context_mode, std::move(configuration));
+   context->InitializeAsync(std::move(initialized_cb));
+   return context;
+ }
+--- a/libcef/browser/request_context_impl.h
++++ b/libcef/browser/request_context_impl.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include "brave/alloy/site_records/storage_mode.h"
++#include "brave/alloy/site_records/native_profile_configuration.h"
+ #include "base/memory/raw_ptr.h"
+ #include "cef/include/cef_request_context.h"
+ #include "cef/libcef/browser/browser_context.h"
+@@ -41,6 +42,10 @@
+       alloy::site_records::NetworkState network_state,
+       CefRefPtr<CefRequestContextHandler> handler);
+   static CefRefPtr<CefRequestContext> CreateMemory(
++      CefRefPtr<CefRequestContextHandler> handler);
++
++  static CefRefPtr<CefRequestContext> CreateEncrypted(
++      std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration,
+       CefRefPtr<CefRequestContextHandler> handler);
+ 
+   // Creates the singleton global RequestContext. Called from
+@@ -182,6 +187,7 @@
+     // via the API.
+     CefRequestContextSettings settings;
+     std::optional<alloy::site_records::ContextMode> context_mode;
++    std::unique_ptr<alloy::site_records::NativeProfileConfiguration> native_configuration;
+     CefRefPtr<CefRequestContextImpl> other;
+ 
+     // Optionally use this handler.
+--- a/libcef/browser/request_context_impl.cc
++++ b/libcef/browser/request_context_impl.cc
+@@ -6,6 +6,7 @@
+ #include "base/alloy/storage_policy.h"
+ 
+ #include "cef/include/alloy/alloy_request_context.h"
++#include "cef/libcef/browser/alloy/profile_configuration.h"
+ #include "base/atomic_sequence_num.h"
+ #include "base/logging.h"
+ #include "base/strings/stringprintf.h"
+@@ -221,6 +222,52 @@
+   return GetOrCreateRequestContext(std::move(config));
+ }
+ 
++// static
++CefRefPtr<CefRequestContext> CefRequestContextImpl::CreateEncrypted(
++    std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration,
++    CefRefPtr<CefRequestContextHandler> handler) {
++  CEF_REQUIRE_UIT();
++  if (!CONTEXT_STATE_VALID() || !configuration) return nullptr;
++  Config config;
++  config.context_mode = alloy::site_records::ContextMode::Encrypted();
++  config.handler = handler;
++  config.unique_id = g_next_id.GetNext();
++  for (auto* existing : CefBrowserContext::GetAll()) {
++    auto* native = existing->AsBrowserContext();
++    auto* input = native ? alloy::site_records::NativeProfileConfiguration::Get(*native) : nullptr;
++    if (input && input->admitted() && input->SharesOwnerWith(*configuration)) {
++      config.browser_context = existing;
++      return GetOrCreateRequestContext(std::move(config));
++    }
++  }
++  if (!configuration->BeginConstruction()) return nullptr;
++  config.native_configuration = std::move(configuration);
++  return GetOrCreateRequestContext(std::move(config));
++}
++
++bool AlloyCreateEncryptedRequestContext(CefRefPtr<AlloyProfile> profile,
++    CefRefPtr<CefRequestContextHandler> handler, CefRefPtr<AlloyRequestContextCallback> callback) {
++  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
++  if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !profile || !callback) return false;
++  alloy::PrepareNativeProfileConfiguration(profile, base::BindOnce(
++      [](CefRefPtr<CefRequestContextHandler> handler, CefRefPtr<AlloyRequestContextCallback> callback,
++         alloy_site_settings_result_t result,
++         std::unique_ptr<alloy::site_records::NativeProfileConfiguration> configuration) {
++        if (result != ALLOY_SETTINGS_OK) { callback->OnComplete(result, nullptr); return; }
++        auto context = CefRequestContextImpl::CreateEncrypted(std::move(configuration), handler);
++        if (!context) { callback->OnComplete(ALLOY_SETTINGS_CANCELLED, nullptr); return; }
++        auto* impl = static_cast<CefRequestContextImpl*>(context.get());
++        impl->ExecuteWhenBrowserContextInitialized(base::BindOnce(
++            [](CefRefPtr<CefRequestContext> context, CefRefPtr<AlloyRequestContextCallback> callback) {
++              auto* impl = static_cast<CefRequestContextImpl*>(context.get());
++              const bool admitted = impl->VerifyBrowserContext();
++              callback->OnComplete(admitted ? ALLOY_SETTINGS_OK : ALLOY_SETTINGS_CANCELLED,
++                                   admitted ? context : nullptr);
++            }, context, callback));
++      }, handler, callback));
++  return true;
++}
++
+ CefRequestContextImpl::~CefRequestContextImpl() {
+   CEF_REQUIRE_UIT();
+ 
+@@ -302,8 +349,7 @@
+   }
+ 
+   if (!browser_context() || !browser_context()->IsInitialized()) {
+-    DCHECK(false) << "Uninitialized context";
+-    return false;
++    return false;  // Revoked encrypted contexts are ordinary cancellation.
+   }
+ 
+   return true;
+@@ -863,7 +909,8 @@
+     // CefBrowserContext for that path. Otherwise, this new instance will
+     // be a completely isolated "incognito mode" context.
+     browser_context_ = CefAppManager::Get()->CreateNewBrowserContext(
+-        config_.settings, std::move(initialized_cb), config_.context_mode);
++        config_.settings, std::move(initialized_cb), config_.context_mode,
++        std::move(config_.native_configuration));
+   } else {
+     // Share the same settings as the existing context.
+     config_.settings = browser_context_->settings();
+@@ -883,11 +930,17 @@
+ }
+ 
+ void CefRequestContextImpl::BrowserContextInitialized() {
++  // Synchronous creation can notify before browser_context_ is assigned.
++  // Check original-context admission in the posted callback, after unwinding.
+   if (config_.handler) {
+     // Always execute asynchronously so the current call stack can unwind.
+     CEF_POST_TASK(
+         CEF_UIT,
+-        base::BindOnce(&CefRequestContextHandler::OnRequestContextInitialized,
+-                       config_.handler, CefRefPtr<CefRequestContext>(this)));
++        base::BindOnce([](CefRefPtr<CefRequestContextImpl> context,
++                          CefRefPtr<CefRequestContextHandler> handler) {
++          if (context->VerifyBrowserContext()) {
++            handler->OnRequestContextInitialized(context);
++          }
++        }, CefRefPtr<CefRequestContextImpl>(this), config_.handler));
+   }
+ }

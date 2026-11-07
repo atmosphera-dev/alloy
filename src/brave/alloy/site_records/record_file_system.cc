@@ -681,6 +681,21 @@ struct RecordFileSystem::Impl {
   }
 
   FileStatus Commit() {
+    const auto admitted = Admission();
+    if (admitted != FileStatus::kOk) return admitted;
+    const auto status = CommitRoots();
+    if (status != FileStatus::kOk) {
+      // Native callers may already have staged namespace/file roots. Never
+      // let a later Close/Sync publish an operation whose publication failed.
+      // Keep the real error (including pre-rename I/O), but revoke all access
+      // and require authoritative reopen instead of replaying mutable state.
+      failure = status;
+      WipeKeys();
+    }
+    return status;
+  }
+
+  FileStatus CommitRoots() {
     auto status = Admission();
     if (status != FileStatus::kOk) {
       return status;

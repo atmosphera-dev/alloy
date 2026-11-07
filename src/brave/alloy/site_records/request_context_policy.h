@@ -21,6 +21,8 @@ class RequestContextPolicy final : public base::SupportsUserData::Data {
   static void AttachStateless(base::SupportsUserData& browser_context,
                               NetworkState network_state);
   static void AttachMemory(base::SupportsUserData& browser_context);
+  static void AttachEncrypted(base::SupportsUserData& browser_context,
+                              const RecordCapability& profile_settings);
   static RequestContextPolicy* Get(base::SupportsUserData& browser_context);
   static const RequestContextPolicy* Get(
       const base::SupportsUserData& browser_context);
@@ -45,6 +47,7 @@ class RequestContextPolicy final : public base::SupportsUserData::Data {
   static void Attach(base::SupportsUserData& browser_context,
                      ContextMode context_mode);
   explicit RequestContextPolicy(ContextMode context_mode);
+  explicit RequestContextPolicy(const RecordCapability& profile_settings);
 
   const ContextMode context_mode_;
   const base::UnguessableToken profile_;

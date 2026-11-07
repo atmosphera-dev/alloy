@@ -1,0 +1,34 @@
+--- a/components/brave_shields/content/browser/ad_block_subscription_download_manager.h
++++ b/components/brave_shields/content/browser/ad_block_subscription_download_manager.h
+@@ -19,6 +19,7 @@
+ #include "base/sequence_checker.h"
+ #include "components/download/public/background_service/download_params.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
+ 
+ namespace download {
+ class BackgroundDownloadService;
+@@ -45,6 +46,9 @@
+   AdBlockSubscriptionDownloadManager& operator=(
+       const AdBlockSubscriptionDownloadManager&) = delete;
+ 
++  // Shared with the profile-private in-memory transport; no relabelling.
++  static const net::NetworkTrafficAnnotationTag& TrafficAnnotation();
++
+   // Starts a download for |download_url|. Will schedule a higher priority
+   // download if |from_ui| is true.
+   void StartDownload(const GURL& download_url, bool from_ui);
+--- a/components/brave_shields/content/browser/ad_block_subscription_download_manager.cc
++++ b/components/brave_shields/content/browser/ad_block_subscription_download_manager.cc
+@@ -51,6 +51,11 @@
+ 
+ }  // namespace
+ 
++const net::NetworkTrafficAnnotationTag&
++AdBlockSubscriptionDownloadManager::TrafficAnnotation() {
++  return kBraveShieldsAdBlockSubscriptionTrafficAnnotation;
++}
++
+ AdBlockSubscriptionDownloadManager::AdBlockSubscriptionDownloadManager(
+     download::BackgroundDownloadService* download_service,
+     scoped_refptr<base::SequencedTaskRunner> background_task_runner)

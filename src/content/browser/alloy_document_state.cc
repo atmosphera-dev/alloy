@@ -9,11 +9,17 @@
 #include "content/browser/renderer_host/frame_tree_node.h"
 #include "content/browser/renderer_host/navigation_request.h"
 #include "content/public/browser/browser_context.h"
+#include "components/keyed_service/core/service_creation_gate.h"
 
 namespace content {
 bool AlloyDocumentStateAdmitted(RenderFrameHost* frame) {
   return frame && !frame->GetBrowserContext()->ShutdownStarted() &&
+         ServiceCreationGate::Allows(*frame->GetBrowserContext()) &&
          static_cast<RenderFrameHostImpl*>(frame)->IsAlloyStateAdmissionOpen();
+}
+
+void RetireAlloyDocumentState(RenderFrameHost* frame) {
+  if (frame) static_cast<RenderFrameHostImpl*>(frame)->document_associated_data().RetireAlloyState();
 }
 
 base::WeakPtr<base::SupportsUserData> AlloyDocumentStateOwner(RenderFrameHost* frame) {
@@ -35,7 +41,7 @@ base::WeakPtr<base::SupportsUserData> AlloyPendingNavigationStateOwner(FrameTree
 
 base::SupportsUserData* AlloyStateOwnerForContext(
     const base::WeakPtr<base::SupportsUserData>& owner, BrowserContext* context) {
-  if (!owner || !context) return nullptr;
+  if (!owner || !context || !ServiceCreationGate::Allows(*context)) return nullptr;
   auto* handle = static_cast<NavigationOrDocumentHandle*>(owner.get());
   return handle->GetAlloyStateBrowserContext() == context ? owner.get() : nullptr;
 }

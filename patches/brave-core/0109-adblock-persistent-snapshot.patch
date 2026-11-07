@@ -1,0 +1,184 @@
+--- a/components/brave_shields/core/common/adblock/resolver/BUILD.gn
++++ b/components/brave_shields/core/common/adblock/resolver/BUILD.gn
+@@ -7,5 +7,7 @@
+ static_library("resolver") {
+   sources = [
++    "../source_identity.cc",
++    "../source_identity.h",
+     "adblock_domain_resolver.cc",
+     "adblock_domain_resolver.h",
+   ]
+@@ -15,5 +17,6 @@
+   deps = [
+     "//brave/components/brave_shields/core/common/adblock/rs:rust_lib",
++    "//crypto",
+     "//net",
+   ]
+ }
+--- a/components/brave_shields/core/common/adblock/rs/src/lib.rs
++++ b/components/brave_shields/core/common/adblock/rs/src/lib.rs
+@@ -22,6 +22,7 @@
+     extern "Rust" {
+         type FilterSet;
+         fn new_filter_set(debug: bool) -> Box<FilterSet>;
++        fn source_identity(&self) -> &[u8];
+         fn add_filter_list(&mut self, rules: &CxxVector<u8>) -> AddFilterListResult;
+         fn add_filter_list_with_permissions(
+             &mut self,
+@@ -127,4 +128,7 @@
+     unsafe extern "C++" {
++        include!("brave/components/brave_shields/core/common/adblock/source_identity.h");
++        fn hash_filter_source(previous: &[u8], rules: &[u8], permissions: u8) -> Vec<u8>;
++
+         include!(
+             "brave/components/brave_shields/core/common/adblock/resolver/adblock_domain_resolver.h"
+         );
+--- a/components/brave_shields/core/common/adblock/rs/src/filter_set.rs
++++ b/components/brave_shields/core/common/adblock/rs/src/filter_set.rs
+@@ -10,7 +10,7 @@
+ use crate::ffi::{AddFilterListResult, AddedFiltersRecord};
+ use crate::result::InternalError;
+ 
+-pub struct FilterSet(pub(crate) InnerFilterSet);
++pub struct FilterSet(pub(crate) InnerFilterSet, Vec<u8>);
+ 
+ impl Default for Box<FilterSet> {
+     fn default() -> Self {
+@@ -19,10 +19,15 @@
+ }
+ 
+ pub fn new_filter_set(debug: bool) -> Box<FilterSet> {
+-    Box::new(FilterSet(InnerFilterSet::new(debug)))
++    Box::new(FilterSet(InnerFilterSet::new(debug),
++        crate::ffi::hash_filter_source(&[], &[u8::from(debug)], 0)))
+ }
+ 
+ impl FilterSet {
++    pub fn source_identity(&self) -> &[u8] {
++        &self.1
++    }
++
+     pub fn add_filter_list(&mut self, rules: &CxxVector<u8>) -> AddFilterListResult {
+         self.add_filter_list_with_permissions(rules, 0)
+     }
+@@ -32,6 +37,7 @@
+         rules: &CxxVector<u8>,
+         permission_mask: u8,
+     ) -> AddFilterListResult {
++        self.1 = crate::ffi::hash_filter_source(&self.1, rules.as_slice(), permission_mask);
+         || -> Result<AddedFiltersRecord, InternalError> {
+             Ok(self
+                 .0
+--- a/components/brave_shields/content/browser/BUILD.gn
++++ b/components/brave_shields/content/browser/BUILD.gn
+@@ -84,4 +84,5 @@
+     "//content/public/browser",
++    "//crypto",
+     "//mojo/public/cpp/bindings",
+     "//third_party/blink/public/mojom:mojom_platform_headers",
+     "//url",
+--- a/components/brave_shields/content/browser/ad_block_service.h
++++ b/components/brave_shields/content/browser/ad_block_service.h
+@@ -118,4 +118,9 @@
+     bool CanLoadDAT() const {return accepts_cache_&&epoch_->current();}
++    void ConfigureSnapshotCache(AdBlockDATCacheManager* cache,
++        base::RepeatingCallback<std::string()> configuration) {
++      snapshot_cache_=cache;configuration_=std::move(configuration);
++    }
++    const std::string& snapshot_identity() const {return snapshot_identity_;}
+ 
+     void OnDATFileRead(DATFileDataBuffer dat);
+ 
+@@ -149,4 +154,7 @@
+     bool accepts_cache_=true;
++    raw_ptr<AdBlockDATCacheManager> snapshot_cache_=nullptr;
++    base::RepeatingCallback<std::string()> configuration_;
++    std::string snapshot_identity_;
+     base::WeakPtrFactory<SourceProviderObserver> weak_factory_{this};
+   };
+ 
+--- a/components/brave_shields/content/browser/ad_block_service.cc
++++ b/components/brave_shields/content/browser/ad_block_service.cc
+@@ -16,5 +16,8 @@
+ #include "base/functional/callback_forward.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/json/json_writer.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -39,4 +40,6 @@
+ #include "components/prefs/pref_service.h"
++#include "crypto/hash.h"
++#include "third_party/boringssl/src/include/openssl/mem.h"
+ #include "services/network/public/cpp/features.h"
+ 
+ namespace brave_shields {
+@@ -136,6 +139,22 @@
+ void AdBlockService::SourceProviderObserver::OnFilterSetCreated(
+     std::unique_ptr<rust::Box<adblock::FilterSet>> filter_set) {
+   TRACE_EVENT("brave.adblock", "OnFilterSetCreated");
++  if(snapshot_cache_&&base::FeatureList::IsEnabled(features::kAdblockDATCache)) {
++    auto config=configuration_.Run();
++    const auto source=(*filter_set)->source_identity();
++    if(config.size()!=32||source.size()!=32)return;
++    snapshot_identity_=config+std::string(reinterpret_cast<const char*>(source.data()),source.size());
++    pending_filter_set_=std::move(filter_set);
++    snapshot_cache_->ReadSnapshot(engine_is_default_,snapshot_identity_,base::BindOnce(
++        [](base::WeakPtr<SourceProviderObserver> self,std::shared_ptr<AdBlockLoadEpoch> epoch,
++           std::optional<DATFileDataBuffer> dat) {
++          if(!self||self->epoch_!=epoch||!epoch->current())return;
++          if(dat){
++            self->pending_filter_set_.reset();self->OnDATFileRead(std::move(*dat));
++          }else self->LoadResources(std::move(self->pending_filter_set_));
++        },weak_factory_.GetWeakPtr(),epoch_));
++    return;
++  }
+   LoadResources(std::move(filter_set));
+ }
+ 
+@@ -322,7 +343,31 @@
+   if(base::FeatureList::IsEnabled(features::kAdblockDATCache)) {
++    if(backends) {
++      auto configure=[&](SourceProviderObserver& observer,bool primary) {
++        observer.ConfigureSnapshotCache(dat_cache_manager_.get(),base::BindRepeating(
++            [](base::WeakPtr<AdBlockService> self,bool primary) {
++              if(!self||self->closed_)return std::string();
++              base::DictValue configuration;
++              configuration.Set("prefs",self->local_state_->GetPreferenceValues(PrefService::INCLUDE_DEFAULTS));
++              configuration.Set("locale",self->locale_);configuration.Set("primary",primary);
++              // Fingerprint the linked native serializer, not an unused
++              // declaration or a separately maintained format number.
++              static const base::NoDestructor<std::string> format([] {
++                const auto bytes=adblock::new_engine()->serialize();CHECK(!bytes.empty());
++                return base::HexEncode(crypto::hash::Sha256(base::span(bytes.data(),bytes.size())));
++              }());
++              configuration.Set("dat_format",*format);
++              auto json=base::WriteJson(configuration);CHECK(json);
++              const auto digest=crypto::hash::Sha256(*json);
++              OPENSSL_cleanse(json->data(),json->size());
++              return std::string(reinterpret_cast<const char*>(digest.data()),digest.size());
++            },weak_factory_.GetWeakPtr(),primary));
++      };
++      configure(*default_service_observer_,true);configure(*additional_filters_service_observer_,false);
++    }
+     read_default_epoch_=default_service_observer_->epoch();
+     read_additional_epoch_=additional_filters_service_observer_->epoch();
+-    dat_cache_manager_->MaybeReadCachedDATFiles(base::BindOnce(
+-        &AdBlockService::OnReadCachedDATFiles,weak_factory_.GetWeakPtr()));
++    if(backends) OnReadCachedDATFiles(std::nullopt,std::nullopt);
++    else dat_cache_manager_->MaybeReadCachedDATFiles(base::BindOnce(
++        &AdBlockService::OnReadCachedDATFiles,weak_factory_.GetWeakPtr()));
+   }
+ }
+@@ -422,5 +467,7 @@
+   if (serialized_dat.has_value() && !serialized_dat->empty()) {
+-    dat_cache_manager_->WriteDATFile(is_default_engine,
+-                                     std::move(*serialized_dat),epoch);
++    const auto& identity=(is_default_engine?default_service_observer_:additional_filters_service_observer_)->snapshot_identity();
++    if(!identity.empty())
++      dat_cache_manager_->WriteSnapshot(is_default_engine,identity,std::move(*serialized_dat),epoch);
++    else dat_cache_manager_->WriteDATFile(is_default_engine,std::move(*serialized_dat),epoch);
+   }
+ }

@@ -7,8 +7,10 @@
 #include "base/metrics/histogram_functions.h"
 #include "base/test/bind.h"
 #include "base/test/metrics/histogram_tester.h"
+#include "base/test/scoped_command_line.h"
 #include "base/test/scoped_feature_list.h"
 #include "base/test/test_future.h"
+#include "brave/alloy/bundled_data.h"
 #include "brave/components/brave_shields/content/browser/ad_block_custom_filters_provider.h"
 #include "brave/components/brave_shields/core/browser/ad_block_component_service_manager.h"
 #include "brave/components/brave_shields/core/common/brave_shield_constants.h"
@@ -148,6 +150,8 @@ TEST_F(ProfileAdBlockServiceTest, StatelessWholeServiceRefusesPrivateProducerMut
 TEST_F(ProfileAdBlockServiceTest, ColdServiceUsesQualifiedCacheAndChangedInputsRebuildAtTheNativeConsumer) {
   base::test::ScopedFeatureList features;features.InitAndEnableFeature(brave_shields::features::kAdblockDATCache);
   base::ScopedTempDir temp;ASSERT_TRUE(temp.CreateUniqueTempDir());auto path=temp.GetPath().AppendASCII("profile");
+  base::test::ScopedCommandLine command_line;
+  command_line.GetProcessCommandLine()->AppendSwitchPath(alloy::kDataDirectorySwitch,temp.GetPath());
   auto key=[] {ObjectId bytes{};bytes.fill(0x92);return SecretKey(bytes);};
   std::shared_ptr<RecordFileSystem> files;std::shared_ptr<ProfileFilterStorage> storage;
   scoped_refptr<ProfileFilterPreferences> input;std::unique_ptr<ProfileAdBlockService> owner;
@@ -172,6 +176,12 @@ TEST_F(ProfileAdBlockServiceTest, ColdServiceUsesQualifiedCacheAndChangedInputsR
   ASSERT_EQ(FileStatus::kOk,RecordFileSystem::Create(path,key(),{},&files));start();ASSERT_TRUE(owner&&owner->Get());
   ASSERT_TRUE(owner->Get()->custom_filters_provider()->UpdateCustomFilters("||first-snapshot.invalid^$important"));
   task_environment()->RunUntilIdle();EXPECT_TRUE(Blocked(owner->Get(),GURL("https://first-snapshot.invalid/image.png")));stop();
+  ASSERT_EQ(FileStatus::kOk,RecordFileSystem::Open(path,key(),&files));observed.hits=0;start();ASSERT_TRUE(owner&&owner->Get());
+  EXPECT_GT(observed.hits,0);EXPECT_TRUE(Blocked(owner->Get(),GURL("https://first-snapshot.invalid/image.png")));
+  stop();command_line.GetProcessCommandLine()->RemoveSwitch(alloy::kDataDirectorySwitch);
+  ASSERT_EQ(FileStatus::kOk,RecordFileSystem::Open(path,key(),&files));observed.hits=0;start();ASSERT_TRUE(owner&&owner->Get());
+  EXPECT_EQ(observed.hits,0);EXPECT_TRUE(Blocked(owner->Get(),GURL("https://first-snapshot.invalid/image.png")));
+  stop();command_line.GetProcessCommandLine()->AppendSwitchPath(alloy::kDataDirectorySwitch,temp.GetPath());
   ASSERT_EQ(FileStatus::kOk,RecordFileSystem::Open(path,key(),&files));observed.hits=0;start();ASSERT_TRUE(owner&&owner->Get());
   EXPECT_GT(observed.hits,0);EXPECT_TRUE(Blocked(owner->Get(),GURL("https://first-snapshot.invalid/image.png")));
   ASSERT_TRUE(owner->Get()->custom_filters_provider()->UpdateCustomFilters("||second-snapshot.invalid^$important"));

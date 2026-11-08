@@ -1,17 +1,17 @@
 {
   "brave-core": {
     "url": "https://github.com/brave/brave-core.git",
-    "revision": "5e268a047e51ba615c536db3aabbb782eb34550c",
-    "version": "1.99.31"
+    "revision": "65a79419506657ac890cff1c39f312a21cc387b2",
+    "version": "1.99.52"
   },
   "chromium": {
-    "tag": "156.0.8078.25",
-    "revision": "1228231501697ff7a4a0150ea8ae6df37bb99331"
+    "tag": "156.0.8078.48",
+    "revision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c"
   },
   "cef": {
     "url": "https://github.com/chromiumembedded/cef.git",
     "branch": "8078",
-    "revision": "47dbc1df023e99f006fb9e850a8d83cc19b4fdd9"
+    "revision": "426920c33ef22551e0b8f48cf343d623ac25642d"
   },
   "tooling": {
     "node": "v24.21.0",

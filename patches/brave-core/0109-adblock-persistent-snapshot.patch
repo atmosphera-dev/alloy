@@ -139,7 +139,7 @@
  }
  
 @@ -322,7 +343,31 @@
-   if(base::FeatureList::IsEnabled(features::kAdblockDATCache)) {
+   if(use_dat_cache_) {
 +    if(backends) {
 +      auto configure=[&](SourceProviderObserver& observer,bool primary) {
 +        observer.ConfigureSnapshotCache(dat_cache_manager_.get(),base::BindRepeating(

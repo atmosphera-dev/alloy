@@ -791,6 +791,10 @@ class NativeEmbeddedStateTest : public ChromeRenderViewHostTestHarness {
 };
 
 TEST_F(NativeEmbeddedStateTest, NativeStorageKeysAndScopesSeparateTabs) {
+  const auto origin = url::Origin::Create(GURL("https://embedded.test/"));
+  EXPECT_EQ(content::GetAlloyEmbeddedStateForCandidate(nullptr, origin).backing,
+            Backing::kNone);
+  EXPECT_FALSE(content::GetAlloyEmbeddedNonceForCandidate(nullptr, origin));
   auto* first = Embed(first_.get());
   auto* second = Embed(second_.get());
   const auto a = content::GetAlloyEmbeddedStateForDocument(first);
@@ -5095,6 +5099,53 @@ TEST_F(NativeDiskEmbeddedCodeCacheTest,
                    "fresh-empty-peer-live");
   }
 }
+TEST_F(NativeDiskEmbeddedCodeCacheTest,
+       DiskCollectionClosePreservesHeldReadAndColdReopen) {
+  using Cache = persistent_cache::PersistentCache;
+  using Collection = persistent_cache::PersistentCacheCollection;
+  constexpr auto client = persistent_cache::Client::kCodeCache;
+  const auto key = base::byte_span_from_cstring("disk-key");
+  const std::string body = "native-disk-cache-survives-owner-close";
+  base::ScopedTempDir directory;
+  ASSERT_TRUE(directory.CreateUniqueTempDir());
+  auto owner = std::make_unique<Collection>(directory.GetPath(), 1024 * 1024,
+                                            client);
+  ASSERT_TRUE(owner->Insert("context", key, base::as_byte_span(body),
+                             {.input_signature = 94}).has_value());
+  auto pending = owner->ShareReadOnlyConnection("context");
+  ASSERT_TRUE(pending);
+  auto bound = Cache::Bind(client, std::move(*pending));
+  ASSERT_TRUE(bound.has_value());
+  Reader reader = std::move(*bound);
+  std::string bytes;
+  bool closed_during_read = false;
+  // SqliteBackendImpl::FindImpl invokes the buffer provider while its native
+  // read transaction/blob holds a shared lock. Close only the independent
+  // collection owner at this boundary, not the reader whose call is active.
+  auto found = reader->Find(key, [&](size_t size) {
+    bytes.resize(size);
+    owner.reset();
+    closed_during_read = true;
+    return base::as_writable_byte_span(bytes);
+  });
+  ASSERT_TRUE(closed_during_read);
+  ASSERT_TRUE(found.has_value());
+  ASSERT_TRUE(found->has_value());
+  EXPECT_EQ(bytes, body);
+  EXPECT_EQ(found->value().input_signature, 94);
+  reader.reset();
+  Collection reopened(directory.GetPath(), 1024 * 1024, client);
+  auto fresh_pending = reopened.ShareReadOnlyConnection("context");
+  ASSERT_TRUE(fresh_pending);
+  auto fresh_bound = Cache::Bind(client, std::move(*fresh_pending));
+  ASSERT_TRUE(fresh_bound.has_value());
+  Reader fresh = std::move(*fresh_bound);
+  const auto retained = Read(fresh, key);
+  EXPECT_TRUE(retained.operational && retained.hit);
+  EXPECT_EQ(retained.bytes, body);
+  EXPECT_EQ(retained.signature, 94);
+}
+
 class NativeDiskEmbeddedCookieTest : public NativeDiskEmbeddedLocalStorageTest {
  protected:
   NativeDiskEmbeddedCookieTest() {

@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Alex Indigo
 // SPDX-License-Identifier: LGPL-3.0-or-later
+// These assertions are the executable's checks, including under release flags.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

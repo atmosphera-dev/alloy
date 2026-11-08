@@ -390,12 +390,15 @@ std::optional<base::UnguessableToken> GetAlloyEmbeddedNonceForCandidate(
 AlloyEmbeddedResolution GetAlloyEmbeddedStateForCandidate(
     RenderFrameHostImpl* frame,
     const url::Origin& origin) {
+  if (!frame) {
+    return {};
+  }
   if (auto* navigation = frame->frame_tree_node()->navigation_request()) {
     if (!navigation->IsSameDocument()) {
       return GetAlloyEmbeddedStateForNavigation(navigation, origin);
     }
   }
-  if (!frame || !frame->IsActive()) {
+  if (!frame->IsActive()) {
     return {};
   }
   // Candidate resolution computes the native key itself, before that key can

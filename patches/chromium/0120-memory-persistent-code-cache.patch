@@ -484,7 +484,7 @@
  #include "base/strings/string_util.h"
  #include "base/types/expected.h"
  #include "base/types/expected_macros.h"
-@@ -63,7 +64,36 @@
+@@ -63,7 +64,38 @@
    ReduceFootPrint();
  }
  
@@ -515,9 +515,11 @@
 +}
 +
 +PersistentCacheCollection::~PersistentCacheCollection() {
-+  // Closing the owner must revoke already-exported and not-yet-bound readers,
-+  // not merely close this process's handles to their original backing.
-+  Clear();
++  // Memory owners revoke exported readers. Disk caches retain their native
++  // close semantics, including when another connection still holds a lock.
++  if (backend_storage_.in_memory()) {
++    Clear();
++  }
 +}
  
  base::expected<std::optional<EntryMetadata>, TransactionError>

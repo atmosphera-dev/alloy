@@ -43,6 +43,7 @@
 #include "chrome/browser/permissions/chrome_permissions_client.h"
 #include "chrome/browser/serial/serial_chooser_context.h"
 #include "chrome/browser/serial/serial_chooser_context_factory.h"
+#include "chrome/browser/serial/chrome_serial_delegate.h"
 #include "chrome/browser/usb/usb_chooser_context.h"
 #include "chrome/browser/usb/usb_chooser_context_factory.h"
 #include "chrome/test/base/chrome_render_view_host_test_harness.h"
@@ -95,6 +96,7 @@
 #include "content/browser/service_worker/service_worker_test_utils.h"
 #include "content/browser/service_worker/service_worker_version.h"
 #include "content/browser/storage_partition_impl.h"
+#include "content/browser/serial/serial_service.h"
 #include "content/browser/web_contents/web_contents_impl.h"
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
@@ -143,6 +145,8 @@
 #include "services/network/public/mojom/network_context.mojom.h"
 #include "services/network/public/mojom/restricted_cookie_manager.mojom.h"
 #include "services/network/public/mojom/url_response_head.mojom.h"
+#include "services/device/public/mojom/serial.mojom.h"
+#include "third_party/blink/public/mojom/serial/serial.mojom.h"
 #include "storage/browser/blob/blob_data_builder.h"
 #include "storage/browser/blob/blob_data_handle.h"
 #include "storage/browser/blob/blob_reader.h"
@@ -840,6 +844,32 @@ TEST_F(NativeEmbeddedStateTest, SameSiteReloadKeepsScopeMoveAndBackDoNot) {
   EXPECT_FALSE(fresh.temporary->Capability(StorePurpose::kDomStorage).active());
 }
 
+TEST_F(NativeEmbeddedStateTest,
+       SameDocumentCommitKeepsOwnerWhileOtherNavigationPending) {
+  auto* frame = static_cast<content::RenderFrameHostImpl*>(Embed(first_.get()));
+  const auto original = content::GetAlloyEmbeddedStateForDocument(frame);
+  ASSERT_TRUE(original.temporary);
+  const auto key = frame->GetStorageKey();
+  ASSERT_TRUE(key.nonce());
+  auto pending = content::NavigationSimulator::CreateRendererInitiated(
+      GURL("https://outer.test/pending"), frame);
+  pending->Start();
+  auto* request = static_cast<content::NavigationRequest*>(
+      pending->GetNavigationHandle());
+  ASSERT_EQ(content::GetAlloyEmbeddedStateForNavigation(
+                request, url::Origin::Create(request->GetURL())).backing,
+            Backing::kRealSite);
+  auto same = content::NavigationSimulator::CreateRendererInitiated(
+      frame->GetLastCommittedURL().Resolve("push-state"), frame);
+  same->CommitSameDocument();
+  EXPECT_EQ(frame->GetStorageKey(), key);
+  EXPECT_EQ(frame->GetIsolationInfoForSubresources().network_isolation_key().GetNonce(),
+            key.nonce());
+  EXPECT_EQ(content::GetAlloyEmbeddedStateForDocument(frame).temporary,
+            original.temporary);
+  pending->Fail(net::ERR_ABORTED);
+}
+
 TEST_F(NativeEmbeddedStateTest, SharedContextChoiceIsFrozenAfterAdmission) {
   EXPECT_FALSE(
       content::ConfigureAlloyEmbeddedStateScope(*child_, Scope::kPerOuterSite));
@@ -1498,8 +1528,8 @@ void CheckServiceWorkerNavigationEntry(content::RenderFrameHost* frame,
       content::NavigationSimulator::CreateRendererInitiated(alpha_url, frame);
   navigation->Start();
   ASSERT_FALSE(navigation->HasFailed());
-  const auto isolation_info =
-      native_frame->ComputeIsolationInfoForNavigation(alpha_url);
+  const auto isolation_info = static_cast<content::NavigationRequest*>(
+      navigation->GetNavigationHandle())->GetIsolationInfo();
   const auto outer = isolation_info.top_frame_origin();
   content::ServiceWorkerMainResourceHandle handle(real, base::DoNothing(), "");
   handle.set_service_worker_client(
@@ -3066,6 +3096,69 @@ TEST_F(NativeDiskEmbeddedLocalStorageTest,
     RecordProperty("retired_backpressured_blob_" + variant,
                    "admitted-prefix-preserved-no-suffix-peer-original-whole");
   }
+}
+
+class NativeSerialObserver final : public content::SerialDelegate::Observer {
+ public:
+  void OnPortAdded(const device::mojom::SerialPortInfo&) override { ++added; }
+  void OnPortRemoved(const device::mojom::SerialPortInfo&) override {}
+  void OnPortConnectedStateChanged(const device::mojom::SerialPortInfo&) override {}
+  void OnPortManagerConnectionError() override {}
+  void OnPermissionRevoked(const url::Origin&) override {}
+  int added = 0;
+};
+
+TEST_F(NativeDiskEmbeddedLocalStorageTest,
+       SerialObserversDetachFromOriginalAfterDocumentRetires) {
+  content::WebContentsTester::For(web_contents())
+      ->NavigateAndCommit(GURL("https://serial-outer.test/"));
+  auto* frame = web_contents()->GetPrimaryMainFrame();
+  auto* context = SerialChooserContextFactory::GetForFrame(frame);
+  ASSERT_TRUE(context);
+  ChromeSerialDelegate delegate;
+  NativeSerialObserver observer;
+  delegate.AddObserver(frame, &observer);
+  auto port = device::mojom::SerialPortInfo::New();
+  port->token = base::UnguessableToken::Create();
+  context->OnPortAdded(port->Clone());
+  ASSERT_EQ(observer.added, 1);
+  ASSERT_TRUE(content::GetContentClientForTesting()->browser()->GetSerialDelegate());
+  auto* service = content::SerialService::GetOrCreateForCurrentDocument(frame);
+  mojo::Remote<blink::mojom::SerialService> remote;
+  service->Bind(remote.BindNewPipeAndPassReceiver());
+  content::RetireAlloyDocumentState(frame);
+  EXPECT_FALSE(SerialChooserContextFactory::GetForFrame(frame));
+  delegate.RemoveObserver(frame, &observer);
+  context->OnPortAdded(port->Clone());
+  EXPECT_EQ(observer.added, 1);
+  base::test::TestFuture<std::vector<blink::mojom::SerialPortInfoPtr>> ports;
+  remote->GetPorts(ports.GetCallback());
+  EXPECT_TRUE(ports.Get().empty());
+  content::SerialService::DeleteForCurrentDocument(frame);
+}
+
+TEST_F(NativeDiskEmbeddedLocalStorageTest,
+       SerialObserversTolerateDestroyedEmbeddedContext) {
+  ASSERT_TRUE(content::ConfigureAlloyEmbeddedStateScope(*profile(), Scope::kPerTab));
+  content::WebContentsTester::For(web_contents())
+      ->NavigateAndCommit(GURL("https://serial-outer.test/"));
+  auto* initial = content::RenderFrameHostTester::For(
+                      web_contents()->GetPrimaryMainFrame())->AppendChild("serial");
+  auto* frame = content::NavigationSimulator::NavigateAndCommitFromDocument(
+      GURL("https://serial-embedded.test/"), initial);
+  auto* context = SerialChooserContextFactory::GetForFrame(frame);
+  ASSERT_TRUE(context);
+  auto original = context->AsWeakPtr();
+  ChromeSerialDelegate delegate;
+  NativeSerialObserver observer;
+  delegate.AddObserver(frame, &observer);
+  auto owner = content::GetAlloyEmbeddedStateForDocument(frame).temporary;
+  ASSERT_TRUE(owner);
+  owner->Retire();
+  EXPECT_FALSE(original);
+  delegate.RemoveObserver(frame, &observer);
+  EXPECT_FALSE(delegate.CanRequestPortPermission(frame));
+  EXPECT_FALSE(delegate.GetPortManager(frame));
 }
 
 TEST_F(NativeEmbeddedStateTest, HeldCacheEndpointEndsWithSiteOwner) {
@@ -5700,18 +5793,24 @@ class NativeDiskEmbeddedOriginTrialsTest
               : "captured-pending-header-no-profile-write-real-control-live");
   }
 
-  void CheckRuntimeProjection(Scope scope) {
+  void CheckRuntimeProjection(Scope scope, bool ordinary = false) {
     ASSERT_TRUE(content::ConfigureAlloyEmbeddedStateScope(*profile(), scope));
-    content::WebContentsTester::For(web_contents())
-        ->NavigateAndCommit(GURL("https://runtime-outer.test/"));
-    auto* initial = content::RenderFrameHostTester::For(
-                        web_contents()->GetPrimaryMainFrame())
-                        ->AppendChild("runtime-trial");
-    auto* frame = static_cast<Frame*>(
-        content::NavigationSimulator::NavigateAndCommitFromDocument(
-            GURL("https://127.0.0.1:44444/title.html"), initial));
+    Frame* frame;
+    const GURL url("https://127.0.0.1:44444/title.html");
+    if (ordinary) {
+      frame = Navigate(web_contents(), url, false);
+    } else {
+      content::WebContentsTester::For(web_contents())
+          ->NavigateAndCommit(GURL("https://runtime-outer.test/"));
+      auto* initial = content::RenderFrameHostTester::For(
+                          web_contents()->GetPrimaryMainFrame())
+                          ->AppendChild("runtime-trial");
+      frame = static_cast<Frame*>(
+          content::NavigationSimulator::NavigateAndCommitFromDocument(url,
+                                                                      initial));
+    }
     auto owner = content::GetAlloyEmbeddedStateForDocument(frame).temporary;
-    ASSERT_TRUE(owner);
+    ASSERT_EQ(!!owner, !ordinary);
     // Published real browser-readable token from
     // render_frame_host_impl_browsertest.
     const std::string token =
@@ -5749,6 +5848,17 @@ class NativeDiskEmbeddedOriginTrialsTest
             .IsTestFeatureForBrowserProcessReadWriteAccessOriginTrialEnabled());
     RecordProperty("positive_runtime_origin_trial",
                    "native-signed-browser-feature-override-live");
+    if (ordinary) {
+      const auto applied =
+          data->runtime_feature_state_read_context().GetFeatureOverrides();
+      profile()->GetOriginTrialsControllerDelegate()->ClearPersistedTokens();
+      task_environment()->RunUntilIdle();
+      EXPECT_EQ(data->runtime_feature_state_read_context().GetFeatureOverrides(),
+                applied);
+      EXPECT_TRUE(data->runtime_feature_state_read_context()
+                      .IsTestFeatureForBrowserProcessReadWriteAccessOriginTrialEnabled());
+      return;
+    }
     owner->Retire();
     EXPECT_EQ(data->runtime_feature_state_read_context().GetFeatureOverrides(),
               baseline);
@@ -5792,6 +5902,10 @@ TEST_F(NativeDiskEmbeddedOriginTrialsTest,
 TEST_F(NativeDiskEmbeddedOriginTrialsTest,
        OuterSiteRuntimeTrialProjectionEndsWithScope) {
   CheckRuntimeProjection(Scope::kPerOuterSite);
+}
+TEST_F(NativeDiskEmbeddedOriginTrialsTest,
+       OrdinaryRuntimeTrialSurvivesPersistedTokenClear) {
+  CheckRuntimeProjection(Scope::kPerTab, true);
 }
 class NativeDiskEmbeddedFaviconTest : public ChromeRenderViewHostTestHarness {
  public:

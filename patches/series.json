@@ -892,6 +892,16 @@
       "patch": "chromium/0123-register-embedded-bfcache-reason.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0124-explicit-embedded-owners.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0125-captured-serial-observation.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

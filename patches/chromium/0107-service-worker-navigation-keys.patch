@@ -18,9 +18,9 @@
 +    // candidate, including native credentialless/fenced-frame nonce rules.
 +    const auto isolation = frame_host->ComputeIsolationInfoForNavigation(
 +        url, navigation->is_credentialless(),
-+        navigation->ComputeFencedFrameNonce());
++        navigation->ComputeFencedFrameNonce(), navigation);
 +    return frame_host->CalculateStorageKey(
-+        origin, base::OptionalToPtr(isolation.nonce()));
++        origin, base::OptionalToPtr(isolation.nonce()), navigation);
 +  }
    return frame_host->CalculateStorageKey(origin, nonce);
  }

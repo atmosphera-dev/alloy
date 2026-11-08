@@ -100,7 +100,8 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
             if mode != 'persistent':
                 assert current == before, 'embedded work changed backing roots while live'
             # Section 6 row 8b requires a live marker scan, not only a final scan.
-            scan_markers(backing, marker)
+            save(root/'live-marker-scan.json', scan_markers(
+                backing, marker, allow_vanished=mode == 'persistent'))
             driver.stdin.write('close\n')
             driver.stdin.flush()
             closed = line(driver, 30)
@@ -116,7 +117,7 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
             v for v in events if v['event'] == 'closed']) == 2
         after = snapshot(backing, root/'after-observation.json')
         save(root/'after.json', after)
-        scan_markers(backing, marker)
+        save(root/'final-marker-scan.json', scan_markers(backing, marker))
         if mode != 'persistent':
             assert after == before
         assert root_identity == {name:dict(device=(backing/name).stat().st_dev,
@@ -138,11 +139,25 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
             browser.wait(timeout=15)
 
 
-def scan_markers(backing, marker):
+def scan_markers(backing, marker, *, allow_vanished=False):
+    scanned, vanished = 0, []
     for name in ROOTS:
         for path in (backing/name).rglob('*'):
             if path.is_file() and not path.is_symlink():
-                assert marker.encode() not in path.read_bytes(), ('embedded marker on disk', str(path))
+                try:
+                    # An open descriptor remains readable if a later atomic
+                    # profile update unlinks its original directory entry.
+                    with path.open('rb') as stream:
+                        data = stream.read()
+                except FileNotFoundError:
+                    if not allow_vanished:
+                        raise
+                    vanished.append(str(path.relative_to(backing)))
+                    continue
+                scanned += 1
+                assert marker.encode() not in data, ('embedded marker on disk', str(path))
+    return dict(scanned_files=scanned, vanished=vanished,
+                allow_vanished=allow_vanished, embedded_marker_absent=True)
 
 
 def run(out, evidence, fixture_type, helpers, scopes, modes=('persistent',)):

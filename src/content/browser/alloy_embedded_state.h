@@ -53,12 +53,17 @@ CONTENT_EXPORT void RevokeAlloyEmbeddedSite(BrowserContext& context,
 CONTENT_EXPORT AlloyEmbeddedResolution
 GetAlloyEmbeddedStateForNavigation(NavigationRequest* navigation,
                                    const url::Origin& origin);
+// Only an explicitly supplied navigation selects navigation authority. Omit it
+// for current-document work, including a same-document commit while a different
+// cross-document navigation is pending on the frame-tree node.
 CONTENT_EXPORT AlloyEmbeddedResolution
 GetAlloyEmbeddedStateForCandidate(RenderFrameHostImpl* frame,
-                                  const url::Origin& origin);
+                                  const url::Origin& origin,
+                                  NavigationRequest* navigation = nullptr);
 CONTENT_EXPORT std::optional<base::UnguessableToken>
 GetAlloyEmbeddedNonceForCandidate(RenderFrameHostImpl* frame,
-                                  const url::Origin& origin);
+                                  const url::Origin& origin,
+                                  NavigationRequest* navigation = nullptr);
 CONTENT_EXPORT std::optional<base::UnguessableToken>
 GetAlloyEmbeddedNonceForNavigation(NavigationRequest* navigation,
                                    const url::Origin& origin);

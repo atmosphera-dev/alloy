@@ -256,6 +256,18 @@ AlloyEmbeddedResolution Resolve(RenderFrameHost* frame,
   if (!owner || !context_lifetime) {
     return {};
   }
+  if (!navigation && result.backing == Backing::kTemporary) {
+    // A first bind must match the key committed for this document. Validate
+    // before publishing the captured selection, so a rejected replacement
+    // cannot become authority on a second lookup. Navigation candidates have
+    // their explicit original owner and mint this key before commit.
+    const auto& key = frame->GetStorageKey();
+    if (!key.nonce() || !result.temporary ||
+        *key.nonce() != result.temporary->Capability(StorePurpose::kDomStorage)
+                            .generation()) {
+      result = {.temporary_admission_closed = true};
+    }
+  }
   auto selection = std::make_unique<Selection>();
   selection->document_url = url;
   selection->origin = origin;
@@ -349,24 +361,8 @@ AlloyEmbeddedResolution GetAlloyEmbeddedStateForDocument(
     return {};
   }
   auto owner = AlloyDocumentStateOwner(frame);
-  const bool captured = owner && owner->GetUserData(&kSelectionKey);
-  auto result = Resolve(frame, frame->GetLastCommittedURL(),
-                        frame->GetLastCommittedOrigin(), owner, false);
-  if (result.backing == Backing::kTemporary && !captured) {
-    // A document first bound after deletion cannot adopt a replacement
-    // generation. Its native key was committed by the original navigation;
-    // this rejects a newly resolved replacement, never looks up a backend by
-    // nonce. An ORIGINAL selection already captured on the native handle is
-    // authority independently of credentialless/fenced-frame security nonces.
-    const auto& native_key = frame->GetStorageKey();
-    if (!native_key.nonce() || !result.temporary ||
-        *native_key.nonce() !=
-            result.temporary->Capability(StorePurpose::kDomStorage)
-                .generation()) {
-      return {.temporary_admission_closed = true};
-    }
-  }
-  return result;
+  return Resolve(frame, frame->GetLastCommittedURL(),
+                 frame->GetLastCommittedOrigin(), owner, false);
 }
 
 AlloyEmbeddedResolution GetAlloyEmbeddedStateForNavigation(
@@ -383,20 +379,23 @@ AlloyEmbeddedResolution GetAlloyEmbeddedStateForNavigation(
 
 std::optional<base::UnguessableToken> GetAlloyEmbeddedNonceForCandidate(
     RenderFrameHostImpl* frame,
-    const url::Origin& origin) {
-  return Nonce(GetAlloyEmbeddedStateForCandidate(frame, origin));
+    const url::Origin& origin,
+    NavigationRequest* navigation) {
+  return Nonce(GetAlloyEmbeddedStateForCandidate(frame, origin, navigation));
 }
 
 AlloyEmbeddedResolution GetAlloyEmbeddedStateForCandidate(
     RenderFrameHostImpl* frame,
-    const url::Origin& origin) {
+    const url::Origin& origin,
+    NavigationRequest* navigation) {
   if (!frame) {
     return {};
   }
-  if (auto* navigation = frame->frame_tree_node()->navigation_request()) {
-    if (!navigation->IsSameDocument()) {
-      return GetAlloyEmbeddedStateForNavigation(navigation, origin);
-    }
+  // A frame may have a different cross-document navigation pending while its
+  // current document commits pushState. Only the actual caller's navigation
+  // can select navigation authority; never infer it from the frame-tree node.
+  if (navigation && !navigation->IsSameDocument()) {
+    return GetAlloyEmbeddedStateForNavigation(navigation, origin);
   }
   if (!frame->IsActive()) {
     return {};

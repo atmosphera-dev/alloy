@@ -404,7 +404,7 @@
   public:
    OriginTrialStateHostImpl(const OriginTrialStateHostImpl&) = delete;
    OriginTrialStateHostImpl& operator=(const OriginTrialStateHostImpl&) = delete;
-@@ -40,7 +43,15 @@
+@@ -40,7 +43,16 @@
        const std::string& token,
        const std::vector<url::Origin>& script_origins) override;
  
@@ -417,12 +417,13 @@
 +  base::WeakPtr<base::SupportsUserData> state_owner_;
 +  std::optional<alloy::site_records::RecordCapability> embedded_capability_;
 +  std::shared_ptr<OriginTrialsControllerDelegate> captured_delegate_;
++  bool observing_delegate_ = false;
    explicit OriginTrialStateHostImpl(
        RenderFrameHost& host,
        mojo::PendingReceiver<blink::mojom::OriginTrialStateHost> receiver);
 --- a/content/browser/renderer_host/origin_trial_state_host_impl.cc
 +++ b/content/browser/renderer_host/origin_trial_state_host_impl.cc
-@@ -19,9 +19,40 @@
+@@ -19,9 +19,43 @@
  OriginTrialStateHostImpl::OriginTrialStateHostImpl(
      RenderFrameHost& host,
      mojo::PendingReceiver<blink::mojom::OriginTrialStateHost> receiver)
@@ -438,14 +439,17 @@
 +  if (auto* root =
 +          host.GetBrowserContext()->GetOriginTrialsControllerDelegate()) {
 +    captured_delegate_ = root->GetForStateOwner(state_owner_);
-+    if (captured_delegate_ && captured_delegate_->IsStateAdmissionOpen())
++    if (embedded_capability_ && captured_delegate_ &&
++        captured_delegate_->IsStateAdmissionOpen()) {
++      observing_delegate_ = true;
 +      captured_delegate_->AddObserver(this);
++    }
 +  }
 +}
  
 -OriginTrialStateHostImpl::~OriginTrialStateHostImpl() = default;
 +OriginTrialStateHostImpl::~OriginTrialStateHostImpl() {
-+  if (captured_delegate_)
++  if (observing_delegate_)
 +    captured_delegate_->RemoveObserver(this);
 +}
 +

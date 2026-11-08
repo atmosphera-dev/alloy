@@ -111,10 +111,10 @@
 +      !ServiceCreationGate::Allows(*web_contents->GetBrowserContext()) ||
 +      initiator_document.WasInvalidated()) return false;
 +  auto* frame = initiator_document.AsRenderFrameHostIfValid();
-+  if (!frame) return !initiating_origin;  // A genuine browser-initiated action.
++  if (!frame) return !initiating_origin ||
++      !alloy::site_records::RequestContextPolicy::Get(*web_contents->GetBrowserContext());
 +  return frame->GetBrowserContext() == web_contents->GetBrowserContext() &&
-+      content::AlloyDocumentStateAdmitted(frame) &&
-+      (!initiating_origin || frame->GetLastCommittedOrigin() == *initiating_origin);
++      content::AlloyDocumentStateAdmitted(frame);
  }
  
  // static.

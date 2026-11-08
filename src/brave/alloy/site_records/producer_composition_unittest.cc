@@ -14,17 +14,24 @@
 #include "chrome/browser/device_api/managed_configuration_api.h"
 #include "chrome/browser/device_api/managed_configuration_api_factory.h"
 #include "chrome/browser/external_protocol/external_protocol_handler.h"
+#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+#include "chrome/browser/permissions/permission_manager_factory.h"
 #include "chrome/browser/shell_integration.h"
 #include "chrome/browser/prefs/browser_prefs.h"
 #include "chrome/common/pref_names.h"
 #include "chrome/test/base/chrome_render_view_host_test_harness.h"
 #include "components/pref_registry/pref_registry_syncable.h"
 #include "components/prefs/testing_pref_store.h"
+#include "components/permissions/permission_manager.h"
+#include "components/permissions/permission_context_base.h"
+#include "components/permissions/permission_request_data.h"
+#include "components/content_settings/core/browser/host_content_settings_map.h"
 #include "components/services/app_service/public/cpp/intent_filter_util.h"
 #include "components/sync_preferences/pref_service_syncable.h"
 #include "components/sync_preferences/pref_service_syncable_factory.h"
 #include "components/web_modal/web_contents_modal_dialog_manager.h"
 #include "content/public/browser/alloy_document_state.h"
+#include "content/public/browser/permission_descriptor_util.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/weak_document_ptr.h"
@@ -34,6 +41,7 @@
 #include "content/browser/alloy_embedded_state.h"
 #include "cef/libcef/browser/alloy/profile_settings.h"
 #include "services/network/test/test_url_loader_factory.h"
+#include "third_party/blink/public/common/permissions/permission_utils.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace alloy::site_records {
@@ -307,6 +315,89 @@ TEST_F(ProducerCompositionTest, ExternalProtocolNativeSchemeReplyKeepsOriginalDo
   content::RetireAlloyDocumentState(frame);
   task_environment()->RunUntilIdle();
   EXPECT_EQ(1,transport.prompts);EXPECT_EQ(0,transport.launches);
+}
+
+TEST_F(ChromeRenderViewHostTestHarness, LegacyDocumentlessExternalRedirectReachesNativePrompt) {
+  ASSERT_FALSE(RequestContextPolicy::Get(*profile()));
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://redirector.test/"));
+  web_modal::WebContentsModalDialogManager::CreateForWebContents(web_contents());
+  ExternalTransport transport;
+  auto getter = base::BindRepeating([](base::WeakPtr<content::WebContents> value) {
+    return value.get();
+  }, web_contents()->GetWeakPtr());
+  ExternalProtocolHandler::PermitLaunchUrl();
+  ExternalProtocolHandler::LaunchUrl(GURL("alloy-owned-protocol:payload"), getter,
+      ui::PAGE_TRANSITION_TYPED, true, false, url::Origin::Create(GURL("https://redirector.test/")), {});
+  task_environment()->RunUntilIdle();
+  EXPECT_EQ(1, transport.workers);
+  EXPECT_EQ(1, transport.prompts);
+  EXPECT_EQ(0, transport.blocked);
+  EXPECT_EQ(0, transport.launches);
+  ExternalProtocolHandler::PermitLaunchUrl();
+}
+
+TEST_F(ProducerCompositionTest, RedirectAttributionDoesNotReplaceOriginalExternalDocumentAuthority) {
+  auto contents = content::WebContentsTester::CreateTestWebContents(native_.get(), nullptr);
+  content::WebContentsTester::For(contents.get())->NavigateAndCommit(a_.GetURL());
+  web_modal::WebContentsModalDialogManager::CreateForWebContents(contents.get());
+  auto* frame = contents->GetPrimaryMainFrame();
+  const auto original = frame->GetWeakDocumentPtr();
+  auto getter = base::BindRepeating([](base::WeakPtr<content::WebContents> value) {
+    return value.get();
+  }, contents->GetWeakPtr());
+  ExternalTransport transport;
+  ExternalProtocolHandler::PermitLaunchUrl();
+  ExternalProtocolHandler::LaunchUrl(GURL("alloy-owned-protocol:payload"), getter,
+      ui::PAGE_TRANSITION_LINK, true, false, b_, original);
+  task_environment()->RunUntilIdle();
+  ASSERT_EQ(1, transport.prompts);
+  EXPECT_EQ(0, transport.blocked);
+  ExternalProtocolHandler::PermitLaunchUrl();
+  ExternalProtocolHandler::LaunchUrl(GURL("alloy-owned-protocol:payload"), getter,
+      ui::PAGE_TRANSITION_LINK, true, false, b_, {});
+  task_environment()->RunUntilIdle();
+  EXPECT_EQ(1, transport.prompts);
+  EXPECT_EQ(1, transport.blocked);  // Managed attribution requires an original document.
+  content::RetireAlloyDocumentState(frame);
+  ExternalProtocolHandler::PermitLaunchUrl();
+  ExternalProtocolHandler::LaunchUrl(GURL("alloy-owned-protocol:payload"), getter,
+      ui::PAGE_TRANSITION_LINK, true, false, b_, original);
+  task_environment()->RunUntilIdle();
+  EXPECT_EQ(1, transport.prompts);
+  EXPECT_EQ(2, transport.blocked);
+  EXPECT_EQ(0, transport.launches);
+}
+
+TEST_F(ChromeRenderViewHostTestHarness, LegacyInheritedSubframesKeepNativePermissionSettings) {
+  ASSERT_FALSE(RequestContextPolicy::Get(*profile()));
+  const GURL outer("https://inherited.test/");
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(outer);
+  auto* settings = HostContentSettingsMapFactory::GetForProfile(profile());
+  settings->SetContentSettingDefaultScope(outer, outer, ContentSettingsType::NOTIFICATIONS, CONTENT_SETTING_ALLOW);
+  auto* manager = PermissionManagerFactory::GetForProfile(profile());
+  ASSERT_TRUE(manager);
+  auto* context = manager->GetPermissionContextForTesting(ContentSettingsType::NOTIFICATIONS);
+  ASSERT_TRUE(context);
+  for (const auto* url : {"about:blank", "about:srcdoc"}) {
+    auto* parent = web_contents()->GetPrimaryMainFrame();
+    auto* child = content::RenderFrameHostTester::For(parent)->AppendChild(url);
+    auto navigation = content::NavigationSimulator::CreateRendererInitiated(GURL(url), child);
+    navigation->SetInitiatorFrame(parent);
+    navigation->Commit();
+    auto* frame = navigation->GetFinalRenderFrameHost();
+    ASSERT_TRUE(frame);
+    ASSERT_EQ(parent->GetLastCommittedOrigin(), frame->GetLastCommittedOrigin());
+    ASSERT_EQ(GURL(url), frame->GetLastCommittedURL());
+    ASSERT_TRUE(RecordDomainForPrincipal(frame->GetLastCommittedURL(), frame->GetLastCommittedOrigin()).empty());
+    ASSERT_EQ(settings, HostContentSettingsMapFactory::GetForFrame(frame));
+    auto descriptor = content::PermissionDescriptorUtil::CreatePermissionDescriptorForPermissionType(
+        blink::PermissionType::NOTIFICATIONS);
+    permissions::PermissionRequestData request(descriptor, permissions::PermissionRequestID(
+        frame, permissions::PermissionRequestID::RequestLocalId()), true, outer, outer);
+    EXPECT_EQ(blink::mojom::PermissionStatus::GRANTED, context->GetPermissionStatus(request, frame).status);
+    content::RetireAlloyDocumentState(frame);
+    EXPECT_EQ(blink::mojom::PermissionStatus::DENIED, context->GetPermissionStatus(request, frame).status);
+  }
 }
 
 TEST_F(ProducerCompositionTest, ExternalProtocolRememberHonorsManagedPrincipalAndStatelessMode) {

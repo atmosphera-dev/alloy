@@ -1,6 +1,6 @@
 --- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
 +++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
-@@ -62,62 +62,95 @@
+@@ -62,62 +62,101 @@
  using content_settings::ProviderType;
  
  namespace {
@@ -103,6 +103,12 @@
 +  if (alloy::site_records::RequestContextPolicy::IsStateless(
 +          *frame->GetBrowserContext()))
 +    return true;
++  // Non-record legacy documents keep native profile settings. Managed
++  // contexts must not borrow that profile root for the same principals.
++  if (!alloy::site_records::RequestContextPolicy::Get(*frame->GetBrowserContext()) &&
++      alloy::site_records::RecordDomainForPrincipal(
++          frame->GetLastCommittedURL(), frame->GetLastCommittedOrigin()).empty())
++    return false;
 +  if (!frame->GetParentOrOuterDocument())
 +    return false;
 +  return content::GetAlloyEmbeddedStateForDocument(frame).backing !=

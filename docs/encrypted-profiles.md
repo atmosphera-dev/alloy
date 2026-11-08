@@ -141,6 +141,33 @@ plaintext fallback. Record HMAC names cannot be tested by plain domain hashes.
 All engine-owned profile, record and file keys are wiped on lock, including
 retained old handles. Forgotten password data has no recovery mechanism.
 
+## Native contexts and site settings
+
+After `CefInitialize`, call `AlloyCreateEncryptedRequestContext` on browser UI
+with the explicit unlocked profile. Its boolean return means queued; the
+callback supplies a context only with `ALLOY_SETTINGS_OK`. Native preferences
+use that profile's original settings projection before Profile construction,
+without an ordinary Preferences file or parent-profile fallback. CEF sharing
+preserves the same native owner.
+
+Permissions/content settings, host zoom, Shields settings/seeds, preferred link
+handlers and managed-origin configuration use their site's record. Explicit
+non-site configuration, including global search choice and profile attributes,
+uses the encrypted profile-level namespace. Process-wide Local State is always
+memory-only; install-wide startup settings are embedder inputs.
+
+`AlloyProfile::DeleteSiteRecord` queues key-first deletion on UI and acknowledges
+only after native documents, workers, grants and generated references retire.
+Unrelated records and user-selected external files are preserved. `LockAsync`
+revokes the original context's keys, native owners and preference caches before
+completion. Unlocking does not reauthorize an old context.
+
+The profile and context embed-list accessors share the same encrypted owner;
+guest context accessors use memory only, and stateless access is refused. See
+[embed-list settings](embed-list-settings.md) for callback, validation and
+publication semantics, and [the system-state boundary](stateless-contexts.md#user-level-system-state)
+for fontconfig indexes outside Alloy profiles.
+
 ## Verification consumers
 
 `alloy_site_records_unittests` covers the hierarchy, production password source,

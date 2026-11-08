@@ -110,10 +110,11 @@
        content_security_policies_(std::move(content_security_policies)),
 --- a/content/browser/worker_host/shared_worker_service_impl.cc
 +++ b/content/browser/worker_host/shared_worker_service_impl.cc
-@@ -3,6 +3,7 @@
+@@ -3,7 +3,8 @@
  // found in the LICENSE file.
  
  #include "content/browser/worker_host/shared_worker_service_impl.h"
+ #include "content/public/browser/alloy_document_state.h"
 +#include "content/browser/alloy_embedded_state.h"
  
  #include <stddef.h>

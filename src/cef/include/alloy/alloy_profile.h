@@ -12,6 +12,24 @@
 
 #if CEF_API_ADDED(CEF_EXPERIMENTAL)
 ///
+/// EXPERIMENTAL: Completion of a profile embed-list operation, on browser UI.
+/// A successful read returns copied canonical record domains in |embedded|;
+/// writes and failed/cancelled reads return an empty vector. OK acknowledges
+/// durable publication for writes. Cancellation never reports a new generation
+/// as the result of an old operation. The callback may reenter or release owners.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloySiteSettingsCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete the accepted operation with |result| and copied |embedded| domains.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result,
+                          const std::vector<CefString>& embedded) = 0;
+};
+
+///
 /// EXPERIMENTAL: Lock completion on browser UI, after original-generation key
 /// revocation, native teardown, and destruction of the shared preference cache.
 ///
@@ -23,6 +41,22 @@ class AlloyProfileLockCallback : public virtual CefBaseRefCounted {
   ///
   /*--cef()--*/
   virtual void OnComplete(alloy_site_settings_result_t result) = 0;
+};
+
+///
+/// EXPERIMENTAL: Record deletion completion on browser UI. OK means the wrapped
+/// key and generated references were durably removed and old live documents and
+/// workers retired. |files_pending| reports unreadable opaque objects awaiting
+/// later unlink; it never means their keys or live grants remain available.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyRecordDeletionCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete deletion with |result| and opaque-file cleanup status.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result, bool files_pending) = 0;
 };
 
 ///
@@ -56,6 +90,7 @@ class AlloyKeySource : public virtual CefBaseRefCounted {
 /// embedder background thread. The library uses one authenticated catalogue and
 /// encrypted file layer for all profile/record state. Store/browser-context
 /// binding is separate. Releasing the last reference locks and wipes the profile.
+/// Embed-list methods below instead queue asynchronous I/O from browser UI.
 ///
 /*--cef(source=library,added=experimental)--*/
 class AlloyProfile : public virtual CefBaseRefCounted {
@@ -113,7 +148,41 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   /*--cef(default_retval=ALLOY_PROFILE_ERROR)--*/
   virtual alloy_profile_state_t GetState() = 0;
 
+  ///
+  /// Read the explicit considered-first-party list belonging to |outer_url|'s
+  /// record. Call on browser UI after CefInitialize. Returns true if queued,
+  /// not a read result; |callback| reports the result asynchronously on UI.
+  /// Returns false for the wrong thread or a missing callback, without calling
+  /// it. A locked profile or an operation losing admission reports CANCELLED.
+  /// No request context or global preference fallback is selected.
+  ///
+  /*--cef()--*/
+  virtual bool GetFirstPartyEmbeds(const CefString& outer_url,
+                                  CefRefPtr<AlloySiteSettingsCallback> callback) = 0;
 
+  ///
+  /// Replace that outer site's complete list using absolute URLs in |embedded|.
+  /// Inputs are copied; canonical duplicate domains collapse. An empty vector
+  /// clears the list. Validation is atomic and invalid input preserves the old
+  /// value. Thread/queue/completion semantics match GetFirstPartyEmbeds; only
+  /// the callback's OK means this replacement was durably published.
+  ///
+  /*--cef()--*/
+  virtual bool SetFirstPartyEmbeds(const CefString& outer_url,
+                                   const std::vector<CefString>& embedded,
+                                   CefRefPtr<AlloySiteSettingsCallback> callback) = 0;
+
+  ///
+  /// Delete the R16 record containing |site_url|. Browser UI only. True means
+  /// queued; only callback OK acknowledges completed deletion. The engine first
+  /// removes its wrapped key, then retires that site's documents/workers and
+  /// native grants, then unlinks opaque objects. Other records remain intact.
+  /// A locked or superseded operation completes CANCELLED, never against a new
+  /// unlock generation. Wrong thread/missing callback returns false unqueued.
+  ///
+  /*--cef()--*/
+  virtual bool DeleteSiteRecord(const CefString& site_url,
+                                CefRefPtr<AlloyRecordDeletionCallback> callback) = 0;
 };
 
 ///

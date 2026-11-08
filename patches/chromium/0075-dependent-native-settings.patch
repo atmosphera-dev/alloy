@@ -1,0 +1,127 @@
+--- a/components/content_settings/core/browser/content_settings_pref.cc
++++ b/components/content_settings/core/browser/content_settings_pref.cc
+@@ -151,7 +151,8 @@
+     const std::string& pref_name,
+     bool off_the_record,
+     bool restore_session,
+-    NotifyObserversCallback notify_callback)
++    NotifyObserversCallback notify_callback,
++    PrepareProjectionCallback prepare_callback)
+     : content_type_(content_type),
+       prefs_(prefs),
+       registrar_(registrar),
+@@ -160,6 +161,7 @@
+       restore_session_(restore_session),
+       updating_preferences_(false),
+       notify_callback_(notify_callback),
++      prepare_callback_(std::move(prepare_callback)),
+       clock_(base::DefaultClock::GetInstance()) {
+   DCHECK(prefs_);
+   content_settings::ContentSettingsRegistry::GetInstance();
+@@ -230,7 +232,9 @@
+                std::move(metadata));
+   }
+ 
++  auto publication = prepare_callback_ ? prepare_callback_.Run() : base::OnceClosure();
+   notify_callback_.Run(primary_pattern, secondary_pattern, content_type_);
++  if (publication) std::move(publication).Run();
+ }
+ 
+ void ContentSettingsPref::ClearAllContentSettingsRules() {
+@@ -253,8 +257,10 @@
+     update->Clear();
+   }
+ 
++  auto publication = prepare_callback_ ? prepare_callback_.Run() : base::OnceClosure();
+   notify_callback_.Run(ContentSettingsPattern::Wildcard(),
+                        ContentSettingsPattern::Wildcard(), content_type_);
++  if (publication) std::move(publication).Run();
+ }
+ 
+ void ContentSettingsPref::OnShutdown() {
+@@ -500,7 +506,9 @@
+   for (const auto& [key, rule] : after)
+     if (!before.contains(key)) changed.emplace(key, std::make_pair(rule->primary_pattern, rule->secondary_pattern));
+   if (changed.empty()) return {};
++  auto publication = prepare_callback_ ? prepare_callback_.Run() : base::OnceClosure();
+   return base::BindOnce([](base::WeakPtr<ContentSettingsPref> owner,
++      base::OnceClosure publication,
+       std::map<std::string, std::pair<ContentSettingsPattern, ContentSettingsPattern>> changes) {
+     for (const auto& [key, patterns] : changes) {
+       if (!owner || !owner->prefs_) return;
+@@ -508,7 +516,8 @@
+       const auto type = owner->content_type_;
+       notify.Run(patterns.first, patterns.second, type);
+     }
+-  }, weak_factory_.GetWeakPtr(), std::move(changed));
++    if (publication) std::move(publication).Run();
++  }, weak_factory_.GetWeakPtr(), std::move(publication), std::move(changed));
+ }
+ 
+ void ContentSettingsPref::UpdatePref(
+--- a/components/content_settings/core/browser/content_settings_pref.h
++++ b/components/content_settings/core/browser/content_settings_pref.h
+@@ -45,13 +45,18 @@
+                                        ContentSettingsType)>
+       NotifyObserversCallback;
+ 
++  // A native provider may derive other maps from this rule map. Installation
++  // is separate from external publication, just like the base projection.
++  using PrepareProjectionCallback = base::RepeatingCallback<base::OnceClosure()>;
++
+   ContentSettingsPref(ContentSettingsType content_type,
+                       PrefService* prefs,
+                       PrefChangeRegistrar* registrar,
+                       const std::string& pref_name,
+                       bool off_the_record,
+                       bool restore_session,
+-                      NotifyObserversCallback notify_callback);
++                      NotifyObserversCallback notify_callback,
++                      PrepareProjectionCallback prepare_callback = {});
+ 
+   ContentSettingsPref(const ContentSettingsPref&) = delete;
+   ContentSettingsPref& operator=(const ContentSettingsPref&) = delete;
+@@ -137,6 +142,7 @@
+   OriginValueMap off_the_record_value_map_;
+ 
+   NotifyObserversCallback notify_callback_;
++  PrepareProjectionCallback prepare_callback_;
+ 
+   base::ThreadChecker thread_checker_;
+ 
+--- a/components/content_settings/core/browser/content_settings_pref_provider.cc
++++ b/components/content_settings/core/browser/content_settings_pref_provider.cc
+@@ -183,7 +183,9 @@
+                           info->type(), prefs_, &pref_change_registrar_,
+                           info->pref_name(), off_the_record_, restore_session,
+                           base::BindRepeating(&PrefProvider::Notify,
+-                                              base::Unretained(this)))));
++                                              base::Unretained(this)),
++                          base::BindRepeating(&PrefProvider::PrepareDependentSettings,
++                                              base::Unretained(this), info->type()))));
+   }
+ 
+ #if !BUILDFLAG(IS_IOS)
+@@ -223,7 +225,9 @@
+                   type, prefs_, &pref_change_registrar_, info->pref_name(),
+                   true, false,
+                   base::BindRepeating(&PrefProvider::Notify,
+-                                      base::Unretained(this))));
++                                      base::Unretained(this)),
++                  base::BindRepeating(&PrefProvider::PrepareDependentSettings,
++                                      base::Unretained(this), type)));
+   }
+ }
+ 
+--- a/components/content_settings/core/browser/content_settings_pref_provider.h
++++ b/components/content_settings/core/browser/content_settings_pref_provider.h
+@@ -85,6 +85,9 @@
+ 
+   ContentSettingsPref* GetPref(ContentSettingsType type) const;
+ 
++ protected:
++  virtual base::OnceClosure PrepareDependentSettings(ContentSettingsType type) { return {}; }
++
+  private:
+   friend class BravePrefProvider;
+   friend class DeadlockCheckerObserver;  // For testing.

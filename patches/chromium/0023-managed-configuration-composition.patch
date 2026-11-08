@@ -1,0 +1,35 @@
+--- a/chrome/browser/device_api/managed_configuration_api_factory.cc
++++ b/chrome/browser/device_api/managed_configuration_api_factory.cc
+@@ -7,5 +7,32 @@
+ #include "base/no_destructor.h"
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/device_api/managed_configuration_api.h"
++#include "chrome/browser/net/system_network_context_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
++#include "components/value_store/leveldb_value_store.h"
++
++// Profile/network composition stays at the native factory boundary. The core
++// origin cache/API receives child factories and never reaches into a parent.
++ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile)
++    : ManagedConfigurationAPI(profile->GetPrefs(),
++        base::BindRepeating([](base::FilePath root, const url::Origin& origin)
++            -> std::optional<ManagedConfigurationStore::Options> {
++          ManagedConfigurationStore::Options options;
++          const auto path = root.AppendASCII("Managed Configuration")
++              .AppendASCII(base::HexEncode(origin.Serialize()));
++          options.create = base::BindRepeating([](base::FilePath path)
++              -> std::unique_ptr<value_store::ValueStore> {
++            return std::make_unique<value_store::LeveldbValueStore>(
++                "OriginManagedConfiguration", path);
++          }, path);
++          options.admitted = base::BindRepeating([] { return true; });
++          options.error = base::BindRepeating([](const value_store::ValueStore::Status&) {});
++          return options;
++        }, profile->GetPath()),
++        base::BindRepeating([]() -> network::mojom::URLLoaderFactory* {
++          return g_browser_process->system_network_context_manager()->GetURLLoaderFactory();
++        })) {}
+ 

@@ -1,0 +1,146 @@
+--- a/components/content_settings/core/browser/brave_content_settings_pref_provider.cc
++++ b/components/content_settings/core/browser/brave_content_settings_pref_provider.cc
+@@ -125,27 +125,26 @@
+ 
+   pref_change_registrar_.Init(prefs);
+ 
+-  pref_change_registrar_.Add(
++  pref_change_registrar_.AddProjection(
+       kGoogleLoginControlType,
+-      base::BindRepeating(&BravePrefProvider::OnCookiePrefsChanged,
+-                          base::Unretained(this)));
++      base::BindRepeating(&BravePrefProvider::PrepareCookieSettings,
++                          base::Unretained(this), ContentSettingsType::BRAVE_COOKIES));
+ 
+   MigrateShieldsSettings(off_the_record_);
+   MigrateFingerprintingSetingsToOriginScoped();
+   MigrateCosmeticFilteringSettings();
+   MigrateBraveRemember1PStorageToAutoShred();
+ 
+-  OnCookieSettingsChanged(ContentSettingsType::BRAVE_COOKIES);
++  auto initial = PrepareCookieSettings(ContentSettingsType::BRAVE_COOKIES);
++  if (initial) std::move(initial).Run();
+ 
+   // Enable change notifications after initial setup to avoid notification spam
+   initialized_ = true;
+-  AddObserver(this);
+ }
+ 
+ BravePrefProvider::~BravePrefProvider() = default;
+ 
+ void BravePrefProvider::ShutdownOnUIThread() {
+-  RemoveObserver(this);
+   pref_change_registrar_.RemoveAll();
+   PrefProvider::ShutdownOnUIThread();
+ }
+@@ -938,7 +937,7 @@
+   return CookieType::kRegularCookie;
+ }
+ 
+-void BravePrefProvider::UpdateCookieRules(ContentSettingsType content_type,
++base::OnceClosure BravePrefProvider::UpdateCookieRules(ContentSettingsType content_type,
+                                           bool incognito) {
+   std::vector<std::unique_ptr<Rule>> rules;
+   auto old_rules = std::move(brave_cookie_rules_[incognito]);
+@@ -1137,39 +1136,42 @@
+       (content_type == ContentSettingsType::BRAVE_COOKIES ||
+        content_type == ContentSettingsType::BRAVE_SHIELDS ||
+        content_type == ContentSettingsType::BRAVE_GOOGLE_SIGN_IN)) {
+-    NotifyChanges(brave_cookie_updates, incognito);
+-  }
++    return base::BindOnce(&BravePrefProvider::NotifyChanges, weak_factory_.GetWeakPtr(),
++                          std::move(brave_cookie_updates), incognito);
++  }
++  return {};
+ }
+ 
+ void BravePrefProvider::NotifyChanges(
+     const std::vector<std::unique_ptr<Rule>>& rules,
+     bool incognito) {
++  auto owner = weak_factory_.GetWeakPtr();
+   for (const auto& rule : rules) {
+-    Notify(rule->primary_pattern, rule->secondary_pattern,
+-           ContentSettingsType::COOKIES);
+-  }
+-}
+-
+-void BravePrefProvider::OnCookiePrefsChanged(const std::string& pref) {
+-  OnCookieSettingsChanged(ContentSettingsType::BRAVE_COOKIES);
+-}
+-
+-void BravePrefProvider::OnCookieSettingsChanged(
+-    ContentSettingsType content_type) {
+-  UpdateCookieRules(content_type, true);
+-  UpdateCookieRules(content_type, false);
+-}
+-
+-void BravePrefProvider::OnContentSettingChanged(
+-    const ContentSettingsPattern& primary_pattern,
+-    const ContentSettingsPattern& secondary_pattern,
+-    ContentSettingsType content_type) {
++    if (!owner || !owner->prefs_) return;
++    owner->Notify(rule->primary_pattern, rule->secondary_pattern,
++                  ContentSettingsType::COOKIES);
++  }
++}
++
++base::OnceClosure BravePrefProvider::PrepareCookieSettings(ContentSettingsType content_type) {
++  auto incognito = UpdateCookieRules(content_type, true);
++  auto regular = UpdateCookieRules(content_type, false);
++  if (!incognito && !regular) return {};
++  return base::BindOnce([](base::OnceClosure incognito, base::OnceClosure regular) {
++    if (incognito) std::move(incognito).Run();
++    if (regular) std::move(regular).Run();
++  }, std::move(incognito), std::move(regular));
++}
++
++base::OnceClosure BravePrefProvider::PrepareDependentSettings(ContentSettingsType content_type) {
++  if (!initialized_) return {};
+   if (content_type == ContentSettingsType::COOKIES ||
+       content_type == ContentSettingsType::BRAVE_COOKIES ||
+       content_type == ContentSettingsType::BRAVE_SHIELDS ||
+       content_type == ContentSettingsType::BRAVE_GOOGLE_SIGN_IN) {
+-    OnCookieSettingsChanged(content_type);
+-  }
++    return PrepareCookieSettings(content_type);
++  }
++  return {};
+ }
+ 
+ }  // namespace content_settings
+--- a/components/content_settings/core/browser/brave_content_settings_pref_provider.h
++++ b/components/content_settings/core/browser/brave_content_settings_pref_provider.h
+@@ -26,7 +26,7 @@
+     "brave.brave_remember_1p_storage_migration";
+ 
+ // With this subclass, shields configuration is persisted across sessions.
+-class BravePrefProvider : public PrefProvider, public Observer {
++class BravePrefProvider : public PrefProvider {
+  public:
+   enum class CookieType {
+     kRegularCookie,
+@@ -105,8 +105,9 @@
+   void MigrateFingerprintingSetingsToOriginScoped();
+   void MigrateCosmeticFilteringSettings();
+   void MigrateBraveRemember1PStorageToAutoShred();
+-  void UpdateCookieRules(ContentSettingsType content_type, bool incognito);
+-  void OnCookieSettingsChanged(ContentSettingsType content_type);
++  base::OnceClosure UpdateCookieRules(ContentSettingsType content_type, bool incognito);
++  base::OnceClosure PrepareCookieSettings(ContentSettingsType content_type);
++  base::OnceClosure PrepareDependentSettings(ContentSettingsType content_type) override;
+   void NotifyChanges(const std::vector<std::unique_ptr<Rule>>& rules,
+                      bool incognito);
+   bool SetWebsiteSettingInternal(
+@@ -115,12 +116,6 @@
+       ContentSettingsType content_type,
+       const base::Value& value,
+       const ContentSettingConstraints& constraints);
+-
+-  // content_settings::Observer overrides:
+-  void OnContentSettingChanged(const ContentSettingsPattern& primary_pattern,
+-                               const ContentSettingsPattern& secondary_pattern,
+-                               ContentSettingsType content_type) override;
+-  void OnCookiePrefsChanged(const std::string& pref);
+ 
+   std::map<bool /* is_incognito */, OriginValueMap> cookie_rules_;
+   std::map<bool /* is_incognito */, std::vector<std::unique_ptr<Rule>>>

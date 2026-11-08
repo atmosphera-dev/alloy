@@ -559,6 +559,111 @@
       "stage": "after-prune"
     },
     {
+      "patch": "chromium/0022-record-value-store-backends.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0023-managed-configuration-composition.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0024-explicit-search-configuration.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0025-remove-shields-activity-counters.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0026-profile-site-settings.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0063-memory-only-local-state.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0064-live-zoom-configuration.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0065-native-service-creation-gate.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0066-native-encrypted-profile-input.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0066-native-encrypted-context.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0067-live-site-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0068-native-site-permission-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0069-native-permission-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0070-native-producer-composition.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0071-encrypted-managed-origin-selection.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0072-native-permission-consumer-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0073-native-retirement-publication-barrier.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0074-native-pref-projection-preparation.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0075-dependent-native-settings.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0075-dependent-native-settings.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0076-native-ssl-owner-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
       "patch": "chromium/0077-network-record-insertion-admission.patch",
       "root": ".",
       "stage": "after-prune"
@@ -659,28 +764,18 @@
       "stage": "after-prune"
     },
     {
-      "patch": "cef/0166-profile-lifecycle-inputs.patch",
-      "root": "cef",
-      "stage": "after-prune"
-    },
-    {
-      "patch": "chromium/0022-record-value-store-backends.patch",
+      "patch": "chromium/0097-native-external-protocol-authority.patch",
       "root": ".",
       "stage": "after-prune"
     },
     {
-      "patch": "chromium/0065-native-service-creation-gate.patch",
+      "patch": "chromium/0098-register-embed-list-settings.patch",
       "root": ".",
       "stage": "after-prune"
     },
     {
-      "patch": "chromium/0066-native-encrypted-profile-input.patch",
-      "root": ".",
-      "stage": "after-prune"
-    },
-    {
-      "patch": "cef/0066-native-encrypted-context.patch",
-      "root": "cef",
+      "patch": "brave-core/0100-no-process-activity-init.patch",
+      "root": "brave",
       "stage": "after-prune"
     },
     {
@@ -746,11 +841,6 @@
     {
       "patch": "cef/0112-profile-custom-filter-api.patch",
       "root": "cef",
-      "stage": "after-prune"
-    },
-    {
-      "patch": "chromium/0168-native-document-retirement.patch",
-      "root": ".",
       "stage": "after-prune"
     },
     {
@@ -901,6 +991,11 @@
     {
       "patch": "chromium/0125-captured-serial-observation.patch",
       "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0126-bind-embed-list-settings.patch",
+      "root": "cef",
       "stage": "after-prune"
     }
   ],

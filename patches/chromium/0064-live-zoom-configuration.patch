@@ -1,0 +1,342 @@
+--- a/content/public/browser/host_zoom_map.h
++++ b/content/public/browser/host_zoom_map.h
+@@ -57,6 +57,9 @@
+     std::string scheme;
+     double zoom_level;
+     base::Time last_modified;
++    // A configuration projection is not a new user action. Consumers must not
++    // echo it back into persistence; a nested native action remains untagged.
++    bool from_preferences = false;
+   };
+ 
+   typedef std::vector<ZoomLevelChange> ZoomLevelVector;
+@@ -185,6 +188,12 @@
+   virtual double GetDefaultZoomLevel() = 0;
+   virtual void SetDefaultZoomLevel(double level) = 0;
+ 
++  // Replace only the persistent configuration. Install the default and all host
++  // entries before any observer/renderer notification. Scheme and temporary
++  // overrides are unaffected; supplied timestamps are retained verbatim.
++  virtual void ReplacePersistentZoomLevels(double default_level,
++                                          ZoomLevelVector levels) = 0;
++
+   using ZoomLevelChangedCallback =
+       base::RepeatingCallback<void(const ZoomLevelChange&)>;
+   // Add and remove zoom level changed callbacks.
+--- a/content/browser/host_zoom_map_impl.h
++++ b/content/browser/host_zoom_map_impl.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_BROWSER_HOST_ZOOM_MAP_IMPL_H_
+ 
+ #include <map>
++#include <memory>
+ #include <set>
+ #include <string>
+ #include <tuple>
+@@ -14,6 +15,7 @@
+ #include "base/callback_list.h"
+ #include "base/containers/flat_map.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner_helpers.h"
+ #include "base/time/time.h"
+ #include "content/common/content_export.h"
+@@ -64,6 +66,8 @@
+   void ClearTemporaryZoomLevel(const GlobalRenderFrameHostId& rfh_id) override;
+   double GetDefaultZoomLevel() override;
+   void SetDefaultZoomLevel(double level) override;
++  void ReplacePersistentZoomLevels(double default_level,
++                                  ZoomLevelVector levels) override;
+   base::CallbackListSubscription AddZoomLevelChangedCallback(
+       ZoomLevelChangedCallback callback) override;
+ 
+@@ -146,9 +150,13 @@
+   // TODO(wjmaclean) Should we use a GURL here? crbug.com/384486
+   void SendZoomLevelChange(const std::string& scheme, const std::string& host);
+ 
+-  // Callbacks called when zoom level changes.
+-  base::RepeatingCallbackList<void(const ZoomLevelChange&)>
+-      zoom_level_changed_callbacks_;
++  void NotifyZoomLevelChanged(const ZoomLevelChange& change);
++
++  // Notify may retire this map. Keep only the subscription storage alive until
++  // iteration unwinds; weak callback adapters stop delivery after retirement.
++  using ZoomCallbacks = base::RepeatingCallbackList<void(const ZoomLevelChange&)>;
++  std::shared_ptr<ZoomCallbacks> zoom_level_changed_callbacks_ =
++      std::make_shared<ZoomCallbacks>();
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   // Map of unique keys to Java callbacks.
+@@ -179,6 +187,7 @@
+   IndependentZoomFrameTreeNodes independent_zoom_frame_tree_nodes_;
+ 
+   raw_ptr<base::Clock> clock_;
++  base::WeakPtrFactory<HostZoomMapImpl> weak_factory_{this};
+ };
+ 
+ }  // namespace content
+--- a/content/browser/host_zoom_map_impl.cc
++++ b/content/browser/host_zoom_map_impl.cc
+@@ -310,7 +310,7 @@
+   change.zoom_level = level;
+   change.last_modified = last_modified;
+ 
+-  zoom_level_changed_callbacks_.Notify(change);
++  NotifyZoomLevelChanged(change);
+ }
+ 
+ void HostZoomMapImpl::SetZoomLevelForHostAndScheme(const std::string& scheme,
+@@ -330,7 +330,7 @@
+   change.zoom_level = level;
+   change.last_modified = base::Time();
+ 
+-  zoom_level_changed_callbacks_.Notify(change);
++  NotifyZoomLevelChanged(change);
+ }
+ 
+ double HostZoomMapImpl::GetDefaultZoomLevel() {
+@@ -364,7 +364,7 @@
+     change.host = host;
+     change.zoom_level = level;
+ 
+-    zoom_level_changed_callbacks_.Notify(change);
++    NotifyZoomLevelChanged(change);
+   }
+ }
+ 
+@@ -421,7 +421,93 @@
+ base::CallbackListSubscription HostZoomMapImpl::AddZoomLevelChangedCallback(
+     ZoomLevelChangedCallback callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+-  return zoom_level_changed_callbacks_.Add(std::move(callback));
++  return zoom_level_changed_callbacks_->Add(base::BindRepeating(
++      [](base::WeakPtr<HostZoomMapImpl> map, ZoomLevelChangedCallback callback,
++         const ZoomLevelChange& event) {
++        if (!map) return;
++        ZoomLevelChange current = event;
++        if (event.mode == ZOOM_CHANGED_FOR_HOST) {
++          // An earlier observer may have replaced this host (or the complete
++          // configuration). Never deliver an obsolete positive value later in
++          // the same notification. Provenance remains that of the original
++          // publication, so this cannot echo a preference-derived timestamp.
++          current.zoom_level = map->GetZoomLevelForHost(event.host);
++          const auto found = map->host_zoom_levels_.find(event.host);
++          current.last_modified = found == map->host_zoom_levels_.end()
++              ? base::Time() : found->second.last_modified;
++        }
++        callback.Run(current);
++      }, weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++void HostZoomMapImpl::NotifyZoomLevelChanged(const ZoomLevelChange& change) {
++  auto callbacks = zoom_level_changed_callbacks_;
++  callbacks->Notify(change);
++}
++
++void HostZoomMapImpl::ReplacePersistentZoomLevels(double default_level,
++                                                 ZoomLevelVector levels) {
++  CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
++  HostZoomLevels next;
++  for (const auto& entry : levels) {
++    CHECK_EQ(entry.mode, ZOOM_CHANGED_FOR_HOST);
++    if (!entry.host.empty() &&
++        !blink::ZoomValuesEqual(entry.zoom_level, default_level)) {
++      next[entry.host] = {entry.zoom_level, entry.last_modified};
++    }
++  }
++  std::set<std::string> changed;
++  for (const auto& [host, value] : host_zoom_levels_) {
++    const auto found = next.find(host);
++    if (found == next.end() ||
++        !blink::ZoomValuesEqual(found->second.level, value.level) ||
++        found->second.last_modified != value.last_modified) changed.insert(host);
++  }
++  for (const auto& [host, value] : next) {
++    if (!host_zoom_levels_.contains(host)) changed.insert(host);
++  }
++  const bool default_changed =
++      !blink::ZoomValuesEqual(default_level, default_zoom_level_);
++  if (!default_changed && changed.empty()) return;
++
++  // One publication boundary: observers can never see a new default with old
++  // hosts, nor a partly removed set of hosts during record revocation.
++  host_zoom_levels_ = std::move(next);
++  default_zoom_level_ = default_level;
++  auto weak = weak_factory_.GetWeakPtr();
++  for (const auto& host : changed) {
++    SendZoomLevelChange(std::string(), host);
++    if (!weak) return;
++    ZoomLevelChange event = {ZOOM_CHANGED_FOR_HOST, host, std::string(),
++                            GetZoomLevelForHost(host), base::Time(), true};
++    NotifyZoomLevelChanged(event);
++    if (!weak) return;
++  }
++  if (default_changed) {
++    for (auto contents : WebContentsImpl::GetAllWebContents()) {
++      if (GetForWebContents(contents) != this) continue;
++      auto id = contents->GetPrimaryMainFrame()->GetGlobalId();
++      if (!UsesTemporaryZoomLevel(id)) contents->UpdateZoom(id);
++      if (!weak) return;
++    }
++    if (IsIndependentSubframeZoomEnabled()) {
++      const auto nodes = independent_zoom_frame_tree_nodes_;
++      for (auto id : nodes) {
++        auto* node = FrameTreeNode::GloballyFindByID(id);
++        if (!node) continue;
++        auto* frame = node->current_frame_host();
++        auto* contents = WebContentsImpl::FromRenderFrameHostImpl(frame);
++        if (contents && frame != contents->GetPrimaryMainFrame() &&
++            !UsesTemporaryZoomLevel(frame->GetGlobalId())) {
++          contents->UpdateZoom(frame->GetGlobalId());
++          if (!weak) return;
++        }
++      }
++    }
++    ZoomLevelChange event = {ZOOM_CHANGED_FOR_HOST, std::string(),
++                            std::string(), default_zoom_level_, base::Time(), true};
++    NotifyZoomLevelChanged(event);
++  }
+ }
+ 
+ double HostZoomMapImpl::GetZoomLevelForWebContents(
+@@ -506,7 +592,7 @@
+   change.host = GetHostFromProcessFrame(rfh);
+   change.zoom_level = level;
+ 
+-  zoom_level_changed_callbacks_.Notify(change);
++  NotifyZoomLevelChanged(change);
+ }
+ 
+ void HostZoomMapImpl::ClearZoomLevels(base::Time delete_begin,
+--- a/chrome/browser/ui/zoom/chrome_zoom_level_prefs.h
++++ b/chrome/browser/ui/zoom/chrome_zoom_level_prefs.h
+@@ -4,6 +4,8 @@
+ 
+ #ifndef CHROME_BROWSER_UI_ZOOM_CHROME_ZOOM_LEVEL_PREFS_H_
+ #define CHROME_BROWSER_UI_ZOOM_CHROME_ZOOM_LEVEL_PREFS_H_
++
++#include <memory>
+ 
+ #include "base/callback_list.h"
+ #include "base/files/file_path.h"
+@@ -66,12 +68,18 @@
+   // zoom levels (if any) managed by this class (for its associated partition).
+   void OnZoomLevelChanged(const content::HostZoomMap::ZoomLevelChange& change);
+ 
++  void ReconcileZoomConfiguration();
++
+   raw_ptr<PrefService> pref_service_;
+   base::WeakPtr<zoom::ZoomEventManager> zoom_event_manager_;
+   raw_ptr<content::HostZoomMap> host_zoom_map_;
+   base::CallbackListSubscription zoom_subscription_;
+   std::string partition_key_;
+-  base::RepeatingClosureList default_zoom_changed_callbacks_;
++  PrefChangeRegistrar pref_change_registrar_;
++  double notified_default_zoom_ = 0.0;
++  std::shared_ptr<base::RepeatingClosureList> default_zoom_changed_callbacks_ =
++      std::make_shared<base::RepeatingClosureList>();
++  base::WeakPtrFactory<ChromeZoomLevelPrefs> weak_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_ZOOM_CHROME_ZOOM_LEVEL_PREFS_H_
+--- a/chrome/browser/ui/zoom/chrome_zoom_level_prefs.cc
++++ b/chrome/browser/ui/zoom/chrome_zoom_level_prefs.cc
+@@ -89,13 +89,8 @@
+ 
+   ScopedDictPrefUpdate update(pref_service_, prefs::kPartitionDefaultZoomLevel);
+   update->Set(partition_key_, level);
+-  // For unregistered paths, OnDefaultZoomLevelChanged won't be called, so
+-  // set this manually.
+-  host_zoom_map_->SetDefaultZoomLevel(level);
+-  default_zoom_changed_callbacks_.Notify();
+-  if (zoom_event_manager_) {
+-    zoom_event_manager_->OnDefaultZoomLevelChanged();
+-  }
++  // The pref observer owns publication and default notifications for both
++  // this setter and external preference replacement.
+ }
+ 
+ double ChromeZoomLevelPrefs::GetDefaultZoomLevelPref() const {
+@@ -111,7 +106,10 @@
+ base::CallbackListSubscription
+ ChromeZoomLevelPrefs::RegisterDefaultZoomLevelCallback(
+     base::RepeatingClosure callback) {
+-  return default_zoom_changed_callbacks_.Add(std::move(callback));
++  return default_zoom_changed_callbacks_->Add(base::BindRepeating(
++      [](base::WeakPtr<ChromeZoomLevelPrefs> owner, base::RepeatingClosure callback) {
++        if (owner) callback.Run();
++      }, weak_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
+ void ChromeZoomLevelPrefs::OnZoomLevelChanged(
+@@ -119,11 +117,13 @@
+   // If there's a manager to aggregate ZoomLevelChanged events, pass this event
+   // along. Since we already hold a subscription to our associated HostZoomMap,
+   // we don't need to create a separate subscription for this.
++  auto weak = weak_factory_.GetWeakPtr();
+   if (zoom_event_manager_) {
+     zoom_event_manager_->OnZoomLevelChanged(change);
+   }
+ 
+-  if (change.mode != content::HostZoomMap::ZOOM_CHANGED_FOR_HOST) {
++  if (!weak || change.from_preferences ||
++      change.mode != content::HostZoomMap::ZOOM_CHANGED_FOR_HOST) {
+     return;
+   }
+   double level = change.zoom_level;
+@@ -216,6 +216,31 @@
+   }
+ }
+ 
++void ChromeZoomLevelPrefs::ReconcileZoomConfiguration() {
++  content::HostZoomMap::ZoomLevelVector levels;
++  const auto& partitions = pref_service_->GetDict(prefs::kPartitionPerHostZoomLevels);
++  if (const auto* hosts = partitions.FindDict(partition_key_)) {
++    for (auto [host, value] : *hosts) {
++      if (host.empty()) continue;
++      const auto* dictionary = value.GetIfDict();
++      auto level = dictionary ? dictionary->FindDouble(kZoomLevelKey) : value.GetIfDouble();
++      if (!level) continue;
++      levels.push_back({content::HostZoomMap::ZOOM_CHANGED_FOR_HOST, host,
++                        std::string(), *level,
++                        dictionary ? GetTimeStamp(*dictionary) : base::Time()});
++    }
++  }
++  auto weak = weak_factory_.GetWeakPtr();
++  host_zoom_map_->ReplacePersistentZoomLevels(GetDefaultZoomLevelPref(), std::move(levels));
++  if (!weak) return;
++  const double current_default = host_zoom_map_->GetDefaultZoomLevel();
++  if (blink::ZoomValuesEqual(current_default, notified_default_zoom_)) return;
++  notified_default_zoom_ = current_default;
++  auto callbacks = default_zoom_changed_callbacks_;
++  callbacks->Notify();
++  if (weak && zoom_event_manager_) zoom_event_manager_->OnDefaultZoomLevelChanged();
++}
++
+ void ChromeZoomLevelPrefs::InitHostZoomMap(
+     content::HostZoomMap* host_zoom_map) {
+   // This init function must be called only once.
+@@ -241,7 +266,14 @@
+   }
+   zoom_subscription_ =
+       host_zoom_map_->AddZoomLevelChangedCallback(base::BindRepeating(
+-          &ChromeZoomLevelPrefs::OnZoomLevelChanged, base::Unretained(this)));
++          &ChromeZoomLevelPrefs::OnZoomLevelChanged, weak_factory_.GetWeakPtr()));
++  notified_default_zoom_ = host_zoom_map_->GetDefaultZoomLevel();
++  pref_change_registrar_.Init(pref_service_);
++  for (const char* pref : {prefs::kPartitionDefaultZoomLevel,
++                           prefs::kPartitionPerHostZoomLevels}) {
++    pref_change_registrar_.Add(pref, base::BindRepeating(
++        &ChromeZoomLevelPrefs::ReconcileZoomConfiguration, weak_factory_.GetWeakPtr()));
++  }
+ 
+ // On Android, the default zoom level is controlled by the Java-side UI and not
+ // the settings flow as it is with other platforms. For Android, we will pass an
+@@ -250,6 +282,6 @@
+ // depend on this file, which will save the Pref to the storage partition.
+ #if BUILDFLAG(IS_ANDROID)
+   host_zoom_map_->SetDefaultZoomLevelPrefCallback(base::BindRepeating(
+-      &ChromeZoomLevelPrefs::SetDefaultZoomLevelPref, base::Unretained(this)));
++      &ChromeZoomLevelPrefs::SetDefaultZoomLevelPref, weak_factory_.GetWeakPtr()));
+ #endif
+ }

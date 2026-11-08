@@ -12,6 +12,7 @@ import time
 
 from smoke import session_processes, terminate_session, wait_for_session_exit
 from workspace import temp_path, validate_output, workspace_path
+import profile_system_cache as system_cache
 
 REPO = Path(__file__).resolve().parents[1]
 W = workspace_path(REPO)
@@ -55,7 +56,8 @@ def main():
         owned = {n: root/n for n in ('home', 'cache', 'config', 'data', 'runtime')}
         for path in owned.values():
             path.mkdir(mode=0o700)
-        env = dict(os.environ, HOME=str(owned['home']), XDG_CACHE_HOME=str(owned['cache']),
+        xdg_cache = system_cache.create(root)
+        env = dict(os.environ, HOME=str(owned['home']), XDG_CACHE_HOME=str(xdg_cache),
             XDG_CONFIG_HOME=str(owned['config']), XDG_DATA_HOME=str(owned['data']),
             XDG_RUNTIME_DIR=str(owned['runtime']), ALLOY_BROWSER_CREATION_MODE=mode,
             ALLOY_BROWSER_CREATION_ROOT=str(root/'browser-root'))
@@ -70,6 +72,7 @@ def main():
                     stderr=subprocess.STDOUT, start_new_session=True)
                 code = process.wait(timeout=90)
             remaining = wait_for_session_exit(process.pid, 10)
+            system_cache.check(xdg_cache)
             text = (root/'stdio.log').read_text(errors='replace')
             events = [line.removeprefix('BROWSER_CREATION_EVENT ')
                 for line in text.splitlines() if line.startswith('BROWSER_CREATION_EVENT ')]

@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2026 Alex Indigo
+// SPDX-License-Identifier: LGPL-3.0-or-later
+#ifndef CEF_LIBCEF_BROWSER_ALLOY_PROFILE_SETTINGS_H_
+#define CEF_LIBCEF_BROWSER_ALLOY_PROFILE_SETTINGS_H_
+
+#include "brave/alloy/site_records/site_pref_store.h"
+#include "cef/libcef/browser/alloy/profile_configuration.h"
+
+class Profile;
+namespace alloy {
+// Native composition uses the exact projection used by the public API. UI-only;
+// explicit profile required; the caller initializes via ReadPrefsAsync and joins
+// its native service teardown to the profile/record lifecycle. No global fallback.
+scoped_refptr<site_records::SitePrefStore> GetProfilePrefStore(CefRefPtr<AlloyProfile> profile);
+// Bind the native embedded-state consumer before its first document. The
+// callback reads the original context's existing settings, never a copied list.
+void BindNativeEmbedListSettings(Profile& profile);
+}  // namespace alloy
+#endif

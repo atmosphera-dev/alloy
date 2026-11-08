@@ -131,7 +131,7 @@ for name, value in json.loads(os.environ['ALLOY_PROFILE_BROWSER_ENV']).items():
     gdb.execute('set environment '+name+' = '+value)
 for symbol, name in (
     ("'(anonymous namespace)::SetBrowserStartupIsComplete(StartupIsCompleteReason)'", 'startup'),
-    ('apps::PreferredAppsImpl::WriteCompleted()', 'preferred-apps-write'),
+    ('apps::PreferredAppsImpl::WriteCompleted', 'preferred-apps-write'),
     ('storage::BlobMemoryController::OnStorageLimitsCalculated(storage::BlobStorageLimits)',
      'blob-limit-setup')):
     entries.append(Observe(symbol, name))

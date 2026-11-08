@@ -1,0 +1,91 @@
+--- a/chrome/browser/apps/app_service/app_service_proxy_base.cc
++++ b/chrome/browser/apps/app_service/app_service_proxy_base.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/apps/app_service/app_service_proxy_base.h"
++#include "chrome/browser/apps/app_service/alloy_preferred_app_storage.h"
+ 
+ #include <stddef.h>
+ 
+@@ -124,8 +125,7 @@
+       app_outer_icon_loader_(&app_icon_coalescer_,
+                              IconCache::GarbageCollectionPolicy::kEager),
+       profile_(profile) {
+-  preferred_apps_impl_ = std::make_unique<apps::PreferredAppsImpl>(
+-      this, profile ? profile->GetPath() : base::FilePath());
++  preferred_apps_impl_ = apps::CreatePreferredAppsForProfile(this, profile);
+   preferred_apps_impl_->SetLongestPrefixMatchEnabled(
+       apps::features::IsNavigationCapturingOnByDefault());
+ }
+@@ -144,10 +144,8 @@
+   skip_pause_dialog_for_testing_ = true;
+   app_registry_cache_.ReinitializeForTesting();  // IN-TEST
+ 
+-  preferred_apps_impl_ = std::make_unique<apps::PreferredAppsImpl>(
+-      this, profile ? profile->GetPath() : base::FilePath(),
+-      std::move(read_completed_for_testing),
+-      std::move(write_completed_for_testing));
++  preferred_apps_impl_ = apps::CreatePreferredAppsForProfile(
++      this, profile, std::move(read_completed_for_testing), std::move(write_completed_for_testing));
+   preferred_apps_impl_->SetLongestPrefixMatchEnabled(
+       apps::features::IsNavigationCapturingOnByDefault());
+ 
+--- a/chrome/browser/apps/app_service/BUILD.gn
++++ b/chrome/browser/apps/app_service/BUILD.gn
+@@ -13,6 +13,8 @@
+     "app_service_proxy.h",
+     "app_service_proxy_base.cc",
+     "app_service_proxy_base.h",
++    "alloy_preferred_app_storage.h",
++    "alloy_preferred_app_storage.cc",
+     "app_service_proxy_factory.cc",
+     "app_service_proxy_factory.h",
+     "app_service_proxy_forward.h",
+@@ -43,6 +45,7 @@
+ 
+   deps = [
+     "//base",
++    "//brave/alloy/site_records:site_profile_configuration",
+     "//chrome/browser/apps/app_service/app_icon:util",
+     "//chrome/browser/component_updater",
+     "//chrome/browser/metrics",
+--- a/chrome/browser/device_api/managed_configuration_api_factory.cc
++++ b/chrome/browser/device_api/managed_configuration_api_factory.cc
+@@ -17,8 +17,12 @@
+ // Profile/network composition stays at the native factory boundary. The core
+ // origin cache/API receives child factories and never reaches into a parent.
+ ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile)
+-    : ManagedConfigurationAPI(profile->GetPrefs(),
+-        base::BindRepeating([](base::FilePath root, const url::Origin& origin)
++    : ManagedConfigurationAPI(profile, base::BindRepeating([]() -> network::mojom::URLLoaderFactory* {
++        return g_browser_process->system_network_context_manager()->GetURLLoaderFactory();
++      })) {}
++
++ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile, LoaderGetter loaders)
++    : ManagedConfigurationAPI(profile->GetPrefs(), base::BindRepeating([](base::FilePath root, const url::Origin& origin)
+             -> std::optional<ManagedConfigurationStore::Options> {
+           ManagedConfigurationStore::Options options;
+           const auto path = root.AppendASCII("Managed Configuration")
+@@ -31,10 +35,7 @@
+           options.admitted = base::BindRepeating([] { return true; });
+           options.error = base::BindRepeating([](const value_store::ValueStore::Status&) {});
+           return options;
+-        }, profile->GetPath()),
+-        base::BindRepeating([]() -> network::mojom::URLLoaderFactory* {
+-          return g_browser_process->system_network_context_manager()->GetURLLoaderFactory();
+-        })) {}
++        }, profile->GetPath()), std::move(loaders)) {}
+ 
+ // static
+ ManagedConfigurationAPIFactory* ManagedConfigurationAPIFactory::GetInstance() {
+--- a/chrome/browser/device_api/BUILD.gn
++++ b/chrome/browser/device_api/BUILD.gn
+@@ -41,6 +41,7 @@
+ 
+   deps = [
+     ":device_api",
++    "//brave/alloy/site_records:site_profile_configuration",
+     "//chrome/browser:browser_process",
+     "//chrome/browser:browser_process_platform_part",
+     "//chrome/browser/app_mode",

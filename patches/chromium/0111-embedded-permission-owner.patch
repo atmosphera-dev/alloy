@@ -1,6 +1,6 @@
 --- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
 +++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
-@@ -62,60 +62,95 @@
+@@ -62,62 +62,95 @@
  using content_settings::ProviderType;
  
  namespace {
@@ -116,6 +116,8 @@
 +  if (!content::AlloyDocumentStateAdmitted(frame))
      return nullptr;
 -  }
+-  if (alloy::site_records::RequestContextPolicy::Get(*frame->GetBrowserContext()) &&
+-      !content::AlloyDocumentStateAdmitted(frame)) return nullptr;
 -  if (!alloy::site_records::RequestContextPolicy::IsStateless(
 -          *frame->GetBrowserContext())) {
 +  if (!UsesScopedSettings(frame))
@@ -207,14 +209,15 @@
    static const int type_key = 0;
 --- a/chrome/browser/permissions/chrome_permissions_client.cc
 +++ b/chrome/browser/permissions/chrome_permissions_client.cc
-@@ -294,16 +294,15 @@
+@@ -294,17 +294,15 @@
  }
  
  HostContentSettingsMap* ChromePermissionsClient::GetSettingsMapForDocument(
 -    content::BrowserContext* browser_context,
 +    content::BrowserContext* context,
      content::RenderFrameHost* frame) {
--  if (RequiresDocumentPermissionContext(browser_context)) {
+-  if (RequiresDocumentPermissionContext(browser_context) ||
+-      (frame && RequiresOriginalPermissionDocument(browser_context))) {
 -    if (!frame || frame->GetBrowserContext() != browser_context ||
 -        browser_context->ShutdownStarted()) {
 -      return nullptr;
@@ -316,7 +319,7 @@
  content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
      content::BrowserContext* context,
      const PermissionRequestData& request) {
--  if (RequiresDocumentPermissionContext(context)) {
+-  if (RequiresOriginalPermissionDocument(context)) {
 -    auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
 -    return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
 -  }
@@ -329,7 +332,7 @@
  content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
      content::BrowserContext* context,
      const PermissionRequest& request) {
--  if (RequiresDocumentPermissionContext(context)) {
+-  if (RequiresOriginalPermissionDocument(context)) {
 -    auto* frame = request.alloy_document().AsRenderFrameHostIfValid();
 -    return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
 -  }
@@ -379,7 +382,7 @@
      const PermissionRequestData& request_data,
      content::RenderFrameHost* render_frame_host) const {
    auto* client = PermissionsClient::Get();
--  if (client->RequiresDocumentPermissionContext(browser_context_)) {
+-  if (client->RequiresOriginalPermissionDocument(browser_context_)) {
 -    render_frame_host =
 -        client->GetPermissionRequestDocument(browser_context_, request_data);
 -    if (!render_frame_host) {
@@ -461,7 +464,7 @@
    auto* client = PermissionsClient::Get();
    auto* rfh =
        client->GetPermissionRequestDocument(browser_context_, *request_data);
--  if (client->RequiresDocumentPermissionContext(browser_context_) && !rfh) {
+-  if (client->RequiresOriginalPermissionDocument(browser_context_) && !rfh) {
 +  if (!rfh) {
      std::move(callback).Run(
          content::PermissionResult(PermissionStatus::DENIED));
@@ -482,11 +485,12 @@
    PermissionRequestID permission_request_id = request_data->id;
  
    std::unique_ptr<PermissionRequest> request =
-@@ -698,10 +705,8 @@
+@@ -698,11 +705,9 @@
      const permissions::PermissionPromptDecision& decision,
      const PermissionRequestData& request_data) {
+   if (retired_requests_.contains(request_data.id.ToString())) return;
    const bool has_authority =
--      !PermissionsClient::Get()->RequiresDocumentPermissionContext(
+-      !PermissionsClient::Get()->RequiresOriginalPermissionDocument(
 -          browser_context_) ||
 -      PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
 -                                                             request_data);
@@ -519,7 +523,7 @@
      bool persist,
      const content::PermissionResult* permission_result,
      const permissions::PermissionPromptDecision& decision) {
--  if (PermissionsClient::Get()->RequiresDocumentPermissionContext(
+-  if (PermissionsClient::Get()->RequiresOriginalPermissionDocument(
 -          browser_context_) &&
 -      !PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
 +  if (!PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
@@ -536,7 +540,7 @@
          weak_factory_.GetWeakPtr(), web_contents, request_data.id,
          std::move(callback), decision.overall_decision, new_permission_result));
    } else {
-@@ -879,18 +885,20 @@
+@@ -879,19 +885,21 @@
    }
  }
  
@@ -545,6 +549,7 @@
 +void PermissionContextBase_ChromiumImpl::CleanUpRequest(
 +    content::WebContents* web_contents,
 +    const PermissionRequestID& id) {
+   retired_requests_.erase(id.ToString());
    size_t success = pending_requests_.erase(id.ToString());
    DCHECK(success == 1) << "Missing request " << id.ToString();
  }
@@ -808,7 +813,7 @@
        store_last_modified_(store_last_modified),
        clock_(base::DefaultClock::GetInstance()) {
    TRACE_EVENT_BEGIN("startup", "PrefProvider::PrefProvider");
-@@ -179,11 +181,12 @@
+@@ -179,13 +181,14 @@
        continue;
      }
      content_settings_prefs_.insert(std::make_pair(
@@ -816,17 +821,21 @@
 -                          info->type(), prefs_, &pref_change_registrar_,
 -                          info->pref_name(), off_the_record_, restore_session,
 -                          base::BindRepeating(&PrefProvider::Notify,
--                                              base::Unretained(this)))));
+-                                              base::Unretained(this)),
+-                          base::BindRepeating(&PrefProvider::PrepareDependentSettings,
+-                                              base::Unretained(this), info->type()))));
 +        info->type(),
 +        std::make_unique<ContentSettingsPref>(
 +            info->type(), prefs_, &pref_change_registrar_, info->pref_name(),
 +            off_the_record_, restore_session,
 +            base::BindRepeating(&PrefProvider::Notify, base::Unretained(this)),
++            base::BindRepeating(&PrefProvider::PrepareDependentSettings,
++                                base::Unretained(this), info->type()),
 +            !isolated_)));
    }
  
  #if !BUILDFLAG(IS_IOS)
-@@ -219,11 +222,12 @@
+@@ -219,13 +222,14 @@
                      ContentSettingsType::PERMISSION_ACTIONS_HISTORY}) {
      const auto* info = WebsiteSettingsRegistry::GetInstance()->Get(type);
      content_settings_prefs_.emplace(
@@ -834,24 +843,30 @@
 -                  type, prefs_, &pref_change_registrar_, info->pref_name(),
 -                  true, false,
 -                  base::BindRepeating(&PrefProvider::Notify,
--                                      base::Unretained(this))));
+-                                      base::Unretained(this)),
+-                  base::BindRepeating(&PrefProvider::PrepareDependentSettings,
+-                                      base::Unretained(this), type)));
 +        type,
 +        std::make_unique<ContentSettingsPref>(
 +            type, prefs_, &pref_change_registrar_, info->pref_name(), true,
 +            false,
 +            base::BindRepeating(&PrefProvider::Notify, base::Unretained(this)),
++            base::BindRepeating(&PrefProvider::PrepareDependentSettings,
++                                base::Unretained(this), type),
 +            !isolated_));
    }
  }
  
 --- a/components/content_settings/core/browser/content_settings_pref.h
 +++ b/components/content_settings/core/browser/content_settings_pref.h
-@@ -50,7 +50,8 @@
+@@ -50,8 +50,9 @@
                        const std::string& pref_name,
                        bool off_the_record,
                        bool restore_session,
--                      NotifyObserversCallback notify_callback);
+-                      NotifyObserversCallback notify_callback,
+-                      PrepareProjectionCallback prepare_callback = {});
 +                      NotifyObserversCallback notify_callback,
++                      PrepareProjectionCallback prepare_callback = {},
 +                      bool inherit_user_settings = true);
  
    ContentSettingsPref(const ContentSettingsPref&) = delete;
@@ -866,12 +881,14 @@
  
 --- a/components/content_settings/core/browser/content_settings_pref.cc
 +++ b/components/content_settings/core/browser/content_settings_pref.cc
-@@ -150,19 +150,22 @@
+@@ -150,21 +150,24 @@
      const std::string& pref_name,
      bool off_the_record,
      bool restore_session,
--    NotifyObserversCallback notify_callback)
+-    NotifyObserversCallback notify_callback,
+-    PrepareProjectionCallback prepare_callback)
 +    NotifyObserversCallback notify_callback,
++    PrepareProjectionCallback prepare_callback,
 +    bool inherit_user_settings)
      : content_type_(content_type),
        prefs_(prefs),
@@ -882,6 +899,7 @@
        restore_session_(restore_session),
        updating_preferences_(false),
        notify_callback_(notify_callback),
+       prepare_callback_(std::move(prepare_callback)),
        clock_(base::DefaultClock::GetInstance()) {
    DCHECK(prefs_);
    content_settings::ContentSettingsRegistry::GetInstance();
@@ -889,8 +907,8 @@
 +  if (inherit_user_settings_)
 +    ReadContentSettingsFromPref();
  
-   registrar_->Add(pref_name_,
-                   base::BindRepeating(&ContentSettingsPref::OnPrefChanged,
+   registrar_->AddProjection(pref_name_,
+                   base::BindRepeating(&ContentSettingsPref::PreparePrefChange,
 @@ -200,8 +203,8 @@
    DCHECK(thread_checker_.CalledOnValidThread());
    DCHECK(prefs_);
@@ -911,12 +929,12 @@
        LOG(ERROR) << "Invalid settings dictionary for pattern string: "
                   << pattern_str << " with value: " << i.second.DebugString();
        continue;
-@@ -472,6 +475,8 @@
+@@ -480,6 +480,8 @@
  }
  
- void ContentSettingsPref::OnPrefChanged() {
+ base::OnceClosure ContentSettingsPref::PreparePrefChange() {
 +  if (!inherit_user_settings_)
-+    return;
++    return {};
    DCHECK(thread_checker_.CalledOnValidThread());
  
    if (updating_preferences_)

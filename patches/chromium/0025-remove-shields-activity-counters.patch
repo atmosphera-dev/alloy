@@ -1,0 +1,177 @@
+--- a/brave/browser/brave_shields/brave_shields_web_contents_observer.cc
++++ b/brave/browser/brave_shields/brave_shields_web_contents_observer.cc
+@@ -14,8 +14,7 @@
+ #include "base/feature_list.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+ #include "brave/browser/brave_shields/brave_shields_settings_service_factory.h"
+-#include "brave/components/brave_perf_predictor/browser/perf_predictor_tab_helper.h"
+ #include "brave/components/brave_shields/core/browser/brave_shields_settings_service.h"
+ #include "brave/components/brave_shields/core/browser/brave_shields_utils.h"
+ #include "brave/components/brave_shields/core/common/brave_shield_constants.h"
+@@ -83,16 +82,6 @@
+           *web_contents),
+       receivers_(web_contents, this) {}
+ 
+-bool BraveShieldsWebContentsObserver::IsBlockedSubresource(
+-    const std::string& subresource) {
+-  return blocked_url_paths_.find(subresource) != blocked_url_paths_.end();
+-}
+-
+-void BraveShieldsWebContentsObserver::AddBlockedSubresource(
+-    const std::string& subresource) {
+-  blocked_url_paths_.insert(subresource);
+-}
+-
+ // static
+ void BraveShieldsWebContentsObserver::BindBraveShieldsHost(
+     mojo::PendingAssociatedReceiver<brave_shields::mojom::BraveShieldsHost>
+@@ -134,34 +123,6 @@
+     DispatchBlockedEventForWebContents(block_type, subresource, web_contents);
+   }
+ 
+-  if (web_contents) {
+-    BraveShieldsWebContentsObserver* observer =
+-        BraveShieldsWebContentsObserver::FromWebContents(web_contents);
+-    if (observer && !observer->IsBlockedSubresource(subresource)) {
+-      observer->AddBlockedSubresource(subresource);
+-      PrefService* prefs =
+-          Profile::FromBrowserContext(web_contents->GetBrowserContext())
+-              ->GetOriginalProfile()
+-              ->GetPrefs();
+-
+-      if (block_type == kAds) {
+-        prefs->SetUint64(kAdsBlocked, prefs->GetUint64(kAdsBlocked) + 1);
+-      } else if (block_type == kHTTPUpgradableResources) {
+-        prefs->SetUint64(kHttpsUpgradesStat,
+-                         prefs->GetUint64(kHttpsUpgradesStat) + 1);
+-      } else if (block_type == kJavaScript) {
+-        prefs->SetUint64(kJavascriptBlocked,
+-                         prefs->GetUint64(kJavascriptBlocked) + 1);
+-      } else if (block_type == kFingerprintingV2) {
+-        prefs->SetUint64(kFingerprintingBlocked,
+-                         prefs->GetUint64(kFingerprintingBlocked) + 1);
+-      }
+-    }
+-  }
+-  if (rfh->IsActive()) {
+-    brave_perf_predictor::PerfPredictorTabHelper::DispatchBlockedEvent(
+-        request_url.spec(), render_frame_token);
+-  }
+ }
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -274,17 +235,9 @@
+ 
+   // When the main frame navigates away.
+   content::ReloadType reload_type = navigation_handle->GetReloadType();
+-  if (navigation_handle->IsInMainFrame()) {
+-    if (reload_type == content::ReloadType::NONE) {
+-      // For new loads, we reset the counters for both blocked scripts and URLs.
+-      allowed_scripts_.clear();
+-      blocked_url_paths_.clear();
+-    } else if (reload_type == content::ReloadType::NORMAL) {
+-      // For normal reloads (or loads to the current URL, internally converted
+-      // into reloads i.e see NavigationControllerImpl::NavigateWithoutEntry),
+-      // we only reset the counter for blocked URLs, not the one for scripts.
+-      blocked_url_paths_.clear();
+-    }
++  if (navigation_handle->IsInMainFrame() &&
++      reload_type == content::ReloadType::NONE) {
++    allowed_scripts_.clear();
+   }
+ 
+   SendShieldsSettings(navigation_handle);
+--- a/brave/browser/brave_shields/brave_shields_web_contents_observer.h
++++ b/brave/browser/brave_shields/brave_shields_web_contents_observer.h
+@@ -7,7 +7,6 @@
+ #define BRAVE_BROWSER_BRAVE_SHIELDS_BRAVE_SHIELDS_WEB_CONTENTS_OBSERVER_H_
+ 
+ #include <map>
+-#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -62,8 +61,6 @@
+       const std::string& block_type);
+   void AllowScriptsOnce(const std::vector<std::string>& origins);
+   void BlockAllowedScripts(const std::vector<std::string>& origins);
+-  bool IsBlockedSubresource(const std::string& subresource);
+-  void AddBlockedSubresource(const std::string& subresource);
+ 
+  protected:
+   // content::WebContentsObserver overrides.
+@@ -96,9 +93,6 @@
+   void SendShieldsSettings(content::NavigationHandle* navigation_handle);
+ 
+   std::vector<std::string> allowed_scripts_;
+-  // We keep a set of the current page's blocked URLs in case the page
+-  // continually tries to load the same blocked URLs.
+-  std::set<std::string> blocked_url_paths_;
+ 
+   content::RenderFrameHostReceiverSet<brave_shields::mojom::BraveShieldsHost>
+       receivers_;
+--- a/brave/browser/android/preferences/brave_pref_service_bridge.cc
++++ b/brave/browser/android/preferences/brave_pref_service_bridge.cc
+@@ -142,38 +142,21 @@
+     JNIEnv* env,
+     const base::android::JavaRef<jobject>& j_profile,
+     jlong count) {
+-  if (count <= 0) {
+-    return;
+-  }
+-  Profile* profile = Profile::FromJavaObject(j_profile);
+-  profile->GetPrefs()->SetUint64(
+-      kTrackersBlocked,
+-      count + profile->GetPrefs()->GetUint64(kTrackersBlocked));
++  // Alloy does not import browsing activity counters.
+ }
+ 
+ void JNI_BravePrefServiceBridge_SetOldAdsBlockedCount(
+     JNIEnv* env,
+     const base::android::JavaRef<jobject>& j_profile,
+     jlong count) {
+-  if (count <= 0) {
+-    return;
+-  }
+-  Profile* profile = Profile::FromJavaObject(j_profile);
+-  profile->GetPrefs()->SetUint64(
+-      kAdsBlocked, count + profile->GetPrefs()->GetUint64(kAdsBlocked));
++  // Alloy does not import browsing activity counters.
+ }
+ 
+ void JNI_BravePrefServiceBridge_SetOldHttpsUpgradesCount(
+     JNIEnv* env,
+     const base::android::JavaRef<jobject>& j_profile,
+     jlong count) {
+-  if (count <= 0) {
+-    return;
+-  }
+-  Profile* profile = Profile::FromJavaObject(j_profile);
+-  profile->GetPrefs()->SetUint64(
+-      kHttpsUpgradesStat,
+-      count + profile->GetPrefs()->GetUint64(kHttpsUpgradesStat));
++  // Alloy does not import browsing activity counters.
+ }
+ 
+ void JNI_BravePrefServiceBridge_ResetPromotionLastFetchStamp(JNIEnv* env) {
+--- a/brave/browser/brave_tab_helpers.cc
++++ b/brave/browser/brave_tab_helpers.cc
+@@ -22,7 +22,6 @@
+ #include "brave/components/ai_chat/core/common/buildflags/buildflags.h"
+ #include "brave/components/brave_ads/buildflags/buildflags.h"
+ #include "brave/components/brave_news/common/buildflags/buildflags.h"
+-#include "brave/components/brave_perf_predictor/browser/perf_predictor_tab_helper.h"
+ #include "brave/components/brave_rewards/core/buildflags/buildflags.h"
+ #include "brave/components/brave_wallet/common/buildflags/buildflags.h"
+ #include "brave/components/brave_wayback_machine/buildflags/buildflags.h"
+@@ -163,9 +162,6 @@
+   BraveWaybackMachineTabHelper::CreateIfNeeded(web_contents);
+ #endif
+ 
+-  brave_perf_predictor::PerfPredictorTabHelper::CreateForWebContents(
+-      web_contents);
+-
+   if (base::FeatureList::IsEnabled(serp_metrics::kSerpMetricsFeature)) {
+     serp_metrics::SerpMetricsTabHelper::MaybeCreateForWebContents(web_contents);
+   }

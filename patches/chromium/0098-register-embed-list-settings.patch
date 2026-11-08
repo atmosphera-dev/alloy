@@ -1,0 +1,26 @@
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -4,5 +4,6 @@
+ 
++#include "brave/alloy/site_records/embed_list_settings.h"
+ #include "chrome/browser/prefs/browser_prefs.h"
+ #include "base/alloy/storage_policy.h"
+ 
+ #include <array>
+@@ -1866,5 +1867,6 @@
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry,
+                           const std::string& locale) {
++  registry->RegisterDictionaryPref(alloy::site_records::embed_list::kPreference);
+   [&]() -> void {
+   TRACE_EVENT0("browser", "chrome::RegisterProfilePrefs");
+   // User prefs. Please keep this list alphabetized.
+--- a/chrome/browser/prefs/BUILD.gn
++++ b/chrome/browser/prefs/BUILD.gn
+@@ -60,6 +60,7 @@
+   deps = [
+     ":prefs",
+     ":util",
++    "//brave/alloy/site_records:pref_files",
+     "//chrome/browser:browser_process",
+     "//chrome/browser:browser_process_impl",
+     "//chrome/browser:chrome_content_browser_client",

@@ -16,6 +16,7 @@ import traceback
 
 from profile_inventory import observe_tree
 from workspace import temp_path, validate_output, workspace_path
+import profile_system_cache as system_cache
 
 REPO = Path(__file__).resolve().parents[1]
 W = workspace_path(REPO)
@@ -51,13 +52,14 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
                                inode=(backing/name).stat().st_ino) for name in ROOTS}
     before = snapshot(backing, root/'before-observation.json')
     save(root/'before.json', before)
+    xdg_cache = system_cache.create(root)
     env = dict(os.environ, TMPDIR=str(temp_path(W)), ALLOY_PROFILE_NO_DISK='1',
         ALLOY_PROFILE_URL='about:blank', ALLOY_PROFILE_ROOT=str(backing/'profile'),
         ALLOY_PROFILE_NETWORK='cut' if mode == 'stateless-cut' else 'keep',
         ALLOY_PROFILE_EMBEDDED_SCOPE=scope,
         ALLOY_PROFILE_SELECTED_FILE=str(root/'unused-input'),
         ALLOY_PROFILE_OUTPUT_FILE=str(root/'unused-output'), HOME=str(backing/'home'),
-        XDG_CACHE_HOME=str(backing/'cache'), XDG_CONFIG_HOME=str(backing/'config'),
+        XDG_CACHE_HOME=str(xdg_cache), XDG_CONFIG_HOME=str(backing/'config'),
         XDG_DATA_HOME=str(backing/'data'), XDG_RUNTIME_DIR=str(root/'runtime'))
     for name in ('ALLOY_PROFILE_MEMORY', 'ALLOY_PROFILE_PERSISTENT'):
         env.pop(name, None)
@@ -116,6 +118,7 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
         assert len([v for v in events if v['event'] == 'created']) == len([
             v for v in events if v['event'] == 'closed']) == 2
         after = snapshot(backing, root/'after-observation.json')
+        system_cache.check(xdg_cache)
         save(root/'after.json', after)
         save(root/'final-marker-scan.json', scan_markers(backing, marker))
         if mode != 'persistent':

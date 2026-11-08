@@ -1,0 +1,159 @@
+--- a/content/public/browser/weak_document_ptr.h
++++ b/content/public/browser/weak_document_ptr.h
+@@ -43,6 +43,9 @@
+     return weak_document_.get();
+   }
+ 
++  // Distinguish a browser action with no document from a retired original.
++  bool WasInvalidated() const { return weak_document_.WasInvalidated(); }
++
+  private:
+   explicit WeakDocumentPtr(base::WeakPtr<RenderFrameHost> weak_rfh);
+ 
+--- a/chrome/browser/external_protocol/external_protocol_handler.h
++++ b/chrome/browser/external_protocol/external_protocol_handler.h
+@@ -103,7 +103,12 @@
+   // True if |initiating_origin| is not nullptr and is considered
+   // potentially trustworthy.
+   static bool MayRememberAllowDecisionsForThisOrigin(
+-      const url::Origin* initiating_origin);
++      const url::Origin* initiating_origin, Profile* profile = nullptr);
++
++  // Shared action boundary for asynchronous replies, UI acceptance and launch.
++  static bool IsLaunchContextAdmitted(content::WebContents* web_contents,
++      const content::WeakDocumentPtr& initiator_document,
++      const url::Origin* initiating_origin = nullptr);
+ 
+   // Returns whether we should block a given scheme.
+   // |initiating_origin| can be nullptr if the user is performing a
+--- a/chrome/browser/external_protocol/external_protocol_handler.cc
++++ b/chrome/browser/external_protocol/external_protocol_handler.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/external_protocol/external_protocol_handler.h"
++#include "brave/alloy/site_records/request_context_policy.h"
++#include "components/keyed_service/core/service_creation_gate.h"
++#include "content/public/browser/alloy_document_state.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/render_frame_host.h"
+ 
+ #include <stddef.h>
+ 
+@@ -173,6 +178,9 @@
+     content::WebContents* web_contents,
+     content::WeakDocumentPtr initiator_document,
+     ExternalProtocolHandler::Delegate* delegate) {
++  if (!ExternalProtocolHandler::IsLaunchContextAdmitted(web_contents, initiator_document))
++    return;
++  auto surviving_contents = web_contents->GetWeakPtr();
+   if (delegate) {
+     delegate->LaunchUrlWithoutSecurityCheck(url, web_contents);
+     return;
+@@ -186,6 +194,11 @@
+   AddMessageToConsole(
+       initiator_document, blink::mojom::ConsoleMessageLevel::kInfo,
+       "Launched external handler for '" + url.possibly_invalid_spec() + "'.");
++
++  // Console callbacks may synchronously navigate, retire or destroy the caller.
++  if (!surviving_contents || !ExternalProtocolHandler::IsLaunchContextAdmitted(
++          surviving_contents.get(), initiator_document)) return;
++  web_contents = surviving_contents.get();
+ 
+   platform_util::OpenExternal(
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -231,10 +244,18 @@
+     const std::u16string& program_name) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+ 
+-  if (delegate)
+-    delegate->FinishedProcessingCheck();
+-
+   content::WebContents* web_contents = web_contents_getter.Run();
++  if (!ExternalProtocolHandler::IsLaunchContextAdmitted(
++          web_contents, initiator_document, base::OptionalToPtr(initiating_origin))) {
++    if (delegate) delegate->BlockRequest();
++    return;
++  }
++  auto surviving_contents = web_contents->GetWeakPtr();
++  if (delegate) delegate->FinishedProcessingCheck();
++  if (!surviving_contents || !ExternalProtocolHandler::IsLaunchContextAdmitted(
++          surviving_contents.get(), initiator_document,
++          base::OptionalToPtr(initiating_origin))) return;
++  web_contents = surviving_contents.get();
+ 
+   // The default handler is hidden if it is Chrome itself, as nothing will
+   // happen if it is selected (since this is invoked by the external protocol
+@@ -381,9 +402,31 @@
+ }
+ 
+ bool ExternalProtocolHandler::MayRememberAllowDecisionsForThisOrigin(
++    const url::Origin* initiating_origin, Profile* profile) {
++  if (!initiating_origin || !network::IsOriginPotentiallyTrustworthy(*initiating_origin))
++    return false;
++  if (profile && (!ServiceCreationGate::Allows(*profile) || profile->ShutdownStarted()))
++    return false;
++  if (profile && alloy::site_records::RequestContextPolicy::Get(*profile)) {
++    if (alloy::site_records::RequestContextPolicy::IsStateless(*profile) ||
++        alloy::site_records::RecordDomainForPrincipal(
++            initiating_origin->GetURL(), *initiating_origin).empty()) return false;
++  }
++  return true;
++}
++
++bool ExternalProtocolHandler::IsLaunchContextAdmitted(
++    content::WebContents* web_contents,
++    const content::WeakDocumentPtr& initiator_document,
+     const url::Origin* initiating_origin) {
+-  return initiating_origin &&
+-         network::IsOriginPotentiallyTrustworthy(*initiating_origin);
++  if (!web_contents || web_contents->GetBrowserContext()->ShutdownStarted() ||
++      !ServiceCreationGate::Allows(*web_contents->GetBrowserContext()) ||
++      initiator_document.WasInvalidated()) return false;
++  auto* frame = initiator_document.AsRenderFrameHostIfValid();
++  if (!frame) return !initiating_origin;  // A genuine browser-initiated action.
++  return frame->GetBrowserContext() == web_contents->GetBrowserContext() &&
++      content::AlloyDocumentStateAdmitted(frame) &&
++      (!initiating_origin || frame->GetLastCommittedOrigin() == *initiating_origin);
+ }
+ 
+ // static.
+@@ -439,7 +482,7 @@
+   }
+ 
+   if (profile_prefs) {
+-    if (MayRememberAllowDecisionsForThisOrigin(initiating_origin)) {
++    if (MayRememberAllowDecisionsForThisOrigin(initiating_origin, profile)) {
+       // Check if there is a matching {Origin+Protocol} pair exemption:
+       const base::DictValue& allowed_origin_protocol_pairs =
+           profile_prefs->GetDict(
+@@ -476,7 +519,7 @@
+   DCHECK_NE(state, BLOCK);
+ 
+   // Set in the stored prefs.
+-  if (MayRememberAllowDecisionsForThisOrigin(&initiating_origin)) {
++  if (MayRememberAllowDecisionsForThisOrigin(&initiating_origin, profile)) {
+     PrefService* profile_prefs = profile->GetPrefs();
+     if (profile_prefs) {  // May be NULL during testing.
+       ScopedDictPrefUpdate update_allowed_origin_protocol_pairs(
+--- a/chrome/browser/ui/views/external_protocol_dialog.cc
++++ b/chrome/browser/ui/views/external_protocol_dialog.cc
+@@ -166,7 +166,7 @@
+       profile->GetPrefs()->GetBoolean(
+           prefs::kExternalProtocolDialogShowAlwaysOpenCheckbox) &&
+       ExternalProtocolHandler::MayRememberAllowDecisionsForThisOrigin(
+-          base::OptionalToPtr(initiating_origin_));
++          base::OptionalToPtr(initiating_origin_), profile);
+ 
+   if (show_remember_selection_checkbox) {
+     message_box_view_->SetCheckBoxLabel(l10n_util::GetStringFUTF16(
+@@ -204,6 +204,9 @@
+ 
+ void ExternalProtocolDialog::OnDialogAccepted() {
+   const bool remember = message_box_view_->IsCheckBoxSelected();
++  if (!web_contents_ || !ExternalProtocolHandler::IsLaunchContextAdmitted(
++          web_contents_.get(), initiator_document_,
++          base::OptionalToPtr(initiating_origin_))) return;
+   ExternalProtocolHandler::RecordHandleStateMetrics(
+       remember, ExternalProtocolHandler::DONT_BLOCK);
+ 

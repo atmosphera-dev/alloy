@@ -15,6 +15,7 @@ import time
 import traceback
 from urllib.parse import parse_qs, urlsplit
 from workspace import temp_path, validate_output, workspace_path
+import profile_system_cache as system_cache
 
 REPO=Path(__file__).resolve().parents[1]
 W=workspace_path(REPO)
@@ -89,10 +90,11 @@ def main():
                 assert condition,row
             owned={n:root/n for n in ('home','cache','config','data','runtime')}
             for p in owned.values():p.mkdir(mode=0o700)
+            xdg_cache=system_cache.create(root)
             argv=['xvfb-run','-a','-s','-screen 0 1280x720x24',str(out/'alloy_encrypted_adblock_consumer'),
                   '--alloy-no-disk','--off-screen-rendering-enabled','--ozone-platform=x11','--disable-gpu',
                   '--no-proxy-server','--host-resolver-rules=MAP adblock-fixture.test 127.0.0.1']
-            env=dict(os.environ,HOME=str(owned['home']),XDG_CACHE_HOME=str(owned['cache']),XDG_CONFIG_HOME=str(owned['config']),
+            env=dict(os.environ,HOME=str(owned['home']),XDG_CACHE_HOME=str(xdg_cache),XDG_CONFIG_HOME=str(owned['config']),
                      XDG_DATA_HOME=str(owned['data']),XDG_RUNTIME_DIR=str(owned['runtime']),
                      ALLOY_ADBLOCK_PHASE=phase,ALLOY_ADBLOCK_ALPHA=str(alpha),ALLOY_ADBLOCK_BETA=str(beta),ALLOY_ADBLOCK_FIXTURE=fixture)
             before=hashes(alpha) if phase in ('locked','wrong') else None
@@ -112,6 +114,7 @@ def main():
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
             code=process.returncode
+            system_cache.check(xdg_cache)
             (root/'exit.json').write_text(json.dumps(dict(exit=code,timed_out=timed_out,timeout_seconds=150),indent=2)+'\n')
             check('consumer-time-bound',not timed_out,exit=code,timed_out=timed_out,timeout_seconds=150)
             output=(root/'stdio.log').read_text()

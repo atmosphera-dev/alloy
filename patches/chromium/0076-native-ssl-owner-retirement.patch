@@ -1,0 +1,231 @@
+--- a/chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.cc
++++ b/chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.cc
+@@ -77,12 +77,15 @@
+ StatefulSSLHostStateDelegate* StatefulSSLHostStateDelegateFactory::GetForOwner(
+     Profile* profile,
+     const base::WeakPtr<base::SupportsUserData>& owner) {
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++  if (!alloy::site_records::RequestContextPolicy::Get(*profile)) {
+     return GetForProfile(profile);
+   }
+   auto* admitted = content::AlloyStateOwnerForContext(owner, profile);
+   if (!admitted) {
+     return nullptr;
++  }
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++    return GetForProfile(profile);
+   }
+   auto* data = static_cast<NativeSSLWorkingState*>(
+       admitted->GetUserData(&kAlloySSLStateKey));
+--- a/components/security_interstitials/content/stateful_ssl_host_state_delegate.cc
++++ b/components/security_interstitials/content/stateful_ssl_host_state_delegate.cc
+@@ -36,6 +36,7 @@
+ #include "net/cert/x509_certificate.h"
+ #include "services/network/public/mojom/network_context.mojom.h"
+ #include "url/gurl.h"
++#include "url/origin.h"
+ 
+ namespace {
+ 
+@@ -101,13 +102,18 @@
+       https_first_balanced_mode_suppressed_for_testing(false),
+       user_state_admitted_(user_state_admitted),
+       owner_resolver_(std::move(resolver)),
+-      network_context_(std::move(network_context)) {}
++      network_context_(std::move(network_context)) {
++  if (host_content_settings_map_) {
++    host_content_settings_map_->AddObserver(this);
++    observing_settings_ = true;
++  }
++}
+ 
+ content::SSLHostStateDelegate* StatefulSSLHostStateDelegate::ForAlloyStateOwner(
+     const base::WeakPtr<base::SupportsUserData>& owner) {
+-  return user_state_admitted_ ? this
+-         : owner_resolver_    ? owner_resolver_.Run(owner)
+-                              : nullptr;
++  // Shared persistence does not grant an old document fresh authority.
++  return owner_resolver_ ? owner_resolver_.Run(owner)
++                        : user_state_admitted_ ? this : nullptr;
+ }
+ 
+ void StatefulSSLHostStateDelegate::RegisterDocumentInstance(
+@@ -121,7 +127,32 @@
+   document_instances_.push_back(instance->weak_factory_.GetWeakPtr());
+ }
+ 
+-StatefulSSLHostStateDelegate::~StatefulSSLHostStateDelegate() = default;
++StatefulSSLHostStateDelegate::~StatefulSSLHostStateDelegate() { Shutdown(); }
++
++void StatefulSSLHostStateDelegate::Shutdown() {
++  if (observing_settings_) {
++    host_content_settings_map_->RemoveObserver(this);
++    observing_settings_ = false;
++  }
++  weak_factory_.InvalidateWeakPtrs();
++}
++
++base::OnceClosure StatefulSSLHostStateDelegate::PrepareSitePermissionRetirement(
++    const content_settings::SitePermissionMatcher& owns) {
++  auto selected = base::BindRepeating(
++      [](const content_settings::SitePermissionMatcher& owns, const std::string& host) {
++        return owns.Run(url::Origin::Create(GetSecureGURLForHost(host)));
++      }, owns);
++  std::erase_if(allowed_certs_for_non_default_storage_partitions_,
++      [&](const auto& entry) { return selected.Run(entry.first); });
++  std::erase_if(ran_mixed_content_hosts_, [&](const auto& host) { return selected.Run(host); });
++  std::erase_if(ran_content_with_cert_errors_hosts_, [&](const auto& host) { return selected.Run(host); });
++  https_only_mode_allowlist_.RetireNonDefaultHosts(selected);
++  https_only_mode_enforcelist_.RetireNonDefaultHosts(selected);
++  // Persistent rules are already prepared by their native pref owner. Never
++  // manufacture a new pref write or external event while retiring live copies.
++  return {};
++}
+ 
+ void StatefulSSLHostStateDelegate::AllowCert(
+     const std::string& host,
+--- a/components/security_interstitials/content/stateful_ssl_host_state_delegate.h
++++ b/components/security_interstitials/content/stateful_ssl_host_state_delegate.h
+@@ -14,6 +14,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/content_settings/core/browser/content_settings_observer.h"
+ #include "components/security_interstitials/core/https_only_mode_allowlist.h"
+ #include "components/security_interstitials/core/https_only_mode_enforcelist.h"
+ #include "content/public/browser/ssl_host_state_delegate.h"
+@@ -42,7 +43,8 @@
+ // - certificate error exceptions
+ // - mixed content exceptions
+ class StatefulSSLHostStateDelegate : public content::SSLHostStateDelegate,
+-                                     public KeyedService {
++                                     public KeyedService,
++                                     public content_settings::Observer {
+  public:
+   using OwnerResolver = base::RepeatingCallback<content::SSLHostStateDelegate*(
+       const base::WeakPtr<base::SupportsUserData>&)>;
+@@ -63,6 +65,9 @@
+       delete;
+ 
+   ~StatefulSSLHostStateDelegate() override;
++  void Shutdown() override;
++  base::OnceClosure PrepareSitePermissionRetirement(
++      const content_settings::SitePermissionMatcher& owns) override;
+ 
+   // content::SSLHostStateDelegate overrides:
+   void AllowCert(const std::string& host,
+@@ -196,6 +201,7 @@
+   // lists, it's allowed to load over HTTP.
+   security_interstitials::HttpsOnlyModeEnforcelist https_only_mode_enforcelist_;
+ 
++  bool observing_settings_ = false;
+   bool https_first_balanced_mode_suppressed_for_testing;
+   const bool user_state_admitted_;
+   const OwnerResolver owner_resolver_;
+--- a/components/security_interstitials/core/https_only_mode_allowlist.cc
++++ b/components/security_interstitials/core/https_only_mode_allowlist.cc
+@@ -126,6 +126,13 @@
+   allowed_http_hosts_for_non_default_storage_partitions_.clear();
+ }
+ 
++void HttpsOnlyModeAllowlist::RetireNonDefaultHosts(
++    const base::RepeatingCallback<bool(const std::string&)>& owns) {
++  std::erase_if(allowed_http_hosts_for_non_default_storage_partitions_, [&](const auto& host) {
++    return owns.Run(host);
++  });
++}
++
+ void HttpsOnlyModeAllowlist::SetClockForTesting(base::Clock* clock) {
+   clock_ = clock;
+ }
+--- a/components/security_interstitials/core/https_only_mode_allowlist.h
++++ b/components/security_interstitials/core/https_only_mode_allowlist.h
+@@ -7,6 +7,7 @@
+ 
+ #include <set>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
+ #include "base/values.h"
+@@ -44,6 +45,9 @@
+ 
+   // Revokes all HTTP exceptions made by the user for host.
+   void RevokeUserAllowExceptions(const std::string& host);
++  // Prepare removal of selected volatile native copies, without pref writes or
++  // consumer notifications. The owning delegate supplies trusted site identity.
++  void RetireNonDefaultHosts(const base::RepeatingCallback<bool(const std::string&)>& owns);
+ 
+   // Clears allowlist for the given pattern filter. If the pattern filter is
+   // empty, clears allowlist for all hosts.
+--- a/components/security_interstitials/core/https_only_mode_enforcelist.cc
++++ b/components/security_interstitials/core/https_only_mode_enforcelist.cc
+@@ -196,6 +196,13 @@
+       current_host_count, accumulated_host_count);
+ }
+ 
++void HttpsOnlyModeEnforcelist::RetireNonDefaultHosts(
++    const base::RepeatingCallback<bool(const std::string&)>& owns) {
++  std::erase_if(enforce_https_hosts_for_non_default_storage_partitions_, [&](const auto& host) {
++    return owns.Run(host);
++  });
++}
++
+ void HttpsOnlyModeEnforcelist::SetClockForTesting(base::Clock* clock) {
+   clock_ = clock;
+ }
+--- a/components/security_interstitials/core/https_only_mode_enforcelist.h
++++ b/components/security_interstitials/core/https_only_mode_enforcelist.h
+@@ -8,6 +8,7 @@
+ #include <set>
+ #include <string>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
+ #include "base/values.h"
+@@ -53,6 +54,9 @@
+ 
+   // Revokes all HTTPS enforcements for host.
+   void RevokeEnforcements(const std::string& host);
++  // Prepare removal of selected volatile native copies, without pref writes or
++  // consumer notifications. The owning delegate supplies trusted site identity.
++  void RetireNonDefaultHosts(const base::RepeatingCallback<bool(const std::string&)>& owns);
+ 
+   // Returns the set of hosts that have enforcement enabled, as HTTPS
+   // origins-like GURLs (i.e. GURLs of the form https://<host>/).
+--- a/content/browser/ssl/ssl_error_handler.cc
++++ b/content/browser/ssl/ssl_error_handler.cc
+@@ -30,7 +30,7 @@
+     : delegate_(delegate),
+       owner_(owner),
+       alloy_scoped_(web_contents &&
+-                    alloy::site_records::RequestContextPolicy::IsStateless(
++                    alloy::site_records::RequestContextPolicy::Get(
+                         *web_contents->GetBrowserContext())),
+       request_url_(url),
+       is_primary_main_frame_request_(is_primary_main_frame_request),
+@@ -73,6 +73,12 @@
+ 
+ void SSLErrorHandler::ContinueRequest() {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
++  // The original owner may retire during an embedder decision or a reentrant
++  // native permission publication. Every completion uses the original handle.
++  if (alloy_scoped_ && !GetScopedStateDelegate()) {
++    DenyRequest();
++    return;
++  }
+   if (delegate_)
+     delegate_->ContinueSSLRequest();
+ }
+--- a/content/browser/ssl/ssl_manager.cc
++++ b/content/browser/ssl/ssl_manager.cc
+@@ -47,7 +47,7 @@
+ 
+ SSLHostStateDelegate* SSLStateForDocument(SSLHostStateDelegate* root,
+                                           RenderFrameHost* frame) {
+-  return root && alloy::site_records::RequestContextPolicy::IsStateless(
++  return root && alloy::site_records::RequestContextPolicy::Get(
+                      *frame->GetBrowserContext())
+              ? root->ForAlloyStateOwner(AlloyDocumentStateOwner(frame))
+              : root;

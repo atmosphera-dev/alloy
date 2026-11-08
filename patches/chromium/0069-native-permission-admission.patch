@@ -1,0 +1,550 @@
+--- a/components/permissions/object_permission_context_base.h
++++ b/components/permissions/object_permission_context_base.h
+@@ -204,7 +204,7 @@
+   void NotifyPermissionChanged();
+   void NotifyPermissionRevoked(const url::Origin& origin);
+   virtual std::vector<url::Origin> RevokeEphemeralPermissions(
+-      const ContentSettingsPattern& primary_pattern,
++      const content_settings::SitePermissionMatcher& primary_pattern,
+       bool unconditional);
+ 
+   const std::optional<ContentSettingsType> guard_content_settings_type_;
+--- a/components/permissions/object_permission_context_base.cc
++++ b/components/permissions/object_permission_context_base.cc
+@@ -310,6 +310,10 @@
+ 
+ void ObjectPermissionContextBase::SaveWebsiteSetting(
+     const url::Origin& origin) {
++  if (!CapturePermissionAdmission(origin).Run()) {
++    origins_with_scheduled_save_settings_calls_.erase(origin);
++    return;
++  }
+   base::AutoReset<bool> auto_reset(&ignore_map_callbacks_, true);
+   auto scheduled_save_it =
+       origins_with_scheduled_save_settings_calls_.find(origin);
+@@ -451,7 +455,10 @@
+   // regardless of the guard setting.
+   bool unconditional = !content_type_set.ContainsAllTypes();
+   std::vector<url::Origin> revoked_ephemeral =
+-      RevokeEphemeralPermissions(primary_pattern, unconditional);
++      RevokeEphemeralPermissions(base::BindRepeating(
++          [](ContentSettingsPattern pattern, const url::Origin& origin) {
++            return pattern.Matches(origin.GetURL());
++          }, primary_pattern), unconditional);
+   revoked_origins.insert(revoked_ephemeral.begin(), revoked_ephemeral.end());
+ 
+   // 2. Invalidate persistent cache and collect revoked origins.
+@@ -502,7 +509,7 @@
+ 
+ std::vector<url::Origin>
+ ObjectPermissionContextBase::RevokeEphemeralPermissions(
+-    const ContentSettingsPattern& primary_pattern,
++    const content_settings::SitePermissionMatcher& primary_pattern,
+     bool unconditional) {
+   return {};
+ }
+@@ -532,8 +539,8 @@
+     if (owns.Run(entry.first)) retired.insert(entry.first);
+   for (const auto& origin : retired) origins_with_scheduled_save_settings_calls_.erase(origin);
+   std::erase_if(objects_, [&](const auto& entry) { return owns.Run(entry.first); });
+-  for (const auto& origin : retired)
+-    RevokeEphemeralPermissions(ContentSettingsPattern::FromURLNoWildcard(origin.GetURL()), true);
++  auto ephemeral = RevokeEphemeralPermissions(owns, true);
++  retired.insert(ephemeral.begin(), ephemeral.end());
+   return base::BindOnce([](base::WeakPtr<ObjectPermissionContextBase> owner,
+                           std::set<url::Origin> origins) {
+     for (const auto& origin : origins) {
+--- a/chrome/browser/usb/usb_chooser_context.h
++++ b/chrome/browser/usb/usb_chooser_context.h
+@@ -123,7 +123,7 @@
+ 
+   // ObjectPermissionContextBase:
+   std::vector<url::Origin> RevokeEphemeralPermissions(
+-      const ContentSettingsPattern& primary_pattern,
++      const content_settings::SitePermissionMatcher& primary_pattern,
+       bool unconditional) override;
+ 
+   void OnDeviceManagerConnectionError();
+--- a/chrome/browser/usb/usb_chooser_context.cc
++++ b/chrome/browser/usb/usb_chooser_context.cc
+@@ -452,12 +452,12 @@
+ }
+ 
+ std::vector<url::Origin> UsbChooserContext::RevokeEphemeralPermissions(
+-    const ContentSettingsPattern& primary_pattern,
++    const content_settings::SitePermissionMatcher& primary_pattern,
+     bool unconditional) {
+   std::vector<url::Origin> revoked_origins;
+   std::erase_if(ephemeral_devices_, [&](const auto& entry) {
+     const auto& [origin, devices] = entry;
+-    if (primary_pattern.Matches(origin.GetURL()) &&
++    if (primary_pattern.Run(origin) &&
+         (unconditional || !CanRequestObjectPermission(origin))) {
+       revoked_origins.push_back(origin);
+       return true;
+--- a/chrome/browser/hid/hid_chooser_context.h
++++ b/chrome/browser/hid/hid_chooser_context.h
+@@ -152,7 +152,7 @@
+ 
+   // ObjectPermissionContextBase:
+   std::vector<url::Origin> RevokeEphemeralPermissions(
+-      const ContentSettingsPattern& primary_pattern,
++      const content_settings::SitePermissionMatcher& primary_pattern,
+       bool unconditional) override;
+ 
+   // HID-specific interface for revoking device permissions.
+--- a/chrome/browser/hid/hid_chooser_context.cc
++++ b/chrome/browser/hid/hid_chooser_context.cc
+@@ -393,12 +393,12 @@
+ }
+ 
+ std::vector<url::Origin> HidChooserContext::RevokeEphemeralPermissions(
+-    const ContentSettingsPattern& primary_pattern,
++    const content_settings::SitePermissionMatcher& primary_pattern,
+     bool unconditional) {
+   std::vector<url::Origin> revoked_origins;
+   std::erase_if(ephemeral_devices_, [&](const auto& entry) {
+     const auto& [origin, devices] = entry;
+-    if (primary_pattern.Matches(origin.GetURL()) &&
++    if (primary_pattern.Run(origin) &&
+         (unconditional || !CanRequestObjectPermission(origin))) {
+       revoked_origins.push_back(origin);
+       return true;
+--- a/chrome/browser/serial/serial_chooser_context.h
++++ b/chrome/browser/serial/serial_chooser_context.h
+@@ -117,7 +117,7 @@
+ 
+   // ObjectPermissionContextBase:
+   std::vector<url::Origin> RevokeEphemeralPermissions(
+-      const ContentSettingsPattern& primary_pattern,
++      const content_settings::SitePermissionMatcher& primary_pattern,
+       bool unconditional) override;
+ 
+   // This raw pointer is safe because instances of this class are created by
+--- a/chrome/browser/serial/serial_chooser_context.cc
++++ b/chrome/browser/serial/serial_chooser_context.cc
+@@ -416,12 +416,12 @@
+ }
+ 
+ std::vector<url::Origin> SerialChooserContext::RevokeEphemeralPermissions(
+-    const ContentSettingsPattern& primary_pattern,
++    const content_settings::SitePermissionMatcher& primary_pattern,
+     bool unconditional) {
+   std::vector<url::Origin> revoked_origins;
+   std::erase_if(ephemeral_ports_, [&](const auto& entry) {
+     const auto& [origin, ports] = entry;
+-    if (primary_pattern.Matches(origin.GetURL()) &&
++    if (primary_pattern.Run(origin) &&
+         (unconditional || !CanRequestObjectPermission(origin))) {
+       revoked_origins.push_back(origin);
+       return true;
+--- a/components/permissions/contexts/bluetooth_chooser_context.h
++++ b/components/permissions/contexts/bluetooth_chooser_context.h
+@@ -104,7 +104,7 @@
+ 
+   // ObjectPermissionContextBase:
+   std::vector<url::Origin> RevokeEphemeralPermissions(
+-      const ContentSettingsPattern& primary_pattern,
++      const content_settings::SitePermissionMatcher& primary_pattern,
+       bool unconditional) override;
+ 
+  private:
+--- a/components/permissions/contexts/bluetooth_chooser_context.cc
++++ b/components/permissions/contexts/bluetooth_chooser_context.cc
+@@ -322,12 +322,12 @@
+ }
+ 
+ std::vector<url::Origin> BluetoothChooserContext::RevokeEphemeralPermissions(
+-    const ContentSettingsPattern& primary_pattern,
++    const content_settings::SitePermissionMatcher& primary_pattern,
+     bool unconditional) {
+   std::vector<url::Origin> revoked_origins;
+   std::erase_if(scanned_devices_, [&](const auto& entry) {
+     const auto& [origin, address_to_id_map] = entry;
+-    if (primary_pattern.Matches(origin.GetURL()) &&
++    if (primary_pattern.Run(origin) &&
+         (unconditional || !CanRequestObjectPermission(origin))) {
+       revoked_origins.push_back(origin);
+       return true;
+--- a/chrome/browser/smart_card/smart_card_permission_context.h
++++ b/chrome/browser/smart_card/smart_card_permission_context.h
+@@ -93,7 +93,7 @@
+ 
+   // ObjectPermissionContextBase:
+   std::vector<url::Origin> RevokeEphemeralPermissions(
+-      const ContentSettingsPattern& primary_pattern,
++      const content_settings::SitePermissionMatcher& primary_pattern,
+       bool unconditional) override;
+ 
+   bool HasReaderPermission(const url::Origin& origin,
+--- a/chrome/browser/smart_card/smart_card_permission_context.cc
++++ b/chrome/browser/smart_card/smart_card_permission_context.cc
+@@ -391,13 +391,13 @@
+ }
+ 
+ std::vector<url::Origin> SmartCardPermissionContext::RevokeEphemeralPermissions(
+-    const ContentSettingsPattern& primary_pattern,
++    const content_settings::SitePermissionMatcher& primary_pattern,
+     bool unconditional) {
+   std::vector<url::Origin> revoked_origins;
+   size_t revoked_permissions_count = 0;
+   base::EraseIf(ephemeral_grants_with_expiry_, [&](const auto& entry) {
+     const auto& [origin, reader_map] = entry;
+-    if (primary_pattern.Matches(origin.GetURL()) &&
++    if (primary_pattern.Run(origin) &&
+         (unconditional || !CanRequestObjectPermission(origin))) {
+       revoked_origins.push_back(origin);
+       revoked_permissions_count += reader_map.size();
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -106,6 +106,8 @@
+   if (!frame) {
+     return nullptr;
+   }
++  if (alloy::site_records::RequestContextPolicy::Get(*frame->GetBrowserContext()) &&
++      !content::AlloyDocumentStateAdmitted(frame)) return nullptr;
+   if (!alloy::site_records::RequestContextPolicy::IsStateless(
+           *frame->GetBrowserContext())) {
+     return GetForProfile(frame->GetBrowserContext());
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+@@ -65,6 +65,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/disallow_activation_reason.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/security_principal.h"
+ #include "content/public/browser/site_instance.h"
+@@ -1778,6 +1779,11 @@
+ content::FileSystemAccessPermissionContext*
+ ChromeFileSystemAccessPermissionContext::ForDocument(
+     const content::WeakDocumentPtr& document) {
++  if (alloy::site_records::RequestContextPolicy::Get(*profile_)) {
++    auto* original = document.AsRenderFrameHostIfValid();
++    if (!content::AlloyDocumentStateAdmitted(original) || original->GetBrowserContext() != profile_)
++      return nullptr;
++  }
+   if (!RequiresDocumentContext()) {
+     return this;
+   }
+--- a/components/permissions/permissions_client.h
++++ b/components/permissions/permissions_client.h
+@@ -97,6 +97,9 @@
+   virtual bool RequiresDocumentPermissionContext(content::BrowserContext*) {
+     return false;
+   }
++  virtual bool RequiresOriginalPermissionDocument(content::BrowserContext* context) {
++    return RequiresDocumentPermissionContext(context);
++  }
+   content::RenderFrameHost* GetPermissionRequestDocument(
+       content::BrowserContext*,
+       const PermissionRequestData&);
+--- a/chrome/browser/permissions/chrome_permissions_client.h
++++ b/chrome/browser/permissions/chrome_permissions_client.h
+@@ -32,6 +32,7 @@
+ 
+   // PermissionsClient:
+   bool RequiresDocumentPermissionContext(content::BrowserContext*) override;
++  bool RequiresOriginalPermissionDocument(content::BrowserContext*) override;
+   permissions::PermissionActionsHistory* GetPermissionActionsHistoryForDocument(
+       content::BrowserContext*,
+       content::RenderFrameHost*) override;
+--- a/chrome/browser/permissions/chrome_permissions_client.cc
++++ b/chrome/browser/permissions/chrome_permissions_client.cc
+@@ -296,7 +296,8 @@
+ HostContentSettingsMap* ChromePermissionsClient::GetSettingsMapForDocument(
+     content::BrowserContext* browser_context,
+     content::RenderFrameHost* frame) {
+-  if (RequiresDocumentPermissionContext(browser_context)) {
++  if (RequiresDocumentPermissionContext(browser_context) ||
++      (frame && RequiresOriginalPermissionDocument(browser_context))) {
+     if (!frame || frame->GetBrowserContext() != browser_context ||
+         browser_context->ShutdownStarted()) {
+       return nullptr;
+@@ -309,6 +310,10 @@
+ bool ChromePermissionsClient::RequiresDocumentPermissionContext(
+     content::BrowserContext* context) {
+   return alloy::site_records::RequestContextPolicy::IsStateless(*context);
++}
++
++bool ChromePermissionsClient::RequiresOriginalPermissionDocument(content::BrowserContext* context) {
++  return alloy::site_records::RequestContextPolicy::Get(*context) != nullptr;
+ }
+ 
+ permissions::PermissionActionsHistory*
+--- a/components/permissions/permissions_client.cc
++++ b/components/permissions/permissions_client.cc
+@@ -78,7 +78,7 @@
+ content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
+     content::BrowserContext* context,
+     const PermissionRequestData& request) {
+-  if (RequiresDocumentPermissionContext(context)) {
++  if (RequiresOriginalPermissionDocument(context)) {
+     auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
+     return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
+   }
+@@ -89,7 +89,7 @@
+ content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
+     content::BrowserContext* context,
+     const PermissionRequest& request) {
+-  if (RequiresDocumentPermissionContext(context)) {
++  if (RequiresOriginalPermissionDocument(context)) {
+     auto* frame = request.alloy_document().AsRenderFrameHostIfValid();
+     return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
+   }
+--- a/components/permissions/permission_context_base.cc
++++ b/components/permissions/permission_context_base.cc
+@@ -328,7 +328,7 @@
+     const PermissionRequestData& request_data,
+     content::RenderFrameHost* render_frame_host) const {
+   auto* client = PermissionsClient::Get();
+-  if (client->RequiresDocumentPermissionContext(browser_context_)) {
++  if (client->RequiresOriginalPermissionDocument(browser_context_)) {
+     render_frame_host =
+         client->GetPermissionRequestDocument(browser_context_, request_data);
+     if (!render_frame_host) {
+@@ -652,7 +652,7 @@
+   auto* client = PermissionsClient::Get();
+   auto* rfh =
+       client->GetPermissionRequestDocument(browser_context_, *request_data);
+-  if (client->RequiresDocumentPermissionContext(browser_context_) && !rfh) {
++  if (client->RequiresOriginalPermissionDocument(browser_context_) && !rfh) {
+     std::move(callback).Run(
+         content::PermissionResult(PermissionStatus::DENIED));
+     return;
+@@ -699,7 +699,7 @@
+     const PermissionRequestData& request_data) {
+   if (retired_requests_.contains(request_data.id.ToString())) return;
+   const bool has_authority =
+-      !PermissionsClient::Get()->RequiresDocumentPermissionContext(
++      !PermissionsClient::Get()->RequiresOriginalPermissionDocument(
+           browser_context_) ||
+       PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
+                                                              request_data);
+@@ -831,7 +831,7 @@
+     bool persist,
+     const content::PermissionResult* permission_result,
+     const permissions::PermissionPromptDecision& decision) {
+-  if (PermissionsClient::Get()->RequiresDocumentPermissionContext(
++  if (PermissionsClient::Get()->RequiresOriginalPermissionDocument(
+           browser_context_) &&
+       !PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
+                                                               request_data)) {
+--- a/chrome/browser/usb/usb_chooser_controller.h
++++ b/chrome/browser/usb/usb_chooser_controller.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_USB_USB_CHOOSER_CONTROLLER_H_
+ #define CHROME_BROWSER_USB_USB_CHOOSER_CONTROLLER_H_
+ 
++#include "base/functional/callback.h"
+ #include <string>
+ #include <unordered_map>
+ #include <utility>
+@@ -63,6 +64,7 @@
+ 
+   blink::mojom::WebUsbRequestDeviceOptionsPtr options_;
+   blink::mojom::WebUsbService::GetPermissionCallback callback_;
++  base::RepeatingCallback<bool()> site_admission_;
+   url::Origin origin_;
+ 
+   // Hold the GlobalRenderFrameHostId for requesting frame so we can always
+--- a/chrome/browser/usb/usb_chooser_controller.cc
++++ b/chrome/browser/usb/usb_chooser_controller.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/usb/usb_chooser_controller.h"
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ 
+ #include <stddef.h>
+ 
+@@ -71,10 +72,11 @@
+ 
+ void OnDeviceInfoRefreshed(
+     base::WeakPtr<UsbChooserContext> chooser_context,
++    base::RepeatingCallback<bool()> admitted,
+     const url::Origin& origin,
+     blink::mojom::WebUsbService::GetPermissionCallback callback,
+     device::mojom::UsbDeviceInfoPtr device_info) {
+-  if (!chooser_context || !device_info) {
++  if (!chooser_context || !device_info || !admitted.Run()) {
+     std::move(callback).Run(nullptr);
+     return;
+   }
+@@ -104,6 +106,8 @@
+   chooser_context_ =
+       UsbChooserContextFactory::GetForFrame(render_frame_host)->AsWeakPtr();
+   DCHECK(chooser_context_);
++  site_admission_ = alloy::site_records::CaptureDocumentPermissionAdmission(
++      render_frame_host, chooser_context_->CapturePermissionAdmission(origin_));
+   chooser_context_->GetDevices(base::BindOnce(
+       &UsbChooserController::GotUsbDeviceList, weak_factory_.GetWeakPtr()));
+ }
+@@ -179,7 +183,7 @@
+   // necessary to grant permission to access the device need to be bound to
+   // this callback.
+   auto on_device_info_refreshed = base::BindOnce(
+-      &OnDeviceInfoRefreshed, chooser_context_, origin_, std::move(callback_));
++      &OnDeviceInfoRefreshed, chooser_context_, site_admission_, origin_, std::move(callback_));
+ #if BUILDFLAG(IS_ANDROID)
+   chooser_context_->RefreshDeviceInfo(guid,
+                                       std::move(on_device_info_refreshed));
+--- a/chrome/browser/ui/hid/hid_chooser_controller.h
++++ b/chrome/browser/ui/hid/hid_chooser_controller.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_HID_HID_CHOOSER_CONTROLLER_H_
+ #define CHROME_BROWSER_UI_HID_HID_CHOOSER_CONTROLLER_H_
+ 
++#include "base/functional/callback.h"
+ #include <map>
+ #include <string>
+ #include <vector>
+@@ -92,6 +93,7 @@
+   std::vector<blink::mojom::HidDeviceFilterPtr> filters_;
+   std::vector<blink::mojom::HidDeviceFilterPtr> exclusion_filters_;
+   content::HidChooser::Callback callback_;
++  base::RepeatingCallback<bool()> site_admission_;
+   content::WeakDocumentPtr initiator_document_;
+   const url::Origin origin_;
+ 
+--- a/chrome/browser/ui/hid/hid_chooser_controller.cc
++++ b/chrome/browser/ui/hid/hid_chooser_controller.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/hid/hid_chooser_controller.h"
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -103,6 +104,8 @@
+   chooser_context_ =
+       HidChooserContextFactory::GetForFrame(render_frame_host)->AsWeakPtr();
+   DCHECK(chooser_context_);
++  site_admission_ = alloy::site_records::CaptureDocumentPermissionAdmission(
++      render_frame_host, chooser_context_->CapturePermissionAdmission(origin_));
+ 
+   chooser_context_->GetHidManager()->GetDevices(base::BindOnce(
+       &HidChooserController::OnGotDevices, weak_factory_.GetWeakPtr()));
+@@ -172,7 +175,7 @@
+   size_t index = indices[0];
+   DCHECK_LT(index, items_.size());
+ 
+-  if (!chooser_context_) {
++  if (!chooser_context_ || !site_admission_.Run()) {
+     std::move(callback_).Run({});
+     return;
+   }
+--- a/chrome/browser/ui/serial/serial_chooser_controller.h
++++ b/chrome/browser/ui/serial/serial_chooser_controller.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_SERIAL_SERIAL_CHOOSER_CONTROLLER_H_
+ #define CHROME_BROWSER_UI_SERIAL_SERIAL_CHOOSER_CONTROLLER_H_
+ 
++#include "base/functional/callback.h"
+ #include <string>
+ #include <vector>
+ 
+@@ -99,6 +100,7 @@
+   std::vector<blink::mojom::SerialPortFilterPtr> filters_;
+   std::vector<::device::BluetoothUUID> allowed_bluetooth_service_class_ids_;
+   content::SerialChooser::Callback callback_;
++  base::RepeatingCallback<bool()> site_admission_;
+   content::WeakDocumentPtr initiator_document_;
+   url::Origin origin_;
+ 
+--- a/chrome/browser/ui/serial/serial_chooser_controller.cc
++++ b/chrome/browser/ui/serial/serial_chooser_controller.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/serial/serial_chooser_controller.h"
++#include "chrome/browser/content_settings/alloy_document_permission_context.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -113,6 +114,8 @@
+   chooser_context_ =
+       SerialChooserContextFactory::GetForFrame(render_frame_host)->AsWeakPtr();
+   DCHECK(chooser_context_);
++  site_admission_ = alloy::site_records::CaptureDocumentPermissionAdmission(
++      render_frame_host, chooser_context_->CapturePermissionAdmission(origin_));
+ 
+   // Post `GetDevices` to be run later after the view is set in the current
+   // sequence, so that it will have a valid view when running `GetDevices`.
+@@ -275,7 +278,7 @@
+   size_t index = indices[0];
+   DCHECK_LT(index, ports_.size());
+ 
+-  if (!chooser_context_) {
++  if (!chooser_context_ || !site_admission_.Run()) {
+     RunCallback(/*port=*/nullptr);
+     return;
+   }
+--- a/components/content_settings/core/browser/content_settings_pref.h
++++ b/components/content_settings/core/browser/content_settings_pref.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/synchronization/lock.h"
+ #include "base/threading/thread_checker.h"
+@@ -140,6 +141,7 @@
+   base::ThreadChecker thread_checker_;
+ 
+   raw_ptr<const base::Clock> clock_;
++  base::WeakPtrFactory<ContentSettingsPref> weak_factory_{this};
+ };
+ 
+ }  // namespace content_settings
+--- a/components/content_settings/core/browser/content_settings_pref.cc
++++ b/components/content_settings/core/browser/content_settings_pref.cc
+@@ -5,6 +5,7 @@
+ #include "components/content_settings/core/browser/content_settings_pref.h"
+ 
+ #include <memory>
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <utility>
+@@ -477,10 +478,34 @@
+   if (updating_preferences_)
+     return;
+ 
++  auto snapshot = [&] {
++    std::map<std::string, std::unique_ptr<Rule>> rules;
++    auto it = GetRuleIterator(false);
++    while (it && it->HasNext()) {
++      auto rule = it->Next();
++      auto key = CreatePatternString(rule->primary_pattern, rule->secondary_pattern);
++      rules.emplace(std::move(key), std::move(rule));
++    }
++    return rules;
++  };
++  auto before = snapshot();
+   ReadContentSettingsFromPref();
+-
+-  notify_callback_.Run(ContentSettingsPattern::Wildcard(),
+-                       ContentSettingsPattern::Wildcard(), content_type_);
++  auto after = snapshot();
++  std::map<std::string, std::pair<ContentSettingsPattern, ContentSettingsPattern>> changed;
++  for (const auto& [key, rule] : before) {
++    const auto it = after.find(key);
++    if (it == after.end() || rule->value != it->second->value || rule->metadata != it->second->metadata)
++      changed.emplace(key, std::make_pair(rule->primary_pattern, rule->secondary_pattern));
++  }
++  for (const auto& [key, rule] : after)
++    if (!before.contains(key)) changed.emplace(key, std::make_pair(rule->primary_pattern, rule->secondary_pattern));
++  const auto notify = notify_callback_;
++  const auto type = content_type_;
++  auto alive = weak_factory_.GetWeakPtr();
++  for (const auto& [key, patterns] : changed) {
++    if (!alive || !alive->prefs_) return;
++    notify.Run(patterns.first, patterns.second, type);
++  }
+ }
+ 
+ void ContentSettingsPref::UpdatePref(

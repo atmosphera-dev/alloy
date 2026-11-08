@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <utility>
 
 #include "brave/alloy/site_records/encrypted_tree.h"
@@ -316,6 +317,7 @@ struct RecordFileSystem::Impl {
   std::map<base::UnguessableToken, std::unique_ptr<Record>> records;
   base::UnguessableToken private_record;
   std::set<ObjectId> deleting;
+  std::map<base::UnguessableToken, ObjectId> pending_deletions;
   FileFault fault;
 
   FileStatus Admission() const {
@@ -775,6 +777,85 @@ struct RecordFileSystem::Impl {
     return FileStatus::kOk;
   }
 
+  // Stage immutable ciphertext and COW namespace roots before publishing any
+  // of them to live state. The enclosing coordinator mutex is the transaction
+  // barrier; no other native adapter can publish an intermediate shard root.
+  FileStatus StageSettings(base::span<const SettingsReplacement> replacements,
+                           base::UnguessableToken deleting_record = {}) {
+    struct Update {
+      ObjectRef names;
+      std::vector<ObjectId> detached;
+    };
+    std::map<Record*, Update> updates;
+    std::set<std::tuple<base::UnguessableToken, uint32_t, ObjectId, std::string>> selected;
+    for (const auto& replacement : replacements) {
+      if ((replacement.purpose != StorePurpose::kSiteSettings &&
+           replacement.purpose != StorePurpose::kProfileSettings) ||
+          replacement.bytes.size() > 64 * 1024 * 1024 ||
+          replacement.capability.record() == deleting_record) {
+        return FileStatus::kInvalid;
+      }
+      Record* record;
+      auto status = Check(replacement.capability, replacement.purpose,
+                          StorageAccess::kWriteRecordFiles, &record);
+      if (status != FileStatus::kOk) return status;
+      const auto tag = PersistentStoreTag(replacement.purpose);
+      NamespaceEntry entry;
+      status = Parent(*record, tag, replacement.name, &entry.parent, &entry.name);
+      if (status != FileStatus::kOk) return status;
+      if (!selected.emplace(record->info.id, tag, entry.parent, entry.name).second) {
+        return FileStatus::kInvalid;
+      }
+      auto [it, inserted] = updates.try_emplace(record);
+      auto& update = it->second;
+      if (inserted) update.names = record->names;
+      NamespaceEntry old;
+      status = GetEntry(*record, tag, entry.parent, entry.name, &old);
+      if (status == FileStatus::kOk) {
+        if (old.directory) return FileStatus::kIsDirectory;
+        // A replacement cannot turn corrupted existing content into an
+        // apparently successful fresh settings file, even after startup load.
+        std::unique_ptr<EncryptedFileContents> previous;
+        status = EncryptedFileContents::Open(*record->objects, record->key,
+            replacement.capability, replacement.purpose, old.root, &previous);
+        if (status != FileStatus::kOk) return status;
+        if (old.root.length > 64 * 1024 * 1024) return FileStatus::kInvalid;
+        WipedPage page;
+        for (uint64_t offset = 0; offset < old.root.length; offset += page.page.size()) {
+          size_t read = 0;
+          const auto count = static_cast<size_t>(
+              std::min<uint64_t>(page.page.size(), old.root.length - offset));
+          status = previous->Read(offset, base::span(page.page).first(count), &read);
+          if (status != FileStatus::kOk) return status;
+          if (read != count) return FileStatus::kIntegrity;
+        }
+        update.detached.push_back(old.root.file_id);
+      } else if (status != FileStatus::kNotFound) {
+        return status;
+      }
+      std::unique_ptr<EncryptedFileContents> contents;
+      status = EncryptedFileContents::Create(*record->objects, record->key,
+          replacement.capability, replacement.purpose, &contents);
+      if (status == FileStatus::kOk) status = contents->Write(0, replacement.bytes);
+      if (status != FileStatus::kOk) return status;
+      entry.purpose = tag;
+      entry.modified_us = NowMicros();
+      entry.root = contents->root();
+      status = PutEntry(*record, entry, &update.names);
+      if (status != FileStatus::kOk) return status;
+    }
+    for (auto& [record, update] : updates) {
+      record->names = update.names;
+      record->dirty = true;
+      record->gc_needed = true;
+      for (const auto& id : update.detached) {
+        const auto old = record->files.find(id);
+        if (old != record->files.end()) old->second->linked = false;
+      }
+    }
+    return FileStatus::kOk;
+  }
+
   FileStatus OpenNative(const RecordCapability& cap, StorePurpose purpose,
                           std::string_view path, RecordOpen mode,
                           std::weak_ptr<RecordFileSystem> owner,
@@ -1133,8 +1214,41 @@ FileStatus RecordFileSystem::RecordKeyEnvelopePathForTesting(
 }
 
 FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
-                                           std::function<void()> teardown,
-                                           RecordDeletion* result) {
+                                            std::function<void()> teardown,
+                                            RecordDeletion* result) {
+  return DeleteRecordWithSettings(id, {}, std::move(teardown), result);
+}
+
+FileStatus RecordFileSystem::ReplaceSettings(
+    base::span<const SettingsReplacement> replacements) {
+  std::lock_guard lock(impl_->mutex);
+  auto status = impl_->Admission();
+  if (status == FileStatus::kOk) status = impl_->StageSettings(replacements);
+  if (status != FileStatus::kOk) return impl_->Observe(status);
+  if (replacements.empty()) return FileStatus::kOk;
+  status = impl_->Commit();
+  // A failed publication must not leave a native client able to publish the
+  // staged transaction later while believing that replacement was refused.
+  return status == FileStatus::kOk ? status
+      : impl_->Observe(FileStatus::kCommitUncertain);
+}
+
+FileStatus RecordFileSystem::DeleteRecordWithSettings(
+    base::UnguessableToken id,
+    base::span<const SettingsReplacement> replacements,
+    std::function<void()> teardown,
+    RecordDeletion* result) {
+  base::UnguessableToken ticket;
+  const auto status = RetireRecordWithSettings(id, replacements, &ticket);
+  if (status != FileStatus::kOk) return status;
+  if (teardown) teardown();
+  return FinishRecordDeletion(ticket, result);
+}
+
+FileStatus RecordFileSystem::RetireRecordWithSettings(
+    base::UnguessableToken id, base::span<const SettingsReplacement> replacements,
+    base::UnguessableToken* ticket) {
+  if (!ticket) return FileStatus::kInvalid;
   std::unique_lock lock(impl_->mutex);
   auto status = impl_->Admission();
   if (status != FileStatus::kOk) {
@@ -1147,6 +1261,8 @@ FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
   if (found->second->profile_private) {
     return FileStatus::kDenied;
   }
+  status = impl_->StageSettings(replacements, id);
+  if (status != FileStatus::kOk) return impl_->Observe(status);
   auto record = std::move(found->second);
   const auto directory = record->info.directory;
   impl_->records.erase(found);
@@ -1165,12 +1281,20 @@ FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
     // exist. Fail closed until reopen instead of reintroducing a revoked key.
     return impl_->Observe(FileStatus::kCommitUncertain);
   }
-  lock.unlock();
-  if (teardown) {
-    teardown();
-  }
-  lock.lock();
-  status = impl_->open ? impl_->root->RemoveChild(directory) : FileStatus::kIo;
+  *ticket = base::UnguessableToken::Create();
+  impl_->pending_deletions.emplace(*ticket, directory);
+  return FileStatus::kOk;
+}
+
+FileStatus RecordFileSystem::FinishRecordDeletion(base::UnguessableToken ticket,
+                                                  RecordDeletion* result) {
+  if (!result) return FileStatus::kInvalid;
+  std::lock_guard lock(impl_->mutex);
+  const auto found = impl_->pending_deletions.find(ticket);
+  if (found == impl_->pending_deletions.end()) return FileStatus::kNotFound;
+  const auto directory = found->second;
+  const auto status = impl_->open ? impl_->root->RemoveChild(directory) : FileStatus::kIo;
+  impl_->pending_deletions.erase(found);
   impl_->deleting.erase(directory);
   *result = status == FileStatus::kOk ? RecordDeletion::kDeleted
                                      : RecordDeletion::kDeletedFilesPending;

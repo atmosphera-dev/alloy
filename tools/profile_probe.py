@@ -25,6 +25,7 @@ from urllib.request import urlopen
 
 sys.dont_write_bytecode = True
 from workspace import PRIMARY, temp_path, validate_output, workspace_path
+import profile_system_cache as system_cache
 from profile_control import CDP_CONTROL, page_control_script
 from profile_inventory import observe_tree
 
@@ -651,11 +652,8 @@ def await_parent_ready(root, process):
             if any(e['event'] == 'bootstrap-created' for e in events):
                 assert not any(e['event'] in ('stateless-start', 'created') for e in events)
                 assert [e['pid'] for e in events if e['event'] == 'process'] == [ready['pid']]
-                # Supporting assertions after the native callbacks, not a polling barrier.
-                preferred = json.loads((root/'profile/Default/PreferredApps').read_text())
-                assert preferred == {'preferred_apps': [], 'version': 1}
-                blobs = list((root/'profile/Default/blob_storage').iterdir())
-                assert len(blobs) == 1 and blobs[0].is_dir()
+                # Native completion is the barrier. Root inventories below test
+                # the no-files boundary without parsing Chromium store formats.
                 return ready
         time.sleep(.05)
     raise AssertionError('native parent startup/store callbacks did not complete')
@@ -695,6 +693,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
     roots = {name:root/name for name in ('profile', 'home', 'cache', 'config', 'data')}
     for path in roots.values():
         path.mkdir()
+    xdg_cache = system_cache.create(root)
     # R11 keeps the OS/NSS certificate store outside Alloy. Give the isolated
     # test user that external input before either page or no-page run, rather
     # than confusing its first-use OS-store initialization with site storage.
@@ -737,7 +736,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
                  ALLOY_PROFILE_OUTPUT_FILE=str(output_file),
                 ALLOY_PROFILE_READY=str(root/'native-ready.json'),
                 ALLOY_PROFILE_SYMBOLS=str(symbol_file),
-               XDG_CACHE_HOME=str(roots['cache']), XDG_CONFIG_HOME=str(roots['config']),
+               XDG_CACHE_HOME=str(xdg_cache), XDG_CONFIG_HOME=str(roots['config']),
                  XDG_DATA_HOME=str(roots['data']))
     if memory:
         env.update(ALLOY_PROFILE_MEMORY='1', ALLOY_PROFILE_OBSERVE_LIFETIME='1')
@@ -833,6 +832,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
     save(root/'process-final-paths.json', inventory(root))
+    system_cache.check(xdg_cache)
     nss_after = {p.name:hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in nss.iterdir() if p.is_file()}
     save(root/'nss-after.json', nss_after)
@@ -867,10 +867,10 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         file_events = [v for v in events if v['event'] == 'file-picker']
         assert [v['held'] for v in file_events] == ([0, 0, 1, 0] if exercise_files else []), file_events
         assert [v['save'] for v in file_events] == ([0, 1, 0, 0] if exercise_files else []), file_events
-        navigations = [v for v in events if v['event'] == 'navigation' and v['browser'] != parent_events[0]['browser']]
+        navigations = [v for v in events if v['event'] == 'history-state' and v['browser'] != parent_events[0]['browser']]
         assert any(v['can_back'] and v['can_forward'] for v in navigations), navigations
         assert any(v['can_back'] and not v['can_forward'] and
-                   v['token'].startswith('d_') for v in navigations), navigations
+                   v['url'].endswith('/page/d') for v in navigations), navigations
         assert not created[-1]['can_back'] and not created[-1]['can_forward'], created
         proof['checks'].append('native-history-flags')
     if baseline < 0 and certificate_base:
@@ -906,7 +906,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=['stateless', 'memory', 'core', 'keyring', 'embedded'], default='core')
+    parser.add_argument('--check', choices=['stateless', 'memory', 'encrypted', 'delete', 'core', 'keyring', 'embedded'], default='core')
     parser.add_argument('--embedded-scope', choices=['both', 'per-tab', 'per-outer-site'],
                         default='both', help='Embedded implemented-storage slice only (default both scopes)')
     parser.add_argument('--exercise-files', action='store_true',
@@ -915,9 +915,16 @@ def main():
                         help='Run real certificate callbacks and late decisions without ignoring certificate errors')
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.check in ('encrypted', 'delete'):
+        from profile_encrypted import main as encrypted_main
+        return encrypted_main()
     if args.check in ('core', 'keyring'):
         from profile_store_probe import main as store_main
-        return store_main()
+        result = store_main()
+        if result or args.check == 'core':
+            return result
+        from profile_encrypted import main as encrypted_main
+        return encrypted_main()
     if args.exercise_files and args.exercise_certificates:
         parser.error('file and certificate consumer matrices are separate runs')
     if args.check in ('memory', 'embedded') and (args.exercise_files or args.exercise_certificates):

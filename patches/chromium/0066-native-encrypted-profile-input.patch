@@ -242,7 +242,7 @@
  std::unique_ptr<content::ZoomLevelDelegate>
  ProfileImpl::CreateZoomLevelDelegate(const base::FilePath& partition_path) {
 -  if (base::alloy::IsNoDiskProcess()) {
-+  if (HasManagedEnvelope()) {
++  if (HasManagedEnvelope() && !alloy_configuration_) {
      return std::make_unique<ChromeZoomLevelOTRDelegate>(
          zoom::ZoomEventManager::GetForBrowserContext(this)->GetWeakPtr());
    }
@@ -324,7 +324,7 @@
  
  ChromeZoomLevelPrefs* ProfileImpl::GetZoomLevelPrefs() {
 -  if (base::alloy::IsNoDiskProcess()) {
-+  if (HasManagedEnvelope()) {
++  if (HasManagedEnvelope() && !alloy_configuration_) {
      return nullptr;
    }
    return static_cast<ChromeZoomLevelPrefs*>(

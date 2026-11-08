@@ -17,6 +17,7 @@
 #include "include/capi/cef_client_capi.h"
 #include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_dialog_handler_capi.h"
+#include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_preference_capi.h"
 #include "include/capi/cef_permission_handler_capi.h"
 #include "include/capi/cef_request_handler_capi.h"
@@ -30,6 +31,7 @@ static cef_client_t client;
 static cef_render_handler_t render;
 static cef_life_span_handler_t life;
 static cef_display_handler_t display;
+static cef_load_handler_t load_handler;
 static cef_permission_handler_t permissions;
 static cef_dialog_handler_t dialogs;
 static cef_request_handler_t requests;
@@ -72,6 +74,30 @@ static void base(cef_base_ref_counted_t* b, size_t size) {
 static void release_ref(void* object) {
   cef_base_ref_counted_t* b=object;
   if (b) b->release(b);
+}
+static void CEF_CALLBACK loading_state_changed(cef_load_handler_t* self,
+    cef_browser_t* browser,int loading,int can_back,int can_forward) {
+  if (!loading) {
+    /* The public load callback follows CEF's navigation-state publication.
+     * A document/control message can arrive before that publication. */
+    if (browser->can_go_back(browser)!=can_back ||
+        browser->can_go_forward(browser)!=can_forward)
+      abort();
+    cef_frame_t* frame=browser->get_main_frame(browser);
+    if (!frame) { release_ref(browser); return; }
+    cef_string_userfree_t url=frame->get_url(frame);
+    cef_string_utf8_t utf8={0};
+    if (url) cef_string_utf16_to_utf8(url->str,url->length,&utf8);
+    printf("PROFILE_EVENT {\"event\":\"history-state\",\"browser\":%d,\"url\":\"%s\",\"can_back\":%d,\"can_forward\":%d}\n",
+        browser->get_identifier(browser),utf8.str?utf8.str:"",can_back,can_forward);
+    cef_string_utf8_clear(&utf8);
+    if (url) cef_string_userfree_free(url);
+    release_ref(frame);
+  }
+  release_ref(browser);
+}
+static cef_load_handler_t* CEF_CALLBACK get_load(cef_client_t* self) {
+  return &load_handler;
 }
 /* CEF's translator consumes a library object's structure reference when it
  * crosses back into the DLL (CppToCRefCounted::Unwrap). Keep owned handles and
@@ -527,6 +553,7 @@ int main(int argc,char** argv) {
   base(&app.base,sizeof(app)); base(&process_handler.base,sizeof(process_handler));
   base(&client.base,sizeof(client)); base(&render.base,sizeof(render));
   base(&life.base,sizeof(life)); base(&display.base,sizeof(display));
+  base(&load_handler.base,sizeof(load_handler));
   base(&permissions.base,sizeof(permissions));
   base(&requests.base,sizeof(requests));requests.on_certificate_error=certificate_error;
   base(&control_persistence_callback.base,sizeof(control_persistence_callback));
@@ -539,6 +566,8 @@ int main(int argc,char** argv) {
   process_handler.on_register_custom_preferences=register_preferences;
   client.get_render_handler=get_render; client.get_life_span_handler=get_life;
   client.get_display_handler=get_display;
+  client.get_load_handler=get_load;
+  load_handler.on_loading_state_change=loading_state_changed;
   client.get_permission_handler=get_permissions;
   client.get_dialog_handler=get_dialogs;
   client.get_request_handler=get_requests;

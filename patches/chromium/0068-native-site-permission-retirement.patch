@@ -1,0 +1,429 @@
+--- a/components/content_settings/core/browser/content_settings_observer.h
++++ b/components/content_settings/core/browser/content_settings_observer.h
+@@ -5,14 +5,23 @@
+ #ifndef COMPONENTS_CONTENT_SETTINGS_CORE_BROWSER_CONTENT_SETTINGS_OBSERVER_H_
+ #define COMPONENTS_CONTENT_SETTINGS_CORE_BROWSER_CONTENT_SETTINGS_OBSERVER_H_
+ 
++#include "base/functional/callback.h"
++#include "url/origin.h"
+ #include "components/content_settings/core/browser/content_settings_type_set.h"
+ #include "components/content_settings/core/common/content_settings_pattern.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+ 
+ namespace content_settings {
+ 
++using SitePermissionMatcher = base::RepeatingCallback<bool(const url::Origin&)>;
++
+ class Observer {
+  public:
++  // Revoke native memory/queued authority without running external callbacks.
++  // The returned notification runs only after every owner has prepared.
++  virtual base::OnceClosure PrepareSitePermissionRetirement(
++      const SitePermissionMatcher& owns) { return {}; }
++
+   virtual void OnContentSettingChanged(
+       const ContentSettingsPattern& primary_pattern,
+       const ContentSettingsPattern& secondary_pattern,
+--- a/components/content_settings/core/browser/host_content_settings_map.h
++++ b/components/content_settings/core/browser/host_content_settings_map.h
+@@ -92,6 +92,12 @@
+ 
+   static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+   void EnableDocumentPermissionState();
++  // Native UI callbacks retain their original epoch; deletion removes it rather
++  // than leaving a domain tombstone or admitting an old callback into a new epoch.
++  base::RepeatingCallback<bool()> CapturePermissionAdmission(const url::Origin& origin);
++  base::OnceClosure PrepareSitePermissionRetirement(
++      const content_settings::SitePermissionMatcher& owns) override;
++
+ 
+   // Adds a new provider for |type|. This should be used instead of
+   // |RegisterProvider|, not in addition.
+@@ -616,6 +622,8 @@
+   std::map<ContentSettingsType, std::unique_ptr<base::OneShotTimer>>
+       expiration_enforcement_timers_;
+ 
++  class SitePermissionEpoch;
++  std::map<url::Origin, std::unique_ptr<SitePermissionEpoch>> permission_epochs_;
+   base::WeakPtrFactory<HostContentSettingsMap> weak_ptr_factory_{this};
+ };
+ 
+--- a/components/content_settings/core/browser/host_content_settings_map.cc
++++ b/components/content_settings/core/browser/host_content_settings_map.cc
+@@ -283,6 +283,11 @@
+ 
+ }  // namespace
+ 
++class HostContentSettingsMap::SitePermissionEpoch {
++ public:
++  base::WeakPtrFactory<SitePermissionEpoch> weak{this};
++};
++
+ HostContentSettingsMap::HostContentSettingsMap(PrefService* prefs,
+                                                bool is_off_the_record,
+                                                bool store_last_modified,
+@@ -1011,6 +1016,7 @@
+ void HostContentSettingsMap::ShutdownOnUIThread() {
+   DCHECK(thread_checker_.CalledOnValidThread());
+   DCHECK(prefs_);
++  permission_epochs_.clear();
+   expiration_enforcement_timers_.clear();
+   prefs_ = nullptr;
+   for (const auto& provider_pair : content_settings_providers_) {
+@@ -1459,3 +1465,44 @@
+         return setting.metadata.decided_by_related_website_sets();
+       });
+ }
++
++
++base::RepeatingCallback<bool()> HostContentSettingsMap::CapturePermissionAdmission(
++    const url::Origin& origin) {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  if (!prefs_) return base::BindRepeating([] { return false; });
++  auto& epoch = permission_epochs_[origin];
++  if (!epoch) epoch = std::make_unique<SitePermissionEpoch>();
++  return base::BindRepeating([](base::WeakPtr<SitePermissionEpoch> original) {
++    return !!original;
++  }, epoch->weak.GetWeakPtr());
++}
++
++base::OnceClosure HostContentSettingsMap::PrepareSitePermissionRetirement(
++    const content_settings::SitePermissionMatcher& owns) {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  scoped_refptr<HostContentSettingsMap> alive(this);
++  std::erase_if(permission_epochs_, [&](const auto& entry) { return owns.Run(entry.first); });
++  std::vector<base::OnceClosure> notifications;
++  for (auto& observer : observers_) {
++    auto notify = observer.PrepareSitePermissionRetirement(owns);
++    if (notify) notifications.push_back(std::move(notify));
++  }
++  return base::BindOnce([](scoped_refptr<HostContentSettingsMap> map,
++      content_settings::SitePermissionMatcher owns, std::vector<base::OnceClosure> notifications) {
++    // Clear native one-time/session providers as well as the already-pruned
++    // pref projection. Global defaults and external policy are not rewritten.
++    for (const auto* info : *content_settings::WebsiteSettingsRegistry::GetInstance()) {
++      if (!map->prefs_) return;
++      map->ClearSettingsForOneTypeWithPredicate(info->type(),
++          [&](const ContentSettingPatternSource& setting) {
++            for (const auto& pattern : {setting.primary_pattern, setting.secondary_pattern}) {
++              const auto origin = url::Origin::Create(pattern.ToRepresentativeUrl());
++              if (!origin.opaque() && owns.Run(origin)) return true;
++            }
++            return false;
++          });
++    }
++    for (auto& notify : notifications) std::move(notify).Run();
++  }, std::move(alive), owns, std::move(notifications));
++}
+--- a/components/permissions/object_permission_context_base.h
++++ b/components/permissions/object_permission_context_base.h
+@@ -184,6 +184,10 @@
+   // the in-memory cache to prevent losing unsaved changes.
+   void FlushScheduledSaveSettingsCalls();
+ 
++  base::RepeatingCallback<bool()> CapturePermissionAdmission(const url::Origin& origin);
++  base::OnceClosure PrepareSitePermissionRetirement(
++      const content_settings::SitePermissionMatcher& owns) override;
++
+   // KeyedService:
+   void Shutdown() override;
+ 
+--- a/components/permissions/object_permission_context_base.cc
++++ b/components/permissions/object_permission_context_base.cc
+@@ -363,8 +363,10 @@
+ 
+   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+       FROM_HERE,
+-      base::BindOnce(&ObjectPermissionContextBase::SaveWebsiteSetting,
+-                     weak_factory_.GetWeakPtr(), origin));
++      base::BindOnce([](base::WeakPtr<ObjectPermissionContextBase> owner,
++                        base::RepeatingCallback<bool()> admitted, url::Origin origin) {
++        if (owner && admitted.Run()) owner->SaveWebsiteSetting(origin);
++      }, weak_factory_.GetWeakPtr(), CapturePermissionAdmission(origin), origin));
+ }
+ 
+ std::vector<std::unique_ptr<ObjectPermissionContextBase::Object>>
+@@ -511,3 +513,33 @@
+ }
+ 
+ }  // namespace permissions
++
++namespace permissions {
++base::RepeatingCallback<bool()> ObjectPermissionContextBase::CapturePermissionAdmission(
++    const url::Origin& origin) {
++  return host_content_settings_map_->CapturePermissionAdmission(origin);
++}
++base::OnceClosure ObjectPermissionContextBase::PrepareSitePermissionRetirement(
++    const content_settings::SitePermissionMatcher& owns) {
++  std::set<url::Origin> retired;
++  for (const auto& object : GetAllGrantedObjects()) {
++    auto origin = url::Origin::Create(object->origin);
++    if (owns.Run(origin)) retired.insert(std::move(origin));
++  }
++  for (const auto& origin : origins_with_scheduled_save_settings_calls_)
++    if (owns.Run(origin)) retired.insert(origin);
++  for (const auto& entry : objects_)
++    if (owns.Run(entry.first)) retired.insert(entry.first);
++  for (const auto& origin : retired) origins_with_scheduled_save_settings_calls_.erase(origin);
++  std::erase_if(objects_, [&](const auto& entry) { return owns.Run(entry.first); });
++  for (const auto& origin : retired)
++    RevokeEphemeralPermissions(ContentSettingsPattern::FromURLNoWildcard(origin.GetURL()), true);
++  return base::BindOnce([](base::WeakPtr<ObjectPermissionContextBase> owner,
++                          std::set<url::Origin> origins) {
++    for (const auto& origin : origins) {
++      if (!owner) return;
++      owner->NotifyPermissionRevoked(origin);
++    }
++  }, weak_factory_.GetWeakPtr(), std::move(retired));
++}
++}  // namespace permissions
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
+@@ -252,6 +252,8 @@
+       const ChromeFileSystemAccessPermissionContext&) = delete;
+   ~ChromeFileSystemAccessPermissionContext() override;
+ 
++  base::OnceClosure PrepareSitePermissionRetirement(
++      const content_settings::SitePermissionMatcher& owns) override;
+   bool RequiresDocumentContext() const override;
+   content::FileSystemAccessPermissionContext* ForDocument(
+       const content::WeakDocumentPtr& document) override;
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+@@ -910,7 +910,8 @@
+         type_(type),
+         path_info_(path_info),
+         access_trigger_(access_trigger),
+-        document_scoped_(context_ && context_->document_mode_) {}
++        document_scoped_(context_ && context_->document_mode_),
++        admitted_(context_ ? context_->CapturePermissionAdmission(origin) : base::BindRepeating([] { return false; })) {}
+ 
+   // FileSystemAccessPermissionGrant:
+   PermissionStatus GetStatus() override {
+@@ -918,6 +919,7 @@
+     if (document_scoped_ && (!context_ || context_->document_ending_)) {
+       return PermissionStatus::DENIED;
+     }
++    if (!admitted_.Run()) return PermissionStatus::DENIED;
+     // TODO(crbug.com/40101962): Determine if this should return denied for
+     // guard block, and how ancestor permission should be handled.
+     if (status_ == PermissionStatus::ASK && context_ &&
+@@ -928,6 +930,12 @@
+     return status_;
+   }
+ 
++  bool PrepareRetirement() {
++    const bool changed = status_ != PermissionStatus::DENIED;
++    status_ = PermissionStatus::DENIED;
++    return changed;
++  }
++  void NotifyRetirement() { NotifyPermissionStatusChanged(); }
+   PermissionStatus GetActivePermissionStatus() const {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     return status_;
+@@ -980,6 +989,10 @@
+       base::OnceCallback<void(PermissionRequestOutcome)> callback) override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     scoped_refptr<PermissionGrantImpl> self(this);
++    if (!admitted_.Run()) {
++      std::move(callback).Run(PermissionRequestOutcome::kRequestAborted);
++      return;
++    }
+ 
+     content::RenderFrameHost* rfh = content::RenderFrameHost::FromID(frame_id);
+ 
+@@ -1206,6 +1219,10 @@
+       new_status = PermissionStatus::DENIED;
+       update_options =
+           PersistedPermissionOptions::kDoNotUpdatePersistedPermission;
++    }
++    if (!admitted_.Run()) {
++      new_status = PermissionStatus::DENIED;
++      update_options = PersistedPermissionOptions::kDoNotUpdatePersistedPermission;
+     }
+     auto permission_changed = status_ != new_status;
+     status_ = new_status;
+@@ -1403,6 +1420,10 @@
+       std::move(callback).Run(PermissionRequestOutcome::kRequestAborted);
+       return;
+     }
++    if (!admitted_.Run()) {
++      std::move(callback).Run(PermissionRequestOutcome::kRequestAborted);
++      return;
++    }
+     if (context_) {
+       context_->UpdateGrantsOnPermissionRequestResult(origin_);
+     }
+@@ -1651,6 +1672,7 @@
+   const AccessTrigger access_trigger_;
+   const bool document_scoped_;
+ 
++  const base::RepeatingCallback<bool()> admitted_;
+   // This member should only be updated via SetStatus(), to make sure
+   // observers are properly notified about any change in status.
+   PermissionStatus status_ = PermissionStatus::ASK;
+@@ -4091,3 +4113,25 @@
+   return it->second.downgraded_read_paths.contains(path);
+ }
+ #endif
++
++base::OnceClosure ChromeFileSystemAccessPermissionContext::PrepareSitePermissionRetirement(
++    const content_settings::SitePermissionMatcher& owns) {
++  std::vector<scoped_refptr<PermissionGrantImpl>> notifications;
++  for (auto it = active_permissions_map_.begin(); it != active_permissions_map_.end();) {
++    if (!owns.Run(it->first)) { ++it; continue; }
++    // Hold all selected grants, detach their slots and close admission before
++    // any observer can reenter and obtain a genuinely fresh slot.
++    std::vector<scoped_refptr<PermissionGrantImpl>> selected;
++    for (const auto& entry : it->second.read_grants) selected.emplace_back(entry.second.get());
++    for (const auto& entry : it->second.write_grants) selected.emplace_back(entry.second.get());
++    it = active_permissions_map_.erase(it);
++    for (auto& grant : selected)
++      if (grant->PrepareRetirement()) notifications.push_back(std::move(grant));
++  }
++  auto notify_objects = permissions::ObjectPermissionContextBase::PrepareSitePermissionRetirement(owns);
++  return base::BindOnce([](std::vector<scoped_refptr<PermissionGrantImpl>> grants,
++                          base::OnceClosure objects) {
++    for (auto& grant : grants) grant->NotifyRetirement();
++    if (objects) std::move(objects).Run();
++  }, std::move(notifications), std::move(notify_objects));
++}
+--- a/content/public/browser/permission_controller_delegate.h
++++ b/content/public/browser/permission_controller_delegate.h
+@@ -39,6 +39,11 @@
+ class CONTENT_EXPORT PermissionControllerDelegate {
+  public:
+   virtual ~PermissionControllerDelegate();
++  // Engine-owned key retirement precedes this native in-memory barrier.
++  // False means the embedder cannot prove retirement; never acknowledge success.
++  virtual bool RetireSitePermissions(
++      const base::RepeatingCallback<bool(const url::Origin&)>& owns) { return false; }
++
+ 
+   // Requests permissions from the given RenderFrameHost. This API takes into
+   // account the lifecycle state of a given document (i.e. whether it's in
+--- a/components/permissions/permission_manager.h
++++ b/components/permissions/permission_manager.h
+@@ -62,6 +62,7 @@
+ 
+   ~PermissionManager() override;
+ 
++  bool RetireSitePermissions(const content_settings::SitePermissionMatcher& owns) override;
+   // KeyedService implementation.
+   void Shutdown() override;
+ 
+--- a/components/permissions/permission_manager.cc
++++ b/components/permissions/permission_manager.cc
+@@ -848,3 +848,32 @@
+ }
+ 
+ }  // namespace permissions
++
++namespace permissions {
++bool PermissionManager::RetireSitePermissions(const content_settings::SitePermissionMatcher& owns) {
++  scoped_refptr<HostContentSettingsMap> map = PermissionsClient::Get()->GetSettingsMap(browser_context_);
++  if (!map) return false;
++  auto notify_objects = map->PrepareSitePermissionRetirement(owns);
++  std::vector<base::OnceClosure> notifications;
++  for (auto& entry : permission_contexts_) {
++    auto notify = entry.second->PreparePermissionRequestRetirement(owns);
++    if (notify) notifications.push_back(std::move(notify));
++  }
++  std::vector<PendingRequestLocalId> removed;
++  for (PendingRequestsMap::iterator it(&pending_requests_); !it.IsAtEnd(); it.Advance()) {
++    auto* request = it.GetCurrentValue();
++    auto* frame = content::RenderFrameHost::FromID(request->render_process_id(), request->render_frame_id());
++    if (frame && owns.Run(frame->GetLastCommittedOrigin())) {
++      auto reply = request->TakeCallback();
++      auto denied = std::vector<content::PermissionResult>(request->permissions().size(),
++          content::PermissionResult(PermissionStatus::DENIED));
++      notifications.push_back(base::BindOnce(std::move(reply), std::move(denied)));
++      removed.push_back(it.GetCurrentKey());
++    }
++  }
++  for (const auto id : removed) pending_requests_.Remove(id);
++  if (notify_objects) std::move(notify_objects).Run();
++  for (auto& notify : notifications) std::move(notify).Run();
++  return true;
++}
++}  // namespace permissions
+--- a/components/permissions/permission_context_base.h
++++ b/components/permissions/permission_context_base.h
+@@ -6,6 +6,7 @@
+ #define COMPONENTS_PERMISSIONS_PERMISSION_CONTEXT_BASE_H_
+ 
+ #include <memory>
++#include <set>
+ #include <unordered_map>
+ 
+ #include "base/functional/callback_forward.h"
+@@ -97,6 +98,9 @@
+       network::mojom::PermissionsPolicyFeature permissions_policy_feature);
+   ~PermissionContextBase_ChromiumImpl() override;
+ 
++  base::OnceClosure PreparePermissionRequestRetirement(
++      const content_settings::SitePermissionMatcher& owns);
++
+   // A field trial used to enable the global permissions kill switch.
+   // This is public so permissions that don't yet inherit from
+   // PermissionContextBase can use it.
+@@ -335,6 +339,7 @@
+       std::pair<base::SafeRef<PermissionRequest>, BrowserPermissionCallback>>
+       pending_requests_;
+ 
++  std::set<std::string> retired_requests_;
+   mutable std::optional<bool> last_has_device_permission_result_ = std::nullopt;
+ 
+   std::optional<bool> has_device_permission_for_test_;
+--- a/components/permissions/permission_context_base.cc
++++ b/components/permissions/permission_context_base.cc
+@@ -697,6 +697,7 @@
+ void PermissionContextBase_ChromiumImpl::PermissionDecided(
+     const permissions::PermissionPromptDecision& decision,
+     const PermissionRequestData& request_data) {
++  if (retired_requests_.contains(request_data.id.ToString())) return;
+   const bool has_authority =
+       !PermissionsClient::Get()->RequiresDocumentPermissionContext(
+           browser_context_) ||
+@@ -881,6 +882,7 @@
+ 
+ void PermissionContextBase_ChromiumImpl::CleanUpRequest(content::WebContents* web_contents,
+                                            const PermissionRequestID& id) {
++  retired_requests_.erase(id.ToString());
+   size_t success = pending_requests_.erase(id.ToString());
+   DCHECK(success == 1) << "Missing request " << id.ToString();
+ }
+@@ -963,3 +965,22 @@
+ }
+ 
+ }  // namespace permissions
++
++namespace permissions {
++base::OnceClosure PermissionContextBase_ChromiumImpl::PreparePermissionRequestRetirement(
++    const content_settings::SitePermissionMatcher& owns) {
++  std::vector<BrowserPermissionCallback> callbacks;
++  for (auto& [id, pending] : pending_requests_) {
++    const auto& request = pending.first;
++    if (owns.Run(url::Origin::Create(request->requesting_origin())) ||
++        owns.Run(url::Origin::Create(request->embedding_origin()))) {
++      retired_requests_.insert(id);
++      if (pending.second) callbacks.push_back(std::move(pending.second));
++    }
++  }
++  return base::BindOnce([](std::vector<BrowserPermissionCallback> callbacks) {
++    for (auto& callback : callbacks)
++      std::move(callback).Run(content::PermissionResult(PermissionStatus::DENIED));
++  }, std::move(callbacks));
++}
++}  // namespace permissions
+--- a/chrome/test/base/testing_profile.cc
++++ b/chrome/test/base/testing_profile.cc
+@@ -1051,7 +1051,7 @@
+   // Typed stateless profiles exercise the native controller and its document
+   // services, just like OffTheRecordProfileImpl, without owning a second
+   // manager.
+-  if (alloy::site_records::RequestContextPolicy::IsNoDisk(*this)) {
++  if (alloy::site_records::RequestContextPolicy::Get(*this)) {
+     return PermissionManagerFactory::GetForProfile(this);
+   }
+   return nullptr;

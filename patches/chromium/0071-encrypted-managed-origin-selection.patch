@@ -1,0 +1,57 @@
+--- a/chrome/browser/device_api/managed_configuration_api_factory.cc
++++ b/chrome/browser/device_api/managed_configuration_api_factory.cc
+@@ -13,16 +13,28 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/value_store/leveldb_value_store.h"
++#include "brave/alloy/site_records/site_profile_configuration.h"
+ 
+ // Profile/network composition stays at the native factory boundary. The core
+ // origin cache/API receives child factories and never reaches into a parent.
+-ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile)
+-    : ManagedConfigurationAPI(profile, base::BindRepeating([]() -> network::mojom::URLLoaderFactory* {
+-        return g_browser_process->system_network_context_manager()->GetURLLoaderFactory();
+-      })) {}
+-
+-ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile, LoaderGetter loaders)
+-    : ManagedConfigurationAPI(profile->GetPrefs(), base::BindRepeating([](base::FilePath root, const url::Origin& origin)
++namespace {
++ManagedConfigurationAPI::StoreFactory ManagedStoresForProfile(Profile* profile) {
++  if (auto* input = alloy::site_records::NativeProfileConfiguration::Get(*profile)) {
++    return base::BindRepeating([](base::WeakPtr<alloy::site_records::NativeProfileConfiguration> input,
++        const url::Origin& origin) -> std::optional<ManagedConfigurationStore::Options> {
++      if (!input) return std::nullopt;
++      auto binding = alloy::site_records::SiteProfileManagedOrigin(*input, origin);
++      if (!binding) return std::nullopt;
++      ManagedConfigurationStore::Options options;
++      options.create = std::move(binding->create);
++      options.admitted = std::move(binding->admitted);
++      options.error = std::move(binding->error);
++      options.runner = std::move(binding->runner);
++      options.observe_retirement = std::move(binding->observe_retirement);
++      return options;
++    }, input->GetWeakPtr());
++  }
++  return base::BindRepeating([](base::FilePath root, const url::Origin& origin)
+             -> std::optional<ManagedConfigurationStore::Options> {
+           ManagedConfigurationStore::Options options;
+           const auto path = root.AppendASCII("Managed Configuration")
+@@ -35,7 +47,17 @@
+           options.admitted = base::BindRepeating([] { return true; });
+           options.error = base::BindRepeating([](const value_store::ValueStore::Status&) {});
+           return options;
+-        }, profile->GetPath()), std::move(loaders)) {}
++        }, profile->GetPath());
++}
++}  // namespace
++
++ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile)
++    : ManagedConfigurationAPI(profile, base::BindRepeating([]() -> network::mojom::URLLoaderFactory* {
++        return g_browser_process->system_network_context_manager()->GetURLLoaderFactory();
++      })) {}
++
++ManagedConfigurationAPI::ManagedConfigurationAPI(Profile* profile, LoaderGetter loaders)
++    : ManagedConfigurationAPI(profile->GetPrefs(), ManagedStoresForProfile(profile), std::move(loaders)) {}
+ 
+ // static
+ ManagedConfigurationAPIFactory* ManagedConfigurationAPIFactory::GetInstance() {

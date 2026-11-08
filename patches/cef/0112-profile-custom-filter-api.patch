@@ -4,8 +4,8 @@
    sources += [ "libcef/browser/alloy/profile_store.cc" ]
    deps += [
 +    "//brave/browser/brave_shields",
-     "//brave/alloy/site_records:native_profile_configuration",
-     "//brave/alloy/site_records:native_profile_preferences",
+     "//brave/alloy/site_records:pref_files",
+     "//brave/alloy/site_records:site_profile_configuration",
      "//brave/alloy/site_records:profile_filter_preferences",
      "//brave/alloy/site_records:profiles",
 --- a/libcef/browser/request_context_impl.cc
@@ -16,7 +16,7 @@
 +#include "brave/browser/brave_shields/profile_adblock_service_factory.h"
 +#include "brave/components/brave_shields/content/browser/ad_block_custom_filters_provider.h"
 +#include "brave/components/brave_shields/content/browser/ad_block_service.h"
- #include "cef/libcef/browser/alloy/profile_configuration.h"
+ #include "cef/libcef/browser/alloy/profile_settings.h"
  #include "base/atomic_sequence_num.h"
  #include "base/logging.h"
 @@ -351,5 +355,48 @@

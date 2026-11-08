@@ -1,0 +1,460 @@
+--- a/chrome/browser/ui/zoom/chrome_zoom_level_prefs.cc
++++ b/chrome/browser/ui/zoom/chrome_zoom_level_prefs.cc
+@@ -216,7 +216,7 @@
+   }
+ }
+ 
+-void ChromeZoomLevelPrefs::ReconcileZoomConfiguration() {
++base::OnceClosure ChromeZoomLevelPrefs::PrepareZoomConfiguration() {
+   content::HostZoomMap::ZoomLevelVector levels;
+   const auto& partitions = pref_service_->GetDict(prefs::kPartitionPerHostZoomLevels);
+   if (const auto* hosts = partitions.FindDict(partition_key_)) {
+@@ -230,15 +230,21 @@
+                         dictionary ? GetTimeStamp(*dictionary) : base::Time()});
+     }
+   }
+-  auto weak = weak_factory_.GetWeakPtr();
+-  host_zoom_map_->ReplacePersistentZoomLevels(GetDefaultZoomLevelPref(), std::move(levels));
+-  if (!weak) return;
+-  const double current_default = host_zoom_map_->GetDefaultZoomLevel();
+-  if (blink::ZoomValuesEqual(current_default, notified_default_zoom_)) return;
+-  notified_default_zoom_ = current_default;
+-  auto callbacks = default_zoom_changed_callbacks_;
+-  callbacks->Notify();
+-  if (weak && zoom_event_manager_) zoom_event_manager_->OnDefaultZoomLevelChanged();
++  auto publication = host_zoom_map_->PreparePersistentZoomLevels(
++      GetDefaultZoomLevelPref(), std::move(levels));
++  if (!publication) return {};
++  return base::BindOnce([](base::WeakPtr<ChromeZoomLevelPrefs> owner,
++                          base::OnceClosure publication) {
++    std::move(publication).Run();
++    if (!owner) return;
++    const double current_default = owner->host_zoom_map_->GetDefaultZoomLevel();
++    if (blink::ZoomValuesEqual(current_default, owner->notified_default_zoom_)) return;
++    owner->notified_default_zoom_ = current_default;
++    auto callbacks = owner->default_zoom_changed_callbacks_;
++    callbacks->Notify();
++    if (owner && owner->zoom_event_manager_)
++      owner->zoom_event_manager_->OnDefaultZoomLevelChanged();
++  }, weak_factory_.GetWeakPtr(), std::move(publication));
+ }
+ 
+ void ChromeZoomLevelPrefs::InitHostZoomMap(
+@@ -271,8 +277,8 @@
+   pref_change_registrar_.Init(pref_service_);
+   for (const char* pref : {prefs::kPartitionDefaultZoomLevel,
+                            prefs::kPartitionPerHostZoomLevels}) {
+-    pref_change_registrar_.Add(pref, base::BindRepeating(
+-        &ChromeZoomLevelPrefs::ReconcileZoomConfiguration, weak_factory_.GetWeakPtr()));
++    pref_change_registrar_.AddProjection(pref, base::BindRepeating(
++        &ChromeZoomLevelPrefs::PrepareZoomConfiguration, base::Unretained(this)));
+   }
+ 
+ // On Android, the default zoom level is controlled by the Java-side UI and not
+--- a/chrome/browser/ui/zoom/chrome_zoom_level_prefs.h
++++ b/chrome/browser/ui/zoom/chrome_zoom_level_prefs.h
+@@ -68,7 +68,7 @@
+   // zoom levels (if any) managed by this class (for its associated partition).
+   void OnZoomLevelChanged(const content::HostZoomMap::ZoomLevelChange& change);
+ 
+-  void ReconcileZoomConfiguration();
++  base::OnceClosure PrepareZoomConfiguration();
+ 
+   raw_ptr<PrefService> pref_service_;
+   base::WeakPtr<zoom::ZoomEventManager> zoom_event_manager_;
+--- a/components/content_settings/core/browser/content_settings_pref.cc
++++ b/components/content_settings/core/browser/content_settings_pref.cc
+@@ -165,8 +165,8 @@
+   content_settings::ContentSettingsRegistry::GetInstance();
+   ReadContentSettingsFromPref();
+ 
+-  registrar_->Add(pref_name_,
+-                  base::BindRepeating(&ContentSettingsPref::OnPrefChanged,
++  registrar_->AddProjection(pref_name_,
++                  base::BindRepeating(&ContentSettingsPref::PreparePrefChange,
+                                       base::Unretained(this)));
+ }
+ 
+@@ -472,11 +472,11 @@
+   }
+ }
+ 
+-void ContentSettingsPref::OnPrefChanged() {
++base::OnceClosure ContentSettingsPref::PreparePrefChange() {
+   DCHECK(thread_checker_.CalledOnValidThread());
+ 
+   if (updating_preferences_)
+-    return;
++    return {};
+ 
+   auto snapshot = [&] {
+     std::map<std::string, std::unique_ptr<Rule>> rules;
+@@ -499,13 +499,16 @@
+   }
+   for (const auto& [key, rule] : after)
+     if (!before.contains(key)) changed.emplace(key, std::make_pair(rule->primary_pattern, rule->secondary_pattern));
+-  const auto notify = notify_callback_;
+-  const auto type = content_type_;
+-  auto alive = weak_factory_.GetWeakPtr();
+-  for (const auto& [key, patterns] : changed) {
+-    if (!alive || !alive->prefs_) return;
+-    notify.Run(patterns.first, patterns.second, type);
+-  }
++  if (changed.empty()) return {};
++  return base::BindOnce([](base::WeakPtr<ContentSettingsPref> owner,
++      std::map<std::string, std::pair<ContentSettingsPattern, ContentSettingsPattern>> changes) {
++    for (const auto& [key, patterns] : changes) {
++      if (!owner || !owner->prefs_) return;
++      const auto notify = owner->notify_callback_;
++      const auto type = owner->content_type_;
++      notify.Run(patterns.first, patterns.second, type);
++    }
++  }, weak_factory_.GetWeakPtr(), std::move(changed));
+ }
+ 
+ void ContentSettingsPref::UpdatePref(
+--- a/components/content_settings/core/browser/content_settings_pref.h
++++ b/components/content_settings/core/browser/content_settings_pref.h
+@@ -97,7 +97,7 @@
+       std::optional<content_settings::mojom::SessionModel> session_model);
+ 
+   // Callback for changes in the pref with the same name.
+-  void OnPrefChanged();
++  base::OnceClosure PreparePrefChange();
+ 
+   // Update the preference that stores content settings exceptions and syncs the
+   // value to the obsolete preference. When calling this function, |lock_|
+--- a/components/prefs/pref_change_registrar.cc
++++ b/components/prefs/pref_change_registrar.cc
+@@ -66,6 +66,19 @@
+   observers_.insert_or_assign(path, std::move(obs));
+ }
+ 
++void PrefChangeRegistrar::AddProjection(std::string_view path, ProjectionCallback prepare) {
++  CHECK(service_); CHECK(!IsObserved(path)); CHECK(prepare);
++  service_->AddPrefObserver(path, this);
++  projections_.insert_or_assign(path, std::move(prepare));
++}
++
++base::OnceClosure PrefChangeRegistrar::PreparePreferenceChange(PrefService*, std::string_view path) {
++  const auto found = projections_.find(path);
++  if (found == projections_.end()) return {};
++  auto prepare = found->second;
++  return prepare.Run();
++}
++
+ void PrefChangeRegistrar::AddMultiple(
+     const std::initializer_list<std::string_view>& paths,
+     base::RepeatingClosure obs) {
+@@ -78,6 +91,7 @@
+   DCHECK(IsObserved(path));
+ 
+   observers_.erase(path);
++  projections_.erase(std::string(path));
+   service_->RemovePrefObserver(path, this);
+ }
+ 
+@@ -87,14 +101,16 @@
+   }
+ 
+   observers_.clear();
++  for (const auto& [key, _] : projections_) service_->RemovePrefObserver(key, this);
++  projections_.clear();
+ }
+ 
+ bool PrefChangeRegistrar::IsEmpty() const {
+-  return observers_.empty();
++  return observers_.empty() && projections_.empty();
+ }
+ 
+ bool PrefChangeRegistrar::IsObserved(std::string_view pref) {
+-  return observers_.contains(pref);
++  return observers_.contains(pref) || projections_.contains(pref);
+ }
+ 
+ void PrefChangeRegistrar::OnServiceDestroyed(PrefService* service) {
+@@ -103,6 +119,11 @@
+ 
+ void PrefChangeRegistrar::OnPreferenceChanged(PrefService* service,
+                                               std::string_view pref) {
++  if (projections_.contains(pref)) {
++    auto publication = PreparePreferenceChange(service, pref);
++    if (publication) std::move(publication).Run();
++    return;
++  }
+   if (auto iter = observers_.find(pref); iter != observers_.end()) {
+     iter->second.Run(pref);
+   }
+--- a/components/prefs/pref_change_registrar.h
++++ b/components/prefs/pref_change_registrar.h
+@@ -56,6 +56,11 @@
+   void Add(std::string_view path, NamedChangeCallback obs);
+   void Add(std::string_view path, NamedChangeAsViewCallback obs);
+ 
++  // The callback installs native cached values and returns consumer publication.
++  // Ordinary changes immediately publish; a preparing store retains publication.
++  using ProjectionCallback = base::RepeatingCallback<base::OnceClosure()>;
++  void AddProjection(std::string_view path, ProjectionCallback prepare);
++
+   void AddMultiple(const std::initializer_list<std::string_view>& paths,
+                    base::RepeatingClosure obs);
+ 
+@@ -77,6 +82,8 @@
+ 
+  private:
+   // PrefObserver:
++  base::OnceClosure PreparePreferenceChange(PrefService* service,
++                                           std::string_view path) final;
+   void OnServiceDestroyed(PrefService* service) final;
+   void OnPreferenceChanged(PrefService* service,
+                            std::string_view pref_name) final;
+@@ -85,6 +92,7 @@
+       absl::flat_hash_map<std::string, NamedChangeAsViewCallback>;
+ 
+   ObserverMap observers_;
++  absl::flat_hash_map<std::string, ProjectionCallback> projections_;
+   raw_ptr<PrefService, AcrossTasksDanglingUntriaged> service_;
+ };
+ 
+--- a/components/prefs/pref_notifier.h
++++ b/components/prefs/pref_notifier.h
+@@ -6,6 +6,8 @@
+ #define COMPONENTS_PREFS_PREF_NOTIFIER_H_
+ 
+ #include <string_view>
++
++#include "base/functional/callback.h"
+ 
+ // Delegate interface used by PrefValueStore to notify its owner about changes
+ // to the preference values.
+@@ -19,6 +21,8 @@
+   // |pref_name|.
+   virtual void OnPreferenceChanged(std::string_view pref_name) = 0;
+ 
++  virtual base::OnceClosure PreparePreferenceChange(std::string_view path) { return {}; }
++
+   // Broadcasts the intialization completed notification.
+   virtual void OnInitializationCompleted(bool succeeded) = 0;
+ };
+--- a/components/prefs/pref_notifier_impl.cc
++++ b/components/prefs/pref_notifier_impl.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "components/prefs/pref_notifier_impl.h"
+ 
++#include <vector>
++
++#include "base/functional/bind.h"
+ #include "base/debug/alias.h"
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/logging.h"
+@@ -77,6 +80,24 @@
+   FireObservers(path);
+ }
+ 
++base::OnceClosure PrefNotifierImpl::PreparePreferenceChange(std::string_view path) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!pref_service_ || !pref_service_->FindPreference(path)) return {};
++  std::vector<base::OnceClosure> publications;
++  auto prepare = [&](PrefObserver& observer) {
++    auto publication = observer.PreparePreferenceChange(pref_service_, path);
++    if (publication) publications.push_back(std::move(publication));
++  };
++  for (auto& observer : all_prefs_pref_observers_) prepare(observer);
++  auto found = pref_observers_.find(path);
++  if (found != pref_observers_.end())
++    for (auto& observer : found->second) prepare(observer);
++  if (publications.empty()) return {};
++  return base::BindOnce([](std::vector<base::OnceClosure> pending) {
++    for (auto& publication : pending) std::move(publication).Run();
++  }, std::move(publications));
++}
++
+ void PrefNotifierImpl::OnInitializationCompleted(bool succeeded) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+--- a/components/prefs/pref_notifier_impl.h
++++ b/components/prefs/pref_notifier_impl.h
+@@ -55,6 +55,7 @@
+ 
+   // PrefNotifier overrides.
+   void OnPreferenceChanged(std::string_view pref_name) override;
++  base::OnceClosure PreparePreferenceChange(std::string_view path) override;
+ 
+  protected:
+   // PrefNotifier overrides.
+--- a/components/prefs/pref_observer.h
++++ b/components/prefs/pref_observer.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string_view>
+ 
++#include "base/functional/callback.h"
+ #include "base/observer_list_types.h"
+ 
+ class PrefService;
+@@ -21,6 +22,9 @@
+   // the PrefService).
+   virtual void OnServiceDestroyed(PrefService* service) = 0;
+ 
++  // Native cache preparation only; ordinary observer delivery remains deferred.
++  virtual base::OnceClosure PreparePreferenceChange(PrefService* service,
++                                                   std::string_view path) { return {}; }
+   // Invoked when the value of the preference named `pref_name` changes.
+   virtual void OnPreferenceChanged(PrefService* service,
+                                    std::string_view pref_name) = 0;
+--- a/components/prefs/pref_store.h
++++ b/components/prefs/pref_store.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <string_view>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/observer_list_types.h"
+ #include "base/values.h"
+@@ -27,6 +28,10 @@
+    public:
+     // Called when the value for the given `key` in the store changes.
+     virtual void OnPrefValueChanged(std::string_view key) {}
++    // Install a native projection without notifying its consumers. The returned
++    // publication is released by the owner only after its retirement barrier.
++    // Ordinary observers do not participate and receive no early event.
++    virtual base::OnceClosure PreparePrefValueChange(std::string_view key) { return {}; }
+     // Notification about the PrefStore being fully initialized.
+     virtual void OnInitializationCompleted(bool succeeded) {}
+   };
+--- a/components/prefs/pref_value_store.cc
++++ b/components/prefs/pref_value_store.cc
+@@ -40,6 +40,10 @@
+ 
+ void PrefValueStore::PrefStoreKeeper::OnPrefValueChanged(std::string_view key) {
+   pref_value_store_->OnPrefValueChanged(type_, key);
++}
++
++base::OnceClosure PrefValueStore::PrefStoreKeeper::PreparePrefValueChange(std::string_view key) {
++  return pref_value_store_->pref_notifier_->PreparePreferenceChange(key);
+ }
+ 
+ void PrefValueStore::PrefStoreKeeper::OnInitializationCompleted(
+--- a/components/prefs/pref_value_store.h
++++ b/components/prefs/pref_value_store.h
+@@ -190,6 +190,7 @@
+    private:
+     // PrefStore::Observer implementation.
+     void OnPrefValueChanged(std::string_view key) override;
++    base::OnceClosure PreparePrefValueChange(std::string_view key) override;
+     void OnInitializationCompleted(bool succeeded) override;
+ 
+     // PrefValueStore this keeper is part of.
+--- a/components/prefs/wrap_with_prefix_pref_store.cc
++++ b/components/prefs/wrap_with_prefix_pref_store.cc
+@@ -7,6 +7,10 @@
+ #include <string>
+ #include <string_view>
+ 
++#include <functional>
++#include <vector>
++
++#include "base/functional/bind.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+ 
+@@ -141,6 +145,19 @@
+                                    original_key);
+ }
+ 
++base::OnceClosure WrapWithPrefixPrefStore::PreparePrefValueChange(std::string_view key) {
++  if (!HasDottedPrefix(key)) return {};
++  std::vector<base::OnceClosure> publications;
++  observers_.NotifyAllowReentrancy([&](auto&& observer) {
++    auto publication = std::invoke(&PrefStore::Observer::PreparePrefValueChange, observer, RemoveDottedPrefix(key));
++    if (publication) publications.push_back(std::move(publication));
++  });
++  if (publications.empty()) return {};
++  return base::BindOnce([](std::vector<base::OnceClosure> pending) {
++    for (auto& publication : pending) std::move(publication).Run();
++  }, std::move(publications));
++}
++
+ void WrapWithPrefixPrefStore::OnInitializationCompleted(bool succeeded) {
+   if (PersistentPrefStore::PrefReadError read_error = GetReadError();
+       read_error != PersistentPrefStore::PREF_READ_ERROR_NONE &&
+--- a/components/prefs/wrap_with_prefix_pref_store.h
++++ b/components/prefs/wrap_with_prefix_pref_store.h
+@@ -73,6 +73,7 @@
+ 
+   // PrefStore::Observer implementation.
+   void OnPrefValueChanged(std::string_view key) override;
++  base::OnceClosure PreparePrefValueChange(std::string_view key) override;
+   void OnInitializationCompleted(bool succeeded) override;
+ 
+  protected:
+--- a/content/browser/host_zoom_map_impl.cc
++++ b/content/browser/host_zoom_map_impl.cc
+@@ -448,6 +448,13 @@
+ void HostZoomMapImpl::ReplacePersistentZoomLevels(double default_level,
+                                                  ZoomLevelVector levels) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
++  auto publication = PreparePersistentZoomLevels(default_level, std::move(levels));
++  if (publication) std::move(publication).Run();
++}
++
++base::OnceClosure HostZoomMapImpl::PreparePersistentZoomLevels(double default_level,
++                                                             ZoomLevelVector levels) {
++  CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   HostZoomLevels next;
+   for (const auto& entry : levels) {
+     CHECK_EQ(entry.mode, ZOOM_CHANGED_FOR_HOST);
+@@ -468,12 +475,18 @@
+   }
+   const bool default_changed =
+       !blink::ZoomValuesEqual(default_level, default_zoom_level_);
+-  if (!default_changed && changed.empty()) return;
++  if (!default_changed && changed.empty()) return {};
+ 
+   // One publication boundary: observers can never see a new default with old
+   // hosts, nor a partly removed set of hosts during record revocation.
+   host_zoom_levels_ = std::move(next);
+   default_zoom_level_ = default_level;
++  return base::BindOnce(&HostZoomMapImpl::PublishPersistentZoomLevels,
++                       weak_factory_.GetWeakPtr(), std::move(changed), default_changed);
++}
++
++void HostZoomMapImpl::PublishPersistentZoomLevels(std::set<std::string> changed,
++                                                bool default_changed) {
+   auto weak = weak_factory_.GetWeakPtr();
+   for (const auto& host : changed) {
+     SendZoomLevelChange(std::string(), host);
+--- a/content/browser/host_zoom_map_impl.h
++++ b/content/browser/host_zoom_map_impl.h
+@@ -68,6 +68,8 @@
+   void SetDefaultZoomLevel(double level) override;
+   void ReplacePersistentZoomLevels(double default_level,
+                                   ZoomLevelVector levels) override;
++  base::OnceClosure PreparePersistentZoomLevels(double default_level,
++                                               ZoomLevelVector levels) override;
+   base::CallbackListSubscription AddZoomLevelChangedCallback(
+       ZoomLevelChangedCallback callback) override;
+ 
+@@ -151,6 +153,7 @@
+   void SendZoomLevelChange(const std::string& scheme, const std::string& host);
+ 
+   void NotifyZoomLevelChanged(const ZoomLevelChange& change);
++  void PublishPersistentZoomLevels(std::set<std::string> changed, bool default_changed);
+ 
+   // Notify may retire this map. Keep only the subscription storage alive until
+   // iteration unwinds; weak callback adapters stop delivery after retirement.
+--- a/content/public/browser/host_zoom_map.h
++++ b/content/public/browser/host_zoom_map.h
+@@ -194,6 +194,10 @@
+   virtual void ReplacePersistentZoomLevels(double default_level,
+                                           ZoomLevelVector levels) = 0;
+ 
++  // Install configuration now; defer renderer/observer delivery to the owner.
++  virtual base::OnceClosure PreparePersistentZoomLevels(double default_level,
++                                                       ZoomLevelVector levels) = 0;
++
+   using ZoomLevelChangedCallback =
+       base::RepeatingCallback<void(const ZoomLevelChange&)>;
+   // Add and remove zoom level changed callbacks.

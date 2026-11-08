@@ -2,8 +2,8 @@
 +++ b/BUILD.gn
 @@ -1165,3 +1165,6 @@
    deps += [
-+    "//brave/alloy/site_records:native_profile_configuration",
-+    "//brave/alloy/site_records:native_profile_preferences",
++    "//brave/alloy/site_records:pref_files",
++    "//brave/alloy/site_records:site_profile_configuration",
 +    "//brave/alloy/site_records:profile_filter_preferences",
      "//brave/alloy/site_records:profiles",
      "//third_party/icu:icuuc",
@@ -14,7 +14,7 @@
  } alloy_keyring_result_t;
 +
 +///
-+/// EXPERIMENTAL: Profile operation result.
++/// EXPERIMENTAL: Durable profile settings operation result.
 +///
 +typedef enum {
 +  ALLOY_SETTINGS_OK = 0,

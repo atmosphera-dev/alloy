@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alex Indigo
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "cef/include/alloy/alloy_profile.h"
+#include "cef/include/alloy/alloy_request_context.h"
 
 #include <memory>
 #include <atomic>
@@ -10,7 +11,8 @@
 #include <vector>
 
 #include "brave/alloy/site_records/encrypted_profile.h"
-#include "brave/alloy/site_records/native_profile_preferences.h"
+#include "brave/alloy/site_records/request_context_policy.h"
+#include "brave/alloy/site_records/site_profile_configuration.h"
 #include "brave/alloy/site_records/profile_filter_preferences.h"
 #include "brave/alloy/site_records/secret_service_key_source.h"
 #include "base/files/file_util.h"
@@ -20,11 +22,18 @@
 #include "base/task/bind_post_task.h"
 #include "base/synchronization/waitable_event.h"
 #include "base/threading/thread_restrictions.h"
-#include "cef/libcef/browser/alloy/profile_configuration.h"
+#include "cef/libcef/browser/alloy/profile_settings.h"
 #include "cef/libcef/browser/thread_util.h"
 #include "cef/libcef/browser/browser_context.h"
 #include "cef/libcef/browser/browser_host_base.h"
+#include "cef/libcef/browser/context.h"
+#include "cef/libcef/browser/request_context_impl.h"
+#include "chrome/browser/profiles/profile.h"
+#include "components/prefs/pref_service.h"
+#include "content/public/browser/alloy_site_retirement.h"
+#include "content/public/browser/alloy_network_retirement.h"
 #include "content/public/browser/browser_context.h"
+#include "content/browser/alloy_embedded_state.h"
 #include "cef/libcef/common/api_version_util.h"
 #include "third_party/icu/source/common/unicode/ustring.h"
 #include "url/gurl.h"
@@ -103,21 +112,90 @@ alloy_site_settings_result_t SettingsResult(sr::FileStatus status) {
   }
 }
 
+void RetireNativeSite(scoped_refptr<sr::SitePrefStore> prefs, GURL site,
+                      sr::SitePrefStore::Completion done) {
+  CEF_REQUIRE_UIT();
+  const auto target = net::AlloyNetworkRecordTarget::FromPrincipal(
+      site, url::Origin::Create(site));
+  if (!target) { std::move(done).Run(sr::FileStatus::kInvalid); return; }
+  std::vector<content::BrowserContext*> native;
+  std::vector<CefRefPtr<CefRequestContextImpl>> keepalive;
+  for (auto* context : CefBrowserContext::GetAll()) {
+    auto* browser_context = context->AsBrowserContext();
+    auto* input = browser_context ? sr::NativeProfileConfiguration::Get(*browser_context) : nullptr;
+    if (!input || sr::GetSiteProfileSettings(*input).get() != prefs.get()) continue;
+    native.push_back(browser_context);
+    keepalive.push_back(context->GetAnyRequestContext(false));
+  }
+  auto success = std::make_shared<bool>(true);
+  // One completion from each site owner and each network owner, plus the
+  // commit-iteration gate. A synchronous drain cannot release our keepalives.
+  auto completed = base::BarrierClosure(native.size() * 2 + 1, base::BindOnce(
+      [](std::vector<CefRefPtr<CefRequestContextImpl>>, std::shared_ptr<bool> success,
+         sr::SitePrefStore::Completion done) {
+        std::move(done).Run(*success ? sr::FileStatus::kOk : sr::FileStatus::kIo);
+      }, std::move(keepalive), success, std::move(done)));
+  auto owns = base::BindRepeating([](net::AlloyNetworkRecordTarget target,
+                                    const url::Origin& origin) {
+    return target.Owns(origin);
+  }, *target);
+  auto close = base::BindRepeating([](content::WebContents* contents) {
+    auto browser = CefBrowserHostBase::GetBrowserForContents(contents);
+    CHECK(browser); browser->CloseBrowser(true);
+  });
+  auto networks = std::make_shared<std::vector<base::OnceClosure>>();
+  auto sites = std::make_shared<std::vector<base::OnceClosure>>();
+  auto prepared = base::BarrierClosure(native.size() + 1, base::BindOnce(
+      [](std::vector<content::BrowserContext*> contexts, GURL site,
+         std::shared_ptr<std::vector<base::OnceClosure>> networks,
+         std::shared_ptr<std::vector<base::OnceClosure>> sites,
+         base::OnceClosure committed) {
+        auto network_commits = std::move(*networks);
+        auto site_commits = std::move(*sites);
+        for (auto& commit : network_commits) std::move(commit).Run();
+        for (auto* context : contexts)
+          content::RevokeAlloyEmbeddedSite(*context, site, url::Origin::Create(site));
+        for (auto& commit : site_commits) std::move(commit).Run();
+        std::move(committed).Run();
+      }, native, site, networks, sites, completed));
+  // Capture/retain every original network endpoint before document preparation
+  // shuts down CUT admission. No native commit runs during either prepare pass.
+  for (auto* context : native) {
+    content::PrepareAlloyNetworkServiceRetirement(context, *target,
+        base::BindOnce([](std::shared_ptr<std::vector<base::OnceClosure>> networks,
+                          base::OnceClosure prepared, base::OnceClosure commit) {
+          networks->push_back(std::move(commit)); std::move(prepared).Run();
+        }, networks, prepared),
+        base::BindOnce([](std::shared_ptr<bool> success,
+                          base::OnceClosure completed, bool ok) {
+          *success = *success && ok; std::move(completed).Run();
+        }, success, completed));
+  }
+  for (auto* context : native) sites->push_back(content::PrepareAlloySiteRetirement(context, owns, close,
+      base::BindOnce([](scoped_refptr<sr::SitePrefStore> prefs, std::shared_ptr<bool> success,
+                       base::OnceClosure completed, bool ok, base::OnceClosure publication) {
+        prefs->DeferNativeRetirementNotification(std::move(publication));
+        *success = *success && ok; std::move(completed).Run();
+      }, prefs, success, completed)));
+  // This final gate also covers the no-context / synchronous-prepare cases.
+  prepared.Run();
+}
+
 class SettingsOwner final : public CefBaseRefCounted {
  public:
   SettingsOwner(std::shared_ptr<sr::RecordFileSystem> files,
                 scoped_refptr<base::SequencedTaskRunner> runner,
                 base::RepeatingCallback<bool()> admitted)
       : files_(std::move(files)), runner_(std::move(runner)), admitted_(std::move(admitted)) {
-    prefs_ = base::MakeRefCounted<sr::NativeProfilePreferences>(files_->ProfileCapability(sr::StorePurpose::kProfileSettings),runner_,admitted_,
-        base::BindRepeating(&SettingsOwner::NativeFailed,weak_factory_.GetWeakPtr()));
+    prefs_ = base::MakeRefCounted<sr::SitePrefStore>(files_,
+        base::BindRepeating(&SettingsOwner::OnError, weak_factory_.GetWeakPtr()), runner_, admitted_);
   }
   ~SettingsOwner() override {
-    CEF_REQUIRE_UIT(); prefs_->Close({});
+    CEF_REQUIRE_UIT(); prefs_->Invalidate();
     if (filters_) filters_->Close({});
   }
   bool Matches(const std::shared_ptr<sr::RecordFileSystem>& files) const { return files == files_; }
-  scoped_refptr<sr::NativeProfilePreferences> prefs() const { return prefs_; }
+  scoped_refptr<sr::SitePrefStore> prefs() const { return prefs_; }
   sr::FileStatus failure() const { return failure_; }
   using FiltersReady = sr::ProfileFilterPreferences::Loaded;
   void PrepareFilters(FiltersReady ready) {
@@ -152,7 +230,7 @@ class SettingsOwner final : public CefBaseRefCounted {
     // Native keyed services/constructors must release borrowed values first.
     // Prepared-only inputs are also covered: their retained filter cache must
     // be wiped even though no native service ever consumed it.
-    prefs_->Close(base::BindOnce(
+    prefs_->CloseNativeCacheAsync(base::BindOnce(
         [](CefRefPtr<SettingsOwner> owner, base::OnceClosure done) {
           if (!owner->filters_) { if (done) std::move(done).Run(); return; }
           owner->filters_->Close(base::BindOnce(
@@ -174,7 +252,6 @@ class SettingsOwner final : public CefBaseRefCounted {
       std::move(callback).Run(result, result == sr::FileStatus::kOk ? filters_ : nullptr);
     }
   }
-  void NativeFailed() { if(failure_==sr::FileStatus::kOk)failure_=sr::FileStatus::kCancelled;OnError(sr::FileStatus::kCancelled); }
   void OnError(sr::FileStatus status) {
     CEF_REQUIRE_UIT();
     if (status != sr::FileStatus::kCancelled && status != sr::FileStatus::kDenied &&
@@ -192,7 +269,7 @@ class SettingsOwner final : public CefBaseRefCounted {
   const std::shared_ptr<sr::RecordFileSystem> files_;
   const scoped_refptr<base::SequencedTaskRunner> runner_;
   const base::RepeatingCallback<bool()> admitted_;
-  scoped_refptr<sr::NativeProfilePreferences> prefs_;
+  scoped_refptr<sr::SitePrefStore> prefs_;
   scoped_refptr<sr::ProfileFilterPreferences> filters_;
   bool filters_loading_ = false;
   std::vector<FiltersReady> filters_ready_;
@@ -276,49 +353,127 @@ class AlloyProfileImpl final : public AlloyProfile {
     }
     return ALLOY_PROFILE_ERROR;
   }
+  scoped_refptr<sr::SitePrefStore> SettingsProjection() {
+    return ProjectionWithGeneration(nullptr);
+  }
+  scoped_refptr<sr::SitePrefStore> ProjectionWithGeneration(
+      std::shared_ptr<sr::RecordFileSystem>* original) {
+    CEF_REQUIRE_UIT();
+    auto runner = SettingsRunner();
+    std::lock_guard lock(settings_mutex_);
+    if (lock_pending_->load()) return nullptr;
+    auto files = profile_->files();
+    if (!files) return nullptr;
+    if (!settings_ || !settings_->Matches(files)) settings_ = new SettingsOwner(files, runner,
+        base::BindRepeating([](std::shared_ptr<std::atomic<bool>> pending) {
+          return !pending->load();
+        }, lock_pending_));
+    if (original) *original = files;
+    return settings_->prefs();
+  }
   void PrepareNativeConfiguration(alloy::NativeProfileConfigurationCallback callback) {
     CEF_REQUIRE_UIT();
-    auto runner=SettingsRunner();std::shared_ptr<sr::RecordFileSystem> files;
-    CefRefPtr<SettingsOwner> settings;
-    {
-      std::lock_guard lock(settings_mutex_);
-      if(!lock_pending_->load())files=profile_->files();
-      if(files){
-        if(!settings_||!settings_->Matches(files))settings_=new SettingsOwner(files,runner,
-            base::BindRepeating([](std::shared_ptr<std::atomic<bool>> pending){return !pending->load();},lock_pending_));
-        settings=settings_;
-      }
+    std::shared_ptr<sr::RecordFileSystem> files;
+    auto prefs = ProjectionWithGeneration(&files);
+    if (!prefs) {
+      CEF_POST_TASK(CEF_UIT, base::BindOnce(
+          [](base::OnceClosure release, alloy::NativeProfileConfigurationCallback callback) {
+            std::move(callback).Run(ALLOY_SETTINGS_CANCELLED, nullptr);
+            std::move(release).Run();
+          }, RetainForReply(), std::move(callback)));
+      return;
     }
-    if(!settings){
-      CEF_POST_TASK(CEF_UIT,base::BindOnce([](base::OnceClosure release,alloy::NativeProfileConfigurationCallback callback){
-        base::ScopedClosureRunner keepalive(std::move(release));std::move(callback).Run(ALLOY_SETTINGS_CANCELLED,nullptr);
-      },RetainForReply(),std::move(callback)));return;
+    auto original = files->ProfileCapability(sr::StorePurpose::kProfileSettings);
+    CefRefPtr<SettingsOwner> settings = settings_;
+    prefs->InitializeAsync(base::BindOnce(
+        [](base::OnceClosure release, sr::RecordCapability original,
+            scoped_refptr<sr::SitePrefStore> prefs,
+           CefRefPtr<SettingsOwner> settings,
+           alloy::NativeProfileConfigurationCallback callback, sr::FileStatus status) {
+          if (status == sr::FileStatus::kOk && (!original.active() || prefs->ReadOnly()))
+            status = sr::FileStatus::kCancelled;
+          if (status != sr::FileStatus::kOk) {
+            base::ScopedClosureRunner keepalive(std::move(release));
+            std::move(callback).Run(SettingsResult(status), nullptr); return;
+          }
+          settings->PrepareFilters(base::BindOnce(
+              [](base::OnceClosure release, sr::RecordCapability original,
+                 scoped_refptr<sr::SitePrefStore> prefs,
+                 alloy::NativeProfileConfigurationCallback callback, sr::FileStatus status,
+                 scoped_refptr<sr::ProfileFilterPreferences> filters) {
+                base::ScopedClosureRunner keepalive(std::move(release));
+                if (status == sr::FileStatus::kOk && (!original.active() || prefs->ReadOnly() ||
+                    !filters || !filters->available())) status = sr::FileStatus::kCancelled;
+                std::unique_ptr<sr::NativeProfileConfiguration> configuration;
+                if (status == sr::FileStatus::kOk) {
+                  auto view = prefs->CreateNativeView();
+                  if (!view) status = sr::FileStatus::kCancelled;
+                  else configuration = sr::MakeSiteProfileConfiguration(
+                      std::move(original), std::move(view), prefs, keepalive.Release(),
+                      base::BindOnce([](scoped_refptr<sr::ProfileFilterPreferences> filters,
+                                        base::SupportsUserData& context) {
+                        sr::ProfileFilterPreferences::Attach(context, filters);
+                      }, filters), base::BindRepeating([](scoped_refptr<sr::ProfileFilterPreferences> filters) {
+                        return filters->available();
+                      }, filters));
+                }
+                std::move(callback).Run(SettingsResult(status), std::move(configuration));
+              }, std::move(release), std::move(original), prefs, std::move(callback)));
+        }, RetainForReply(), std::move(original), prefs, settings, std::move(callback)));
+  }
+  bool GetFirstPartyEmbeds(const CefString& outer,
+      CefRefPtr<AlloySiteSettingsCallback> callback) override {
+    if (!CEF_CURRENTLY_ON_UIT() || !callback) return false;
+    auto prefs = SettingsProjection();
+    if (!prefs) { Cancel(std::move(callback)); return true; }
+    prefs->GetFirstPartyEmbedsAsync(GURL(outer.ToString()), base::BindOnce(
+        [](base::OnceClosure release, scoped_refptr<sr::SitePrefStore> prefs,
+           CefRefPtr<AlloySiteSettingsCallback> callback,
+           sr::FileStatus status, std::vector<std::string> domains) {
+          if (status == sr::FileStatus::kOk && prefs->ReadOnly()) status = sr::FileStatus::kCancelled;
+          std::vector<CefString> result;
+          if (status == sr::FileStatus::kOk) for (const auto& domain : domains) result.emplace_back(domain);
+          callback->OnComplete(SettingsResult(status), result);
+          std::move(release).Run();
+        }, RetainForReply(), prefs, std::move(callback)));
+    return true;
+  }
+  bool SetFirstPartyEmbeds(const CefString& outer, const std::vector<CefString>& embedded,
+      CefRefPtr<AlloySiteSettingsCallback> callback) override {
+    if (!CEF_CURRENTLY_ON_UIT() || !callback) return false;
+    auto prefs = SettingsProjection();
+    if (!prefs) { Cancel(std::move(callback)); return true; }
+    std::vector<GURL> sites;
+    for (const auto& site : embedded) sites.emplace_back(site.ToString());
+    prefs->SetFirstPartyEmbedsAsync(GURL(outer.ToString()), std::move(sites), base::BindOnce(
+        [](base::OnceClosure release, scoped_refptr<sr::SitePrefStore> prefs,
+           CefRefPtr<AlloySiteSettingsCallback> callback, sr::FileStatus status) {
+          if (status == sr::FileStatus::kOk && prefs->ReadOnly()) status = sr::FileStatus::kCancelled;
+          callback->OnComplete(SettingsResult(status), {});
+          std::move(release).Run();
+        }, RetainForReply(), prefs, std::move(callback)));
+    return true;
+  }
+  bool DeleteSiteRecord(const CefString& site,
+      CefRefPtr<AlloyRecordDeletionCallback> callback) override {
+    if (!CEF_CURRENTLY_ON_UIT() || !callback) return false;
+    auto prefs = SettingsProjection();
+    if (!prefs) {
+      CEF_POST_TASK(CEF_UIT, base::BindOnce([](base::OnceClosure release,
+          CefRefPtr<AlloyRecordDeletionCallback> callback) {
+        callback->OnComplete(ALLOY_SETTINGS_CANCELLED, false); std::move(release).Run();
+      }, RetainForReply(), callback));
+      return true;
     }
-    auto original=files->ProfileCapability(sr::StorePurpose::kProfileSettings);
-    settings->PrepareFilters(base::BindOnce([](base::OnceClosure release,sr::RecordCapability original,
-        CefRefPtr<SettingsOwner> settings,alloy::NativeProfileConfigurationCallback callback,
-        sr::FileStatus status,scoped_refptr<sr::ProfileFilterPreferences> filters){
-      base::ScopedClosureRunner keepalive(std::move(release));
-      auto prefs=settings->prefs();
-      if(status==sr::FileStatus::kOk&&(!original.active()||prefs->ReadOnly()||!filters||!filters->available()))status=sr::FileStatus::kCancelled;
-      std::unique_ptr<sr::NativeProfileConfiguration> configuration;
-      if(status==sr::FileStatus::kOk){
-        auto view=prefs->CreateNativeView();
-        if(!view)status=sr::FileStatus::kCancelled;
-        else {
-          sr::NativeProfileConfiguration::Bindings bindings;bindings.prefs=view;
-          bindings.admitted=base::BindRepeating([](scoped_refptr<sr::NativePrefView> view,
-              scoped_refptr<sr::ProfileFilterPreferences> filters){return view->CanStartServiceConstruction()&&filters->available();},view,filters);
-          bindings.begin_construction=base::BindOnce(&sr::NativePrefView::BeginConstruction,view);
-          bindings.construction_finished=base::BindRepeating(&sr::NativePrefView::ConstructionFinished,view);
-          bindings.finish_teardown=base::BindOnce(&sr::NativePrefView::FinishTeardown,view);
-          bindings.attach_consumer=base::BindOnce([](scoped_refptr<sr::ProfileFilterPreferences> filters,
-              base::SupportsUserData& context){sr::ProfileFilterPreferences::Attach(context,filters);},filters);
-          configuration=std::make_unique<sr::NativeProfileConfiguration>(std::move(original),std::move(bindings),keepalive.Release());
-        }
-      }
-      std::move(callback).Run(SettingsResult(status),std::move(configuration));
-    },RetainForReply(),std::move(original),settings,std::move(callback)));
+    GURL url(site.ToString());
+    prefs->DeleteSiteWithTeardownAsync(url, base::BindOnce(&RetireNativeSite, prefs, url),
+        base::BindOnce([](base::OnceClosure release, scoped_refptr<sr::SitePrefStore> prefs,
+            CefRefPtr<AlloyRecordDeletionCallback> callback, sr::FileStatus status, sr::RecordDeletion deleted) {
+          if (status == sr::FileStatus::kOk && prefs->ReadOnly()) status = sr::FileStatus::kCancelled;
+          callback->OnComplete(SettingsResult(status), deleted == sr::RecordDeletion::kDeletedFilesPending);
+          std::move(release).Run();
+        }, RetainForReply(), prefs, callback));
+    return true;
   }
  private:
   bool StartRuntimeLock(scoped_refptr<base::SequencedTaskRunner> runner,
@@ -363,6 +518,13 @@ class AlloyProfileImpl final : public AlloyProfile {
     return base::BindPostTask(SettingsRunner(), base::BindOnce(
         [](CefRefPtr<AlloyProfile>) {}, CefRefPtr<AlloyProfile>(this)));
   }
+  void Cancel(CefRefPtr<AlloySiteSettingsCallback> callback) {
+    CEF_POST_TASK(CEF_UIT, base::BindOnce(
+        [](base::OnceClosure release, CefRefPtr<AlloySiteSettingsCallback> callback) {
+          callback->OnComplete(ALLOY_SETTINGS_CANCELLED, {});
+          std::move(release).Run();
+        }, RetainForReply(), std::move(callback)));
+  }
   ~AlloyProfileImpl() override = default;
   std::unique_ptr<sr::EncryptedProfile> profile_;
   // The same lock cut outlives this API owner when native inputs are retained.
@@ -377,7 +539,121 @@ class AlloyProfileImpl final : public AlloyProfile {
 base::FilePath ProfilePath(const CefString& path) {
   return base::FilePath::FromUTF8Unsafe(path.ToString());
 }
+
+void ContextEmbedList(CefRefPtr<CefRequestContext> context, GURL outer,
+                     std::optional<std::vector<GURL>> replacement,
+                     CefRefPtr<AlloySiteSettingsCallback> callback) {
+  CEF_REQUIRE_UIT();
+  auto reply = base::BindOnce([](CefRefPtr<AlloySiteSettingsCallback> callback,
+      sr::FileStatus status, std::vector<std::string> domains) {
+    std::vector<CefString> result;
+    if (status == sr::FileStatus::kOk)
+      for (const auto& domain : domains) result.emplace_back(domain);
+    callback->OnComplete(SettingsResult(status), result);
+  }, std::move(callback));
+  auto* impl = static_cast<CefRequestContextImpl*>(context.get());
+  auto* cef_context = impl && impl->VerifyBrowserContext() ? impl->GetBrowserContext() : nullptr;
+  auto* native = cef_context ? cef_context->AsBrowserContext() : nullptr;
+  const auto* policy = native ? sr::RequestContextPolicy::Get(*native) : nullptr;
+  if (!policy || policy->storage_mode() == sr::StorageMode::kStateless) {
+    std::move(reply).Run(sr::FileStatus::kCancelled, {}); return;
+  }
+  const auto original = policy->StorageCapability(sr::StorePurpose::kSiteSettings);
+  if (!original.active()) { std::move(reply).Run(sr::FileStatus::kCancelled, {}); return; }
+  if (policy->storage_mode() == sr::StorageMode::kEncrypted) {
+    const auto* input = sr::NativeProfileConfiguration::Get(*native);
+    auto settings = input && input->admitted() ? sr::GetSiteProfileSettings(*input) : nullptr;
+    if (!settings) { std::move(reply).Run(sr::FileStatus::kCancelled, {}); return; }
+    auto completed = base::BindOnce([](CefRefPtr<CefRequestContext> context,
+        scoped_refptr<sr::SitePrefStore> settings,
+        base::OnceCallback<void(sr::FileStatus, std::vector<std::string>)> reply,
+        sr::FileStatus status, std::vector<std::string> domains) {
+      auto* impl = static_cast<CefRequestContextImpl*>(context.get());
+      if (status == sr::FileStatus::kOk && (settings->ReadOnly() || !impl->VerifyBrowserContext()))
+        status = sr::FileStatus::kCancelled;
+      std::move(reply).Run(status, std::move(domains));
+    }, context, settings, std::move(reply));
+    if (replacement) settings->SetFirstPartyEmbedsAsync(std::move(outer), std::move(*replacement),
+        base::BindOnce([](decltype(completed) completed, sr::FileStatus status) {
+          std::move(completed).Run(status, {});
+        }, std::move(completed)));
+    else settings->GetFirstPartyEmbedsAsync(std::move(outer), std::move(completed));
+    return;
+  }
+  auto* prefs = Profile::FromBrowserContext(native)->GetPrefs();
+  if (!prefs || !prefs->FindPreference(sr::embed_list::kPreference)) {
+    std::move(reply).Run(sr::FileStatus::kCancelled, {}); return;
+  }
+  if (!sr::embed_list::Canonicalize(outer, {})) {
+    std::move(reply).Run(sr::FileStatus::kInvalid, {}); return;
+  }
+  if (replacement) {
+    auto candidate = sr::embed_list::Canonicalize(outer, *replacement);
+    if (!candidate) { std::move(reply).Run(sr::FileStatus::kInvalid, {}); return; }
+    auto next = prefs->GetDict(sr::embed_list::kPreference).Clone();
+    if (candidate->embedded.empty()) next.Remove(candidate->outer);
+    else next.Set(candidate->outer, std::move(candidate->embedded));
+    auto expected = next.Clone();
+    prefs->SetDict(sr::embed_list::kPreference, std::move(next));
+    const auto status = !original.active() || !impl->VerifyBrowserContext() ? sr::FileStatus::kCancelled :
+        prefs->GetDict(sr::embed_list::kPreference) == expected ? sr::FileStatus::kOk : sr::FileStatus::kBusy;
+    std::move(reply).Run(status, {});
+  } else {
+    base::Value value(prefs->GetDict(sr::embed_list::kPreference).Clone());
+    std::vector<std::string> domains;
+    const auto status = sr::embed_list::Read(&value, outer, &domains) ? sr::FileStatus::kOk : sr::FileStatus::kIntegrity;
+    std::move(reply).Run(status, std::move(domains));
+  }
+}
 }  // namespace
+
+bool AlloyGetFirstPartyEmbeds(CefRefPtr<CefRequestContext> context, const CefString& outer,
+                             CefRefPtr<AlloySiteSettingsCallback> callback) {
+  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
+  if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !callback) return false;
+  CEF_POST_TASK(CEF_UIT, base::BindOnce(&ContextEmbedList, std::move(context),
+      GURL(outer.ToString()), std::nullopt, std::move(callback)));
+  return true;
+}
+
+bool AlloySetFirstPartyEmbeds(CefRefPtr<CefRequestContext> context, const CefString& outer,
+                             const std::vector<CefString>& embedded,
+                             CefRefPtr<AlloySiteSettingsCallback> callback) {
+  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
+  if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !callback) return false;
+  std::vector<GURL> sites;
+  for (const auto& site : embedded) sites.emplace_back(site.ToString());
+  CEF_POST_TASK(CEF_UIT, base::BindOnce(&ContextEmbedList, std::move(context),
+      GURL(outer.ToString()), std::make_optional(std::move(sites)), std::move(callback)));
+  return true;
+}
+
+scoped_refptr<sr::SitePrefStore> alloy::GetProfilePrefStore(CefRefPtr<AlloyProfile> profile) {
+  if (!profile || !CEF_CURRENTLY_ON_UIT()) return nullptr;
+  return static_cast<AlloyProfileImpl*>(profile.get())->SettingsProjection();
+}
+
+void alloy::BindNativeEmbedListSettings(Profile& profile) {
+  CEF_REQUIRE_UIT();
+  const auto* mode = sr::RequestContextPolicy::Get(profile);
+  if (!mode || mode->storage_mode() == sr::StorageMode::kStateless) return;
+  sr::EmbeddedFirstPartyPolicy::Predicate predicate;
+  if (mode->storage_mode() == sr::StorageMode::kEncrypted) {
+    const auto* input = sr::NativeProfileConfiguration::Get(profile);
+    auto settings = input ? sr::GetSiteProfileSettings(*input) : nullptr;
+    if (!settings) return;
+    predicate = base::BindRepeating(&sr::SitePrefStore::IsConsideredFirstParty, settings);
+  } else {
+    predicate = base::BindRepeating([](sr::RecordCapability original, PrefService* prefs,
+                                     const GURL& outer, const GURL& embedded) {
+      if (!original.active()) return false;
+      base::Value value(prefs->GetDict(sr::embed_list::kPreference).Clone());
+      return sr::embed_list::Contains(&value, outer, embedded);
+    }, mode->StorageCapability(sr::StorePurpose::kSiteSettings), profile.GetPrefs());
+  }
+  CHECK(content::ConfigureAlloyEmbeddedFirstPartyPolicy(
+      profile, sr::EmbeddedFirstPartyPolicy::Bind(std::move(predicate))));
+}
 
 void alloy::PrepareNativeProfileConfiguration(
     CefRefPtr<AlloyProfile> profile, NativeProfileConfigurationCallback callback) {

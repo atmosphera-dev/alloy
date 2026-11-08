@@ -1,0 +1,81 @@
+--- a/chrome/browser/metrics/chrome_feature_list_creator.cc
++++ b/chrome/browser/metrics/chrome_feature_list_creator.cc
+@@ -113,11 +113,6 @@
+ }
+
+ void ChromeFeatureListCreator::CreatePrefService() {
+-  base::FilePath local_state_file;
+-  bool result =
+-      base::PathService::Get(chrome::FILE_LOCAL_STATE, &local_state_file);
+-  DCHECK(result);
+-
+   auto pref_registry = base::MakeRefCounted<PrefRegistrySimple>();
+   RegisterLocalState(pref_registry.get());
+
+@@ -131,62 +126,13 @@
+       std::make_unique<policy::ChromeBrowserPolicyConnector>();
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+
+-  // ManagementService needs Local State but creating local state needs
+-  if (base::alloy::IsNoDiskProcess()) {
+-    local_state_ = chrome_prefs::CreateLocalState(
+-        base::FilePath(), base::MakeRefCounted<InMemoryPrefStore>(),
+-        browser_policy_connector_->GetPolicyService(), std::move(pref_registry),
+-        browser_policy_connector_.get());
+-    return;
+-  }
+-
+-  // ManagementService, instantiate the underlying PrefStore early and share it
+-  // between both.
+-  auto local_state_pref_store =
+-      base::MakeRefCounted<JsonPrefStore>(local_state_file);
+-
+-  // Try and read the local state prefs, if it succeeds, use it as the
+-  // ManagementService's cache.
+-  const auto read_error = local_state_pref_store->ReadPrefs();
+-
+-  // Record whether Local State was present when ReadPrefs() attempted to load
+-  // it. Deriving this from the read result avoids a separate PathExists() call
+-  // on the startup critical path.
+-  base::UmaHistogramBoolean(
+-      "UMA.Startup.LocalStateFileExistence",
+-      read_error != JsonPrefStore::PREF_READ_ERROR_NO_FILE);
+-
+-  if (read_error == JsonPrefStore::PREF_READ_ERROR_NONE) {
+-    auto* platform_management_service =
+-        policy::ManagementServiceFactory::GetForPlatform();
+-    platform_management_service->UsePrefStoreAsCache(local_state_pref_store);
+-  }
+-
++  // Local State belongs to the process, not to a password profile. Native
++  // defaults, startup configuration and policy are composed normally, while
++  // the user store is always memory-only, before any JSON/path/cache intake.
+   local_state_ = chrome_prefs::CreateLocalState(
+-      local_state_file, local_state_pref_store,
++      base::FilePath(), base::MakeRefCounted<InMemoryPrefStore>(),
+       browser_policy_connector_->GetPolicyService(), std::move(pref_registry),
+       browser_policy_connector_.get());
+-
+-  // Apply local test policies from the kLocalTestPoliciesForNextStartup pref if
+-  // there are any.
+-  browser_policy_connector_->MaybeApplyLocalTestPolicies(local_state_.get());
+-
+-// TODO(asvitkine): This is done here so that the pref is set before
+-// VariationsService queries the locale. This should potentially be moved to
+-// somewhere better, e.g. as a helper in first_run namespace.
+-#if BUILDFLAG(IS_WIN)
+-  if (first_run::IsChromeFirstRun()) {
+-    // During first run we read the google_update registry key to find what
+-    // language the user selected when downloading the installer. This
+-    // becomes our default language in the prefs.
+-    // Other platforms obey the system locale.
+-    std::wstring install_lang;
+-    if (GoogleUpdateSettings::GetLanguage(&install_lang)) {
+-      local_state_->SetString(language::prefs::kApplicationLocale,
+-                              base::WideToASCII(install_lang));
+-    }
+-  }
+-#endif  // BUILDFLAG(IS_WIN)
+ }
+
+ void ChromeFeatureListCreator::ConvertFlagsToSwitches() {

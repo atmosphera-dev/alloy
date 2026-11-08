@@ -18,10 +18,37 @@ bool Authority(const apps::Condition& condition) {
   return condition.condition_type == apps::ConditionType::kAuthority;
 }
 
+// The pinned native matcher treats '.' as a wildcard even after an escape,
+// and '*' repeats the preceding atom. Recover only fixed-character patterns;
+// the canonical host is checked against that same matcher before assigning it.
+std::optional<std::string> SingleHostGlob(std::string_view pattern) {
+  std::string literal;
+  for (size_t i = 0; i < pattern.size();) {
+    char value = pattern[i++];
+    bool escaped = false;
+    if (value == '\\') {
+      if (i == pattern.size()) return std::nullopt;
+      escaped = true;
+      value = pattern[i++];
+    }
+    if (value == '.' || (!escaped && value == '*') ||
+        (i < pattern.size() && pattern[i] == '*')) return std::nullopt;
+    literal.push_back(value);
+  }
+  return literal;
+}
+
 std::string AuthorityOwner(const apps::ConditionValue& value) {
-  auto host = apps_util::AuthorityView::Decode(value.value).host;
+  const auto authority = apps_util::AuthorityView::Decode(value.value);
+  auto host = authority.host;
+  std::string literal_host;
   if (value.match_type == apps::PatternMatchType::kSuffix && host.starts_with('.')) {
     host.remove_prefix(1);
+  } else if (value.match_type == apps::PatternMatchType::kGlob) {
+    auto literal = SingleHostGlob(host);
+    if (!literal) return {};
+    literal_host = std::move(*literal);
+    host = literal_host;
   } else if (value.match_type != apps::PatternMatchType::kLiteral) {
     // A selector spanning unrelated sites is explicit global dispatch policy,
     // not a fact about any particular visited origin.
@@ -30,6 +57,8 @@ std::string AuthorityOwner(const apps::ConditionValue& value) {
   const GURL url("https://" + std::string(host) + "/");
   if (!url.is_valid() || url.has_username() || url.has_password() ||
       url.GetPath() != "/" || url.has_query() || url.has_ref()) return {};
+  if (value.match_type == apps::PatternMatchType::kGlob &&
+      !apps_util::MatchGlob(url.GetHost(), authority.host)) return {};
   return RecordDomainForPrincipal(url, url::Origin::Create(url));
 }
 

@@ -141,6 +141,31 @@ class PreferredAppPersistenceTest : public testing::Test {
   std::unique_ptr<Native> impl_;
 };
 
+TEST_F(PreferredAppPersistenceTest, SingleHostGlobRetiresFromTheLiveNativeModelAndColdStore) {
+  Start();
+  auto filters = Links("localhost");
+  for (auto& condition : filters[0]->conditions)
+    if (condition->condition_type == apps::ConditionType::kAuthority)
+      for (auto& value : condition->condition_values) value->match_type = apps::PatternMatchType::kGlob;
+  impl_->SetSupportedLinksPreference("single-host", std::move(filters));
+  impl_->SetSupportedLinksPreference("unrelated", Links("beta.test"));
+  tasks_.RunUntilIdle();
+  ASSERT_EQ("single-host", Find("localhost"));
+  ASSERT_EQ("unrelated", Find("beta.test"));
+  RecordInfo visit;
+  const GURL url("https://localhost/");
+  ASSERT_EQ(FileStatus::kOk, files_->ResolveRecord(url, url::Origin::Create(url), true, &visit));
+  Reopen();
+  ASSERT_EQ("single-host", Find("localhost"));
+  Delete("localhost");
+  tasks_.RunUntilIdle();
+  ASSERT_FALSE(Find("localhost"));
+  EXPECT_EQ("unrelated", Find("beta.test"));
+  Reopen();
+  EXPECT_FALSE(Find("localhost"));
+  EXPECT_EQ("unrelated", Find("beta.test"));
+}
+
 TEST_F(PreferredAppPersistenceTest, ActualNativeSetterColdReopensEncryptedChoicesOnTwoSites) {
   Start();
   ASSERT_TRUE(impl_->preferred_apps_list().IsInitialized());

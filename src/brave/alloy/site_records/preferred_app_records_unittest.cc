@@ -188,6 +188,57 @@ TEST_F(PreferredAppRecordsTest, NativeLastMatchOrderingIsIndependentOfShardEnume
   EXPECT_EQ("global-choice", native.GetReference()[1]->app_id);
 }
 
+TEST_F(PreferredAppRecordsTest, SingleHostGlobsRetireWithTheirRecordAfterColdReopen) {
+  struct Case { const char* pattern; const char* url; };
+  for (const auto& sample : {Case{"localhost", "https://localhost/"},
+                            Case{R"(local\host)", "https://localhost/"},
+                            Case{"localhost:8443", "https://localhost:8443/"},
+                            Case{"[::1]:443", "https://[::1]/"}}) {
+    apps::PreferredApps choices;
+    choices.push_back(App("single-host", Filter(sample.pattern, apps::PatternMatchType::kGlob)));
+    choices.push_back(App("unrelated", Filter("beta.test")));
+    ASSERT_EQ(FileStatus::kOk, store_->SetPreferredApps(choices));
+    const GURL url(sample.url);
+    RecordInfo visit;
+    ASSERT_EQ(FileStatus::kOk, files_->ResolveRecord(url, url::Origin::Create(url), true, &visit));
+    Reopen();
+    apps::PreferredAppsList native(nullptr);
+    native.Init(Read());
+    ASSERT_EQ("single-host", native.FindPreferredAppForUrl(url)) << sample.pattern;
+    ASSERT_EQ("unrelated", native.FindPreferredAppForUrl(GURL("https://beta.test/")));
+    RecordDeletion deletion;
+    ASSERT_EQ(FileStatus::kOk, store_->DeleteSite(url, {}, &deletion));
+    Reopen();
+    native.Init(Read());
+    ASSERT_FALSE(native.FindPreferredAppForUrl(url)) << sample.pattern;
+    EXPECT_EQ("unrelated", native.FindPreferredAppForUrl(GURL("https://beta.test/")));
+  }
+}
+
+TEST_F(PreferredAppRecordsTest, MultiHostGlobsRetainTheirExplicitGlobalDispatchChoice) {
+  struct Case { const char* pattern; const char* first; const char* second; };
+  for (const auto& sample : {Case{".*", "localhost", "beta.test"},
+                            Case{"alpha.test", "alpha.test", "alphaxtest"},
+                            Case{R"(alpha\.test)", "alpha.test", "alphaxtest"},
+                            Case{"localh*ost", "localhost", "localost"}}) {
+    ASSERT_TRUE(apps_util::MatchGlob(sample.first, sample.pattern));
+    ASSERT_TRUE(apps_util::MatchGlob(sample.second, sample.pattern));
+    apps::PreferredApps choices;
+    choices.push_back(App("global", Filter(sample.pattern, apps::PatternMatchType::kGlob)));
+    ASSERT_EQ(FileStatus::kOk, store_->SetPreferredApps(choices));
+    const GURL first("https://"+std::string(sample.first)+"/");
+    RecordInfo visit;
+    ASSERT_EQ(FileStatus::kOk, files_->ResolveRecord(first, url::Origin::Create(first), true, &visit));
+    RecordDeletion deletion;
+    ASSERT_EQ(FileStatus::kOk, store_->DeleteSite(first, {}, &deletion));
+    Reopen();
+    apps::PreferredAppsList native(nullptr);
+    native.Init(Read());
+    EXPECT_EQ("global", native.FindPreferredAppForUrl(first));
+    EXPECT_EQ("global", native.FindPreferredAppForUrl(GURL("https://"+std::string(sample.second)+"/")));
+  }
+}
+
 TEST_F(PreferredAppRecordsTest, MalformedOrSplicedFragmentsFailWithoutAReplacement) {
   apps::PreferredApps original;
   original.push_back(App("chooser", Filter("alpha.test:443")));

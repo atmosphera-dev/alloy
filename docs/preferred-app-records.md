@@ -11,7 +11,11 @@ The record representation therefore stores fragments with opaque join IDs,
 native entry ordinals and original authority-value positions. Each fragment
 retains common native conditions and activity attributes, but only authority
 values belonging to its owner. Native AuthorityView decodes host/port; R16
-groups literal authorities and domain-boundary suffixes into records. Explicit
+groups literal authorities, domain-boundary suffixes and proven single-host glob
+authorities into records. Fixed-character globs are decoded and confirmed with
+the pinned native matcher, preserving ports and escape syntax. Native wildcard
+and repetition patterns remain global; in this pin even an escaped dot is still
+a wildcard, so it cannot prove a single-host owner. Explicit
 origin-free protocol/MIME choices and selectors spanning unrelated sites remain
 profile-level dispatch configuration. Native matching syntax is not changed.
 

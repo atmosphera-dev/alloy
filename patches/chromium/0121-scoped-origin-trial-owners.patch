@@ -1,0 +1,678 @@
+--- a/content/public/browser/origin_trials_controller_delegate.h
++++ b/content/public/browser/origin_trials_controller_delegate.h
+@@ -5,7 +5,11 @@
+ #ifndef CONTENT_PUBLIC_BROWSER_ORIGIN_TRIALS_CONTROLLER_DELEGATE_H_
+ #define CONTENT_PUBLIC_BROWSER_ORIGIN_TRIALS_CONTROLLER_DELEGATE_H_
+ 
++#include <memory>
++#include <optional>
+ #include <string>
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ 
+ #include "base/containers/flat_set.h"
+ #include "base/observer_list_types.h"
+@@ -55,6 +59,15 @@
+   };
+ 
+   virtual ~OriginTrialsControllerDelegate() = default;
++
++  // Capture the original browser-owned state before any persistence/query.
++  // Ordinary embedders retain their existing BrowserContext-lifetime delegate.
++  virtual std::shared_ptr<OriginTrialsControllerDelegate> GetForStateOwner(
++      std::optional<base::WeakPtr<base::SupportsUserData>> owner) {
++    return std::shared_ptr<OriginTrialsControllerDelegate>(
++        this, [](OriginTrialsControllerDelegate*) {});
++  }
++  virtual bool IsStateAdmissionOpen() const { return true; }
+ 
+   // Observers.
+   virtual void AddObserver(Observer* observer) {}
+--- a/components/origin_trials/browser/leveldb_persistence_provider.h
++++ b/components/origin_trials/browser/leveldb_persistence_provider.h
+@@ -60,6 +60,7 @@
+       const base::FilePath& profile_dir,
+       leveldb_proto::ProtoDatabaseProvider* database_provider);
+   ~LevelDbPersistenceProvider() override;
++  static std::unique_ptr<LevelDbPersistenceProvider> CreateInMemory();
+ 
+   // Create an instance for testing that uses the provided |db| instance
+   static std::unique_ptr<LevelDbPersistenceProvider> CreateForTesting(
+@@ -78,6 +79,9 @@
+   void ClearPersistedTokens() override;
+ 
+  private:
++  struct MemoryTag {};
++  explicit LevelDbPersistenceProvider(MemoryTag);
++  bool memory_only_ = false;
+   bool db_loaded_;
+   // Proto db for storing all the entries, keyed by serialized origin.
+   std::unique_ptr<
+--- a/components/origin_trials/browser/leveldb_persistence_provider.cc
++++ b/components/origin_trials/browser/leveldb_persistence_provider.cc
+@@ -150,6 +150,20 @@
+               base::ThreadPool::CreateSequencedTaskRunner(
+                   {base::MayBlock(), base::TaskPriority::USER_BLOCKING}))) {}
+ 
++LevelDbPersistenceProvider::LevelDbPersistenceProvider(MemoryTag)
++    : memory_only_(true),
++      db_loaded_(true),
++      trial_status_cache_(std::make_unique<OriginTrialMap>()),
++      site_origins_map_(std::make_unique<SiteOriginsMap>()),
++      lookups_before_db_loaded_(0) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++}
++
++std::unique_ptr<LevelDbPersistenceProvider>
++LevelDbPersistenceProvider::CreateInMemory() {
++  return base::WrapUnique(new LevelDbPersistenceProvider(MemoryTag{}));
++}
++
+ // Private constructor
+ LevelDbPersistenceProvider::LevelDbPersistenceProvider(
+     std::unique_ptr<
+@@ -392,7 +406,7 @@
+ 
+   UpdateSiteToOriginsMap(origin, !needs_delete);
+ 
+-  if (db_loaded_) {
++  if (db_loaded_ && !memory_only_) {
+     std::string origin_key = origin.Serialize();
+     std::unique_ptr<ProtoKeyEntryVector> entries_to_save =
+         std::make_unique<ProtoKeyEntryVector>();
+@@ -414,6 +428,8 @@
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   trial_status_cache_ = std::make_unique<OriginTrialMap>();
+   site_origins_map_ = std::make_unique<SiteOriginsMap>();
++  if (memory_only_)
++    return;
+   db_->UpdateEntriesWithRemoveFilter(
+       std::make_unique<ProtoKeyEntryVector>(),
+       base::BindRepeating([](const std::string& key) { return true; }),
+--- a/chrome/browser/origin_trials/origin_trials_factory.cc
++++ b/chrome/browser/origin_trials/origin_trials_factory.cc
+@@ -3,11 +3,16 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/origin_trials/origin_trials_factory.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ #include "chrome/browser/profiles/profile_selections.h"
+ #include "components/keyed_service/content/browser_context_dependency_manager.h"
+ #include "components/origin_trials/browser/leveldb_persistence_provider.h"
+ #include "components/origin_trials/browser/origin_trials.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/storage_partition.h"
+@@ -15,6 +20,195 @@
+ 
+ namespace {
+ 
++using TrialDelegate = content::OriginTrialsControllerDelegate;
++using TrialCapability = alloy::site_records::RecordCapability;
++using TrialPurpose = alloy::site_records::StorePurpose;
++
++class TrialForwarder : public TrialDelegate {
++ public:
++  void AddObserver(Observer* observer) override {
++    if (auto* n = Native())
++      n->AddObserver(observer);
++  }
++  void RemoveObserver(Observer* observer) override {
++    if (auto* n = RemovalTarget())
++      n->RemoveObserver(observer);
++  }
++  void PersistTrialsFromTokens(const url::Origin& origin,
++                               const url::Origin& partition,
++                               base::span<const std::string> tokens,
++                               base::Time time,
++                               std::optional<ukm::SourceId> id) override {
++    if (auto* n = Native())
++      n->PersistTrialsFromTokens(origin, partition, tokens, time, id);
++  }
++  void PersistAdditionalTrialsFromTokens(
++      const url::Origin& origin,
++      const url::Origin& partition,
++      base::span<const url::Origin> scripts,
++      base::span<const std::string> tokens,
++      base::Time time,
++      std::optional<ukm::SourceId> id) override {
++    if (auto* n = Native())
++      n->PersistAdditionalTrialsFromTokens(origin, partition, scripts, tokens,
++                                           time, id);
++  }
++  bool IsFeaturePersistedForOrigin(const url::Origin& origin,
++                                   const url::Origin& partition,
++                                   blink::mojom::OriginTrialFeature feature,
++                                   base::Time time) override {
++    auto* n = Native();
++    return n &&
++           n->IsFeaturePersistedForOrigin(origin, partition, feature, time);
++  }
++  base::flat_set<std::string> GetPersistedTrialsForOrigin(
++      const url::Origin& origin,
++      const url::Origin& partition,
++      base::Time time) override {
++    auto* n = Native();
++    return n ? n->GetPersistedTrialsForOrigin(origin, partition, time)
++             : base::flat_set<std::string>();
++  }
++  void ClearPersistedTokens() override {
++    if (auto* n = Native())
++      n->ClearPersistedTokens();
++  }
++
++ protected:
++  virtual origin_trials::OriginTrials* Native() = 0;
++  virtual origin_trials::OriginTrials* RemovalTarget() = 0;
++};
++
++class ScopedTrialLease final : public TrialForwarder {
++ public:
++  explicit ScopedTrialLease(TrialCapability capability)
++      : capability_(std::move(capability)) {
++    if (capability_.Allows(TrialPurpose::kOriginTrials,
++                           alloy::site_records::StorageAccess::kWriteMemory)) {
++      native_ = std::make_unique<origin_trials::OriginTrials>(
++          origin_trials::LevelDbPersistenceProvider::CreateInMemory(),
++          std::make_unique<blink::TrialTokenValidator>());
++    }
++  }
++  ~ScopedTrialLease() override { Close(); }
++  bool IsStateAdmissionOpen() const override {
++    return !closed_ && native_ &&
++           capability_.Allows(TrialPurpose::kOriginTrials,
++                              alloy::site_records::StorageAccess::kWriteMemory);
++  }
++  void Close() {
++    if (closed_)
++      return;
++    closed_ = true;
++    if (native_)
++      native_->ClearPersistedTokens();
++    native_.reset();
++  }
++
++ protected:
++  origin_trials::OriginTrials* Native() override {
++    return IsStateAdmissionOpen() ? native_.get() : nullptr;
++  }
++  origin_trials::OriginTrials* RemovalTarget() override {
++    return native_.get();
++  }
++
++ private:
++  const TrialCapability capability_;
++  bool closed_ = false;
++  std::unique_ptr<origin_trials::OriginTrials> native_;
++};
++
++std::shared_ptr<TrialDelegate> ClosedTrialLease() {
++  static const base::NoDestructor<std::shared_ptr<TrialDelegate>> closed(
++      std::make_shared<ScopedTrialLease>(TrialCapability()));
++  return *closed;
++}
++
++class ScopedTrialService final : public KeyedService {
++ public:
++  explicit ScopedTrialService(TrialCapability capability)
++      : lease_(std::make_shared<ScopedTrialLease>(std::move(capability))) {}
++  ~ScopedTrialService() override { Shutdown(); }
++  void Shutdown() override {
++    if (lease_)
++      lease_->Close();
++  }
++  std::shared_ptr<TrialDelegate> lease() const { return lease_; }
++
++ private:
++  std::shared_ptr<ScopedTrialLease> lease_;
++};
++
++// The global factory publishes a routing facade without opening a Profile DB.
++// Only a real ordinary operation constructs the ordinary native controller.
++class AlloyOriginTrialsRoot final : public KeyedService, public TrialForwarder {
++ public:
++  explicit AlloyOriginTrialsRoot(content::BrowserContext* context)
++      : context_(context) {}
++  bool IsStateAdmissionOpen() const override {
++    return !context_->ShutdownStarted() &&
++           !alloy::site_records::RequestContextPolicy::IsStateless(*context_);
++  }
++  std::shared_ptr<TrialDelegate> GetForStateOwner(
++      std::optional<base::WeakPtr<base::SupportsUserData>> owner) override {
++    if (!IsStateAdmissionOpen())
++      return ClosedTrialLease();
++    if (!owner)
++      return std::shared_ptr<TrialDelegate>(this, [](TrialDelegate*) {});
++    auto selected = content::AlloyEmbeddedStateForStateOwner(*owner, context_);
++    if (selected.temporary) {
++      static const char kTrialService = 0;
++      auto* service = static_cast<ScopedTrialService*>(
++          selected.temporary->GetOrCreateService(
++              &kTrialService, TrialPurpose::kOriginTrials,
++              base::BindOnce([](TrialCapability capability)
++                                 -> std::unique_ptr<KeyedService> {
++                return std::make_unique<ScopedTrialService>(
++                    std::move(capability));
++              })));
++      return service ? service->lease() : ClosedTrialLease();
++    }
++    if (selected.temporary_admission_closed ||
++        selected.backing !=
++            alloy::site_records::EmbeddedStateRegistry::Backing::kRealSite) {
++      return ClosedTrialLease();
++    }
++    return std::shared_ptr<TrialDelegate>(this, [](TrialDelegate*) {});
++  }
++
++ protected:
++  origin_trials::OriginTrials* Native() override {
++    if (!IsStateAdmissionOpen())
++      return nullptr;
++    if (!ordinary_) {
++      const auto* policy =
++          alloy::site_records::RequestContextPolicy::Get(*context_);
++      const bool memory =
++          context_->IsOffTheRecord() ||
++          (policy &&
++           policy->storage_mode() == alloy::site_records::StorageMode::kMemory);
++      std::unique_ptr<origin_trials::OriginTrialsPersistenceProvider> provider;
++      if (memory)
++        provider = origin_trials::LevelDbPersistenceProvider::CreateInMemory();
++      else
++        provider = std::make_unique<origin_trials::LevelDbPersistenceProvider>(
++            context_->GetPath(),
++            context_->GetDefaultStoragePartition()->GetProtoDatabaseProvider());
++      ordinary_ = std::make_unique<origin_trials::OriginTrials>(
++          std::move(provider), std::make_unique<blink::TrialTokenValidator>());
++    }
++    return ordinary_.get();
++  }
++  origin_trials::OriginTrials* RemovalTarget() override {
++    return ordinary_.get();
++  }
++
++ private:
++  const raw_ptr<content::BrowserContext> context_;
++  std::unique_ptr<origin_trials::OriginTrials> ordinary_;
++};
++
+ base::LazyInstance<OriginTrialsFactory>::DestructorAtExit
+     g_origin_trials_factory = LAZY_INSTANCE_INITIALIZER;
+ 
+@@ -23,7 +217,7 @@
+ // static
+ content::OriginTrialsControllerDelegate*
+ OriginTrialsFactory::GetForBrowserContext(content::BrowserContext* context) {
+-  return static_cast<origin_trials::OriginTrials*>(
++  return static_cast<AlloyOriginTrialsRoot*>(
+       GetInstance()->GetServiceForBrowserContext(context, true));
+ }
+ 
+@@ -40,7 +234,7 @@
+               // Do not use for system and internal profiles
+               // TODO(crbug.com/40247867): May need to enable Guest in the
+               // future.
+-              .WithGuest(ProfileSelection::kNone)
++              .WithGuest(ProfileSelection::kOwnInstance)
+               .WithSystem(ProfileSelection::kNone)
+               .WithAshInternals(ProfileSelection::kNone)
+               .Build()) {}
+@@ -51,9 +245,5 @@
+ OriginTrialsFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  return std::make_unique<origin_trials::OriginTrials>(
+-      std::make_unique<origin_trials::LevelDbPersistenceProvider>(
+-          context->GetPath(),
+-          context->GetDefaultStoragePartition()->GetProtoDatabaseProvider()),
+-      std::make_unique<blink::TrialTokenValidator>());
+-}
++  return std::make_unique<AlloyOriginTrialsRoot>(context);
++}
+--- a/chrome/browser/origin_trials/BUILD.gn
++++ b/chrome/browser/origin_trials/BUILD.gn
+@@ -15,6 +15,8 @@
+ 
+   deps = [
+     "//base",
++    "//brave/alloy/site_records:embedded_state",
++    "//brave/alloy/site_records:capabilities",
+     "//components/keyed_service/content",
+     "//components/origin_trials:browser",
+     "//third_party/blink/public/common",
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -875,7 +875,8 @@
+     const url::Origin& partition_origin,
+     const network::mojom::URLResponseHead* response,
+     BrowserContext* browser_context,
+-    ukm::SourceId source_id) {
++    ukm::SourceId source_id,
++    base::WeakPtr<base::SupportsUserData> state_owner) {
+   // It is not possible to serialize opaque origins, so we cannot save any
+   // information for them.
+   if (origin.opaque())
+@@ -886,9 +887,11 @@
+   if (!response || !response->headers)
+     return;
+ 
+-  OriginTrialsControllerDelegate* origin_trials_delegate =
+-      browser_context->GetOriginTrialsControllerDelegate();
+-  if (!origin_trials_delegate)
++  auto* root = browser_context->GetOriginTrialsControllerDelegate();
++  auto origin_trials_delegate =
++      root ? root->GetForStateOwner(state_owner) : nullptr;
++  if (!origin_trials_delegate ||
++      !origin_trials_delegate->IsStateAdmissionOpen())
+     return;
+ 
+   std::vector<std::string> tokens =
+@@ -7276,7 +7279,8 @@
+   }
+ 
+   PersistOriginTrialsFromHeaders(origin_to_commit, partition_origin, response(),
+-                                 browser_context, GetNextPageUkmSourceId());
++                                 browser_context, GetNextPageUkmSourceId(),
++                                 AlloyNavigationStateOwner(this));
+ 
+   // Sticky user activation should only be preserved for same-site subframe
+   // navigations, and same-origin top-frame navigations behind the feature flag
+--- a/content/browser/renderer_host/origin_trial_state_host_impl.h
++++ b/content/browser/renderer_host/origin_trial_state_host_impl.h
+@@ -5,7 +5,9 @@
+ #ifndef CONTENT_BROWSER_RENDERER_HOST_ORIGIN_TRIAL_STATE_HOST_IMPL_H_
+ #define CONTENT_BROWSER_RENDERER_HOST_ORIGIN_TRIAL_STATE_HOST_IMPL_H_
+ 
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/document_service.h"
++#include "content/public/browser/origin_trials_controller_delegate.h"
+ #include "content/public/browser/runtime_feature_state/runtime_feature_state_document_data.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "third_party/blink/public/mojom/origin_trials/origin_trial_state_host.mojom.h"
+@@ -22,7 +24,8 @@
+ // RenderFrameHost's RuntimeFeatureStateReadContext with the validated feature
+ // state we receive.
+ class CONTENT_EXPORT OriginTrialStateHostImpl
+-    : public DocumentService<blink::mojom::OriginTrialStateHost> {
++    : public DocumentService<blink::mojom::OriginTrialStateHost>,
++      public OriginTrialsControllerDelegate::Observer {
+  public:
+   OriginTrialStateHostImpl(const OriginTrialStateHostImpl&) = delete;
+   OriginTrialStateHostImpl& operator=(const OriginTrialStateHostImpl&) = delete;
+@@ -40,7 +43,15 @@
+       const std::string& token,
+       const std::vector<url::Origin>& script_origins) override;
+ 
++  void OnStatusChanged(const OriginTrialStatusChangeDetails&) override {}
++  void OnPersistedTokensCleared() override;
++  std::string trial_name() override { return {}; }
++
+  private:
++  bool StateAdmissionOpen() const;
++  base::WeakPtr<base::SupportsUserData> state_owner_;
++  std::optional<alloy::site_records::RecordCapability> embedded_capability_;
++  std::shared_ptr<OriginTrialsControllerDelegate> captured_delegate_;
+   explicit OriginTrialStateHostImpl(
+       RenderFrameHost& host,
+       mojo::PendingReceiver<blink::mojom::OriginTrialStateHost> receiver);
+--- a/content/browser/renderer_host/origin_trial_state_host_impl.cc
++++ b/content/browser/renderer_host/origin_trial_state_host_impl.cc
+@@ -19,9 +19,40 @@
+ OriginTrialStateHostImpl::OriginTrialStateHostImpl(
+     RenderFrameHost& host,
+     mojo::PendingReceiver<blink::mojom::OriginTrialStateHost> receiver)
+-    : DocumentService(host, std::move(receiver)) {}
++    : DocumentService(host, std::move(receiver)),
++      state_owner_(AlloyDocumentStateOwner(&host)) {
++  auto selected = GetAlloyEmbeddedStateForDocument(&host);
++  if (selected.temporary)
++    embedded_capability_ = selected.temporary->Capability(
++        alloy::site_records::StorePurpose::kOriginTrials);
++  else if (selected.temporary_admission_closed)
++    embedded_capability_ = alloy::site_records::RecordCapability();
++  if (auto* root =
++          host.GetBrowserContext()->GetOriginTrialsControllerDelegate()) {
++    captured_delegate_ = root->GetForStateOwner(state_owner_);
++    if (captured_delegate_ && captured_delegate_->IsStateAdmissionOpen())
++      captured_delegate_->AddObserver(this);
++  }
++}
+ 
+-OriginTrialStateHostImpl::~OriginTrialStateHostImpl() = default;
++OriginTrialStateHostImpl::~OriginTrialStateHostImpl() {
++  if (captured_delegate_)
++    captured_delegate_->RemoveObserver(this);
++}
++
++bool OriginTrialStateHostImpl::StateAdmissionOpen() const {
++  return state_owner_ && AlloyDocumentStateAdmitted(&render_frame_host()) &&
++         (!embedded_capability_ || embedded_capability_->active());
++}
++
++void OriginTrialStateHostImpl::OnPersistedTokensCleared() {
++  auto* data = RuntimeFeatureStateDocumentData::GetForCurrentDocument(
++      &render_frame_host());
++  if (data)
++    data->GetMutableRuntimeFeatureStateReadContext(
++            base::PassKey<OriginTrialStateHostImpl>())
++        .ResetOriginTrialChanges();
++}
+ 
+ // static
+ void OriginTrialStateHostImpl::Create(
+@@ -37,6 +68,8 @@
+     base::flat_map<::blink::mojom::RuntimeFeature,
+                    ::blink::mojom::OriginTrialFeatureStatePtr>
+         origin_trial_features) {
++  if (!StateAdmissionOpen())
++    return;
+   // TODO(crbug.com/40243430): RuntimeFeatureState does not yet support
+   // HTTP header origin trial tokens, which currently cause this function to be
+   // called between RenderFrameHostImpl::CommitNavigation() and
+@@ -134,11 +167,8 @@
+ void OriginTrialStateHostImpl::EnablePersistentTrial(
+     const std::string& token,
+     const std::vector<url::Origin>& script_origins) {
+-  OriginTrialsControllerDelegate* delegate =
+-      render_frame_host()
+-          .GetBrowserContext()
+-          ->GetOriginTrialsControllerDelegate();
+-  if (!delegate) {
++  auto* delegate = captured_delegate_.get();
++  if (!StateAdmissionOpen() || !delegate || !delegate->IsStateAdmissionOpen()) {
+     return;
+   }
+ 
+--- a/content/browser/loader/url_loader_throttles.cc
++++ b/content/browser/loader/url_loader_throttles.cc
+@@ -18,6 +18,7 @@
+ #include "content/browser/renderer_host/frame_tree_node.h"
+ #include "content/browser/webid/webid_utils.h"
+ #include "content/common/features.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/client_hints_controller_delegate.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -87,9 +88,16 @@
+ 
+   // Handle Critical Origin Trial headers if the context supports it and this
+   // is a navigation request.
+-  OriginTrialsControllerDelegate* origin_trials_delegate =
++  auto* origin_trials_root =
+       browser_context->GetOriginTrialsControllerDelegate();
++  std::optional<base::WeakPtr<base::SupportsUserData>> state_owner;
++  if (frame_tree_node)
++    state_owner = AlloyPendingNavigationStateOwner(frame_tree_node_id);
++  auto origin_trials_delegate =
++      origin_trials_root ? origin_trials_root->GetForStateOwner(state_owner)
++                         : nullptr;
+   if (origin_trials_delegate &&
++      origin_trials_delegate->IsStateAdmissionOpen() &&
+       CriticalOriginTrialsThrottle::IsNavigationRequest(request)) {
+     // Critical Origin Trials may restart the network request, so only allow on
+     // safe methods, since the origin trials in question may change request
+@@ -112,7 +120,7 @@
+                     navigation_id.value(), ukm::SourceIdType::NAVIGATION_ID))
+               : std::nullopt;
+       throttles.push_back(std::make_unique<CriticalOriginTrialsThrottle>(
+-          *origin_trials_delegate, std::move(top_origin), source_id));
++          std::move(origin_trials_delegate), std::move(top_origin), source_id));
+     }
+   }
+ 
+--- a/content/browser/origin_trials/critical_origin_trials_throttle.h
++++ b/content/browser/origin_trials/critical_origin_trials_throttle.h
+@@ -5,6 +5,7 @@
+ #ifndef CONTENT_BROWSER_ORIGIN_TRIALS_CRITICAL_ORIGIN_TRIALS_THROTTLE_H_
+ #define CONTENT_BROWSER_ORIGIN_TRIALS_CRITICAL_ORIGIN_TRIALS_THROTTLE_H_
+ 
++#include <memory>
+ #include <optional>
+ 
+ #include "base/containers/flat_set.h"
+@@ -33,6 +34,10 @@
+       std::optional<url::Origin> top_frame_origin,
+       std::optional<ukm::SourceId> source_id);
+ 
++  CriticalOriginTrialsThrottle(
++      std::shared_ptr<OriginTrialsControllerDelegate> origin_trials_delegate,
++      std::optional<url::Origin> top_frame_origin,
++      std::optional<ukm::SourceId> source_id);
+   ~CriticalOriginTrialsThrottle() override;
+ 
+   // blink::URLLoaderThrottle
+@@ -53,9 +58,9 @@
+   static bool IsNavigationRequest(const network::ResourceRequest& request);
+ 
+  private:
+-  // The delegate is owned by the BrowserContext, and is expected to outlive
+-  // this throttle.
+-  raw_ref<OriginTrialsControllerDelegate> origin_trials_delegate_;
++  // Retain the original native object without extending scope admission.
++  // Scoped delegates remain closed and empty after their owner retires.
++  std::shared_ptr<OriginTrialsControllerDelegate> origin_trials_delegate_;
+ 
+   std::optional<url::Origin> top_frame_origin_;
+ 
+--- a/content/browser/origin_trials/critical_origin_trials_throttle.cc
++++ b/content/browser/origin_trials/critical_origin_trials_throttle.cc
+@@ -33,7 +33,18 @@
+     OriginTrialsControllerDelegate& origin_trials_delegate,
+     std::optional<url::Origin> top_frame_origin,
+     std::optional<ukm::SourceId> source_id)
+-    : origin_trials_delegate_(origin_trials_delegate),
++    : CriticalOriginTrialsThrottle(
++          std::shared_ptr<OriginTrialsControllerDelegate>(
++              &origin_trials_delegate,
++              [](OriginTrialsControllerDelegate*) {}),
++          std::move(top_frame_origin),
++          source_id) {}
++
++CriticalOriginTrialsThrottle::CriticalOriginTrialsThrottle(
++    std::shared_ptr<OriginTrialsControllerDelegate> origin_trials_delegate,
++    std::optional<url::Origin> top_frame_origin,
++    std::optional<ukm::SourceId> source_id)
++    : origin_trials_delegate_(std::move(origin_trials_delegate)),
+       top_frame_origin_(std::move(top_frame_origin)),
+       source_id_(source_id) {}
+ 
+@@ -45,7 +56,8 @@
+   // Right now, Persistent Origin Trials are only supported on navigation
+   // requests. Until support is implemented for other request types, we need to
+   // only intercept navigation requests.
+-  is_navigation_request_ = IsNavigationRequest(*request);
++  is_navigation_request_ = origin_trials_delegate_->IsStateAdmissionOpen() &&
++                           IsNavigationRequest(*request);
+ 
+   if (is_navigation_request_)
+     SetPreRequestFields(request->url);
+@@ -55,9 +67,10 @@
+     const GURL& response_url,
+     const network::mojom::URLResponseHead& response_head,
+     RestartWithURLReset* restart_with_url_reset) {
+-  if (is_navigation_request_) {
++  if (is_navigation_request_ &&
++      origin_trials_delegate_->IsStateAdmissionOpen()) {
+     // TODO(crbug.com/571118321): CHECK-exclusion: Convert to a CHECK once
+     // we are confident it won't be triggered.
+     DCHECK_EQ(response_url, request_url_);
+     MaybeRestartWithTrials(response_head, restart_with_url_reset);
+   }
+@@ -65,7 +78,8 @@
+     const net::RedirectInfo& redirect_info,
+     const network::mojom::URLResponseHead& response_head,
+     RestartWithURLReset* restart_with_url_reset) {
+-  if (is_navigation_request_) {
++  if (is_navigation_request_ &&
++      origin_trials_delegate_->IsStateAdmissionOpen()) {
+     MaybeRestartWithTrials(response_head, restart_with_url_reset);
+     // Update the stored information for the new request
+     SetPreRequestFields(redirect_info.new_url);
+@@ -75,6 +89,10 @@
+ void CriticalOriginTrialsThrottle::MaybeRestartWithTrials(
+     const network::mojom::URLResponseHead& response_head,
+     RestartWithURLReset* restart_with_url_reset) {
++  if (!origin_trials_delegate_->IsStateAdmissionOpen()) {
++    original_persisted_trials_.clear();
++    return;
++  }
+   if (!response_head.headers)
+     return;
+ 
+--- a/third_party/blink/renderer/build/scripts/templates/runtime_feature_state_read_context.h.tmpl
++++ b/third_party/blink/renderer/build/scripts/templates/runtime_feature_state_read_context.h.tmpl
+@@ -6,6 +6,7 @@
+ #ifndef {{header_guard}}
+ #define {{header_guard}}
+ 
++#include <optional>
+ #include "base/containers/flat_map.h"
+ #include "base/containers/span.h"
+ #include "base/notreached.h"
+@@ -130,12 +131,41 @@
+     // Feature values sent from the renderer process take precedence over state
+     // held currently in the browser process, so insert_or_assign is used.
+     for (auto const& feature : modified_features) {
++      if (!prior_trial_features_.contains(feature.first)) {
++        auto found=feature_overrides_.find(feature.first);
++        prior_trial_features_[feature.first]=found==feature_overrides_.end() ?
++            std::optional<bool>() : std::optional<bool>(found->second);
++      }
+       feature_overrides_.insert_or_assign(feature.first, feature.second);
+     }
+     for (auto const& feature : possible_third_party_features) {
++      if (!prior_trial_tokens_.contains(feature.first)) {
++        auto found=possible_third_party_feature_overrides_.find(feature.first);
++        prior_trial_tokens_[feature.first]=found==possible_third_party_feature_overrides_.end() ?
++            std::optional<std::vector<std::string>>() :
++            std::optional<std::vector<std::string>>(found->second);
++      }
+       possible_third_party_feature_overrides_.insert_or_assign(feature.first,
+                                                                feature.second);
+     }
++  }
++
++  base::flat_map<blink::mojom::RuntimeFeature, std::optional<bool>> prior_trial_features_;
++  base::flat_map<blink::mojom::RuntimeFeature, std::optional<std::vector<std::string>>> prior_trial_tokens_;
++
++  // Restore only this origin-trial writer's changes, preserving initial policy
++  // and unrelated runtime-feature state.
++  void ResetOriginTrialChanges() {
++    for (const auto& [feature,value] : prior_trial_features_) {
++      if (value) feature_overrides_.insert_or_assign(feature,*value);
++      else feature_overrides_.erase(feature);
++    }
++    for (const auto& [feature,value] : prior_trial_tokens_) {
++      if (value) possible_third_party_feature_overrides_.insert_or_assign(feature,*value);
++      else possible_third_party_feature_overrides_.erase(feature);
++    }
++    prior_trial_features_.clear();
++    prior_trial_tokens_.clear();
+   }
+ 
+   // RuntimeFeatureStateDocumentData should be able to update the origin used

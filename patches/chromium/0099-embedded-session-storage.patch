@@ -1,0 +1,178 @@
+--- a/content/browser/dom_storage/dom_storage_context_wrapper.h
++++ b/content/browser/dom_storage/dom_storage_context_wrapper.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_BROWSER_DOM_STORAGE_DOM_STORAGE_CONTEXT_WRAPPER_H_
+ 
+ #include <map>
++#include <memory>
+ #include <optional>
+ #include <string>
+ 
+@@ -41,6 +42,7 @@
+ class SessionStorageNamespaceHandleImpl;
+ class RenderFrameHostImpl;
+ class StoragePartitionImpl;
++class AlloySessionStorageRouter;
+ 
+ // This is owned by Storage Partition and encapsulates all its dom storage
+ // state.
+@@ -195,6 +197,7 @@
+   // Connections to the partition's Session and Local Storage control interfaces
+   // within the Storage Service.
+   mojo::Remote<storage::mojom::SessionStorageControl> session_storage_control_;
++  std::unique_ptr<AlloySessionStorageRouter> session_storage_router_;
+   mojo::Remote<storage::mojom::LocalStorageControl> local_storage_control_;
+ 
+   std::optional<storage::StoragePolicyObserver> storage_policy_observer_;
+--- a/content/browser/dom_storage/dom_storage_context_wrapper.cc
++++ b/content/browser/dom_storage/dom_storage_context_wrapper.cc
+@@ -144,6 +144,13 @@
+ DOMStorageContextWrapper::GetSessionStorageControl() {
+   if (!session_storage_control_)
+     return nullptr;
++  if (partition_) {
++    if (!session_storage_router_) {
++      session_storage_router_ = CreateAlloySessionStorageRouter(
++          *partition_, *session_storage_control_.get());
++    }
++    return session_storage_router_.get();
++  }
+   return session_storage_control_.get();
+ }
+ 
+@@ -173,7 +180,7 @@
+     return;
+   }
+ 
+-  session_storage_control_->GetUsage(
++  GetSessionStorageControl()->GetUsage(
+       base::BindOnce(&AdaptSessionStorageUsageInfo, std::move(callback)));
+ }
+ 
+@@ -210,7 +217,7 @@
+     std::move(callback).Run();
+     return;
+   }
+-  session_storage_control_->DeleteStorage(
++  GetSessionStorageControl()->DeleteStorage(
+       usage_info.storage_key, usage_info.namespace_id, std::move(callback));
+ }
+ 
+@@ -223,7 +230,7 @@
+     return;
+   }
+ 
+-  session_storage_control_->CleanUpStorage(std::move(callback));
++  GetSessionStorageControl()->CleanUpStorage(std::move(callback));
+ }
+ 
+ scoped_refptr<SessionStorageNamespaceHandle>
+@@ -239,7 +246,7 @@
+     return;
+   }
+ 
+-  session_storage_control_->ScavengeUnusedNamespaces();
++  GetSessionStorageControl()->ScavengeUnusedNamespaces();
+ }
+ 
+ void DOMStorageContextWrapper::SetForceKeepSessionState() {
+@@ -257,6 +264,7 @@
+   partition_ = nullptr;
+ 
+   // Signals the implementation to perform shutdown operations.
++  session_storage_router_.reset();
+   session_storage_control_.reset();
+   local_storage_control_.reset();
+ 
+@@ -266,7 +274,7 @@
+ 
+ void DOMStorageContextWrapper::Flush() {
+   if (session_storage_control_)
+-    session_storage_control_->Flush();
++    GetSessionStorageControl()->Flush();
+   if (local_storage_control_)
+     local_storage_control_->Flush();
+ }
+@@ -330,7 +338,7 @@
+   }
+ 
+   CHECK(session_storage_control_, base::NotFatalUntil::M158);
+-  session_storage_control_->BindNamespace(namespace_id, std::move(receiver));
++  GetSessionStorageControl()->BindNamespace(namespace_id, std::move(receiver));
+ }
+ 
+ void DOMStorageContextWrapper::BindStorageArea(
+@@ -340,14 +348,41 @@
+     mojo::PendingReceiver<blink::mojom::StorageArea> receiver,
+     ChildProcessSecurityPolicyImpl::Handle security_policy_handle,
+     mojo::ReportBadMessageCallback bad_message_callback) {
++  const auto process_id = security_policy_handle.child_id();
++  RenderFrameHostImpl* frame = nullptr;
+   if (!IsRequestValid(StorageType::kSessionStorage, storage_key,
+                       local_frame_token, std::move(security_policy_handle),
+-                      std::move(bad_message_callback))) {
+-    return;
++                      std::move(bad_message_callback), &frame)) {
++    return;
++  }
++  if (partition_) {
++    if (!frame && storage_key.nonce()) {
++      frame = FindStorageFrame(process_id, partition_, storage_key);
++      if (!frame) {
++        return;
++      }
++    }
++    if (frame) {
++      const auto selected = GetAlloyEmbeddedStateForDocument(frame);
++      using Backing = alloy::site_records::EmbeddedStateRegistry::Backing;
++      if (selected.backing == Backing::kNone) {
++        return;
++      }
++      if (selected.backing == Backing::kTemporary) {
++        if (storage_key != frame->GetStorageKey()) {
++          return;
++        }
++        if (GetSessionStorageControl()) {
++          session_storage_router_->BindTemporary(selected.temporary, storage_key,
++                                                namespace_id, std::move(receiver));
++        }
++        return;
++      }
++    }
+   }
+   CHECK(session_storage_control_, base::NotFatalUntil::M158);
+-  session_storage_control_->BindStorageArea(storage_key, namespace_id,
+-                                            std::move(receiver));
++  GetSessionStorageControl()->BindStorageArea(storage_key, namespace_id,
++                                             std::move(receiver));
+ }
+ 
+ bool DOMStorageContextWrapper::IsRequestValid(
+@@ -420,8 +455,8 @@
+   // namespaces.
+   base::AutoLock lock(alive_namespaces_lock_);
+   for (const auto& entry : alive_namespaces_)
+-    session_storage_control_->CreateNamespace(entry.first);
+-  session_storage_control_->ScavengeUnusedNamespaces();
++    GetSessionStorageControl()->CreateNamespace(entry.first);
++  GetSessionStorageControl()->ScavengeUnusedNamespaces();
+ 
+   partition_->ResetSessionStorageConnections();
+ }
+@@ -430,6 +465,7 @@
+     bool clear_on_open) {
+   if (!partition_)
+     return;
++  session_storage_router_.reset();
+   session_storage_control_.reset();
+   partition_->GetStorageService()->BindSessionStorageControl(
+       partition_->GetStoragePartitionPath(), clear_on_open,
+@@ -492,7 +528,7 @@
+ 
+   if (purge_option == PURGE_AGGRESSIVE) {
+     CHECK(session_storage_control_, base::NotFatalUntil::M158);
+-    session_storage_control_->PurgeMemory();
++    GetSessionStorageControl()->PurgeMemory();
+     local_storage_control_->PurgeMemory();
+   }
+ }

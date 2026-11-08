@@ -1,0 +1,46 @@
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -3621,6 +3621,7 @@
+   // A temporary scope cannot acquire a disk path even if an embedder supplied
+   // one while configuring its ordinary disk BrowserContext. Do this before
+   // creating any Network Service state, including on crash recreation.
++  context_params->alloy_scoped_memory = memory_only;
+   if (memory_only) {
+     context_params->file_paths.reset();
+     context_params->persist_session_cookies = false;
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -744,6 +744,10 @@
+       prefetch_cache_(prefetch_enabled_ ? std::make_unique<PrefetchCache>()
+                                         : nullptr),
+       variations_headers_(std::move(params_->initial_variations_headers)) {
++  if (params_->alloy_scoped_memory) {
++    CHECK(!params_->file_paths);
++    CHECK(!params_->alloy_stateless);
++  }
+   if (params_->alloy_stateless) {
+     params_->file_paths.reset();
+     params_->http_cache_enabled = false;
+@@ -842,6 +846,10 @@
+       std::move(on_url_request_context_builder_configured),
+       params_->bound_network);
+   url_request_context_ = url_request_context_owner_.url_request_context.get();
++  if (params_->alloy_scoped_memory) {
++    url_request_context_->transport_security_state()
++        ->SetAlloyScopedMemoryOnly();
++  }
+ 
+   cookie_manager_ = std::make_unique<CookieManager>(
+       url_request_context_, std::move(session_cleanup_cookie_store),
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -354,6 +354,9 @@
+ struct NetworkContextParams {
+   // Engine-owned stateless storage admission. Never selected by a renderer.
+   bool alloy_stateless = false;
++  // Engine-owned temporary scope, not an ordinary shared memory profile.
++  // Requires no file paths and cannot be combined with stateless admission.
++  bool alloy_scoped_memory = false;
+   // Derived from the browser-owned context policy, independently of storage
+   // admission. A guest retains memory stores but cannot acquire a log writer.
+   bool alloy_no_recording = false;

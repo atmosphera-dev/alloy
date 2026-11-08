@@ -9,40 +9,80 @@
 
 namespace alloy::site_records {
 
+struct DocumentSettings::State : public base::RefCounted<State> {
+  explicit State(PrefService* configuration)
+      : map(base::MakeRefCounted<HostContentSettingsMap>(configuration,
+                                                         true,
+                                                         false,
+                                                         false,
+                                                         false,
+                                                         true)) {
+    map->EnableDocumentPermissionState();
+  }
+  const scoped_refptr<HostContentSettingsMap> map;
+  std::map<const void*, std::unique_ptr<KeyedService>> services;
+  bool closing = false;
+
+ private:
+  friend class base::RefCounted<State>;
+  ~State() { map->ShutdownOnUIThread(); }
+};
+
 DocumentSettings::DocumentSettings(PrefService* configuration, Changed changed)
-    : settings_(base::MakeRefCounted<HostContentSettingsMap>(configuration,
-                                                             true,
-                                                             false,
-                                                             false,
-                                                             false)),
+    : state_(base::MakeRefCounted<State>(configuration)),
       changed_(std::move(changed)) {
-  settings_->EnableDocumentPermissionState();
-  settings_->AddObserver(this);
+  state_->map->AddObserver(this);
 }
 
 DocumentSettings::~DocumentSettings() {
-  shutting_down_ = true;
-  settings_->RemoveObserver(this);
-  for (auto& [key, service] : services_) {
+  Shutdown();
+}
+
+void DocumentSettings::Shutdown() {
+  auto state = state_;
+  if (state->closing) {
+    return;
+  }
+  state->closing = true;
+  state->map->RemoveObserver(this);
+  auto services = std::move(state->services);
+  state->services.clear();
+  for (auto& [key, service] : services) {
+    if (!service) {
+      continue;
+    }
     service->Shutdown();
   }
-  services_.clear();
-  settings_->ShutdownOnUIThread();
+  services.clear();
+}
+
+HostContentSettingsMap& DocumentSettings::settings() {
+  return *state_->map;
 }
 
 KeyedService* DocumentSettings::GetOrCreateService(const void* key,
                                                    ServiceFactory factory) {
-  if (shutting_down_) {
+  // A native constructor may synchronously retire this entire wrapper. Keep
+  // the native map alive through rejected-client shutdown, then close it.
+  auto state = state_;
+  if (state->closing) {
     return nullptr;
   }
   CHECK(key);
-  if (auto found = services_.find(key); found != services_.end()) {
-    return found->second.get();
+  auto [slot, created] = state->services.try_emplace(key, nullptr);
+  if (!created) {
+    return slot->second.get();
   }
-  auto service = std::move(factory).Run(settings_.get());
+  auto service = std::move(factory).Run(state->map.get());
+  if (state->closing) {
+    if (service) {
+      service->Shutdown();
+    }
+    return nullptr;
+  }
   CHECK(service);
   auto* result = service.get();
-  services_.emplace(key, std::move(service));
+  slot->second = std::move(service);
   return result;
 }
 

@@ -1,0 +1,190 @@
+--- a/third_party/blink/renderer/modules/buckets/storage_bucket_manager.cc
++++ b/third_party/blink/renderer/modules/buckets/storage_bucket_manager.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/modules/buckets/storage_bucket_manager.h"
+ 
+ #include <cstdint>
++#include "mojo/public/cpp/bindings/callback_helpers.h"
+ 
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/task_type.h"
+@@ -140,8 +141,11 @@
+   GetBucketManager(script_state)
+       ->OpenBucket(
+           name, std::move(bucket_policies),
+-          BindOnce(&StorageBucketManager::DidOpen, WrapPersistent(this),
+-                   WrapPersistent(resolver), name));
++          mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++              blink::BindOnce(&StorageBucketManager::DidOpen,
++                              WrapPersistent(this), WrapPersistent(resolver),
++                              name),
++              mojo::NullRemote(), mojom::blink::BucketError::kUnknown));
+   return promise;
+ }
+ 
+@@ -166,8 +170,10 @@
+   }
+ 
+   GetBucketManager(script_state)
+-      ->Keys(BindOnce(&StorageBucketManager::DidGetKeys, WrapPersistent(this),
+-                      WrapPersistent(resolver)));
++      ->Keys(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++          blink::BindOnce(&StorageBucketManager::DidGetKeys,
++                          WrapPersistent(this), WrapPersistent(resolver)),
++          Vector<String>(), false));
+   return promise;
+ }
+ 
+@@ -200,8 +206,11 @@
+ 
+   GetBucketManager(script_state)
+       ->DeleteBucket(
+-          name, BindOnce(&StorageBucketManager::DidDelete, WrapPersistent(this),
+-                         WrapPersistent(resolver)));
++          name,
++          mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++              resolver->WrapCallbackInScriptScope(blink::BindOnce(
++                  &StorageBucketManager::DidDelete, WrapPersistent(this))),
++              false));
+   return promise;
+ }
+ 
+--- a/third_party/blink/renderer/modules/buckets/storage_bucket.cc
++++ b/third_party/blink/renderer/modules/buckets/storage_bucket.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/modules/buckets/storage_bucket.h"
+ 
+ #include "base/time/time.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -53,8 +54,10 @@
+     return promise;
+   }
+ 
+-  remote_->Persist(BindOnce(&StorageBucket::DidRequestPersist,
+-                            WrapPersistent(this), WrapPersistent(resolver)));
++  remote_->Persist(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      resolver->WrapCallbackInScriptScope(blink::BindOnce(
++          &StorageBucket::DidRequestPersist, WrapPersistent(this))),
++      false, false));
+   return promise;
+ }
+ 
+@@ -71,8 +74,10 @@
+     return promise;
+   }
+ 
+-  remote_->Persisted(BindOnce(&StorageBucket::DidGetPersisted,
+-                              WrapPersistent(this), WrapPersistent(resolver)));
++  remote_->Persisted(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      resolver->WrapCallbackInScriptScope(blink::BindOnce(
++          &StorageBucket::DidGetPersisted, WrapPersistent(this))),
++      false, false));
+   return promise;
+ }
+ 
+@@ -90,8 +95,10 @@
+     return promise;
+   }
+ 
+-  remote_->Estimate(BindOnce(&StorageBucket::DidGetEstimate,
+-                             WrapPersistent(this), WrapPersistent(resolver)));
++  remote_->Estimate(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      resolver->WrapCallbackInScriptScope(blink::BindOnce(
++          &StorageBucket::DidGetEstimate, WrapPersistent(this))),
++      int64_t{0}, int64_t{0}, false));
+   return promise;
+ }
+ 
+@@ -110,8 +117,10 @@
+     return promise;
+   }
+ 
+-  remote_->Durability(BindOnce(&StorageBucket::DidGetDurability,
+-                               WrapPersistent(this), WrapPersistent(resolver)));
++  remote_->Durability(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      resolver->WrapCallbackInScriptScope(blink::BindOnce(
++          &StorageBucket::DidGetDurability, WrapPersistent(this))),
++      mojom::blink::BucketDurability::kRelaxed, false));
+   return promise;
+ }
+ 
+@@ -130,9 +139,12 @@
+     return promise;
+   }
+ 
+-  remote_->SetExpires(base::Time::FromMillisecondsSinceUnixEpoch(expires),
+-                      BindOnce(&StorageBucket::DidSetExpires,
+-                               WrapPersistent(this), WrapPersistent(resolver)));
++  remote_->SetExpires(
++      base::Time::FromMillisecondsSinceUnixEpoch(expires),
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++          resolver->WrapCallbackInScriptScope(blink::BindOnce(
++              &StorageBucket::DidSetExpires, WrapPersistent(this))),
++          false));
+   return promise;
+ }
+ 
+@@ -150,9 +162,10 @@
+     return promise;
+   }
+ 
+-  remote_->Expires(blink::BindOnce(&StorageBucket::DidGetExpires,
+-                                   WrapPersistent(this),
+-                                   WrapPersistent(resolver)));
++  remote_->Expires(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      resolver->WrapCallbackInScriptScope(
++          blink::BindOnce(&StorageBucket::DidGetExpires, WrapPersistent(this))),
++      std::optional<base::Time>(), false));
+   return promise;
+ }
+ 
+@@ -201,8 +214,8 @@
+     ExceptionState& exception_state) {
+   return StorageManagerFileSystemAccess::CheckStorageAccessIsAllowed(
+       script_state, exception_state,
+-      BindOnce(&StorageBucket::GetSandboxedFileSystem,
+-               WrapWeakPersistent(this)));
++      blink::BindOnce(&StorageBucket::GetSandboxedFileSystem,
++                      WrapWeakPersistent(this)));
+ }
+ 
+ void StorageBucket::GetDirectoryForDevTools(
+@@ -328,9 +341,14 @@
+     return;
+   }
+ 
+-  remote_->GetDirectory(
+-      BindOnce(&StorageManagerFileSystemAccess::DidGetSandboxedFileSystem,
+-               WrapPersistent(resolver)));
++  remote_->GetDirectory(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      resolver->WrapCallbackInScriptScope(blink::BindOnce(
++          &StorageManagerFileSystemAccess::DidGetSandboxedFileSystem)),
++      mojom::blink::FileSystemAccessError::New(
++          mojom::blink::FileSystemAccessStatus::kInvalidState,
++          base::File::Error::FILE_ERROR_FAILED,
++          "Storage bucket connection closed."),
++      mojo::NullRemote()));
+ }
+ 
+ void StorageBucket::GetSandboxedFileSystemForDevtools(
+@@ -355,8 +373,14 @@
+ 
+   remote_->GetDirectoryForDevtools(
+       directory_path_components,
+-      blink::BindOnce(
+-          &StorageManagerFileSystemAccess::DidGetSandboxedFileSystemForDevtools,
+-          WrapWeakPersistent(context), std::move(callback)));
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++          blink::BindOnce(&StorageManagerFileSystemAccess::
++                              DidGetSandboxedFileSystemForDevtools,
++                          WrapWeakPersistent(context), std::move(callback)),
++          mojom::blink::FileSystemAccessError::New(
++              mojom::blink::FileSystemAccessStatus::kInvalidState,
++              base::File::Error::FILE_ERROR_FAILED,
++              "Storage bucket connection closed."),
++          mojo::NullRemote()));
+ }
+ }  // namespace blink

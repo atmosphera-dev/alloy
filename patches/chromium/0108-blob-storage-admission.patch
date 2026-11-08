@@ -1,0 +1,528 @@
+--- a/content/browser/blob_storage/chrome_blob_storage_context.cc
++++ b/content/browser/blob_storage/chrome_blob_storage_context.cc
+@@ -94,7 +94,9 @@
+ 
+ }  // namespace
+ 
+-ChromeBlobStorageContext::ChromeBlobStorageContext() {}
++ChromeBlobStorageContext::ChromeBlobStorageContext(
++    base::RepeatingCallback<bool()> storage_admission)
++    : storage_admission_(std::move(storage_admission)) {}
+ 
+ // static
+ ChromeBlobStorageContext* ChromeBlobStorageContext::GetFor(
+@@ -177,7 +179,8 @@
+     scoped_refptr<base::TaskRunner> file_task_runner) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M159);
+   context_ = std::make_unique<BlobStorageContext>(profile_dir, blob_storage_dir,
+-                                                  std::move(file_task_runner));
++                                                  std::move(file_task_runner),
++                                                  storage_admission_);
+   // Signal the BlobMemoryController when it's appropriate to calculate its
+   // storage limits.
+   content::GetIOThreadTaskRunner({base::TaskPriority::BEST_EFFORT})
+@@ -204,6 +207,9 @@
+     const std::string& content_type) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M159);
+ 
++  if (!context_->IsStorageAccessAllowed()) {
++    return nullptr;
++  }
+   std::string uuid(base::Uuid::GenerateRandomV4().AsLowercaseString());
+   auto blob_data_builder = std::make_unique<storage::BlobDataBuilder>(uuid);
+   blob_data_builder->set_content_type(content_type);
+@@ -231,6 +237,9 @@
+         file_access) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M159);
+ 
++  if (!context_->IsStorageAccessAllowed()) {
++    return;
++  }
+   auto blob_builder = std::make_unique<storage::BlobDataBuilder>(blob_uuid);
+   if (file_size > 0) {
+     // Use AppendFileSystemFile here, since we're streaming the file directly
+--- a/content/browser/blob_storage/chrome_blob_storage_context.h
++++ b/content/browser/blob_storage/chrome_blob_storage_context.h
+@@ -54,7 +54,8 @@
+     : public base::RefCountedThreadSafe<ChromeBlobStorageContext,
+                                         BrowserThread::DeleteOnIOThread> {
+  public:
+-  ChromeBlobStorageContext();
++  explicit ChromeBlobStorageContext(
++      base::RepeatingCallback<bool()> storage_admission = {});
+ 
+   // Must be called on the UI thread.
+   static ChromeBlobStorageContext* GetFor(
+@@ -143,6 +144,7 @@
+   friend struct BrowserThread::DeleteOnThread<BrowserThread::IO>;
+   friend class base::DeleteHelper<ChromeBlobStorageContext>;
+ 
++  const base::RepeatingCallback<bool()> storage_admission_;
+   std::unique_ptr<storage::BlobStorageContext> context_;
+ };
+ 
+--- a/storage/browser/blob/blob_data_handle.cc
++++ b/storage/browser/blob/blob_data_handle.cc
+@@ -36,8 +36,13 @@
+       content_type_(content_type),
+       content_disposition_(content_disposition),
+       size_(size),
++      storage_admission_(context->storage_admission()),
+       context_(context->AsWeakPtr()) {
+   context_->IncrementBlobRefCount(uuid);
++}
++
++bool BlobDataHandle::IsStorageAccessAllowed() const {
++  return !shared_->storage_admission_ || shared_->storage_admission_.Run();
+ }
+ 
+ std::unique_ptr<BlobReader> BlobDataHandle::CreateReader() const {
+@@ -116,6 +121,9 @@
+ }
+ 
+ std::unique_ptr<BlobDataSnapshot> BlobDataHandle::CreateSnapshot() const {
++  if (!IsStorageAccessAllowed()) {
++    return nullptr;
++  }
+   DCHECK(io_task_runner_->RunsTasksInCurrentSequence());
+   if (!shared_->context_.get())
+     return nullptr;
+--- a/storage/browser/blob/blob_data_handle.h
++++ b/storage/browser/blob/blob_data_handle.h
+@@ -10,7 +10,7 @@
+ #include <string>
+ 
+ #include "base/component_export.h"
+-#include "base/functional/callback_forward.h"
++#include "base/functional/callback.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner_helpers.h"
+@@ -80,6 +80,10 @@
+   // of time.
+   std::unique_ptr<BlobReader> CreateReader() const;
+ 
++  // Captured admission is shared by aliases and remains meaningful even when
++  // an ordinary context no longer owns the already-materialized snapshot.
++  bool IsStorageAccessAllowed() const;
++
+   // May be accessed on any thread.
+   const std::string& uuid() const;
+   // May be accessed on any thread.
+@@ -123,6 +127,7 @@
+     const std::string content_type_;
+     const std::string content_disposition_;
+     const uint64_t size_;
++    const base::RepeatingCallback<bool()> storage_admission_;
+     base::WeakPtr<BlobStorageContext> context_;
+   };
+ 
+--- a/storage/browser/blob/blob_impl.cc
++++ b/storage/browser/blob/blob_impl.cc
+@@ -102,11 +102,17 @@
+ }
+ 
+ void BlobImpl::Clone(mojo::PendingReceiver<blink::mojom::Blob> receiver) {
++  if (!handle_->IsStorageAccessAllowed()) {
++    return;
++  }
+   receivers_.Add(this, std::move(receiver));
+ }
+ 
+ void BlobImpl::AsDataPipeGetter(
+     mojo::PendingReceiver<network::mojom::DataPipeGetter> receiver) {
++  if (!handle_->IsStorageAccessAllowed()) {
++    return;
++  }
+   data_pipe_getter_receivers_.Add(this, std::move(receiver));
+ }
+ 
+@@ -147,6 +153,19 @@
+ }
+ 
+ void BlobImpl::ReadSideData(ReadSideDataCallback callback) {
++  if (!handle_->IsStorageAccessAllowed()) {
++    std::move(callback).Run(std::nullopt);
++    return;
++  }
++  callback = base::BindOnce(
++      [](BlobDataHandle handle, ReadSideDataCallback callback,
++         std::optional<mojo_base::BigBuffer> data) {
++        if (!handle.IsStorageAccessAllowed()) {
++          data.reset();
++        }
++        std::move(callback).Run(std::move(data));
++      },
++      *handle_, std::move(callback));
+   handle_->RunOnConstructionComplete(base::BindOnce(
+       [](BlobDataHandle handle, ReadSideDataCallback callback,
+          BlobStatus status) {
+@@ -157,6 +176,10 @@
+         }
+ 
+         auto snapshot = handle.CreateSnapshot();
++        if (!snapshot) {
++          std::move(callback).Run(std::nullopt);
++          return;
++        }
+         // Currently side data is supported only for blobs with a single entry.
+         const auto& items = snapshot->items();
+         if (items.size() != 1) {
+@@ -190,6 +213,20 @@
+ }
+ 
+ void BlobImpl::CaptureSnapshot(CaptureSnapshotCallback callback) {
++  if (!handle_->IsStorageAccessAllowed()) {
++    std::move(callback).Run(0, std::nullopt);
++    return;
++  }
++  callback = base::BindOnce(
++      [](BlobDataHandle handle, CaptureSnapshotCallback callback, uint64_t size,
++         std::optional<base::Time> time) {
++        if (!handle.IsStorageAccessAllowed()) {
++          std::move(callback).Run(0, std::nullopt);
++          return;
++        }
++        std::move(callback).Run(size, time);
++      },
++      *handle_, std::move(callback));
+   handle_->RunOnConstructionComplete(base::BindOnce(
+       [](base::WeakPtr<BlobImpl> blob_impl, CaptureSnapshotCallback callback,
+          BlobStatus status) {
+@@ -208,6 +245,10 @@
+         }
+ 
+         auto snapshot = handle->CreateSnapshot();
++        if (!snapshot) {
++          std::move(callback).Run(0, std::nullopt);
++          return;
++        }
+         // Only blobs consisting of a single file can have a modification
+         // time.
+         const auto& items = snapshot->items();
+@@ -260,6 +301,9 @@
+ 
+ void BlobImpl::Clone(
+     mojo::PendingReceiver<network::mojom::DataPipeGetter> receiver) {
++  if (!handle_->IsStorageAccessAllowed()) {
++    return;
++  }
+   data_pipe_getter_receivers_.Add(this, std::move(receiver));
+ }
+ 
+--- a/storage/browser/blob/blob_reader.cc
++++ b/storage/browser/blob/blob_reader.cc
+@@ -83,7 +83,9 @@
+           {base::MayBlock(), base::TaskPriority::USER_BLOCKING})),
+       net_error_(net::OK) {
+   if (blob_handle) {
+-    if (blob_handle->IsBroken()) {
++    if (!blob_handle->IsStorageAccessAllowed()) {
++      net_error_ = net::ERR_ACCESS_DENIED;
++    } else if (blob_handle->IsBroken()) {
+       net_error_ = ConvertBlobErrorToNetError(blob_handle->GetBlobStatus());
+     } else {
+       blob_handle_ = std::make_unique<BlobDataHandle>(*blob_handle);
+@@ -93,8 +95,15 @@
+ 
+ BlobReader::~BlobReader() = default;
+ 
++bool BlobReader::IsStorageAccessAllowed() const {
++  return !blob_handle_ || blob_handle_->IsStorageAccessAllowed();
++}
++
+ BlobReader::Status BlobReader::CalculateSize(net::CompletionOnceCallback done) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    return ReportError(net::ERR_ACCESS_DENIED);
++  }
+   DCHECK(!total_size_calculated_);
+   DCHECK(size_callback_.is_null());
+   if (!blob_handle_.get())
+@@ -131,6 +140,11 @@
+ 
+ void BlobReader::ReadSideData(StatusCallback done) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    side_data_.reset();
++    std::move(done).Run(ReportError(net::ERR_ACCESS_DENIED));
++    return;
++  }
+ 
+   side_data_.reset();
+   if (!has_side_data()) {
+@@ -145,6 +159,9 @@
+ }
+ 
+ std::optional<mojo_base::BigBuffer> BlobReader::TakeSideData() {
++  if (!IsStorageAccessAllowed()) {
++    side_data_.reset();
++  }
+   return std::move(side_data_);
+ }
+ 
+@@ -153,6 +170,11 @@
+                                  int result,
+                                  mojo_base::BigBuffer data) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    side_data_.reset();
++    std::move(done).Run(ReportError(net::ERR_ACCESS_DENIED));
++    return;
++  }
+   if (result == expected_size) {
+     DCHECK_EQ(static_cast<size_t>(expected_size), data.size());
+     RecordBytesReadFromDataHandle(/* item_index= */ 0, result);
+@@ -165,6 +187,9 @@
+ 
+ BlobReader::Status BlobReader::SetReadRange(uint64_t offset, uint64_t length) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    return ReportError(net::ERR_ACCESS_DENIED);
++  }
+ 
+   if (!blob_handle_.get())
+     return ReportError(net::ERR_FILE_NOT_FOUND);
+@@ -214,6 +239,9 @@
+   DCHECK(read_callback_.is_null());
+ 
+   *bytes_read = 0;
++  if (!IsStorageAccessAllowed()) {
++    return ReportError(net::ERR_ACCESS_DENIED);
++  }
+   if (!blob_data_.get())
+     return ReportError(net::ERR_FILE_NOT_FOUND);
+   if (!total_size_calculated_)
+@@ -260,13 +288,25 @@
+     mojo::ScopedDataPipeProducerHandle producer,
+     net::CompletionOnceCallback done) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    std::move(done).Run(net::ERR_ACCESS_DENIED);
++    return;
++  }
+   DCHECK(IsSingleMojoDataItem());
+ 
+   // Read the set range of this single data item.
+   auto item = blob_data_->items()[0];
+-  item->data_handle()->Read(std::move(producer),
+-                            item->offset() + current_item_offset_,
+-                            remaining_bytes_, std::move(done));
++  item->data_handle()->Read(
++      std::move(producer), item->offset() + current_item_offset_,
++      remaining_bytes_,
++      base::BindOnce(
++          [](BlobDataHandle handle, net::CompletionOnceCallback done,
++             int result) {
++            std::move(done).Run(handle.IsStorageAccessAllowed()
++                                    ? result
++                                    : net::ERR_ACCESS_DENIED);
++          },
++          *blob_handle_, std::move(done)));
+ }
+ 
+ void BlobReader::Kill() {
+@@ -315,6 +355,10 @@
+ void BlobReader::AsyncCalculateSize(net::CompletionOnceCallback done,
+                                     BlobStatus status) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    InvalidateCallbacksAndDone(net::ERR_ACCESS_DENIED, std::move(done));
++    return;
++  }
+ 
+   if (BlobStatusIsError(status)) {
+     InvalidateCallbacksAndDone(ConvertBlobErrorToNetError(status),
+@@ -341,6 +385,9 @@
+ BlobReader::Status BlobReader::CalculateSizeImpl(
+     net::CompletionOnceCallback* done) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    return ReportError(net::ERR_ACCESS_DENIED);
++  }
+   DCHECK(!total_size_calculated_);
+   DCHECK(size_callback_.is_null());
+ 
+@@ -437,6 +484,11 @@
+   // Do nothing if we have encountered an error.
+   if (net_error_)
+     return;
++  if (!IsStorageAccessAllowed()) {
++    InvalidateCallbacksAndDone(net::ERR_ACCESS_DENIED,
++                               std::move(size_callback_));
++    return;
++  }
+ 
+   if (!result.has_value()) {
+     InvalidateCallbacksAndDone(result.error(), std::move(size_callback_));
+@@ -466,6 +518,13 @@
+   DCHECK(!net_error_);
+   total_size_calculated_ = true;
+   remaining_bytes_ = total_size_;
++  if (!IsStorageAccessAllowed()) {
++    net_error_ = net::ERR_ACCESS_DENIED;
++    if (!size_callback_.is_null()) {
++      InvalidateCallbacksAndDone(net_error_, std::move(size_callback_));
++    }
++    return;
++  }
+   // This is set only if we're async.
+   if (!size_callback_.is_null())
+     std::move(size_callback_).Run(net::OK);
+@@ -482,12 +541,18 @@
+     return read_status;
+   }
+ 
++  if (!IsStorageAccessAllowed()) {
++    return ReportError(net::ERR_ACCESS_DENIED);
++  }
+   *bytes_read = BytesReadCompleted();
+   return Status::DONE;
+ }
+ 
+ BlobReader::Status BlobReader::ReadItem() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!IsStorageAccessAllowed()) {
++    return ReportError(net::ERR_ACCESS_DENIED);
++  }
+ 
+   // Are we done with reading all the blob data?
+   if (remaining_bytes_ == 0)
+@@ -665,6 +730,9 @@
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(io_pending_) << "Asynchronous IO completed while IO wasn't pending?";
+   io_pending_ = false;
++  if (!IsStorageAccessAllowed()) {
++    result = net::ERR_ACCESS_DENIED;
++  }
+   if (result <= 0) {
+     InvalidateCallbacksAndDone(result, std::move(read_callback_));
+     return;
+--- a/storage/browser/blob/blob_reader.h
++++ b/storage/browser/blob/blob_reader.h
+@@ -193,6 +193,7 @@
+   }
+ 
+  private:
++  bool IsStorageAccessAllowed() const;
+   Status ReportError(int net_error);
+   void InvalidateCallbacksAndDone(int net_error,
+                                   net::CompletionOnceCallback done);
+--- a/storage/browser/blob/blob_storage_context.cc
++++ b/storage/browser/blob/blob_storage_context.cc
+@@ -55,8 +55,10 @@
+ BlobStorageContext::BlobStorageContext(
+     const base::FilePath& profile_directory,
+     const base::FilePath& storage_directory,
+-    scoped_refptr<base::TaskRunner> file_runner)
+-    : profile_directory_(profile_directory),
++    scoped_refptr<base::TaskRunner> file_runner,
++    base::RepeatingCallback<bool()> storage_admission)
++    : storage_admission_(std::move(storage_admission)),
++      profile_directory_(profile_directory),
+       memory_controller_(storage_directory, std::move(file_runner)) {
+   base::trace_event::MemoryDumpManager::GetInstance()->RegisterDumpProvider(
+       this, "BlobStorageContext",
+@@ -70,6 +72,9 @@
+ 
+ std::unique_ptr<BlobDataHandle> BlobStorageContext::GetBlobDataFromUUID(
+     const std::string& uuid) {
++  if (!IsStorageAccessAllowed()) {
++    return nullptr;
++  }
+   BlobEntry* entry = registry_.GetEntry(uuid);
+   if (!entry)
+     return nullptr;
+@@ -388,6 +393,9 @@
+ 
+ void BlobStorageContext::Bind(
+     mojo::PendingReceiver<mojom::BlobStorageContext> receiver) {
++  if (!IsStorageAccessAllowed()) {
++    return;
++  }
+   receivers_.Add(this, std::move(receiver));
+ }
+ 
+@@ -413,6 +421,9 @@
+ std::unique_ptr<BlobDataSnapshot> BlobStorageContext::CreateSnapshot(
+     const std::string& uuid) {
+   std::unique_ptr<BlobDataSnapshot> result;
++  if (!IsStorageAccessAllowed()) {
++    return result;
++  }
+   BlobEntry* entry = registry_.GetEntry(uuid);
+   if (entry->status() != BlobStatus::DONE)
+     return result;
+@@ -674,6 +685,9 @@
+     mojo::PendingReceiver<::blink::mojom::Blob> blob,
+     const std::string& uuid,
+     mojom::BlobDataItemPtr item) {
++  if (!IsStorageAccessAllowed()) {
++    return;
++  }
+   if (registry_.HasEntry(uuid)) {
+     receivers_.ReportBadMessage("duplicate uuid");
+     return;
+@@ -691,6 +705,9 @@
+     mojo::PendingReceiver<::blink::mojom::Blob> blob,
+     const std::string& uuid,
+     mojo_base::BigBuffer data) {
++  if (!IsStorageAccessAllowed()) {
++    return;
++  }
+   if (registry_.HasEntry(uuid)) {
+     receivers_.ReportBadMessage("duplicate uuid");
+     return;
+@@ -710,6 +727,10 @@
+     std::optional<base::Time> last_modified,
+     uint64_t expected_size,
+     BlobStorageContext::WriteBlobToFileCallback callback) {
++  if (!IsStorageAccessAllowed()) {
++    std::move(callback).Run(mojom::WriteBlobToFileResult::kError);
++    return;
++  }
+   DCHECK(!last_modified || !last_modified.value().is_null());
+   if (profile_directory_.empty()) {
+     std::move(callback).Run(mojom::WriteBlobToFileResult::kBadPath);
+--- a/storage/browser/blob/blob_storage_context.h
++++ b/storage/browser/blob/blob_storage_context.h
+@@ -15,7 +15,7 @@
+ 
+ #include "base/component_export.h"
+ #include "base/files/file_path.h"
+-#include "base/functional/callback_forward.h"
++#include "base/functional/callback.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/trace_event/memory_dump_provider.h"
+@@ -62,7 +62,8 @@
+   // Disk support is enabled if |file_runner| isn't null.
+   BlobStorageContext(const base::FilePath& profile_directory,
+                      const base::FilePath& blob_storage_directory,
+-                     scoped_refptr<base::TaskRunner> file_runner);
++                     scoped_refptr<base::TaskRunner> file_runner,
++                     base::RepeatingCallback<bool()> storage_admission = {});
+ 
+   BlobStorageContext(const BlobStorageContext&) = delete;
+   BlobStorageContext& operator=(const BlobStorageContext&) = delete;
+@@ -201,6 +202,12 @@
+   std::unique_ptr<BlobDataSnapshot> CreateSnapshot(const std::string& uuid);
+ 
+   BlobStatus GetBlobStatus(const std::string& uuid) const;
++  bool IsStorageAccessAllowed() const {
++    return !storage_admission_ || storage_admission_.Run();
++  }
++  const base::RepeatingCallback<bool()>& storage_admission() const {
++    return storage_admission_;
++  }
+ 
+   // Runs |done| when construction completes with the final status of the blob.
+   void RunOnConstructionComplete(const std::string& uuid,
+@@ -268,6 +275,7 @@
+                        WriteBlobToFileCallback callback) override;
+   void Clone(mojo::PendingReceiver<mojom::BlobStorageContext> cloned) override;
+ 
++  const base::RepeatingCallback<bool()> storage_admission_;
+   base::FilePath profile_directory_;
+   BlobStorageRegistry registry_;
+   BlobMemoryController memory_controller_;

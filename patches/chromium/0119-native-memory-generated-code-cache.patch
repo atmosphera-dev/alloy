@@ -1,0 +1,170 @@
+--- a/content/browser/code_cache/generated_code_cache.h
++++ b/content/browser/code_cache/generated_code_cache.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_BROWSER_CODE_CACHE_GENERATED_CODE_CACHE_H_
+ 
+ #include <map>
++#include <optional>
+ 
+ #include "base/containers/queue.h"
+ #include "base/files/file_path.h"
+@@ -44,6 +45,8 @@
+ // thread.
+ class CONTENT_EXPORT GeneratedCodeCache {
+  public:
++  enum class Backing { kDisk, kMemory };
++
+   using ReadDataCallback =
+       base::OnceCallback<void(const base::Time&, mojo_base::BigBuffer data)>;
+   using GetBackendCallback = base::OnceCallback<void(disk_cache::Backend*)>;
+@@ -90,7 +93,8 @@
+   // some heuristics.
+   GeneratedCodeCache(const base::FilePath& path,
+                      int max_size_bytes,
+-                     CodeCacheType cache_type);
++                     CodeCacheType cache_type,
++                     Backing backing = Backing::kDisk);
+ 
+   GeneratedCodeCache(const GeneratedCodeCache&) = delete;
+   GeneratedCodeCache& operator=(const GeneratedCodeCache&) = delete;
+@@ -181,6 +185,10 @@
+ 
+   // Creates a simple_disk_cache backend.
+   void CreateBackend();
++  std::optional<std::string> GetCacheKeyForBackend(
++      const GURL& resource_url,
++      const GURL& origin_lock,
++      const net::NetworkIsolationKey& nik);
+   void DidCreateBackend(disk_cache::BackendResult result);
+ 
+   // Adds operation to the appropriate queue.
+@@ -259,6 +267,9 @@
+   base::FilePath path_;
+   int max_size_bytes_;
+   CodeCacheType cache_type_;
++  const Backing backing_;
++  // Native identity namespace, never serialized or reused for another NIK.
++  std::map<net::NetworkIsolationKey, std::string> memory_nik_prefixes_;
+ 
+   // A hypothetical memory-backed code cache. Used to collect UMAs.
+   SimpleLruCache lru_cache_;
+--- a/content/browser/code_cache/generated_code_cache.cc
++++ b/content/browser/code_cache/generated_code_cache.cc
+@@ -477,14 +477,17 @@
+ 
+ GeneratedCodeCache::GeneratedCodeCache(const base::FilePath& path,
+                                        int max_size_bytes,
+-                                       CodeCacheType cache_type)
++                                       CodeCacheType cache_type,
++                                       Backing backing)
+     : backend_state_(kInitializing),
+       path_(path),
+       max_size_bytes_(max_size_bytes),
+       cache_type_(cache_type),
++      backing_(backing),
+       lru_cache_(max_size_bytes == 0
+                      ? kLruCacheCapacity
+                      : std::min<int64_t>(kLruCacheCapacity, max_size_bytes)) {
++  CHECK(backing_ != Backing::kMemory || path_.empty());
+   CreateBackend();
+ }
+ 
+@@ -520,7 +523,11 @@
+   if (data.size() >= std::numeric_limits<int32_t>::max())
+     return;
+ 
+-  const std::string key = GetCacheKey(url, origin_lock, nik, cache_type_);
++  auto backend_key = GetCacheKeyForBackend(url, origin_lock, nik);
++  if (!backend_key) {
++    return;
++  }
++  const std::string& key = *backend_key;
+   if (cache_type_ == CodeCacheType::kJavaScript) {
+     lru_cache_.Put(key, response_time, base::span(data));
+   }
+@@ -601,7 +608,12 @@
+     return;
+   }
+ 
+-  std::string key = GetCacheKey(url, origin_lock, nik, cache_type_);
++  auto backend_key = GetCacheKeyForBackend(url, origin_lock, nik);
++  if (!backend_key) {
++    std::move(read_data_callback).Run(base::Time(), {});
++    return;
++  }
++  std::string key = std::move(*backend_key);
+   auto op = std::make_unique<PendingOperation>(
+       Operation::kFetch, url, origin_lock, key, std::move(read_data_callback));
+   EnqueueOperation(std::move(op));
+@@ -616,19 +628,49 @@
+     return;
+   }
+ 
+-  std::string key = GetCacheKey(url, origin_lock, nik, cache_type_);
++  auto backend_key = GetCacheKeyForBackend(url, origin_lock, nik);
++  if (!backend_key) {
++    return;
++  }
++  std::string key = std::move(*backend_key);
+   auto op = std::make_unique<PendingOperation>(Operation::kDelete, url,
+                                                origin_lock, key);
+   EnqueueOperation(std::move(op));
+ 
+   lru_cache_.Delete(key);
++}
++
++std::optional<std::string> GeneratedCodeCache::GetCacheKeyForBackend(
++    const GURL& resource_url,
++    const GURL& origin_lock,
++    const net::NetworkIsolationKey& nik) {
++  if (backing_ == Backing::kDisk) {
++    // Keep the legacy empty-NIK contract, but never erase transient identity.
++    if (nik.IsTransient() && !nik.IsEmpty()) {
++      return std::nullopt;
++    }
++    return GetCacheKey(resource_url, origin_lock, nik, cache_type_);
++  }
++  auto it = memory_nik_prefixes_.find(nik);
++  if (it == memory_nik_prefixes_.end()) {
++    if (memory_nik_prefixes_.size() >= 16384) {
++      return std::nullopt;
++    }
++    const std::string prefix =
++        "memory-nik-" + std::to_string(memory_nik_prefixes_.size()) + "\n";
++    it = memory_nik_prefixes_.emplace(nik, prefix).first;
++  }
++  return GetCacheKey(resource_url, origin_lock, nik, cache_type_) + kSeparator +
++         it->second;
+ }
+ 
+ void GeneratedCodeCache::CreateBackend() {
+   // If the initialization of the existing cache fails, this call would delete
+   // all the contents and recreates a new one.
+   disk_cache::BackendResult result = disk_cache::CreateCacheBackend(
+-      CodeCacheTypeToNetCacheType(cache_type_), net::CACHE_BACKEND_SIMPLE,
++      backing_ == Backing::kMemory ? net::MEMORY_CACHE
++                                   : CodeCacheTypeToNetCacheType(cache_type_),
++      net::CACHE_BACKEND_SIMPLE,
+       /*file_operations=*/nullptr, path_, max_size_bytes_,
+       disk_cache::ResetHandling::kResetOnError, /*net_log=*/nullptr,
+       /*cache_encryption_delegate=*/nullptr,
+@@ -1073,13 +1115,18 @@
+   // initialized here. All other operations handle the case when backend was not
+   // yet opened.
+   CHECK_EQ(backend_state_, kInitialized, base::NotFatalUntil::M159);
++  auto backend_key = GetCacheKeyForBackend(resource_url, origin_lock, nik);
++  if (!backend_key) {
++    std::move(user_callback).Run();
++    return;
++  }
+   auto split = base::SplitOnceCallback(std::move(user_callback));
+ 
+   disk_cache::EntryResultCallback callback = base::BindOnce(
+       &GeneratedCodeCache::OpenCompleteForSetLastUsedForTest,
+       weak_ptr_factory_.GetWeakPtr(), time, std::move(split.first));
+ 
+-  std::string key = GetCacheKey(resource_url, origin_lock, nik, cache_type_);
++  std::string key = std::move(*backend_key);
+   disk_cache::EntryResult result =
+       backend_->OpenEntry(key, net::LOWEST, std::move(callback));
+   if (result.net_error() != net::ERR_IO_PENDING) {

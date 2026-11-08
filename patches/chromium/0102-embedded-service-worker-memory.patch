@@ -1,0 +1,56 @@
+--- a/content/browser/service_worker/service_worker_context_wrapper.h
++++ b/content/browser/service_worker/service_worker_context_wrapper.h
+@@ -116,6 +116,11 @@
+             storage::QuotaManagerProxy* quota_manager_proxy,
+             storage::SpecialStoragePolicy* special_storage_policy,
+             ChromeBlobStorageContext* blob_context);
++  // Native memory backend for a captured embedded scope. The enclosing
++  // BrowserContext keeps its truthful identity; no profile paths are used.
++  bool InitForEmbeddedMemoryScope(StoragePartitionImpl& partition,
++                                  storage::QuotaManagerProxy* quota_manager_proxy,
++                                  ChromeBlobStorageContext* blob_context);
+   void Shutdown();
+ 
+   // Deletes all files on disk and restarts the system asynchronously. This
+--- a/content/browser/service_worker/service_worker_context_wrapper.cc
++++ b/content/browser/service_worker/service_worker_context_wrapper.cc
+@@ -347,8 +347,37 @@
+       std::move(non_network_pending_loader_factory_bundle_for_update_check),
+       core_observer_list_.get(), core_sync_observer_list_.get(), this);
+ 
+-  GetContentClient()->browser()->PrewarmServiceWorkerRegistrationForDSE(
+-      browser_context, *this);
++  if (storage_owner_.backing !=
++      alloy::site_records::EmbeddedStateRegistry::Backing::kTemporary) {
++    GetContentClient()->browser()->PrewarmServiceWorkerRegistrationForDSE(
++        browser_context, *this);
++  }
++}
++
++bool ServiceWorkerContextWrapper::InitForEmbeddedMemoryScope(
++    StoragePartitionImpl& partition,
++    storage::QuotaManagerProxy* quota_manager_proxy,
++    ChromeBlobStorageContext* blob_context) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  using alloy::site_records::StorePurpose;
++  using alloy::site_records::StorageAccess;
++  if (storage_owner_.backing !=
++          alloy::site_records::EmbeddedStateRegistry::Backing::kTemporary ||
++      !storage_owner_.temporary) {
++    return false;
++  }
++  const auto capability = storage_owner_.temporary->Capability(StorePurpose::kServiceWorkers);
++  if (!capability.Allows(StorePurpose::kServiceWorkers, StorageAccess::kWriteMemory)) {
++    return false;
++  }
++  CHECK(!storage_partition_ && !context_core_);
++  set_storage_partition(&partition);
++  Init(base::FilePath(), quota_manager_proxy, nullptr, blob_context);
++  if (!capability.active()) {
++    Shutdown();
++    return false;
++  }
++  return true;
+ }
+ 
+ void ServiceWorkerContextWrapper::Shutdown() {

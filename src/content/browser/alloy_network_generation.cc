@@ -6,20 +6,21 @@
 #include <utility>
 #include <vector>
 
-#include "base/check.h"
 #include "base/barrier_closure.h"
-#include "base/no_destructor.h"
-#include "base/functional/callback_helpers.h"
+#include "base/check.h"
 #include "base/functional/bind.h"
+#include "base/functional/callback_helpers.h"
+#include "base/no_destructor.h"
 #include "brave/alloy/site_records/request_context_policy.h"
+#include "content/browser/alloy_embedded_state.h"
 #include "content/browser/renderer_host/render_frame_host_impl.h"
 #include "content/browser/storage_partition_impl.h"
+#include "content/public/browser/alloy_document_state.h"
 #include "content/public/browser/browser_context.h"
 #include "content/public/browser/browser_thread.h"
-#include "content/public/browser/alloy_document_state.h"
 #include "content/public/browser/document_user_data.h"
-#include "mojo/public/cpp/bindings/remote.h"
 #include "mojo/public/cpp/bindings/callback_helpers.h"
+#include "mojo/public/cpp/bindings/remote.h"
 #include "services/network/public/mojom/cert_verifier_service_updater.mojom.h"
 #include "services/network/public/mojom/network_context.mojom.h"
 
@@ -32,18 +33,33 @@ struct AlloyNetworkGeneration::Endpoints {
   base::RepeatingClosure recreate;
 };
 
-AlloyNetworkGeneration::AlloyNetworkGeneration()
-    : endpoints_(std::make_shared<Endpoints>()) {}
+AlloyNetworkGeneration::AlloyNetworkGeneration(
+    std::optional<alloy::site_records::RecordCapability> memory_owner)
+    : endpoints_(std::make_shared<Endpoints>()),
+      memory_owner_(std::move(memory_owner)) {}
 
 AlloyNetworkGeneration::~AlloyNetworkGeneration() {
   Shutdown();
 }
 
+bool AlloyNetworkGeneration::CheckAdmission() {
+  if (memory_owner_ &&
+      !memory_owner_->Allows(
+          alloy::site_records::StorePurpose::kNetworkWorkingState,
+          alloy::site_records::StorageAccess::kWriteMemory)) {
+    Shutdown();
+  }
+  return !closed_;
+}
+
 void AlloyNetworkGeneration::Bind(
     mojo::PendingRemote<network::mojom::NetworkContext> context,
-    mojo::PendingRemote<cert_verifier::mojom::CertVerifierServiceUpdater> verifier,
-    base::OnceClosure remove_client, base::RepeatingClosure recreate) {
-  if (closed_) return;
+    mojo::PendingRemote<cert_verifier::mojom::CertVerifierServiceUpdater>
+        verifier,
+    base::OnceClosure remove_client,
+    base::RepeatingClosure recreate) {
+  if (!CheckAdmission())
+    return;
   endpoints_->recreate.Reset();
   if (endpoints_->context.is_bound())
     endpoints_->context.set_disconnect_handler(base::DoNothing());
@@ -53,15 +69,18 @@ void AlloyNetworkGeneration::Bind(
   endpoints_->verifier.Bind(std::move(verifier));
   endpoints_->remove_client.ReplaceClosure(std::move(remove_client));
   endpoints_->recreate = std::move(recreate);
-  endpoints_->context.set_disconnect_handler(base::BindOnce(
-      [](base::RepeatingClosure recreate) { recreate.Run(); }, endpoints_->recreate));
+  endpoints_->context.set_disconnect_handler(
+      base::BindOnce([](base::RepeatingClosure recreate) { recreate.Run(); },
+                     endpoints_->recreate));
 }
 
 network::mojom::NetworkContext* AlloyNetworkGeneration::GetNetworkContext() {
   // A late native client sees ordinary Mojo disconnection, never a newly
   // created context or the partition's shared state after its owner retires.
-  if (closed_) return endpoints_->context.get();
-  if ((!endpoints_->context.is_bound() || !endpoints_->context.is_connected()) &&
+  if (!CheckAdmission())
+    return endpoints_->context.get();
+  if ((!endpoints_->context.is_bound() ||
+       !endpoints_->context.is_connected()) &&
       endpoints_->recreate) {
     endpoints_->recreate.Run();
   }
@@ -71,14 +90,15 @@ network::mojom::NetworkContext* AlloyNetworkGeneration::GetNetworkContext() {
 
 cert_verifier::mojom::CertVerifierServiceUpdater*
 AlloyNetworkGeneration::GetVerifier() {
-  if (closed_) return nullptr;
+  if (!CheckAdmission())
+    return nullptr;
   GetNetworkContext();
   return endpoints_->verifier.is_bound() ? endpoints_->verifier.get() : nullptr;
 }
 
 base::WeakPtr<AlloyNetworkGeneration> AlloyNetworkGeneration::GetWeakPtr() {
-  return closed_ ? base::WeakPtr<AlloyNetworkGeneration>()
-                 : weak_factory_.GetWeakPtr();
+  return !CheckAdmission() ? base::WeakPtr<AlloyNetworkGeneration>()
+                           : weak_factory_.GetWeakPtr();
 }
 
 base::OnceClosure AlloyNetworkGeneration::RetainNativeRetirementEndpoints() {
@@ -87,7 +107,8 @@ base::OnceClosure AlloyNetworkGeneration::RetainNativeRetirementEndpoints() {
 }
 
 void AlloyNetworkGeneration::Shutdown() {
-  if (closed_) return;
+  if (closed_)
+    return;
   closed_ = true;
   weak_factory_.InvalidateWeakPtrs();
   endpoints_->recreate.Reset();
@@ -101,14 +122,31 @@ void AlloyNetworkGeneration::Shutdown() {
 }
 
 namespace {
+// The existing scope service graph owns the SAME native generation registered
+// weakly by StoragePartition. There is no additional selector or registry.
+class EmbeddedNetworkService final : public KeyedService {
+ public:
+  explicit EmbeddedNetworkService(scoped_refptr<AlloyNetworkGeneration> lease)
+      : lease_(std::move(lease)) {}
+  ~EmbeddedNetworkService() override { Shutdown(); }
+  void Shutdown() override {
+    if (lease_)
+      lease_->Shutdown();
+    lease_.reset();
+  }
+  scoped_refptr<AlloyNetworkGeneration> lease() const { return lease_; }
+
+ private:
+  scoped_refptr<AlloyNetworkGeneration> lease_;
+};
+
 // One in-flight operation owns physical prepared endpoints. Context/generation
 // discovery remains exclusively StoragePartitionImpl::ForEachNetworkContext.
 class NetworkServiceRetirement final
     : public base::RefCounted<NetworkServiceRetirement> {
  public:
-  NetworkServiceRetirement(
-      base::OnceCallback<void(base::OnceClosure)> prepared,
-      base::OnceCallback<void(bool)> drained)
+  NetworkServiceRetirement(base::OnceCallback<void(base::OnceClosure)> prepared,
+                           base::OnceCallback<void(bool)> drained)
       : prepared_(std::move(prepared)), drained_(std::move(drained)) {}
   void Start(BrowserContext* context,
              const net::AlloyNetworkRecordTarget& target) {
@@ -127,7 +165,7 @@ class NetworkServiceRetirement final
     endpoints_.resize(originals.size());
     auto all_prepared = base::BarrierClosure(
         originals.size(), base::BindOnce(&NetworkServiceRetirement::Prepared,
-                                        base::WrapRefCounted(this)));
+                                         base::WrapRefCounted(this)));
     for (size_t i = 0; i < originals.size(); ++i) {
       originals[i]->PrepareAlloyNetworkServiceRetirement(
           target.domain(), endpoints_[i].BindNewPipeAndPassReceiver(),
@@ -146,14 +184,13 @@ class NetworkServiceRetirement final
     std::move(finish).Run();
   }
   void Prepared() {
-    std::move(prepared_).Run(net::CommitNetworkRetirementOnDrop(
-        base::BindOnce(&NetworkServiceRetirement::Commit,
-                       base::WrapRefCounted(this))));
+    std::move(prepared_).Run(net::CommitNetworkRetirementOnDrop(base::BindOnce(
+        &NetworkServiceRetirement::Commit, base::WrapRefCounted(this))));
   }
   void Commit() {
     auto all_drained = base::BarrierClosure(
         endpoints_.size(), base::BindOnce(&NetworkServiceRetirement::Finished,
-                                         base::WrapRefCounted(this)));
+                                          base::WrapRefCounted(this)));
     for (auto& endpoint : endpoints_) {
       endpoint->Commit(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
           base::BindOnce(&NetworkServiceRetirement::OnPrepared,
@@ -176,7 +213,8 @@ class NetworkServiceRetirement final
 network::mojom::NetworkContext* UnavailableNetworkContext() {
   // Closed document admission must not fall through to the shared partition.
   // This immutable disconnected endpoint has no Network Service/server state.
-  static base::NoDestructor<mojo::Remote<network::mojom::NetworkContext>> closed;
+  static base::NoDestructor<mojo::Remote<network::mojom::NetworkContext>>
+      closed;
   if (!closed->is_bound()) {
     auto disconnected = closed->BindNewPipeAndPassReceiver();
     disconnected.reset();
@@ -189,9 +227,11 @@ class AlloyDocumentNetworkData final
  public:
   ~AlloyDocumentNetworkData() override { Retire(); }
   void Retire() {
-    if (owns_generation_ && generation) generation->Shutdown();
+    if (owns_generation_ && generation)
+      generation->Shutdown();
   }
   scoped_refptr<AlloyNetworkGeneration> generation;
+
  private:
   explicit AlloyDocumentNetworkData(RenderFrameHost* frame)
       : DocumentUserData(frame),
@@ -218,27 +258,57 @@ void PrepareAlloyNetworkServiceRetirement(
 }
 
 scoped_refptr<AlloyNetworkGeneration> GetAlloyNetworkGenerationForDocument(
-    RenderFrameHostImpl* frame) {
-  if (!AlloyDocumentStateAdmitted(frame) ||
-      frame->GetBrowserContext()->ShutdownStarted()) return nullptr;
+    RenderFrameHostImpl* frame,
+    const AlloyEmbeddedResolution* pending_owner) {
+  if (!frame || (!pending_owner && !AlloyDocumentStateAdmitted(frame)) ||
+      frame->GetBrowserContext()->ShutdownStarted())
+    return nullptr;
+  const auto selected =
+      pending_owner ? *pending_owner : GetAlloyEmbeddedStateForDocument(frame);
+  if (selected.temporary) {
+    using alloy::site_records::RecordCapability;
+    using alloy::site_records::StorePurpose;
+    static const char kNetworkService = 0;
+    auto* partition =
+        static_cast<StoragePartitionImpl*>(frame->GetStoragePartition());
+    auto* service = static_cast<EmbeddedNetworkService*>(
+        selected.temporary->GetOrCreateService(
+            &kNetworkService, StorePurpose::kNetworkWorkingState,
+            base::BindOnce(
+                [](StoragePartitionImpl* partition, RecordCapability capability)
+                    -> std::unique_ptr<KeyedService> {
+                  return std::make_unique<EmbeddedNetworkService>(
+                      partition->CreateAlloyNetworkGeneration(capability));
+                },
+                base::Unretained(partition)),
+            partition));
+    return service ? service->lease() : nullptr;
+  }
+  // The canonical captured selection, not an unrelated native nonce, tells us
+  // whether a temporary principal retired. Never borrow CUT's parent lease.
+  if (selected.temporary_admission_closed)
+    return nullptr;
   const auto* policy = alloy::site_records::RequestContextPolicy::Get(
       *frame->GetBrowserContext());
-  if (!policy || policy->network_state() != alloy::site_records::NetworkState::kCut)
+  if (!policy ||
+      policy->network_state() != alloy::site_records::NetworkState::kCut)
     return nullptr;
   auto* data = AlloyDocumentNetworkData::GetOrCreateForCurrentDocument(frame);
   if (!data->generation) {
     if (auto* parent = frame->GetParentOrOuterDocument()) {
       data->generation = GetAlloyNetworkGenerationForDocument(parent);
     } else {
-      data->generation = static_cast<StoragePartitionImpl*>(frame->GetStoragePartition())
-                             ->CreateAlloyNetworkGeneration();
+      data->generation =
+          static_cast<StoragePartitionImpl*>(frame->GetStoragePartition())
+              ->CreateAlloyNetworkGeneration();
     }
   }
   return data->generation;
 }
 
 void SetAlloyNetworkGenerationForDocument(
-    RenderFrameHostImpl* frame, scoped_refptr<AlloyNetworkGeneration> generation) {
+    RenderFrameHostImpl* frame,
+    scoped_refptr<AlloyNetworkGeneration> generation) {
   if (generation && AlloyDocumentStateAdmitted(frame) &&
       !frame->GetBrowserContext()->ShutdownStarted()) {
     AlloyDocumentNetworkData::GetOrCreateForCurrentDocument(frame)->generation =
@@ -248,17 +318,21 @@ void SetAlloyNetworkGenerationForDocument(
 
 network::mojom::NetworkContext* GetAlloyNetworkContextForDocument(
     RenderFrameHostImpl* frame) {
-  if (!frame) return UnavailableNetworkContext();
+  if (!frame)
+    return UnavailableNetworkContext();
   const auto* policy = alloy::site_records::RequestContextPolicy::Get(
       *frame->GetBrowserContext());
-  if (!policy) return frame->GetStoragePartition()->GetNetworkContext();
   if (!AlloyDocumentStateAdmitted(frame) ||
       frame->GetBrowserContext()->ShutdownStarted()) {
     return UnavailableNetworkContext();
   }
   auto generation = GetAlloyNetworkGenerationForDocument(frame);
-  if (generation) return generation->GetNetworkContext();
-  if (policy && policy->network_state() == alloy::site_records::NetworkState::kCut)
+  if (generation)
+    return generation->GetNetworkContext();
+  if (GetAlloyEmbeddedStateForDocument(frame).temporary_admission_closed)
+    return UnavailableNetworkContext();
+  if (policy &&
+      policy->network_state() == alloy::site_records::NetworkState::kCut)
     return UnavailableNetworkContext();
   return frame->GetStoragePartition()->GetNetworkContext();
 }

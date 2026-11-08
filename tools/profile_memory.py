@@ -14,13 +14,13 @@ const parentTarget=await until(async()=>{
 },'ready persistent control browser');
 proof.parentTarget=parentTarget.id;
 const parent=await connect(parentTarget);await parent.send('Page.enable');
-async function control(c,name){await value(c,`document.title=${JSON.stringify('ALLOY_PROFILE_PROBE:'+name)}`)}
 async function guests(){return(await pageTargets()).filter(t=>t.id!==parentTarget.id)}
 async function navigate(c,label){
   const url=base+'/page/'+label;const result=await c.send('Page.navigate',{url});
   check(!result.errorText,'memory navigation '+JSON.stringify(result));
   await until(async()=>await value(c,`document.readyState==='complete'&&location.href===${JSON.stringify(url)}&&!!window.docNonce`),'memory page '+label);
   await committedHistory(c,url);
+  await pageControl(c);
 }
 async function write(c,marker){return value(c,`(async()=>{
   const marker=${JSON.stringify(marker)};
@@ -156,3 +156,14 @@ proof.finalRetirement=await destroyed(6,4);
 parent.ws.close();proof.driveSeconds=(performance.now()-start)/1000;
 console.log(JSON.stringify(proof));
 '''
+
+
+def build_scenario(helpers):
+    from profile_browser_lifecycle import make_scenario
+    return make_scenario(DRIVE.replace('__CDP_HELPERS__', helpers), [
+        ('start-stateless', 2),
+        ('memory-peer', 1),
+        ('memory-peer-stateless', 1),
+        ('open-tab-held', 1),
+        ('memory-restart', 2),
+    ])

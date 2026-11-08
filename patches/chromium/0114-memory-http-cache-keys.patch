@@ -1,0 +1,372 @@
+--- a/net/http/http_cache.cc
++++ b/net/http/http_cache.cc
+@@ -529,6 +529,32 @@
+ 
+ //-----------------------------------------------------------------------------
+ 
++namespace {
++// Entry-key namespace only: this never discovers or selects a backend. Native
++// equality/order retains every site, opaque identity, nonce and partition.
++class MemoryCacheKeySpace {
++ public:
++  std::optional<std::string> Key(const NetworkIsolationKey& key) {
++    if (key.IsEmpty())
++      return std::nullopt;
++    if (!key.IsTransient())
++      return key.ToCacheKeyString();
++    auto found = identities_.find(key);
++    if (found == identities_.end()) {
++      // Bound metadata without evicting/reusing an existing identity. New
++      // identities at capacity simply miss, like a full native memory cache.
++      if (identities_.size() >= 16384)
++        return std::nullopt;
++      found = identities_.emplace(key, identities_.size() + 1).first;
++    }
++    return base::StrCat({"*memory*", base::NumberToString(found->second)});
++  }
++
++ private:
++  std::map<NetworkIsolationKey, uint64_t> identities_;
++};
++}  // namespace
++
+ HttpCache::HttpCache(
+     std::unique_ptr<HttpTransactionFactory> network_layer,
+     std::unique_ptr<BackendFactory> backend_factory,
+@@ -543,10 +569,28 @@
+       file_operations_(std::move(file_operations)) {
+   g_init_cache = true;
+ 
++  if (backend_factory_ && backend_factory_->GetCacheType() == MEMORY_CACHE) {
++    memory_isolation_key_ = base::BindRepeating(
++        [](std::shared_ptr<MemoryCacheKeySpace> owner,
++           const NetworkIsolationKey& key) { return owner->Key(key); },
++        std::make_shared<MemoryCacheKeySpace>());
++  }
++
+   if (base::FeatureList::IsEnabled(features::kHttpCacheNoVarySearch)) {
+     size_t max_entries = features::kHttpCacheNoVarySearchCacheMaxEntries.Get();
+     if (max_entries) {
+-      no_vary_search_cache_ = std::make_unique<NoVarySearchCache>(max_entries);
++      base::RepeatingCallback<std::optional<std::string>(
++          const HttpRequestInfo&)>
++          memory_partition_key;
++      if (memory_isolation_key_ && !file_operations_) {
++        memory_partition_key = base::BindRepeating(
++            [](MemoryIsolationKey key, const HttpRequestInfo& request) {
++              return GenerateCacheKeyInternal(request, false, key);
++            },
++            memory_isolation_key_);
++      }
++      no_vary_search_cache_ = std::make_unique<NoVarySearchCache>(
++          max_entries, std::move(memory_partition_key));
+     }
+   }
+   HttpNetworkSession* session = network_layer_->GetSession();
+@@ -713,7 +757,7 @@
+ 
+ void HttpCache::OnExternalCacheHitForRequest(
+     const HttpRequestInfo& request_info) {
+-  std::optional<std::string> key = GenerateCacheKeyForRequest(&request_info);
++  std::optional<std::string> key = GenerateCacheKeyForBackend(&request_info);
+   if (!key) {
+     return;
+   }
+@@ -832,16 +876,37 @@
+     bool is_shared_resource,
+     std::optional<url::Origin> initiator,
+     bool include_url) {
++  return GenerateCacheKeyWithMemoryIdentity(
++      url, load_flags, network_isolation_key, upload_data_identifier,
++      is_subframe_document_resource, is_mainframe_navigation,
++      is_shared_resource, std::move(initiator), include_url, {});
++}
++
++std::optional<std::string> HttpCache::GenerateCacheKeyWithMemoryIdentity(
++    const GURL& url,
++    int load_flags,
++    const NetworkIsolationKey& network_isolation_key,
++    std::optional<int64_t> upload_data_identifier,
++    bool is_subframe_document_resource,
++    bool is_mainframe_navigation,
++    bool is_shared_resource,
++    std::optional<url::Origin> initiator,
++    bool include_url,
++    const MemoryIsolationKey& memory_key) {
+   std::string isolation_key;
+-  if (IsSplitCacheEnabled()) {
++  const bool transient_memory =
++      memory_key && network_isolation_key.IsTransient();
++  if (IsSplitCacheEnabled() || transient_memory) {
+     // Requests with a transient NetworkIsolationKey should not be cached when
+     // network state partitioning is enabled. Transient keys have no persistent
+     // string representation, and caching them could cause cross-site leaks.
+-    if (network_isolation_key.IsTransient()) {
++    auto serialized_key = memory_key ? memory_key.Run(network_isolation_key)
++                                     : network_isolation_key.ToCacheKeyString();
++    if (!serialized_key) {
+       return std::nullopt;
+     }
+ 
+-    if (!is_shared_resource) {
++    if (!is_shared_resource || transient_memory) {
+       // Prepend the key with |kDoubleKeyPrefix| = "_dk_" to mark it as
+       // double-keyed (and makes it an invalid url so that it doesn't get
+       // confused with a single-keyed entry). Separate the origin and url
+@@ -861,7 +926,7 @@
+           kDoubleKeyPrefix,
+           subframe_prefix,
+           cross_site_prefix,
+-          *network_isolation_key.ToCacheKeyString(),
++          *serialized_key,
+           include_url ? kDoubleKeySeparator : "",
+       });
+     }
+@@ -901,16 +966,22 @@
+ // static
+ std::optional<std::string> HttpCache::GenerateCacheKeyInternal(
+     const HttpRequestInfo& request,
+-    bool include_url) {
++    bool include_url,
++    const MemoryIsolationKey& memory_key) {
+   const std::optional<int64_t> upload_data_identifier =
+       request.upload_data_stream
+           ? std::optional(request.upload_data_stream->identifier())
+           : std::nullopt;
+-  return GenerateCacheKey(
++  return GenerateCacheKeyWithMemoryIdentity(
+       request.url, request.load_flags, request.network_isolation_key,
+       upload_data_identifier, request.is_subframe_document_resource,
+       request.is_main_frame_navigation, request.is_shared_resource,
+-      request.initiator, include_url);
++      request.initiator, include_url, memory_key);
++}
++
++std::optional<std::string> HttpCache::GenerateCacheKeyForBackend(
++    const HttpRequestInfo* request) {
++  return GenerateCacheKeyInternal(*request, true, memory_isolation_key_);
+ }
+ 
+ // static
+@@ -1100,7 +1171,7 @@
+   temp_info.is_main_frame_navigation = is_main_frame_navigation;
+   temp_info.initiator = initiator;
+ 
+-  std::optional<std::string> key = GenerateCacheKeyForRequest(&temp_info);
++  std::optional<std::string> key = GenerateCacheKeyForBackend(&temp_info);
+   if (!key) {
+     return;
+   }
+@@ -1874,6 +1945,9 @@
+     backend_factory_.reset();  // Reclaim memory.
+     if (result == OK) {
+       disk_cache_ = std::move(pending_op->backend);
++      if (memory_isolation_key_) {
++        CHECK_EQ(disk_cache_->GetCacheType(), MEMORY_CACHE);
++      }
+       UMA_HISTOGRAM_MEMORY_KB("HttpCache.MaxFileSizeOnInit",
+                               disk_cache_->MaxFileSize() / 1024);
+       MaybeLoadNoVarySearchCacheFromDisk();
+--- a/net/http/http_cache.h
++++ b/net/http/http_cache.h
+@@ -414,6 +414,10 @@
+   static std::optional<std::string> GenerateCacheKeyForRequest(
+       const HttpRequestInfo* request);
+ 
++  // Uses this native cache owner's memory identity namespace when applicable.
++  std::optional<std::string> GenerateCacheKeyForBackend(
++      const HttpRequestInfo* request);
++
+   // Generates the cache partition key, which is the cache key not including the
+   // URL. This does include the upload data identifier when needed.
+   static std::optional<std::string> GenerateCachePartitionKeyForRequest(
+@@ -662,10 +666,26 @@
+ 
+   // Methods ------------------------------------------------------------------
+ 
++  using MemoryIsolationKey = base::RepeatingCallback<std::optional<std::string>(
++      const NetworkIsolationKey&)>;
++
++  static std::optional<std::string> GenerateCacheKeyWithMemoryIdentity(
++      const GURL& url,
++      int load_flags,
++      const NetworkIsolationKey& network_isolation_key,
++      std::optional<int64_t> upload_data_identifier,
++      bool is_subframe_document_resource,
++      bool is_mainframe_navigation,
++      bool is_shared_resource,
++      std::optional<url::Origin> initiator,
++      bool include_url,
++      const MemoryIsolationKey& memory_key);
++
+   // Calls GenerateCacheKey() with fields extracted from `request`.
+   static std::optional<std::string> GenerateCacheKeyInternal(
+       const HttpRequestInfo& request,
+-      bool include_url);
++      bool include_url,
++      const MemoryIsolationKey& memory_key = {});
+ 
+   // Generates a cache key for `request_info` and informs the backend it should
+   // consider it used if it exists.
+@@ -916,6 +936,7 @@
+ 
+   // Used when lazily constructing the disk_cache_.
+   std::unique_ptr<BackendFactory> backend_factory_;
++  MemoryIsolationKey memory_isolation_key_;
+   bool building_backend_ = false;
+   bool bypass_lock_for_test_ = false;
+   bool bypass_lock_after_headers_for_test_ = false;
+--- a/net/http/http_cache_transaction.cc
++++ b/net/http/http_cache_transaction.cc
+@@ -1018,7 +1018,7 @@
+   const bool should_pass_through = ShouldPassThrough();
+ 
+   std::optional<std::string> cache_key =
+-      HttpCache::GenerateCacheKeyForRequest(request_);
++      cache_->GenerateCacheKeyForBackend(request_);
+ 
+   // If no cache key is generated from this request, treat that the same way we
+   // do other pass-through cases. This prevents resources whose origin is opaque
+@@ -4541,7 +4541,7 @@
+ 
+   // Regenerate the cache key with the modified URL.
+   std::optional<std::string> cache_key =
+-      HttpCache::GenerateCacheKeyForRequest(request_);
++      cache_->GenerateCacheKeyForBackend(request_);
+   // NoVarySearchCache should never rewrite a URL that has a valid cache key to
+   // one that doesn't.
+   CHECK(cache_key);
+--- a/net/http/no_vary_search_cache.cc
++++ b/net/http/no_vary_search_cache.cc
+@@ -322,7 +322,12 @@
+   }
+ }
+ 
+-NoVarySearchCache::NoVarySearchCache(size_t max_size) : max_size_(max_size) {
++NoVarySearchCache::NoVarySearchCache(
++    size_t max_size,
++    base::RepeatingCallback<std::optional<std::string>(const HttpRequestInfo&)>
++        memory_partition_key)
++    : max_size_(max_size),
++      memory_partition_key_(std::move(memory_partition_key)) {
+   CHECK_GE(max_size_, 1u);
+   // We can't serialize if `max_size` won't fit in an int.
+   CHECK(base::IsValueInRangeForNumericType<int>(max_size));
+@@ -335,6 +340,7 @@
+       partition_lru_(std::move(rhs.partition_lru_)),
+       size_(std::exchange(rhs.size_, 0u)),
+       max_size_(rhs.max_size_),
++      memory_partition_key_(std::move(rhs.memory_partition_key_)),
+       max_partition_size_(rhs.max_partition_size_),
+       max_partitions_(rhs.max_partitions_) {}
+ 
+@@ -365,7 +371,9 @@
+   // string copies. Try to reduce the amount of work done for a miss.
+   ASSIGN_OR_RETURN(
+       const std::string cache_partition_key,
+-      HttpCache::GenerateCachePartitionKeyForRequest(request),
++      memory_partition_key_
++          ? memory_partition_key_.Run(request)
++          : HttpCache::GenerateCachePartitionKeyForRequest(request),
+       []() -> std::optional<NoVarySearchCache::LookupResult> { return {}; });
+ 
+   const auto partition_it = partitions_.find(cache_partition_key);
+@@ -424,9 +432,12 @@
+   std::optional<std::string> query =
+       url.has_query() ? std::make_optional(url.GetQuery()) : std::nullopt;
+ 
+-  ASSIGN_OR_RETURN(const std::string cache_partition_key,
+-                   HttpCache::GenerateCachePartitionKeyForRequest(request),
+-                   [] { return; });
++  ASSIGN_OR_RETURN(
++      const std::string cache_partition_key,
++      memory_partition_key_
++          ? memory_partition_key_.Run(request)
++          : HttpCache::GenerateCachePartitionKeyForRequest(request),
++      [] { return; });
+ 
+   const base::Time update_time = base::Time::Now();
+ 
+@@ -476,6 +487,7 @@
+ }
+ 
+ void NoVarySearchCache::SetJournal(Journal* journal) {
++  CHECK(!journal || !memory_partition_key_);
+   journal_ = journal;
+ }
+ 
+@@ -551,6 +563,7 @@
+ }
+ 
+ void NoVarySearchCache::MergeFrom(const NoVarySearchCache& newer) {
++  CHECK(memory_partition_key_ == newer.memory_partition_key_);
+   for (auto* part_node = newer.partition_lru_.tail();
+        part_node != newer.partition_lru_.end();
+        part_node = part_node->previous()) {
+@@ -840,6 +853,7 @@
+ void PickleTraits<NoVarySearchCache>::Serialize(
+     base::Pickle& pickle,
+     const NoVarySearchCache& cache) {
++  CHECK(!cache.memory_partition_key_);
+   // `size_t` is different sizes on 32-bit and 64-bit platforms. For a
+   // consistent format, serialize as int. This will crash if someone creates a
+   // NoVarySearchCache which supports over 2 billion entries, which would be a
+--- a/net/http/no_vary_search_cache.h
++++ b/net/http/no_vary_search_cache.h
+@@ -16,6 +16,7 @@
+ #include <vector>
+ 
+ #include "base/containers/linked_list.h"
++#include "base/functional/callback.h"
+ #include "base/functional/function_ref.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/stack_allocated.h"
+@@ -121,7 +122,10 @@
+   // The cache will hold at most `max_size` entries. Each entry stores the query
+   // parameter from a previous response, which will typically be 100 to 200
+   // bytes.
+-  explicit NoVarySearchCache(size_t max_size);
++  explicit NoVarySearchCache(
++      size_t max_size,
++      base::RepeatingCallback<std::optional<std::string>(
++          const HttpRequestInfo&)> memory_partition_key = {});
+ 
+   // Move-constructible to permit deserialization and passing between threads.
+   NoVarySearchCache(NoVarySearchCache&&);
+@@ -352,6 +356,8 @@
+ 
+   // Query objects will be evicted to avoid exceeding `max_size_`.
+   size_t max_size_;
++  base::RepeatingCallback<std::optional<std::string>(const HttpRequestInfo&)>
++      memory_partition_key_;
+ 
+   // Maximum number of entries allowed in a single partition.
+   size_t max_partition_size_;
+--- a/services/network/cors/cors_url_loader.cc
++++ b/services/network/cors/cors_url_loader.cc
+@@ -1587,14 +1587,17 @@
+   // Note: We use the nullopt upload_data_identifier because we only care
+   // about GET requests for the Renderer Accessible HTTP Cache, which don't have
+   // upload data. Also assuming is_upload is false.
+-  if (auto key = net::HttpCache::GenerateCacheKey(
+-          request_.url, request_.load_flags,
+-          isolation_info_.network_isolation_key(),
+-          /*upload_data_identifier=*/std::nullopt,
+-          /*is_subframe_document_resource=*/false,
+-          /*is_mainframe_navigation=*/false,
+-          /*is_shared_resource=*/false, request_.request_initiator,
+-          /*include_url=*/true)) {
++  net::HttpRequestInfo cache_request;
++  cache_request.url = request_.url;
++  cache_request.method = "GET";
++  cache_request.load_flags = request_.load_flags;
++  cache_request.network_isolation_key = isolation_info_.network_isolation_key();
++  cache_request.is_subframe_document_resource = false;
++  cache_request.is_main_frame_navigation = false;
++  cache_request.is_shared_resource = false;
++  cache_request.initiator = request_.request_initiator;
++  if (auto key = context_->GetHttpCache()->GenerateCacheKeyForBackend(
++          &cache_request)) {
+     backend->OnEntryEligibleForSharedCache(
+         *key, request_.url,
+         std::move(response_info_for_renderer_accessible_cache_),

@@ -98,6 +98,21 @@ bool AlloyGetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
 /*--cef(added=experimental,optional_param=context,optional_param=filters)--*/
 bool AlloySetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
                                 const CefString& filters);
+
+///
+/// EXPERIMENTAL: Selects the embedded-state lifetime for an explicit initialized
+/// request context. Must be called on browser UI before the first network
+/// document is admitted. |scope| is "per-outer-site" (the default, including a
+/// 30-second keepalive after its last tab closes) or "per-tab" (tab + outer site,
+/// immediate retirement on tab close or moving to a different outer site).
+/// Back after a per-tab scope ends starts fresh. Sharing contexts share this
+/// immutable choice. Returns false for a null/uninitialized context, wrong
+/// thread, invalid option, retired context or a choice made after admission.
+/// Stateless contexts still refuse all storage in either scope.
+///
+/*--cef(added=experimental)--*/
+bool AlloySetEmbeddedStateScope(CefRefPtr<CefRequestContext> context,
+                                const CefString& scope);
 #endif
 
 #endif  // ALLOY_INCLUDE_ALLOY_REQUEST_CONTEXT_H_

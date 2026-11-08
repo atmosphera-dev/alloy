@@ -13,8 +13,8 @@
 
 namespace alloy::site_records {
 
-// The native factory supplies its ordinary getter; only stateless documents
-// construct their own complete native grant context with the same map owner.
+// The native factory supplies its ordinary getter. Working-state documents and
+// embedded scopes construct complete native contexts with their map's owner.
 template <typename T>
 T* DocumentPermissionContext(content::RenderFrameHost* frame,
                              T* (*profile_getter)(Profile*)) {
@@ -22,7 +22,7 @@ T* DocumentPermissionContext(content::RenderFrameHost* frame,
     return nullptr;
   }
   auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
-  if (!RequestContextPolicy::IsStateless(*profile)) {
+  if (!HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
     return profile_getter(profile);
   }
   static const int type_key = 0;

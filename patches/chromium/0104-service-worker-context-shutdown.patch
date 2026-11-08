@@ -1,0 +1,75 @@
+--- a/content/browser/service_worker/service_worker_context_core.h
++++ b/content/browser/service_worker/service_worker_context_core.h
+@@ -545,7 +545,8 @@
+   }
+ 
+   base::WeakPtr<ServiceWorkerContextCore> AsWeakPtr() {
+-    return weak_factory_.GetWeakPtr();
++    return is_shutting_down_ ? base::WeakPtr<ServiceWorkerContextCore>()
++                             : weak_factory_.GetWeakPtr();
+   }
+ 
+   int GetNextEmbeddedWorkerId();
+@@ -720,6 +721,7 @@
+ 
+   base::ObserverList<TestVersionObserver> test_version_observers_;
+ 
++  bool is_shutting_down_ = false;
+   base::WeakPtrFactory<ServiceWorkerContextCore> weak_factory_{this};
+ };
+ 
+--- a/content/browser/service_worker/service_worker_context_core.cc
++++ b/content/browser/service_worker/service_worker_context_core.cc
+@@ -400,11 +400,22 @@
+ }
+ 
+ ServiceWorkerContextCore::~ServiceWorkerContextCore() {
++  // A version can be retained by an event or registration after its owning
++  // context ends, while a sibling still keeps the renderer alive. Closing a
++  // catalogue/process reference is not termination of that native worker.
++  is_shutting_down_ = true;
++  std::vector<scoped_refptr<ServiceWorkerVersion>> versions;
+   for (const auto& it : live_versions_) {
++    versions.emplace_back(it.second.get());
+     it.second->RemoveObserver(this);
+   }
+-
++  // Close old and newly requested weak admission before native cleanup calls
++  // back. Jobs retain a raw core only for their synchronous abort cleanup.
++  weak_factory_.InvalidateWeakPtrs();
+   job_coordinator_->AbortAll();
++  for (const auto& version : versions) {
++    version->StopWorker(base::DoNothing());
++  }
+ }
+ 
+ ServiceWorkerClientOwner::ServiceWorkerClientIterator
+--- a/content/browser/service_worker/service_worker_version.cc
++++ b/content/browser/service_worker/service_worker_version.cc
+@@ -2604,6 +2604,15 @@
+     StatusCallback callback,
+     blink::ServiceWorkerStatusCode status,
+     scoped_refptr<ServiceWorkerRegistration> registration) {
++  // Registry replies can outlive the context that admitted this start.
++  if (!context_) {
++    RecordStartWorkerResult(purpose, prestart_status, kInvalidTraceId,
++                            is_browser_startup_complete,
++                            blink::ServiceWorkerStatusCode::kErrorAbort);
++    RunSoon(base::BindOnce(std::move(callback),
++                           blink::ServiceWorkerStatusCode::kErrorAbort));
++    return;
++  }
+   scoped_refptr<ServiceWorkerRegistration> protect = registration;
+   if (status == blink::ServiceWorkerStatusCode::kErrorNotFound) {
+     // When the registration has already been deleted from the storage but its
+@@ -3246,8 +3255,8 @@
+   // the worker was stopping. The worker must be restarted to fulfill the
+   // request.
+   bool should_restart = !start_callbacks_.empty();
+-  if (is_redundant() || in_dtor_) {
+-    // This worker will be destroyed soon.
++  if (!context_ || is_redundant() || in_dtor_) {
++    // The owner ended or this worker will be destroyed soon.
+     should_restart = false;
+   } else if (ping_controller_.IsTimedOut()) {
+     // This worker exhausted its time to run, don't let it restart.

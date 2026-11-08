@@ -1,0 +1,121 @@
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3639,6 +3639,14 @@
+   sources += [ "alloy_network_generation.cc", "alloy_network_generation.h" ]
+ 
+   sources += [ "alloy_document_identity.cc" ]
++  sources += [
++    "alloy_embedded_state.cc",
++    "alloy_embedded_state.h",
++    "dom_storage/alloy_embedded_local_storage.cc",
++    "dom_storage/alloy_embedded_local_storage.h",
++  ]
++  deps += [ "//brave/alloy/site_records:embedded_state" ]
++
+ 
+ }
+ 
+--- a/content/browser/browser_context.cc
++++ b/content/browser/browser_context.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/public/browser/browser_context.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+@@ -362,7 +363,8 @@
+ }
+ 
+ void BrowserContext::NotifyWillBeDestroyed() {
++  ShutdownAlloyEmbeddedState(*this);
+   impl()->NotifyWillBeDestroyed();
+ }
+ 
+ void BrowserContext::EnsureResourceContextInitialized() {
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <stddef.h>
+ 
+@@ -4596,7 +4597,8 @@
+   }
+ 
+   // Let the embedder know about the newly created and initialized WebContents.
++  InitializeAlloyEmbeddedTab(this);
+   GetContentClient()->browser()->OnWebContentsCreated(this);
+ 
+   // Ensure that observers are notified of the creation of this WebContents's
+   // main RenderFrameHost. It must be done here for main frames, since the
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -5701,9 +5702,12 @@
+ 
+   BRAVE_RENDER_FRAME_HOST_IMPL_COMPUTE_ISOLATION_INFO_INTERNAL
+   std::optional<base::UnguessableToken> nonce =
+       ComputeNonce(is_credentialless, fenced_frame_nonce_for_navigation);
++  if (!nonce) {
++    nonce = GetAlloyEmbeddedNonceForCandidate(this, frame_origin);
++  }
+   return net::IsolationInfo::Create(
+       request_type, top_frame_origin, frame_origin, candidate_site_for_cookies,
+       nonce, net::NetworkIsolationPartition::kGeneral,
+       candidate_frame_ancestor_relation);
+ }
+@@ -5813,7 +5817,12 @@
+   }
+ 
++  if (GetAlloyEmbeddedStateForCandidate(this, new_rfh_origin)
++          .considered_first_party) {
++    return blink::StorageKey::CreateFirstParty(new_rfh_origin);
++  }
++
+   if (GetContentClient()->browser()->ShouldUseFirstPartyStorageKey(
+           new_rfh_origin)) {
+     // Extension subframes should not take their top-level site into account
+     // when determining storage access. Thus, we construct all extension frame
+     // StorageKeys as first-party using the extension origin.
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/renderer_host/navigation_request.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -1617,6 +1618,9 @@
+   std::optional<base::UnguessableToken> nonce = render_frame_host->ComputeNonce(
+       navigation_request->is_credentialless(),
+       navigation_request->ComputeFencedFrameNonce());
++  if (!nonce) {
++    nonce = GetAlloyEmbeddedNonceForNavigation(navigation_request.get(), origin);
++  }
+   url::Origin top_level_origin =
+       render_frame_host->ComputeTopFrameOrigin(origin);
+   if (nonce) {
+@@ -7163,6 +7167,9 @@
+   std::optional<base::UnguessableToken> nonce =
+       GetRenderFrameHost()->ComputeNonce(is_credentialless(),
+                                          ComputeFencedFrameNonce());
++  if (!nonce) {
++    nonce = GetAlloyEmbeddedNonceForNavigation(this, origin_to_commit);
++  }
+ 
+   commit_params_->storage_key = GetRenderFrameHost()->CalculateStorageKey(
+       origin_to_commit, base::OptionalToPtr(nonce));

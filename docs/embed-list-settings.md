@@ -99,6 +99,14 @@ backing. Native composition tests check the actual frame StorageKey selection
 for both encrypted and guest settings. Record retirement also revokes matching
 temporary embedded scopes through the same embedded-state lifecycle hook.
 
+The captured admission also supplies cookie policy and jar selection. A listed
+document uses its own real cookie jar for script and HTTP access. The browser
+passes the captured document origin to its native cookie manager and network
+factories; network requests recheck that origin on each destination and redirect.
+Cross-origin fetches cannot borrow the exception. Native origin, SameSite,
+HttpOnly and explicit site-cookie blocks still apply. Unlisted documents keep
+their existing temporary backing and cannot read the real first-party jar.
+
 ## Native consumer contract (item 6E)
 
 The following member names/signatures and the canonical-domain dictionary schema

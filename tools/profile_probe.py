@@ -1091,8 +1091,14 @@ def main():
             assert ordinary['pass_'] and ordinary['ordinary_functional_and_restart']
             assert not ordinary['encrypted_profile_verified']
             save(evidence/'ordinary-persistent.json',dict(root=str(ordinary_root),result=ordinary))
+            from profile_embedded_profiles import run as run_profiles
+            profiles = run_profiles(out, evidence/'encrypted-list-composition', CDP_HELPERS, scopes)
+            assert len(profiles) == 5*len(scopes)
         coverage = dict(embedded_storage_only=False, embedded_network_slice_only=True,
-                         ordinary_persistent_exercised=ordinary is not None,
+                          ordinary_persistent_exercised=ordinary is not None,
+                          encrypted_profile_verified=True,
+                          directional_list_delete_and_explicit_lock_verified=True,
+                          decay_verified=False, autolock_verified=False,
                          all_mode_kernel_proof=False,
                         full_item6E_gate=False) if args.check == 'embedded' else {}
         save(evidence/'result.json', dict(pass_=True, config=out.name, results=results,

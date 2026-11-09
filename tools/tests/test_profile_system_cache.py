@@ -10,6 +10,28 @@ import profile_system_cache as cache
 
 
 class SystemCacheBoundary(unittest.TestCase):
+    def test_dconf_is_the_only_allowed_runtime_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = cache.create_runtime(Path(directory))
+            cache.check_runtime(root)
+            (root/'dconf').mkdir()
+            (root/'dconf/user').write_bytes(b'\0\0')
+            cache.check_runtime(root)
+            (root/'dconf/browser-state').write_bytes(b'private')
+            with self.assertRaisesRegex(AssertionError, 'unexpected system runtime'):
+                cache.check_runtime(root)
+
+    def test_runtime_unknown_directories_and_symlinks_fail(self):
+        for kind in ('directory', 'symlink'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = cache.create_runtime(Path(directory))
+                if kind == 'directory':
+                    (root/'browser-runtime').mkdir()
+                else:
+                    (root/'dconf').symlink_to(Path(directory), target_is_directory=True)
+                with self.assertRaises(AssertionError):
+                    cache.check_runtime(root)
+
     def test_font_indexes_and_tags_are_the_only_allowed_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = cache.create(Path(directory))

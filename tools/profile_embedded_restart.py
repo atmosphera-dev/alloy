@@ -53,6 +53,7 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
     before = snapshot(backing, root/'before-observation.json')
     save(root/'before.json', before)
     xdg_cache = system_cache.create(root)
+    xdg_runtime = system_cache.create_runtime(root)
     env = dict(os.environ, TMPDIR=str(temp_path(W)), ALLOY_PROFILE_NO_DISK='1',
         ALLOY_PROFILE_URL='about:blank', ALLOY_PROFILE_ROOT=str(backing/'profile'),
         ALLOY_PROFILE_NETWORK='cut' if mode == 'stateless-cut' else 'keep',
@@ -60,7 +61,7 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
         ALLOY_PROFILE_SELECTED_FILE=str(root/'unused-input'),
         ALLOY_PROFILE_OUTPUT_FILE=str(root/'unused-output'), HOME=str(backing/'home'),
         XDG_CACHE_HOME=str(xdg_cache), XDG_CONFIG_HOME=str(backing/'config'),
-        XDG_DATA_HOME=str(backing/'data'), XDG_RUNTIME_DIR=str(root/'runtime'))
+        XDG_DATA_HOME=str(backing/'data'), XDG_RUNTIME_DIR=str(xdg_runtime))
     for name in ('ALLOY_PROFILE_MEMORY', 'ALLOY_PROFILE_PERSISTENT'):
         env.pop(name, None)
     if mode == 'memory':
@@ -119,6 +120,7 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
             v for v in events if v['event'] == 'closed']) == 2
         after = snapshot(backing, root/'after-observation.json')
         system_cache.check(xdg_cache)
+        system_cache.check_runtime(xdg_runtime)
         save(root/'after.json', after)
         save(root/'final-marker-scan.json', scan_markers(backing, marker))
         if mode != 'persistent':
@@ -142,9 +144,9 @@ def run_phase(root, backing, phase, mode, scope, marker, executable, out, fixtur
             browser.wait(timeout=15)
 
 
-def scan_markers(backing, marker, *, allow_vanished=False):
+def scan_markers(backing, marker, *, allow_vanished=False, roots=ROOTS):
     scanned, vanished = 0, []
-    for name in ROOTS:
+    for name in roots:
         for path in (backing/name).rglob('*'):
             if path.is_file() and not path.is_symlink():
                 try:

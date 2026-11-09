@@ -222,6 +222,11 @@ TEST_F(ProducerCompositionTest, ColdRecordListSelectsNativeEmbeddedOwnerAndTrack
   EXPECT_TRUE(real.considered_first_party);
   EXPECT_EQ(EmbeddedStateRegistry::Backing::kRealSite, real.backing);
   EXPECT_FALSE(listed->GetStorageKey().nonce());
+  auto listed_owner = content::AlloyDocumentStateOwner(listed);
+  EXPECT_EQ(b_, content::AlloyConsideredFirstPartyCookieOrigin(
+                    listed_owner, native_.get()));
+  EXPECT_FALSE(content::AlloyConsideredFirstPartyCookieOrigin(
+      listed_owner, profile()));
   ASSERT_EQ(FileStatus::kOk, store_->SetFirstPartyEmbeds(a_.GetURL(), {}));
   auto* unlisted = embed(); ASSERT_TRUE(unlisted);
   const auto temporary = content::GetAlloyEmbeddedStateForDocument(unlisted);
@@ -229,6 +234,14 @@ TEST_F(ProducerCompositionTest, ColdRecordListSelectsNativeEmbeddedOwnerAndTrack
   EXPECT_EQ(EmbeddedStateRegistry::Backing::kTemporary, temporary.backing);
   ASSERT_TRUE(temporary.temporary);
   EXPECT_TRUE(unlisted->GetStorageKey().nonce());
+  EXPECT_FALSE(content::AlloyConsideredFirstPartyCookieOrigin(
+      content::AlloyDocumentStateOwner(unlisted), native_.get()));
+  // Removing a list affects new admissions, not a captured live document.
+  EXPECT_EQ(b_, content::AlloyConsideredFirstPartyCookieOrigin(
+                    listed_owner, native_.get()));
+  content::RetireAlloyDocumentState(listed);
+  EXPECT_FALSE(content::AlloyConsideredFirstPartyCookieOrigin(
+      listed_owner, native_.get()));
 }
 
 TEST_F(ProducerCompositionTest, ExternalProtocolOriginDictionaryRetiresOnlyItsRecord) {

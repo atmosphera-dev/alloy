@@ -19,6 +19,11 @@ inline constexpr char kNoDiskSwitch[] = "alloy-no-disk";
 BASE_EXPORT void InitializeStoragePolicy(bool no_disk);
 BASE_EXPORT bool IsNoDiskProcess();
 
+// Native GPU/shader caches have no encrypted record owner. None of Alloy's
+// context modes admits their plaintext disk backends, independently of the
+// installation bootstrap's legacy/no-disk choice or runtime feature switches.
+BASE_EXPORT bool AllowsGpuDiskCaches();
+
 }  // namespace base::alloy
 
 #endif  // BASE_ALLOY_STORAGE_POLICY_H_

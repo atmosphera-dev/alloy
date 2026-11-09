@@ -1,0 +1,86 @@
+diff --git a/chromium_src/components/content_settings/core/common/cookie_settings_base.cc b/chromium_src/components/content_settings/core/common/cookie_settings_base.cc
+index 3ce9d1a..c6e4a82 100644
+--- a/chromium_src/components/content_settings/core/common/cookie_settings_base.cc
++++ b/chromium_src/components/content_settings/core/common/cookie_settings_base.cc
+@@ -144,7 +144,10 @@ bool CookieSettingsBase::IsEphemeralCookieAccessAllowed(
+     net::CookieSettingOverrides overrides,
+     base::optional_ref<const net::CookiePartitionKey> cookie_partition_key,
+     CookieSettingWithMetadata* cookie_settings) const {
+-  if (ShouldUseEphemeralStorage(url, site_for_cookies, top_frame_origin)) {
++  // A listed document uses its own real jar. Run native policy even when it
++  // refuses access, rather than falling back to an allowed temporary jar.
++  if (!overrides.Has(net::CookieSettingOverride::kAlloyConsideredFirstParty) &&
++      ShouldUseEphemeralStorage(url, site_for_cookies, top_frame_origin)) {
+     return true;
+   }
+ 
+@@ -163,6 +166,9 @@ bool CookieSettingsBase::IsFullCookieAccessAllowed(
+   bool allow = IsFullCookieAccessAllowed_ChromiumImpl(
+       url, site_for_cookies, top_frame_origin, overrides, cookie_partition_key,
+       cookie_settings);
++  if (overrides.Has(net::CookieSettingOverride::kAlloyConsideredFirstParty)) {
++    return allow;
++  }
+ 
+   const bool is_1p_ephemeral_feature_enabled = base::FeatureList::IsEnabled(
+       net::features::kBraveFirstPartyEphemeralStorage);
+diff --git a/chromium_src/net/url_request/url_request_http_job.cc b/chromium_src/net/url_request/url_request_http_job.cc
+index 9d45ccb..5f75706 100644
+--- a/chromium_src/net/url_request/url_request_http_job.cc
++++ b/chromium_src/net/url_request/url_request_http_job.cc
+@@ -74,11 +74,14 @@ CookieOptions CreateCookieOptionsCaller(
+ CookieOptions URLRequestHttpJob::CreateCookieOptions(
+     CookieOptions::SameSiteCookieContext same_site_context) const {
+   CookieOptions cookie_options = CreateCookieOptionsCaller(same_site_context);
+-  FillEphemeralStorageParams(
+-      request_->url(), request_->site_for_cookies(),
+-      request_->isolation_info().top_frame_origin(),
+-      request_->context()->cookie_store()->cookie_access_delegate(),
+-      &cookie_options);
++  if (!request_->cookie_setting_overrides().Has(
++          CookieSettingOverride::kAlloyConsideredFirstParty)) {
++    FillEphemeralStorageParams(
++        request_->url(), request_->site_for_cookies(),
++        request_->isolation_info().top_frame_origin(),
++        request_->context()->cookie_store()->cookie_access_delegate(),
++        &cookie_options);
++  }
+   return cookie_options;
+ }
+ 
+diff --git a/chromium_src/services/network/restricted_cookie_manager.cc b/chromium_src/services/network/restricted_cookie_manager.cc
+index a6aace1..02cac90 100644
+--- a/chromium_src/services/network/restricted_cookie_manager.cc
++++ b/chromium_src/services/network/restricted_cookie_manager.cc
+@@ -40,9 +40,12 @@ net::CookieOptions RestrictedCookieManager::MakeOptionsForSet(
+     const CookieSettings& cookie_settings) const {
+   net::CookieOptions cookie_options = ::network::MakeOptionsForSet(
+       role, url, site_for_cookies, top_frame_origin, cookie_settings);
+-  net::FillEphemeralStorageParams(url, site_for_cookies, top_frame_origin,
+-                                  cookie_store_->cookie_access_delegate(),
+-                                  &cookie_options);
++  if (!cookie_setting_overrides_.Has(
++          net::CookieSettingOverride::kAlloyConsideredFirstParty)) {
++    net::FillEphemeralStorageParams(url, site_for_cookies, top_frame_origin,
++                                   cookie_store_->cookie_access_delegate(),
++                                   &cookie_options);
++  }
+   return cookie_options;
+ }
+ 
+@@ -54,9 +57,12 @@ net::CookieOptions RestrictedCookieManager::MakeOptionsForGet(
+     const CookieSettings& cookie_settings) const {
+   net::CookieOptions cookie_options = ::network::MakeOptionsForGet(
+       role, url, site_for_cookies, top_frame_origin, cookie_settings);
+-  net::FillEphemeralStorageParams(url, site_for_cookies, top_frame_origin,
+-                                  cookie_store_->cookie_access_delegate(),
+-                                  &cookie_options);
++  if (!cookie_setting_overrides_.Has(
++          net::CookieSettingOverride::kAlloyConsideredFirstParty)) {
++    net::FillEphemeralStorageParams(url, site_for_cookies, top_frame_origin,
++                                   cookie_store_->cookie_access_delegate(),
++                                   &cookie_options);
++  }
+   return cookie_options;
+ }
+ 

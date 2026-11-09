@@ -24,4 +24,8 @@ bool IsNoDiskProcess() {
   return g_disk_policy.load() == DiskPolicy::kNoDisk;
 }
 
+bool AllowsGpuDiskCaches() {
+  return false;
+}
+
 }  // namespace base::alloy

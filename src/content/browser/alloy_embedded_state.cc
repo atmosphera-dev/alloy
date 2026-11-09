@@ -293,6 +293,21 @@ std::optional<base::UnguessableToken> Nonce(AlloyEmbeddedResolution value) {
 
 }  // namespace
 
+std::optional<url::Origin> AlloyConsideredFirstPartyCookieOrigin(
+    const base::WeakPtr<base::SupportsUserData>& owner,
+    BrowserContext* context) {
+  const auto resolved = AlloyEmbeddedStateForStateOwner(owner, context);
+  if (!resolved.considered_first_party || resolved.backing != Backing::kRealSite ||
+      !AlloyStateOwnerForContext(owner, context)) {
+    return std::nullopt;
+  }
+  const auto* selection =
+      static_cast<const Selection*>(owner->GetUserData(&kSelectionKey));
+  return selection && !selection->origin.opaque()
+             ? std::make_optional(selection->origin)
+             : std::nullopt;
+}
+
 CodeCacheHostImpl::ReceiverSet* GetAlloyEmbeddedCodeCacheReceivers(
     StoragePartitionImpl& partition,
     scoped_refptr<alloy::site_records::EmbeddedState> owner) {

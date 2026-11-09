@@ -241,6 +241,14 @@ executable("alloy_encrypted_context_consumer") {
   deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
 }
 
+executable("alloy_embedded_profile_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "embedded_profile_consumer.cc", "profile_control.h" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
 executable("alloy_encrypted_adblock_consumer") {
   testonly = true
   use_libcxx_modules = false

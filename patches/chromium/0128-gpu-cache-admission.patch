@@ -1,0 +1,35 @@
+diff --git a/content/browser/gpu/gpu_process_host.cc b/content/browser/gpu/gpu_process_host.cc
+index 49a3020..deb077f 100644
+--- a/content/browser/gpu/gpu_process_host.cc
++++ b/content/browser/gpu/gpu_process_host.cc
+@@ -573,7 +573,7 @@ void BindDiscardableMemoryReceiverOnUI(
+ // src/content/browser/browser_main_loop.cc once the persistent cache is used
+ // for all cache types.
+ void InitGpuPersistentCacheFileFactoryOnce() {
+-  if (base::alloy::IsNoDiskProcess()) {
++  if (!base::alloy::AllowsGpuDiskCaches()) {
+     return;
+   }
+   if ((features::SkiaGraphiteUsesPersistentCache() ||
+diff --git a/gpu/config/gpu_finch_features.cc b/gpu/config/gpu_finch_features.cc
+index 2d19ed0..b398ff5 100644
+--- a/gpu/config/gpu_finch_features.cc
++++ b/gpu/config/gpu_finch_features.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "gpu/config/gpu_finch_features.h"
++#include "base/alloy/storage_policy.h"
+ 
+ #include <string_view>
+ 
+@@ -251,6 +252,9 @@ BASE_FEATURE(kClearGrShaderDiskCacheOnInvalidPrefix,
+ BASE_FEATURE(kGpuShaderDiskCache, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ bool IsShaderDiskCacheEnabled(const base::CommandLine* command_line) {
++  if (!base::alloy::AllowsGpuDiskCaches()) {
++    return false;
++  }
+   if (command_line->HasSwitch(switches::kDisableGpuShaderDiskCache)) {
+     return false;
+   }

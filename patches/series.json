@@ -997,6 +997,21 @@
       "patch": "cef/0126-bind-embed-list-settings.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0127-listed-cookie-authority.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0127-listed-cookie-authority.patch",
+      "root": "brave",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0128-gpu-cache-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

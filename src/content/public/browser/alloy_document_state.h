@@ -45,6 +45,11 @@ CONTENT_EXPORT base::SupportsUserData* AlloyStateOwnerForContext(
 CONTENT_EXPORT AlloyEmbeddedResolution AlloyEmbeddedStateForStateOwner(
     const base::WeakPtr<base::SupportsUserData>& owner,
     BrowserContext* context);
+// The original captured list exception, never a new policy lookup. Cookie
+// consumers must confine this authority to this exact origin on every hop.
+CONTENT_EXPORT std::optional<url::Origin> AlloyConsideredFirstPartyCookieOrigin(
+    const base::WeakPtr<base::SupportsUserData>& owner,
+    BrowserContext* context);
 CONTENT_EXPORT network::mojom::NetworkContext* AlloyNetworkContextForStateOwner(
     const base::WeakPtr<base::SupportsUserData>& owner,
     BrowserContext* context);

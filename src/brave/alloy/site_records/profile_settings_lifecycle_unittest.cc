@@ -176,6 +176,36 @@ class ProfileSettingsLifecycleTest : public testing::Test {
   std::unique_ptr<PrefService> prefs_;
 };
 
+TEST(ProfileAutoLockApiTest, RuntimeAdoptionPreservesCoreOnlyBlockingLockWithoutUiPumping) {
+  content::BrowserTaskEnvironment tasks;
+  ASSERT_NE(nullptr, cef_api_hash(CEF_API_VERSION, 0));
+  base::ScopedTempDir temp; ASSERT_TRUE(temp.CreateUniqueTempDir());
+  CefRefPtr<AlloyProfile> profile;
+  const auto path = temp.GetPath().AppendASCII("standalone").AsUTF8Unsafe();
+  std::thread create([&] { profile = AlloyCreateProfile(path, "standalone-password"); });
+  create.join(); ASSERT_TRUE(profile);
+  alloy::InitializeProfileAutoLock();
+  base::WaitableEvent completed;
+  bool locked = false;
+  std::thread lock([&] { locked = profile->Lock(); completed.Signal(); });
+  const bool without_pumping = completed.TimedWait(base::Seconds(5));
+  // If the regression is present, drain its queued UI lock before joining so
+  // the test records a failure rather than hanging the entire native suite.
+  if (!without_pumping) tasks.RunUntilIdle();
+  lock.join(); EXPECT_TRUE(without_pumping); ASSERT_TRUE(locked);
+  EXPECT_EQ(ALLOY_PROFILE_LOCKED, profile->GetState());
+  bool unlocked = false;
+  std::thread unlock([&] { unlocked = profile->UnlockWithPassword("standalone-password"); });
+  unlock.join(); ASSERT_TRUE(unlocked);
+  auto fresh = alloy::GetProfilePrefStore(profile); ASSERT_TRUE(fresh);
+  tasks.RunUntilIdle();
+  EXPECT_EQ(ALLOY_PROFILE_UNLOCKED, profile->GetState());
+  EXPECT_EQ(fresh, alloy::GetProfilePrefStore(profile));
+  fresh.reset();
+  std::thread release([&] { profile = nullptr; }); release.join();
+  tasks.RunUntilIdle();
+}
+
 TEST_F(ProfileSettingsLifecycleTest, NativeEditBeforeLockSurvivesWithoutOwnerPumpingBeforeRevocation) {
   bool locked = false;
   const auto cache = store_->GetNativeCacheForTesting();
@@ -189,10 +219,10 @@ TEST_F(ProfileSettingsLifecycleTest, NativeEditBeforeLockSurvivesWithoutOwnerPum
     })));
     store_->CommitPendingWrite({}, base::BindLambdaForTesting([&] { revoked.Signal(); }));
   }
-  // No UI pumping before key revocation. Completion, unlike the I/O fence,
-  // must wait until the UI/native and worker plaintext caches are destroyed.
+  // The I/O fence is not a key-revocation fence. Until UI/native teardown can
+  // run, existing consumers retain admitted storage for their final writes.
   ASSERT_TRUE(revoked.TimedWait(base::Seconds(5)));
-  EXPECT_TRUE(store_->ReadOnly()); EXPECT_FALSE(locked); EXPECT_TRUE(cache);
+  EXPECT_FALSE(store_->ReadOnly()); EXPECT_FALSE(locked); EXPECT_TRUE(cache);
   EXPECT_EQ(ALLOY_PROFILE_TRANSITION, profile_->GetState());
   tasks_.RunUntilIdle();
   ASSERT_TRUE(locked); EXPECT_EQ(ALLOY_PROFILE_LOCKED, profile_->GetState());
@@ -227,11 +257,11 @@ TEST_F(ProfileSettingsLifecycleTest, KeyRevocationDuringNativeConstructionMustNo
     base::WaitableEvent revoked;
     store_->CommitPendingWrite({}, base::BindLambdaForTesting([&] { revoked.Signal(); }));
     EXPECT_TRUE(revoked.TimedWait(base::Seconds(5)));
-    EXPECT_TRUE(store_->ReadOnly()); EXPECT_FALSE(completed);
+    EXPECT_FALSE(store_->ReadOnly()); EXPECT_FALSE(completed);
     const base::Value* external = nullptr;
-    EXPECT_FALSE(store_->GetValue(kNativeSetting, &external));
-    EXPECT_FALSE(view->CanStartServiceConstruction());
-    EXPECT_FALSE(store_->CreateNativeView());
+    EXPECT_TRUE(store_->GetValue(kNativeSetting, &external));
+    EXPECT_TRUE(view->CanStartServiceConstruction());
+    EXPECT_EQ(nullptr, alloy::GetProfilePrefStore(profile_));
   });
   auto registry = base::MakeRefCounted<user_prefs::PrefRegistrySyncable>();
   HostContentSettingsMap::RegisterProfilePrefs(registry.get());
@@ -369,7 +399,7 @@ TEST_F(ProfileSettingsLifecycleTest, FilterInputSharesProfileAndLockDrainsNative
   native.reset(); input.reset(); tasks_.RunUntilIdle();
 }
 
-TEST_F(ProfileSettingsLifecycleTest, FilterAttachmentAfterKeyRevocationCannotCrashOrReauthorize) {
+TEST_F(ProfileSettingsLifecycleTest, StartedNativeConstructionFinishesBeforeServiceGateCloses) {
   std::unique_ptr<NativeProfileConfiguration> input;
   PrepareFilterInput(profile_, tasks_, &input); ASSERT_TRUE(input); ASSERT_TRUE(input->BeginConstruction());
   auto native = std::make_unique<TestingProfile>();
@@ -382,7 +412,8 @@ TEST_F(ProfileSettingsLifecycleTest, FilterAttachmentAfterKeyRevocationCannotCra
   store_->CommitPendingWrite({}, base::BindLambdaForTesting([&] { revoked.Signal(); }));
   ASSERT_TRUE(revoked.TimedWait(base::Seconds(5))); EXPECT_FALSE(locked);
   input->Attach(*native);
-  EXPECT_FALSE(ProfileFilterPreferences::Get(*native)); EXPECT_FALSE(input->admitted());
+  EXPECT_TRUE(ProfileFilterPreferences::Get(*native)); EXPECT_TRUE(input->admitted());
+  EXPECT_FALSE(alloy::ProfileNavigationAllowed(*input));
   input->ConstructionFinished(); tasks_.RunUntilIdle(); EXPECT_TRUE(locked);
 }
 

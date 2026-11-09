@@ -44,6 +44,34 @@ class AlloyProfileLockCallback : public virtual CefBaseRefCounted {
 };
 
 ///
+/// EXPERIMENTAL: Transient profile auto-lock events, delivered on browser UI.
+/// This handler owns UI policy only, never permission to postpone key revocation.
+/// The embedder may close its UI tabs or keep their shells and show its own
+/// locked page in a separate stateless context. Retired contexts cannot be reused.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyProfileLockHandler : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Lock has completed. OK acknowledges key wiping, native cache destruction
+  /// and page-process teardown. Other results report failure, not successful
+  /// locking. This callback also covers explicit runtime locks and may reenter.
+  ///
+  /*--cef()--*/
+  virtual void OnLocked(alloy_profile_lock_reason_t reason,
+                        alloy_site_settings_result_t result) = 0;
+
+  ///
+  /// Available native triggers changed. Each reason's bit is (1 << reason).
+  /// Browser close and engine-input idle are always available; absent Linux
+  /// providers are not proof of activity or an unlocked desktop. The embedder
+  /// chooses its unavailable-provider policy and may supply trusted signals.
+  ///
+  /*--cef()--*/
+  virtual void OnLockTriggersChanged(int available_triggers) = 0;
+};
+
+///
 /// EXPERIMENTAL: Record deletion completion on browser UI. OK means the wrapped
 /// key and generated references were durably removed and old live documents and
 /// workers retired. |files_pending| reports unreadable opaque objects awaiting
@@ -147,6 +175,36 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   ///
   /*--cef(default_retval=ALLOY_PROFILE_ERROR)--*/
   virtual alloy_profile_state_t GetState() = 0;
+
+  ///
+  /// Configure auto-lock on browser UI after CefInitialize. |idle_milliseconds|
+  /// must be nonnegative: zero disables only idle locking, not other triggers.
+  /// This runtime setting is embedder policy, not a persisted browser default.
+  /// Native input routed through this profile resets the engine's monotonic idle
+  /// timer. Set before creating a context to observe initial provider events.
+  /// Replacing |handler| releases the old one; NULL stops notifications only.
+  /// Returns false for invalid thread/state or a negative timeout.
+  ///
+  /*--cef(optional_param=handler)--*/
+  virtual bool SetAutoLock(int64_t idle_milliseconds,
+                          CefRefPtr<AlloyProfileLockHandler> handler) = 0;
+
+  ///
+  /// Report trusted embedder input outside its CEF surfaces. Browser UI only.
+  /// Page-script activity does not count. Does not unlock or reauthorize a
+  /// context. Returns false before CEF initialization or on the wrong thread.
+  ///
+  /*--cef()--*/
+  virtual bool NotifyUserActivity() = 0;
+
+  ///
+  /// Supply a trusted sleep, screen-lock or user-switch signal from the embedder
+  /// on browser UI. Native providers feed the same lock lifecycle. Returns false
+  /// for another reason, invalid initialization or thread. True means accepted,
+  /// not completed: OnLocked is the teardown acknowledgement. No signal unlocks.
+  ///
+  /*--cef()--*/
+  virtual bool NotifyLockSignal(alloy_profile_lock_reason_t reason) = 0;
 
   ///
   /// Read the explicit considered-first-party list belonging to |outer_url|'s

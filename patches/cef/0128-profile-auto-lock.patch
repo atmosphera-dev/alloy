@@ -1,0 +1,167 @@
+--- a/include/internal/cef_types.h
++++ b/include/internal/cef_types.h
+@@ -4275,6 +4275,18 @@
+ } alloy_profile_state_t;
+ 
+ ///
++/// EXPERIMENTAL: Profile lock reason. Trigger availability uses (1 << reason).
++///
++typedef enum {
++  ALLOY_LOCK_EXPLICIT = 0,
++  ALLOY_LOCK_BROWSER_CLOSE = 1,
++  ALLOY_LOCK_IDLE = 2,
++  ALLOY_LOCK_SLEEP = 3,
++  ALLOY_LOCK_SCREEN = 4,
++  ALLOY_LOCK_USER_SWITCH = 5,
++} alloy_profile_lock_reason_t;
++
++///
+ /// EXPERIMENTAL: Secret Service result. MISSING includes a missing default
+ /// collection or profile entry. FAILED includes protocol/integrity/I/O errors.
+ ///
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1163,4 +1163,6 @@
+   sources += [ "libcef/browser/alloy/profile_store.cc" ]
++  deps += [ "//brave/alloy/site_records:auto_lock",
++            "//components/dbus" ]
+   deps += [ "//brave/alloy/site_records:embedded_state" ]
+   deps += [
+     "//brave/browser/brave_shields",
+--- a/libcef/browser/browser_host_base.cc
++++ b/libcef/browser/browser_host_base.cc
+@@ -4,3 +4,4 @@
+ 
+ #include "cef/libcef/browser/browser_host_base.h"
++#include "cef/libcef/browser/alloy/profile_settings.h"
+ 
+@@ -1040,4 +1041,5 @@
+ 
+   if (platform_delegate_) {
++    alloy::NotifyProfileUserActivity(GetBrowserContext());
+     platform_delegate_->SendKeyEvent(event);
+   }
+@@ -1056,4 +1058,5 @@
+ 
+   if (platform_delegate_) {
++    alloy::NotifyProfileUserActivity(GetBrowserContext());
+     platform_delegate_->SendMouseClickEvent(event, type, mouseUp, clickCount);
+   }
+@@ -1070,4 +1073,5 @@
+ 
+   if (platform_delegate_) {
++    if (!mouseLeave) alloy::NotifyProfileUserActivity(GetBrowserContext());
+     platform_delegate_->SendMouseMoveEvent(event, mouseLeave);
+   }
+@@ -1090,4 +1094,5 @@
+ 
+   if (platform_delegate_) {
++    alloy::NotifyProfileUserActivity(GetBrowserContext());
+     platform_delegate_->SendMouseWheelEvent(event, deltaX, deltaY);
+   }
+--- a/libcef/browser/alloy/alloy_browser_host_impl.cc
++++ b/libcef/browser/alloy/alloy_browser_host_impl.cc
+@@ -4,3 +4,4 @@
+ 
+ #include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
++#include "cef/libcef/browser/alloy/profile_settings.h"
+ 
+@@ -417,4 +418,5 @@
+ 
+   if (platform_delegate_) {
++    alloy::NotifyProfileUserActivity(GetBrowserContext());
+     platform_delegate_->SendTouchEvent(event);
+   }
+--- a/libcef/browser/context.cc
++++ b/libcef/browser/context.cc
+@@ -5,2 +5,3 @@
+ #include "cef/libcef/browser/context.h"
++#include "cef/libcef/browser/alloy/profile_settings.h"
+ #include "base/alloy/storage_policy.h"
+@@ -543,3 +544,4 @@
+ void CefContext::OnContextInitialized() {
++  alloy::InitializeProfileAutoLock();
+   CEF_REQUIRE_UIT();
+ 
+@@ -569,3 +571,4 @@
+   CEF_REQUIRE_UIT();
+ 
++  alloy::LockProfilesForBrowserClose();
+   browser_info_manager_->DestroyAllBrowsers();
+--- a/libcef/browser/browser_host_base.cc
++++ b/libcef/browser/browser_host_base.cc
+@@ -1394,5 +1394,6 @@
+ bool CefBrowserHostBase::Navigate(const content::OpenURLParams& params) {
+   CEF_REQUIRE_UIT();
+   auto web_contents = GetWebContents();
++  if (web_contents && !alloy::ProfileNavigationAllowed(*web_contents->GetBrowserContext())) return false;
+   if (web_contents) {
+     GURL gurl = params.url;
+--- a/libcef/browser/chrome/chrome_browser_context.h
++++ b/libcef/browser/chrome/chrome_browser_context.h
+@@ -34,3 +34,4 @@
+   void InitializeAsync(base::OnceClosure initialized_cb);
++  void RetireForProfileLock() { RetireEncryptedProfile(); }
+ 
+   // CefBrowserContext overrides.
+--- a/libcef/browser/chrome/chrome_browser_context.cc
++++ b/libcef/browser/chrome/chrome_browser_context.cc
+@@ -121,3 +121,4 @@
+   const auto* configuration = alloy::site_records::NativeProfileConfiguration::Get(*profile_);
++  if (configuration && !alloy::ProfileNavigationAllowed(*configuration)) return false;
+   return !configuration || (initialization_finished_ && configuration->admitted());
+ }
+@@ -315,2 +316,9 @@
+ void ChromeBrowserContext::InitializeEncryptedProfile() {
++  if (!alloy::ProfileNavigationAllowed(*pending_configuration_)) {
++    pending_configuration_.reset();
++    revoked_ = true;
++    CEF_POST_TASK(CEF_UIT, base::BindOnce(&ChromeBrowserContext::CompleteEncryptedInitialization,
++                                        weak_ptr_factory_.GetWeakPtr()));
++    return;
++  }
+   pending_configuration_->SetTeardownHandler(base::BindOnce(
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.h
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.h
+@@ -134,3 +134,4 @@
+   void CreateThrottlesForNavigation(
+       content::NavigationThrottleRegistry& registry) override;
++  bool CanCommitURL(content::RenderProcessHost* process, const GURL& url) override;
+   bool ConfigureNetworkContextParams(
+--- a/libcef/browser/chrome/chrome_content_browser_client_cef.cc
++++ b/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+@@ -6,2 +6,5 @@
+ #include "cef/libcef/browser/chrome/chrome_content_browser_client_cef.h"
++#include "cef/libcef/browser/alloy/profile_settings.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
+ #include "base/alloy/storage_policy.h"
+@@ -689,5 +692,28 @@
++namespace {
++class ProfileLockNavigationThrottle final : public content::NavigationThrottle {
++ public:
++  explicit ProfileLockNavigationThrottle(content::NavigationThrottleRegistry& registry)
++      : NavigationThrottle(registry) {}
++  ThrottleCheckResult CheckAdmission() {
++    return alloy::ProfileNavigationAllowed(*navigation_handle()->GetWebContents()->GetBrowserContext())
++        ? PROCEED : CANCEL_AND_IGNORE;
++  }
++  ThrottleCheckResult WillStartRequest() override { return CheckAdmission(); }
++  ThrottleCheckResult WillRedirectRequest() override { return CheckAdmission(); }
++  ThrottleCheckResult WillProcessResponse() override { return CheckAdmission(); }
++  ThrottleCheckResult WillCommitWithoutUrlLoader() override { return CheckAdmission(); }
++  const char* GetNameForLogging() override { return "AlloyProfileLock"; }
++};
++}  // namespace
++bool ChromeContentBrowserClientCef::CanCommitURL(content::RenderProcessHost* process,
++                                               const GURL& url) {
++  return alloy::ProfileNavigationAllowed(*process->GetBrowserContext()) &&
++      BraveContentBrowserClient::CanCommitURL(process, url);
++}
++
+ void ChromeContentBrowserClientCef::CreateThrottlesForNavigation(
+     content::NavigationThrottleRegistry& registry) {
++  registry.AddThrottle(std::make_unique<ProfileLockNavigationThrottle>(registry));
+   BraveContentBrowserClient::CreateThrottlesForNavigation(registry);
+   throttle::CreateThrottlesForNavigation(registry);
+ }

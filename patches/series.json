@@ -1012,6 +1012,11 @@
       "patch": "chromium/0128-gpu-cache-admission.patch",
       "root": ".",
       "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0128-profile-auto-lock.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

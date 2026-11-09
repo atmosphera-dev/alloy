@@ -126,6 +126,12 @@ source_set("profiles") {
   ]
 }
 
+source_set("auto_lock") {
+  sources = [ "profile_auto_lock.cc", "profile_auto_lock.h",
+              "linux_lock_signals.cc", "linux_lock_signals.h" ]
+  public_deps = [ "//base", "//dbus" ]
+}
+
 source_set("pref_files") {
   sources = [
     "embed_list_settings.cc",
@@ -249,6 +255,14 @@ executable("alloy_embedded_profile_consumer") {
   deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
 }
 
+executable("alloy_profile_auto_lock_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "profile_auto_lock_consumer.cc", "profile_control.h" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
 executable("alloy_encrypted_adblock_consumer") {
   testonly = true
   use_libcxx_modules = false
@@ -324,6 +338,8 @@ test("alloy_site_records_unittests") {
     "authenticated_objects_unittest.cc",
     "encrypted_file_contents_unittest.cc",
     "encrypted_profile_unittest.cc",
+    "profile_auto_lock_unittest.cc",
+    "linux_lock_signals_unittest.cc",
     "secret_service_key_source_unittest.cc",
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",
@@ -353,6 +369,8 @@ test("alloy_site_records_unittests") {
     ":record_files",
     ":profiles",
     ":pref_files",
+    ":auto_lock",
+    "//dbus:test_support",
     ":value_stores",
     ":managed_settings_test_support",
     ":zoom_settings_test_support",

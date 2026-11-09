@@ -49,6 +49,12 @@ observers are destroyed while native services remain admitted. Native profiles
 finish their teardown notifications, completed writes are flushed, and only then
 are service admission, plaintext caches and keys closed. Pending unlocks are
 cancelled, and completion waits for their transient keys.
+Public context access goes through CEF's initialization check, which rejects the
+same pending generation immediately. This refuses filter/preference writes,
+embed-list changes and embedded-state configuration without closing native
+services used during teardown. Profile setters and record deletion reject the
+pending transition before obtaining their settings projection. Queued APIs may
+return true for delivering a CANCELLED reply; that is not mutation admission.
 `OnLocked(reason, result)` is a transient UI callback, not a stored event log.
 Only OK acknowledges completed teardown. Failed operations are not represented
 as successful locks. The ordinary explicit `LockAsync` completion remains.
@@ -80,6 +86,10 @@ unlock/readback and browser-close locking of retained standalone profiles.
 Explicit lock and browser close also run while a server holds a navigation:
 the completed native preference is read back after unlocking or reopening,
 and the retired context cannot admit another document or native preferences.
+Callback-lock cases also attempt filter/preference replacements, both embed-list
+setters and record deletion before the posted teardown. Refusals are checked
+immediately or through their cancellation callbacks, and reopening verifies that
+only the previously accepted filters, preference and site record persisted.
 `alloy_site_records_unittests` also covers timer lifetime and D-Bus parsing,
 initial state, provider absence/loss and session ownership. Physical desktop
 locker integration and a real suspend are outside this fixture.

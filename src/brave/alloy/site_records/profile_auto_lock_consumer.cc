@@ -64,6 +64,15 @@ class LockReply final : public AlloyProfileLockCallback {
  private:
   IMPLEMENT_REFCOUNTING(LockReply);
 };
+class RefusedDeletionReply final : public AlloyRecordDeletionCallback {
+ public:
+  void OnComplete(alloy_site_settings_result_t status, bool files_pending) override {
+    Check(status == ALLOY_SETTINGS_CANCELLED && !files_pending, "pending-lock record deletion refused");
+    Event("pending-mutation-refused");
+  }
+ private:
+  IMPLEMENT_REFCOUNTING(RefusedDeletionReply);
+};
 class Consumer final : public CefApp, public CefBrowserProcessHandler, public CefClient,
                         public CefRenderHandler, public CefLifeSpanHandler, public CefDisplayHandler, public CefLoadHandler,
                        public AlloyProfileLockHandler {
@@ -160,12 +169,20 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
         [self = CefRefPtr<Consumer>(this), reopen](CefRefPtr<CefRequestContext> context) {
           self->context_ = context;
           if (!reopen) {
+            Check(AlloySetAdBlockCustomFilters(context, "||admitted-before-lock.test^"), "baseline filter edit admitted");
+            CefRefPtr<CefValue> homepage = CefValue::Create();
+            homepage->SetString("https://completed-before-lock.test/");
+            CefString error;
+            Check(context->SetPreference("homepage", homepage, error), "baseline preference edit admitted");
             Check(self->profile_->SetFirstPartyEmbeds("https://alpha.test", {"https://beta.test"}, new ListReply(
                 [self](auto status, const auto&) {
                   Check(status == ALLOY_SETTINGS_OK, "setting durably written before lock");
                   self->Open(self->context_, self->base_+"/managed");
                 })), "initial setting queued");
           } else {
+            CefString filters;
+            Check(AlloyGetAdBlockCustomFilters(context, filters) && filters == "||admitted-before-lock.test^",
+                  "accepted filters persisted without pending-lock replacement");
             if (self->pending_write_ || std::getenv("ALLOY_AUTOLOCK_REOPEN")) {
               auto homepage = context->GetPreference("homepage");
               Check(homepage && homepage->GetString() == "https://completed-before-lock.test/",
@@ -175,8 +192,9 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
             if (std::getenv("ALLOY_AUTOLOCK_REOPEN")) { CefQuitMessageLoop(); return; }
             Check(AlloyGetFirstPartyEmbeds(context, "https://alpha.test", new ListReply(
                 [self](auto status, const auto& values) {
-                  Check(status == ALLOY_SETTINGS_OK && values.size() == 1 && values[0] == "beta.test",
-                      "fresh context reads encrypted value only after unlock");
+                   Check(status == ALLOY_SETTINGS_OK && values.size() == 1 && values[0] == "beta.test",
+                       "fresh context reads encrypted value only after unlock");
+                   if (self->pending_mutations_) Event("pending-mutations-not-persisted");
                   self->Open(self->context_, self->base_+"/reopened"); Event("unlocked");
                 })), "fresh generation read queued");
           }
@@ -186,6 +204,26 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     inside_lock_callback_ = true;
     Check(profile_->LockAsync(new LockReply), "first callback lock accepted");
     Check(created_ != closed_, "entry did not destroy the generation inline");
+    Check(profile_->GetState() == ALLOY_PROFILE_TRANSITION, "mutation probes run before lock completion");
+    Check(!AlloySetAdBlockCustomFilters(context_, "||refused-during-lock.test^"), "pending-lock filter replacement refused");
+    CefRefPtr<CefValue> homepage = CefValue::Create(); homepage->SetString("https://refused-during-lock.test/");
+    CefString error;
+    Check(!context_->CanSetPreference("homepage") && !context_->SetPreference("homepage", homepage, error),
+          "pending-lock public preference replacement refused");
+    Check(!AlloySetEmbeddedStateScope(context_, "per-tab"), "pending-lock embedded-state edit refused");
+    auto refused_list = [] {
+      return new ListReply([](auto status, const auto& values) {
+        Check(status == ALLOY_SETTINGS_CANCELLED && values.empty(), "pending-lock embed-list replacement refused");
+        Event("pending-mutation-refused");
+      });
+    };
+    Check(profile_->SetFirstPartyEmbeds("https://alpha.test", {"https://refused-during-lock.test"}, refused_list()),
+          "profile embed-list refusal queued");
+    Check(AlloySetFirstPartyEmbeds(context_, "https://alpha.test", {"https://refused-during-lock.test"}, refused_list()),
+          "context embed-list refusal queued");
+    Check(profile_->DeleteSiteRecord("https://alpha.test", new RefusedDeletionReply), "profile deletion refusal queued");
+    pending_mutations_ = true; pending_write_ = true;
+    Event("pending-writers-refused");
     Check(profile_->LockAsync(new LockReply), "second callback lock joins the first");
     inside_lock_callback_ = false;
     Event(returned_event);
@@ -245,6 +283,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
   const bool show_locked_;
   bool tab_shell_open_ = true, shutdown_callback_ = false;
   bool pending_write_ = false;
+  bool pending_mutations_ = false;
   bool navigation_callback_lock_ = false, inside_lock_callback_ = false;
   int created_ = 0, closed_ = 0;
   CefRefPtr<CefRequestContext> control_context_, context_;

@@ -100,6 +100,8 @@ if(trigger==='close'){
     check(receipts.some(e=>e.event===trigger+'-returned'),'observer callback did not return before teardown');
     check(receipts.filter(e=>e.event==='explicit-complete').length===2,'joined locks did not both complete');
     check(receipts.filter(e=>e.event==='callback'&&e.value===0).length===1,'joined locks duplicated retirement');
+    check(receipts.some(e=>e.event==='pending-writers-refused'),'synchronous pending-lock mutation refusal missing');
+    check(receipts.filter(e=>e.event==='pending-mutation-refused').length===3,'pending-lock mutation callbacks did not all refuse');
   }
   stage('lock-acknowledged');
   const afterPids=await processes();
@@ -123,6 +125,8 @@ if(trigger==='close'){
   stage('unlock-requested');
   await until(async()=>(await events()).some(e=>e.event==='unlocked'),'readback after explicit password unlock');
   if(trigger==='explicit')check((await events()).some(e=>e.event==='completed-write-readback'),'completed write missing after unlock');
+  if(trigger.endsWith('-callback'))await until(async()=>(await events()).some(e=>e.event==='pending-mutations-not-persisted'),
+    'refused mutations absent from reopened filters, preferences and site record');
   await until(async()=>(await pageTargets()).some(t=>t.url.endsWith('/reopened')),'fresh context after unlock');
   await control(controlPage,'finish');
 }

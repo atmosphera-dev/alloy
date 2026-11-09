@@ -164,7 +164,10 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   /// Queue lock from browser UI after CefInitialize. Completion is asynchronous
   /// on UI after keys are revoked, native owners retire and preference caches
   /// are destroyed. Until completion the state remains TRANSITION. Returns false
-  /// for a missing callback, wrong thread or another lifecycle transition.
+  /// for a missing callback, wrong thread or a standalone lifecycle transition.
+  /// Safe from observer/embedder callbacks: navigation admission stops immediately,
+  /// native teardown runs in a posted task, and repeated UI locks join it. Each
+  /// accepted callback receives the same final result; the first reason is kept.
   ///
   /*--cef()--*/
   virtual bool LockAsync(CefRefPtr<AlloyProfileLockCallback> callback) = 0;

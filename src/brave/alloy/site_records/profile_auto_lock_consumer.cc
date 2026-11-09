@@ -9,6 +9,7 @@
 #include "include/cef_render_handler.h"
 #include "include/cef_values.h"
 #include "include/cef_frame.h"
+#include "include/cef_load_handler.h"
 #include "brave/alloy/site_records/profile_control.h"
 #include <cstdio>
 #include <cerrno>
@@ -64,7 +65,7 @@ class LockReply final : public AlloyProfileLockCallback {
   IMPLEMENT_REFCOUNTING(LockReply);
 };
 class Consumer final : public CefApp, public CefBrowserProcessHandler, public CefClient,
-                       public CefRenderHandler, public CefLifeSpanHandler, public CefDisplayHandler,
+                        public CefRenderHandler, public CefLifeSpanHandler, public CefDisplayHandler, public CefLoadHandler,
                        public AlloyProfileLockHandler {
  public:
   Consumer(CefRefPtr<AlloyProfile> profile, std::string root, std::string base, bool show_locked)
@@ -73,6 +74,15 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+  void OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
+                   TransitionType) override {
+    // CEF invokes this directly inside WebContentsObserver::DidFinishNavigation.
+    if (navigation_callback_lock_ && frame->IsMain() && managed_ && browser->IsSame(managed_)) {
+      navigation_callback_lock_ = false;
+      LockFromCallback("navigation-callback-returned");
+    }
+  }
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override { rect = CefRect(0, 0, 800, 600); }
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType, const RectList&, const void*, int, int) override {}
   void OnContextInitialized() override {
@@ -92,12 +102,15 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     } else { managed_ = browser; ++created_; Event("managed-created"); }
   }
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    Check(!inside_lock_callback_, "native destruction waits for lock callback to unwind");
     if (managed_ && browser->IsSame(managed_)) { ++closed_; Event("managed-closed"); }
   }
   void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) override {
     const auto text = title.ToString();
     const int result = profile_control_receive(&transport_, browser->GetIdentifier(), text.c_str(),
-        [](void* self, const profile_control_request* request) { static_cast<Consumer*>(self)->Command(request->action); },
+        [](void* self, const profile_control_request* request) {
+          static_cast<Consumer*>(self)->Command(request->action, request->browser);
+        },
         [](void*, const profile_control_request* request, int replayed) {
           std::printf("PROFILE_EVENT {\"event\":\"control-reply\",\"request_id\":\"%s\",\"token\":\"%s\","
               "\"browser\":%d,\"executions\":%u,\"phase\":\"%s\"}\n", request->id, request->action,
@@ -169,9 +182,24 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
           }
         })), "encrypted context queued");
   }
-  void Command(const std::string& command) {
+  void LockFromCallback(const char* returned_event) {
+    inside_lock_callback_ = true;
+    Check(profile_->LockAsync(new LockReply), "first callback lock accepted");
+    Check(created_ != closed_, "entry did not destroy the generation inline");
+    Check(profile_->LockAsync(new LockReply), "second callback lock joins the first");
+    inside_lock_callback_ = false;
+    Event(returned_event);
+  }
+  void Command(const std::string& command, int browser_id) {
     if (command == "ready") Event("ready");
     else if (command == "start") Context(false);
+    else if (command == "title-callback-lock") {
+      Check(managed_ && managed_->GetIdentifier() == browser_id, "lock originated in managed OnTitleChange");
+      LockFromCallback("title-callback-returned");
+    } else if (command == "navigation-callback-lock") {
+      navigation_callback_lock_ = true;
+      managed_->GetMainFrame()->LoadURL(base_+"/callback-lock");
+    }
     else if (command == "pending-navigation") {
       CefRefPtr<CefValue> value = CefValue::Create();
       value->SetString("https://completed-before-lock.test/");
@@ -217,6 +245,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
   const bool show_locked_;
   bool tab_shell_open_ = true, shutdown_callback_ = false;
   bool pending_write_ = false;
+  bool navigation_callback_lock_ = false, inside_lock_callback_ = false;
   int created_ = 0, closed_ = 0;
   CefRefPtr<CefRequestContext> control_context_, context_;
   CefRefPtr<CefBrowser> control_, managed_;

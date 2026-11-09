@@ -69,7 +69,14 @@ if(trigger==='explicit'||trigger==='close')await pendingNavigation();
 if(trigger==='close'){
   await control(controlPage,'finish');
 }else{
-  if(trigger==='explicit'){
+  if(trigger==='title-callback'){
+    const request=profileControlRequest('title-callback-lock');
+    try{await value(page,`document.title=${JSON.stringify(request.title)}`)}
+    catch(error){if(!error.cdpTerminal)throw error} // The command retires this exact target.
+    await profileControlReply(request);
+  }else if(trigger==='navigation-callback'){
+    await control(controlPage,'navigation-callback-lock');
+  }else if(trigger==='explicit'){
     await control(controlPage,'explicit-lock');
   }else if(trigger==='idle'){
     await control(controlPage,'arm-idle');
@@ -84,10 +91,16 @@ if(trigger==='close'){
     await promisify(execFile)('dbus-send',['--session','--print-reply','--dest=org.alloy.AutoLockFixture',
       '/org/alloy/Test','org.alloy.AutoLockFixture.Trigger','string:'+trigger]);
   }
-  const expected={explicit:0,idle:2,sleep:3,screen:4,switch:5,'logind-lock':4,'embedder-sleep':3}[trigger];
+  const expected={explicit:0,'title-callback':0,'navigation-callback':0,idle:2,sleep:3,screen:4,switch:5,'logind-lock':4,'embedder-sleep':3}[trigger];
   await until(async()=>(await events()).some(e=>e.event==='locked'&&e.value===expected),'lock acknowledgement and refused read');
   if(trigger==='explicit')await until(async()=>(await events()).some(e=>e.event==='late-context-refused'),
     'queued native context refused after navigation admission closed');
+  if(trigger.endsWith('-callback')){
+    const receipts=await events();
+    check(receipts.some(e=>e.event===trigger+'-returned'),'observer callback did not return before teardown');
+    check(receipts.filter(e=>e.event==='explicit-complete').length===2,'joined locks did not both complete');
+    check(receipts.filter(e=>e.event==='callback'&&e.value===0).length===1,'joined locks duplicated retirement');
+  }
   stage('lock-acknowledged');
   const afterPids=await processes();
   stage('locked-processes');
@@ -181,7 +194,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['autolock'], default='autolock')
     parser.add_argument('--inside', action='store_true')
-    parser.add_argument('--case', choices=['explicit', 'idle', 'sleep', 'screen', 'logind-lock', 'switch', 'embedder-sleep', 'close'])
+    parser.add_argument('--case', choices=['title-callback', 'navigation-callback', 'explicit', 'idle', 'sleep', 'screen', 'logind-lock', 'switch', 'embedder-sleep', 'close'])
     args = parser.parse_args()
     out = args.out.resolve()
     validate_output(W, out, REPO)
@@ -203,7 +216,7 @@ def main():
     print('AUTOLOCK_EVIDENCE', evidence, flush=True)
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    cases = [args.case] if args.case else ['explicit', 'idle', 'sleep', 'screen', 'logind-lock', 'switch', 'embedder-sleep', 'close']
+    cases = [args.case] if args.case else ['title-callback', 'navigation-callback', 'explicit', 'idle', 'sleep', 'screen', 'logind-lock', 'switch', 'embedder-sleep', 'close']
     try:
         for trigger in cases:
             for choice in (['close'] if trigger == 'close' else ['close', 'locked-page']):

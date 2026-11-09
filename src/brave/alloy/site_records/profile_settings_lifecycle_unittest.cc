@@ -336,12 +336,16 @@ TEST_F(ProfileSettingsLifecycleTest, LockCallbackWaitsForEveryNativeViewAndRejec
   EXPECT_EQ(ALLOY_PROFILE_TRANSITION, profile_->GetState());
   EXPECT_FALSE(prepared->BeginConstruction(base::BindOnce([] {})));
   EXPECT_FALSE(store_->CreateNativeView());
-  EXPECT_FALSE(profile_->LockAsync(new LockReply([](alloy_site_settings_result_t) { ADD_FAILURE(); })));
+  bool joined = false;
+  EXPECT_TRUE(profile_->LockAsync(new LockReply([&](alloy_site_settings_result_t result) {
+    EXPECT_EQ(ALLOY_SETTINGS_OK, result); EXPECT_FALSE(cache); joined = true;
+  })));
+  EXPECT_FALSE(joined);
   bool unlocked = true;
   std::thread unlock([&] { unlocked = profile_->UnlockWithPassword("lifecycle-password"); });
   unlock.join(); EXPECT_FALSE(unlocked);
   active->FinishTeardown(); tasks_.RunUntilIdle();
-  EXPECT_TRUE(completed); EXPECT_FALSE(cache);
+  EXPECT_TRUE(completed); EXPECT_TRUE(joined); EXPECT_FALSE(cache);
   const base::Value* value = nullptr;
   EXPECT_FALSE(store_->GetValue(kNativeSetting, &value));
   EXPECT_FALSE(active->GetValue(kNativeSetting, &value));
@@ -397,6 +401,33 @@ std::unique_ptr<PrefService> NativeFilterPrefs(scoped_refptr<ProfileFilterPrefer
   auto registry = base::MakeRefCounted<PrefRegistrySimple>();
   brave_shields::RegisterPrefsForAdBlockService(registry.get());
   PrefServiceFactory factory; factory.set_user_prefs(prefs); return factory.Create(registry);
+}
+
+TEST_F(ProfileSettingsLifecycleTest, EntryClosesNavigationBeforePostedTeardownAndJoinsLocks) {
+  std::unique_ptr<NativeProfileConfiguration> input;
+  PrepareFilterInput(profile_, tasks_, &input); ASSERT_TRUE(input);
+  ASSERT_TRUE(input->BeginConstruction());
+  auto native = std::make_unique<TestingProfile>(); input->Attach(*native);
+  bool retired = false;
+  input->SetTeardownHandler(base::BindLambdaForTesting([&] {
+    native.reset(); input.reset(); retired = true;
+  }));
+  input->ConstructionFinished();
+  ASSERT_TRUE(alloy::ProfileNavigationAllowed(*input));
+  int completed = 0;
+  auto reply = [&] {
+    return new LockReply([&](alloy_site_settings_result_t status) {
+      EXPECT_EQ(ALLOY_SETTINGS_OK, status); EXPECT_TRUE(retired);
+      EXPECT_EQ(ALLOY_PROFILE_LOCKED, profile_->GetState()); ++completed;
+    });
+  };
+  ASSERT_TRUE(profile_->LockAsync(reply()));
+  EXPECT_FALSE(alloy::ProfileNavigationAllowed(*input));
+  EXPECT_TRUE(input->admitted()); EXPECT_FALSE(retired); EXPECT_EQ(0, completed);
+  ASSERT_TRUE(profile_->LockAsync(reply()));
+  EXPECT_FALSE(retired); EXPECT_EQ(0, completed);
+  tasks_.RunUntilIdle();
+  EXPECT_TRUE(retired); EXPECT_EQ(2, completed);
 }
 
 TEST_F(ProfileSettingsLifecycleTest, FilterInputSharesProfileAndLockDrainsNativeEditBeforeUnlock) {

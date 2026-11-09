@@ -41,7 +41,10 @@ not activity in another application or an unavailable OS-wide idle oracle.
 
 Automatic, supplied and explicit runtime locks share the original profile's
 key/native-cache teardown barrier. Navigation admission closes first, including
-retained contexts and prepared configurations. The generation's WebContents and
+retained contexts and prepared configurations. Entry is safe inside observer and
+embedder callbacks: native destruction runs in a posted task after the triggering
+callback returns. Repeated UI lock calls join the transition and each accepted
+callback receives its completed result. The generation's WebContents and
 observers are destroyed while native services remain admitted. Native profiles
 finish their teardown notifications, completed writes are flushed, and only then
 are service admission, plaintext caches and keys closed. Pending unlocks are

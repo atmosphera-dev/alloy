@@ -23,6 +23,7 @@
 #include "components/dbus/thread_linux/dbus_thread_linux.h"
 #include "base/files/file_util.h"
 #include "base/functional/bind.h"
+#include "base/functional/callback_helpers.h"
 #include "base/barrier_closure.h"
 #include "base/task/thread_pool.h"
 #include "base/task/bind_post_task.h"
@@ -371,15 +372,29 @@ struct ProfileRuntime final : public CefContext::Observer,
   bool StartLock(sr::ProfileLockReason reason, bool retry_busy,
                   base::OnceCallback<void(sr::FileStatus)> completion) {
     CEF_REQUIRE_UIT();
+    if (ui_lock_in_flight) {
+      if (completion) lock_waiters.push_back(std::move(completion));
+      return true;
+    }
+    // This entry can run inside any native observer or embedder callback. Cut
+    // navigation admission now, but never destroy that callback's owner inline.
+    if (settings) settings->StopNavigations();
     ui_lock_in_flight = true;
+    if (base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
+        base::BindOnce(&ProfileRuntime::BeginLockTeardown, shared_from_this(),
+                       reason, retry_busy, std::move(completion)))) return true;
+    ui_lock_in_flight = false;
+    return false;
+  }
+  void BeginLockTeardown(sr::ProfileLockReason reason, bool retry_busy,
+                         base::OnceCallback<void(sr::FileStatus)> completion) {
+    CEF_REQUIRE_UIT();
     if (!settings) {
-      const bool posted = WipeKeys(reason, retry_busy, std::move(completion));
-      if (!posted) ui_lock_in_flight = false;
-      return posted;
+      WipeKeys(reason, retry_busy, std::move(completion));
+      return;
     }
     // Navigation and native service admission are distinct boundaries. Existing
     // observers and service destructors retain their original admitted settings.
-    settings->StopNavigations();
     std::vector<CefRefPtr<CefRequestContextImpl>> keepalive;
     std::vector<ChromeBrowserContext*> contexts;
     std::vector<base::WeakPtr<sr::NativeProfileConfiguration>> native;
@@ -402,7 +417,6 @@ struct ProfileRuntime final : public CefContext::Observer,
     for (auto* context : contexts) context->RetireForProfileLock();
     keepalive.clear();
     AwaitNativeTeardown(std::move(native), reason, retry_busy, std::move(completion));
-    return true;
   }
   void AwaitNativeTeardown(std::vector<base::WeakPtr<sr::NativeProfileConfiguration>> native,
                            sr::ProfileLockReason reason, bool retry_busy,
@@ -424,23 +438,26 @@ struct ProfileRuntime final : public CefContext::Observer,
               [](std::shared_ptr<ProfileRuntime> self, sr::ProfileLockReason reason,
                  bool retry_busy, base::OnceCallback<void(sr::FileStatus)> completion) {
                 *self->services_admitted = false;
-                if (!self->WipeKeys(reason, retry_busy, std::move(completion)))
-                  *self->pending = false;
+                self->WipeKeys(reason, retry_busy, std::move(completion));
               }, self, reason, retry_busy, std::move(completion)));
         }, shared_from_this(), reason, retry_busy, std::move(completion)));
   }
-  bool WipeKeys(sr::ProfileLockReason reason, bool retry_busy,
+  void WipeKeys(sr::ProfileLockReason reason, bool retry_busy,
                 base::OnceCallback<void(sr::FileStatus)> completion) {
     auto self = shared_from_this();
     auto ui = base::SingleThreadTaskRunner::GetCurrentDefault();
-    return runner->PostTask(FROM_HERE, base::BindOnce(
+    auto replies = base::SplitOnceCallback(base::BindOnce(
+        [](std::shared_ptr<ProfileRuntime> self, sr::ProfileLockReason reason,
+           bool retry_busy, base::OnceCallback<void(sr::FileStatus)> completion, sr::FileStatus status) {
+          self->FinishLock(reason, retry_busy, status, std::move(completion));
+        }, self, reason, retry_busy, std::move(completion)));
+    if (!runner->PostTask(FROM_HERE, base::BindOnce(
         [](std::shared_ptr<ProfileRuntime> self, scoped_refptr<base::SingleThreadTaskRunner> ui,
-           sr::ProfileLockReason reason, bool retry_busy,
-           base::OnceCallback<void(sr::FileStatus)> completion) {
+           base::OnceCallback<void(sr::FileStatus)> reply) {
           const auto result = self->profile->Lock();
-          ui->PostTask(FROM_HERE, base::BindOnce(&ProfileRuntime::FinishLock,
-              self, reason, retry_busy, result, std::move(completion)));
-        }, self, ui, reason, retry_busy, std::move(completion)));
+          ui->PostTask(FROM_HERE, base::BindOnce(std::move(reply), result));
+        }, self, ui, std::move(replies.first))))
+      std::move(replies.second).Run(sr::FileStatus::kCancelled);
   }
   void FinishLock(sr::ProfileLockReason reason, bool retry_busy, sr::FileStatus result,
                   base::OnceCallback<void(sr::FileStatus)> completion) {
@@ -451,13 +468,15 @@ struct ProfileRuntime final : public CefContext::Observer,
       retry.Start(FROM_HERE, base::Milliseconds(10), base::BindOnce(
           [](std::shared_ptr<ProfileRuntime> self, sr::ProfileLockReason reason,
              base::OnceCallback<void(sr::FileStatus)> completion) {
-            if (!self->WipeKeys(reason, true, std::move(completion))) *self->pending = false;
+            self->WipeKeys(reason, true, std::move(completion));
           }, shared_from_this(), reason, std::move(completion)));
       return;
     }
     auto completed = base::BindOnce(
         [](std::shared_ptr<ProfileRuntime> self, sr::ProfileLockReason reason,
            sr::FileStatus result, base::OnceCallback<void(sr::FileStatus)> completion) {
+          auto joined = std::move(self->lock_waiters);
+          auto shutdown_done = std::move(self->shutdown_done);
           if (result == sr::FileStatus::kOk && self->settings &&
               self->settings->failure() != sr::FileStatus::kOk) result = self->settings->failure();
           if (result == sr::FileStatus::kOk) result = self->flush_status;
@@ -470,7 +489,8 @@ struct ProfileRuntime final : public CefContext::Observer,
           auto handler = self->handler;
           if (handler) handler->OnLocked(static_cast<alloy_profile_lock_reason_t>(reason), SettingsResult(result));
           if (completion) std::move(completion).Run(result);
-          if (self->shutdown_done) std::move(self->shutdown_done).Run();
+          for (auto& waiter : joined) std::move(waiter).Run(result);
+          if (shutdown_done) std::move(shutdown_done).Run();
         }, shared_from_this(), reason, result, std::move(completion));
     CEF_POST_TASK(CEF_UIT, std::move(completed));
   }
@@ -520,6 +540,7 @@ struct ProfileRuntime final : public CefContext::Observer,
   base::CallbackListSubscription signal_subscription, available_subscription;
   base::OneShotTimer retry;
   base::OnceClosure shutdown_done;
+  std::vector<base::OnceCallback<void(sr::FileStatus)>> lock_waiters;
   bool observing = false;
   bool ui_lock_in_flight = false;
   std::atomic<bool> closed{false};
@@ -658,9 +679,9 @@ class AlloyProfileImpl final : public AlloyProfile {
   }
   bool LockAsync(CefRefPtr<AlloyProfileLockCallback> callback) override {
     if (!CEF_CURRENTLY_ON_UIT() || !callback) return false;
-    bool expected = false;
-    if (!lock_pending_->compare_exchange_strong(expected, true)) return false;
     auto runtime = Runtime();
+    bool expected = false;
+    if (!lock_pending_->compare_exchange_strong(expected, true) && !runtime->ui_lock_in_flight) return false;
     if (runtime->StartLock(sr::ProfileLockReason::kExplicit, false, base::BindOnce(
         [](CefRefPtr<AlloyProfileLockCallback> callback, sr::FileStatus result) {
           callback->OnComplete(SettingsResult(result));

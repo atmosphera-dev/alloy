@@ -371,7 +371,12 @@ struct ProfileRuntime final : public CefContext::Observer,
   bool StartLock(sr::ProfileLockReason reason, bool retry_busy,
                   base::OnceCallback<void(sr::FileStatus)> completion) {
     CEF_REQUIRE_UIT();
-    if (!settings) return WipeKeys(reason, retry_busy, std::move(completion));
+    ui_lock_in_flight = true;
+    if (!settings) {
+      const bool posted = WipeKeys(reason, retry_busy, std::move(completion));
+      if (!posted) ui_lock_in_flight = false;
+      return posted;
+    }
     // Navigation and native service admission are distinct boundaries. Existing
     // observers and service destructors retain their original admitted settings.
     settings->StopNavigations();
@@ -460,6 +465,7 @@ struct ProfileRuntime final : public CefContext::Observer,
           self->services_admitted.reset();
           self->flush_status = sr::FileStatus::kOk;
           self->has_settings = false;
+          self->ui_lock_in_flight = false;
           *self->pending = false;
           auto handler = self->handler;
           if (handler) handler->OnLocked(static_cast<alloy_profile_lock_reason_t>(reason), SettingsResult(result));
@@ -468,10 +474,24 @@ struct ProfileRuntime final : public CefContext::Observer,
         }, shared_from_this(), reason, result, std::move(completion));
     CEF_POST_TASK(CEF_UIT, std::move(completed));
   }
+  void StartBrowserCloseLockWhenIdle() {
+    CEF_REQUIRE_UIT();
+    if (pending->exchange(true)) {
+      // Only a UI-owned transition reaches FinishLock and resolves shutdown_done.
+      // A standalone Lock may even have started before this runtime existed.
+      if (!ui_lock_in_flight) retry.Start(FROM_HERE, base::Milliseconds(10),
+          base::BindOnce(&ProfileRuntime::StartBrowserCloseLockWhenIdle, shared_from_this()));
+      return;
+    }
+    if (!StartLock(sr::ProfileLockReason::kBrowserClose, true, {})) {
+      *pending = false;
+      if (shutdown_done) std::move(shutdown_done).Run();
+    }
+  }
   void OnContextDestroyed() override {
     CEF_REQUIRE_UIT();
+    if (observing) CefContext::Get()->RemoveObserver(this);
     observing = false;
-    CefContext::Get()->RemoveObserver(this);
     automatic.reset(); signal_subscription = {}; available_subscription = {};
     // A last-reference release may already have posted deletion to UI. In that
     // case the queued deleter, not this observer, owns the final blocking lock.
@@ -481,11 +501,7 @@ struct ProfileRuntime final : public CefContext::Observer,
     // UI is still pumping here and native retirement already uses event fences.
     base::RunLoop finished(base::RunLoop::Type::kNestableTasksAllowed);
     shutdown_done = finished.QuitClosure();
-    if (!pending->exchange(true)) {
-      if (!StartLock(sr::ProfileLockReason::kBrowserClose, true, {})) {
-        *pending = false; shutdown_done.Reset(); return;
-      }
-    }
+    StartBrowserCloseLockWhenIdle();
     finished.Run();
     handler = nullptr;
     closed = true;
@@ -505,6 +521,7 @@ struct ProfileRuntime final : public CefContext::Observer,
   base::OneShotTimer retry;
   base::OnceClosure shutdown_done;
   bool observing = false;
+  bool ui_lock_in_flight = false;
   std::atomic<bool> closed{false};
 };
 
@@ -526,6 +543,7 @@ struct ProfileLifecycle {
   scoped_refptr<base::SequencedTaskRunner> runner;
   scoped_refptr<base::SingleThreadTaskRunner> ui;
   std::shared_ptr<ProfileRuntime> runtime;
+  base::RepeatingClosure standalone_lock_hook_for_testing;
 };
 std::mutex& ProfilesMutex() { static std::mutex mutex; return mutex; }
 std::vector<std::weak_ptr<ProfileLifecycle>>& Profiles() {
@@ -591,11 +609,14 @@ class AlloyProfileImpl final : public AlloyProfile {
     bool expected = false;
     if (!lock_pending_->compare_exchange_strong(expected, true)) return false;
     std::shared_ptr<ProfileRuntime> runtime;
+    base::RepeatingClosure standalone_lock_hook;
     {
       std::lock_guard lock(lifecycle_->mutex);
       runtime = lifecycle_->runtime;
+      standalone_lock_hook = lifecycle_->standalone_lock_hook_for_testing;
     }
     if (!runtime || !runtime->has_settings) {
+      if (standalone_lock_hook) standalone_lock_hook.Run();
       const auto result = profile_->Lock();
       *lock_pending_ = false;
       // Preserve the standalone blocking contract: adopting a key-only profile
@@ -646,6 +667,10 @@ class AlloyProfileImpl final : public AlloyProfile {
         }, std::move(callback)))) return true;
     *lock_pending_ = false;
     return false;
+  }
+  void SetStandaloneLockHookForTesting(base::RepeatingClosure hook) {
+    std::lock_guard lock(lifecycle_->mutex);
+    lifecycle_->standalone_lock_hook_for_testing = std::move(hook);
   }
   alloy_keyring_result_t UnlockWithKeyring() override {
     if (lock_pending_->load()) return ALLOY_KEYRING_FAILED;
@@ -971,6 +996,11 @@ void alloy::InitializeProfileAutoLock() {
   // Includes profiles opened before CefInitialize, even if no request context or
   // idle setting is ever requested. Browser-close and OS locking are mechanisms.
   for (const auto& state : live) RuntimeFor(state);
+}
+void alloy::SetProfileStandaloneLockHookForTesting(CefRefPtr<AlloyProfile> profile,
+                                                  base::RepeatingClosure hook) {
+  CHECK(profile);
+  static_cast<AlloyProfileImpl*>(profile.get())->SetStandaloneLockHookForTesting(std::move(hook));
 }
 
 void alloy::LockProfilesForBrowserClose() {

@@ -26,5 +26,9 @@ void InitializeProfileAutoLock();
 // Shutdown adopts even profiles just registered on another embedder thread,
 // then joins every key/cache/page teardown before CEF stops its task runners.
 void LockProfilesForBrowserClose();
+// Per-profile test seam, invoked on the embedder thread after standalone lock
+// admission. Lets lifecycle tests control overlap without filesystem timing.
+void SetProfileStandaloneLockHookForTesting(CefRefPtr<AlloyProfile> profile,
+                                           base::RepeatingClosure hook);
 }  // namespace alloy
 #endif

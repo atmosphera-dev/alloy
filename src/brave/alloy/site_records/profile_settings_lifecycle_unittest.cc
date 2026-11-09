@@ -9,6 +9,7 @@
 #include "base/functional/bind.h"
 #include "base/synchronization/waitable_event.h"
 #include "base/run_loop.h"
+#include "base/task/single_thread_task_runner.h"
 #include "base/threading/thread_restrictions.h"
 #include "brave/alloy/site_records/site_pref_store.h"
 #include "brave/alloy/site_records/native_pref_view.h"
@@ -204,6 +205,43 @@ TEST(ProfileAutoLockApiTest, RuntimeAdoptionPreservesCoreOnlyBlockingLockWithout
   fresh.reset();
   std::thread release([&] { profile = nullptr; }); release.join();
   tasks.RunUntilIdle();
+}
+
+void BrowserCloseOverlappingStandaloneLock(bool adopt_before_lock) {
+  content::BrowserTaskEnvironment tasks;
+  ASSERT_NE(nullptr, cef_api_hash(CEF_API_VERSION, 0));
+  base::ScopedTempDir temp; ASSERT_TRUE(temp.CreateUniqueTempDir());
+  CefRefPtr<AlloyProfile> profile;
+  std::thread create([&] {
+    profile = AlloyCreateProfile(temp.GetPath().AppendASCII("standalone").AsUTF8Unsafe(), "shutdown-password");
+  });
+  create.join(); ASSERT_TRUE(profile);
+  if (adopt_before_lock) alloy::InitializeProfileAutoLock();
+  base::WaitableEvent entered, release;
+  alloy::SetProfileStandaloneLockHookForTesting(profile, base::BindLambdaForTesting([&] {
+    entered.Signal(); release.Wait();
+  }));
+  bool locked = false;
+  std::thread worker([&] { locked = profile->Lock(); });
+  const bool started = entered.TimedWait(base::Seconds(5));
+  if (!started) { release.Signal(); worker.join(); FAIL() << "standalone lock did not enter"; }
+  EXPECT_EQ(ALLOY_PROFILE_TRANSITION, profile->GetState());
+  // Browser close must pump this release and then acquire its own lock, rather
+  // than await a UI completion that the standalone worker never sends.
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(FROM_HERE,
+      base::BindLambdaForTesting([&] { release.Signal(); }), base::Milliseconds(10));
+  alloy::LockProfilesForBrowserClose();
+  worker.join(); EXPECT_TRUE(locked);
+  EXPECT_EQ(ALLOY_PROFILE_LOCKED, profile->GetState());
+  alloy::SetProfileStandaloneLockHookForTesting(profile, {});
+  profile = nullptr; tasks.RunUntilIdle();
+}
+
+TEST(ProfileAutoLockApiTest, BrowserCloseJoinsStandaloneLockWithAdoptedRuntime) {
+  BrowserCloseOverlappingStandaloneLock(true);
+}
+TEST(ProfileAutoLockApiTest, BrowserCloseAdoptsRuntimeDuringStandaloneLock) {
+  BrowserCloseOverlappingStandaloneLock(false);
 }
 
 TEST_F(ProfileSettingsLifecycleTest, NativeEditBeforeLockSurvivesWithoutOwnerPumpingBeforeRevocation) {

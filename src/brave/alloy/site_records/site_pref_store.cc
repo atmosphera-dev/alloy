@@ -278,6 +278,10 @@ void SitePrefStore::RemoveValuesByPrefixSilently(std::string_view prefix) {
   for (const auto& key : removed) Changed(key, false);
 }
 
+bool SitePrefStore::RecordWorkingStateAdmitted(std::string_view domain) const {
+  return initialized_ && Admitted() && retiring_record_ != domain;
+}
+
 bool SitePrefStore::CanStartNativeConstruction() const {
   return initialized_ && !closing_cache_ && Admitted();
 }
@@ -411,6 +415,7 @@ void SitePrefStore::Retired(std::unique_ptr<Request> request, State state) {
   RetireAdmission();
   request->admission = admission_;
   in_teardown_ = true;
+  retiring_record_ = Domain(request->site);
   Install(&next, true, true);
   const auto ticket = state.ticket;
   auto teardown = std::move(request->teardown);
@@ -625,6 +630,7 @@ void SitePrefStore::PublishRetirementNotifications(bool success) {
   auto changed = std::move(retirement_notifications_);
   native_retirement_publications_.clear(); retirement_notifications_.clear();
   if (!success) return;
+  retiring_record_.clear();
   for (auto& publication : publications) std::move(publication).Run();
   for (const auto& key : changed) NotifyChange(key);
 }

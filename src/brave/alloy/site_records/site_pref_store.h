@@ -95,6 +95,9 @@ class SitePrefStore final : public NativePrefSource {
   void PublishPreferredAppsAsync(PreferredVersion expected, apps::PreferredApps entries,
       base::OnceCallback<void(FileStatus, PreferredVersion)> completion);
   bool IsConsideredFirstParty(const GURL& outer, const GURL& embedded) const;
+  // Shared admission for context-wide native working state. A context created
+  // during R13 must observe the same closed record as existing contexts.
+  bool RecordWorkingStateAdmitted(std::string_view domain) const;
   // Key + references publish first; revoke/drain every old native access before
   // preference observers or the final deletion acknowledgement (R13/R4).
   FileStatus DeleteSite(const GURL& site, std::function<void()> teardown,
@@ -169,6 +172,7 @@ class SitePrefStore final : public NativePrefSource {
   bool reading_ = false;
   bool busy_ = false;
   bool in_teardown_ = false;
+  std::string retiring_record_;
   std::set<std::string> retirement_notifications_;
   std::vector<base::OnceClosure> native_retirement_publications_;
   uint64_t mutation_ = 0;

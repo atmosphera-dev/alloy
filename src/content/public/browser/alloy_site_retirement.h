@@ -10,6 +10,12 @@
 namespace content {
 class BrowserContext;
 class WebContents;
+// Native first-party backends join the same R13 barrier AFTER old documents,
+// workers and network writers have drained, while new admission stays closed.
+// Completion reports native deletion failure rather than acknowledging it.
+CONTENT_EXPORT void RetireAlloyFirstPartyStores(
+    BrowserContext* context, const GURL& site,
+    base::OnceCallback<void(bool)> done);
 
 // UI-only, after durable key retirement. The browser supplies its native close
 // action; content owns frame/worker enumeration and actual teardown completion.

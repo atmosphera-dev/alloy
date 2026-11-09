@@ -1017,6 +1017,16 @@
       "patch": "cef/0128-profile-auto-lock.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0130-first-party-retirement.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0130-first-party-retirement.patch",
+      "root": "brave",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

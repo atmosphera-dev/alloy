@@ -39,6 +39,8 @@
 #include "cef/libcef/browser/context.h"
 #include "cef/libcef/browser/request_context_impl.h"
 #include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/history/history_service_factory.h"
+#include "components/history/core/browser/history_service.h"
 #include "components/prefs/pref_service.h"
 #include "content/public/browser/alloy_site_retirement.h"
 #include "content/public/browser/alloy_network_retirement.h"
@@ -122,6 +124,25 @@ alloy_site_settings_result_t SettingsResult(sr::FileStatus status) {
   }
 }
 
+void RetireNativeHistory(content::BrowserContext* context, const GURL& site,
+                         base::OnceCallback<void(bool)> done) {
+  auto* profile = Profile::FromBrowserContext(context);
+  auto* original = profile->GetOriginalProfile();
+  if (original != profile) {
+    const auto* input = sr::NativeProfileConfiguration::Get(*profile);
+    const auto* parent = sr::NativeProfileConfiguration::Get(*original);
+    if (!input || !parent || !input->SharesOwnerWith(*parent)) {
+      std::move(done).Run(false); return;
+    }
+  }
+  // Never construct a dormant history backend merely to delete a record.
+  auto* service = HistoryServiceFactory::GetForProfileIfExists(
+      profile, ServiceAccessType::EXPLICIT_ACCESS);
+  if (!service) { std::move(done).Run(true); return; }
+  const auto target = *net::AlloyNetworkRecordTarget::FromPrincipal(site, url::Origin::Create(site));
+  service->RetireAlloyRecord(target.domain(), std::move(done));
+}
+
 void RetireNativeSite(scoped_refptr<sr::SitePrefStore> prefs, GURL site,
                       sr::SitePrefStore::Completion done) {
   CEF_REQUIRE_UIT();
@@ -134,6 +155,8 @@ void RetireNativeSite(scoped_refptr<sr::SitePrefStore> prefs, GURL site,
     auto* browser_context = context->AsBrowserContext();
     auto* input = browser_context ? sr::NativeProfileConfiguration::Get(*browser_context) : nullptr;
     if (!input || sr::GetSiteProfileSettings(*input).get() != prefs.get()) continue;
+    prefs->DeferNativeRetirementNotification(
+        content::BeginAlloyFirstPartyRetirement(*browser_context, site));
     native.push_back(browser_context);
     keepalive.push_back(context->GetAnyRequestContext(false));
   }
@@ -141,10 +164,27 @@ void RetireNativeSite(scoped_refptr<sr::SitePrefStore> prefs, GURL site,
   // One completion from each site owner and each network owner, plus the
   // commit-iteration gate. A synchronous drain cannot release our keepalives.
   auto completed = base::BarrierClosure(native.size() * 2 + 1, base::BindOnce(
-      [](std::vector<CefRefPtr<CefRequestContextImpl>>, std::shared_ptr<bool> success,
+      [](std::vector<CefRefPtr<CefRequestContextImpl>> keepalive,
+         std::vector<content::BrowserContext*> contexts, GURL site,
+         std::shared_ptr<bool> success,
          sr::SitePrefStore::Completion done) {
-        std::move(done).Run(*success ? sr::FileStatus::kOk : sr::FileStatus::kIo);
-      }, std::move(keepalive), success, std::move(done)));
+        // No clear while old writers can still refill a context-wide backend.
+        // Keep replacement admission closed until native completion AND the
+        // coordinator's FinishRecordDeletion/publication, not just scheduling.
+        auto removed = base::BarrierClosure(contexts.size() * 2, base::BindOnce(
+            [](std::vector<CefRefPtr<CefRequestContextImpl>>,
+               std::shared_ptr<bool> success, sr::SitePrefStore::Completion done) {
+              std::move(done).Run(*success ? sr::FileStatus::kOk : sr::FileStatus::kIo);
+            }, std::move(keepalive), success, std::move(done)));
+        for (auto* context : contexts) {
+          auto result = base::BindRepeating([](std::shared_ptr<bool> success,
+                                               base::RepeatingClosure removed, bool ok) {
+            *success = *success && ok; removed.Run();
+          }, success, removed);
+          RetireNativeHistory(context, site, result);
+          content::RetireAlloyFirstPartyStores(context, site, result);
+        }
+      }, std::move(keepalive), native, site, success, std::move(done)));
   auto owns = base::BindRepeating([](net::AlloyNetworkRecordTarget target,
                                     const url::Origin& origin) {
     return target.Owns(origin);

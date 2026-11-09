@@ -52,6 +52,63 @@ class EmbeddedStateTest : public testing::Test {
   const base::UnguessableToken tab_b_ = base::UnguessableToken::Create();
 };
 
+TEST_F(EmbeddedStateTest, FirstPartyRetirementClosesOldAndPendingAdmissionUntilPublication) {
+  EmbeddedStateRegistry registry(profile_, StorageMode::kEncrypted,
+                                 Scope::kPerOuterSite, nullptr);
+  const GURL alpha("https://sub.alpha.test/a"), beta("https://beta.test/");
+  auto resolve = [&](const GURL& url) {
+    return registry.ResolveFirstParty(url, url::Origin::Create(url));
+  };
+  const auto old = resolve(alpha).first_party;
+  const auto other = resolve(beta).first_party;
+  ASSERT_TRUE(old.active()); ASSERT_TRUE(other.active());
+  EXPECT_EQ(old.generation(), resolve(GURL("http://alpha.test:8080/b")).first_party.generation());
+  auto publication = registry.BeginFirstPartyRetirement(alpha, url::Origin::Create(alpha));
+  EXPECT_FALSE(old.active());
+  EXPECT_TRUE(other.active());
+  const auto pending = resolve(alpha);
+  EXPECT_EQ(Backing::kNone, pending.backing);
+  EXPECT_TRUE(pending.temporary_admission_closed);
+  EXPECT_FALSE(pending.first_party.active());
+  std::move(publication).Run();
+  const auto fresh = resolve(alpha).first_party;
+  EXPECT_TRUE(fresh.active());
+  EXPECT_NE(old.generation(), fresh.generation());
+  EXPECT_FALSE(old.active()); EXPECT_FALSE(pending.first_party.active());
+  EXPECT_EQ(other.generation(), resolve(beta).first_party.generation());
+  registry.Shutdown();
+  EXPECT_FALSE(fresh.active()); EXPECT_FALSE(other.active());
+}
+
+TEST_F(EmbeddedStateTest, NewContextCannotBypassSharedRecordRetirement) {
+  bool retiring = true;
+  EmbeddedStateRegistry registry(profile_, StorageMode::kEncrypted,
+      Scope::kPerOuterSite, nullptr, {}, base::BindRepeating(
+          [](bool* retiring, std::string_view site) {
+            return !*retiring || site != "alpha.test";
+          }, &retiring));
+  const GURL a("https://alpha.test/"), b("https://beta.test/");
+  const auto blocked = registry.ResolveFirstParty(a, url::Origin::Create(a));
+  EXPECT_TRUE(blocked.temporary_admission_closed);
+  EXPECT_TRUE(registry.ResolveFirstParty(b, url::Origin::Create(b)).first_party.active());
+  retiring = false;
+  EXPECT_TRUE(registry.ResolveFirstParty(a, url::Origin::Create(a)).first_party.active());
+  EXPECT_FALSE(blocked.first_party.active());
+}
+
+TEST_F(EmbeddedStateTest, FirstPartyLeaseIsChildOfOriginalProfileGeneration) {
+  RecordCapabilityIssuer parent(profile_, base::UnguessableToken::Create(),
+      base::UnguessableToken::Create(), StorageMode::kEncrypted);
+  EmbeddedStateRegistry registry(profile_, StorageMode::kEncrypted,
+      Scope::kPerOuterSite, nullptr, parent.Issue(StorePurpose::kProfileSettings));
+  const GURL site("https://alpha.test/");
+  auto old = registry.ResolveFirstParty(site, url::Origin::Create(site)).first_party;
+  ASSERT_TRUE(old.active());
+  parent.Revoke();
+  EXPECT_FALSE(old.active());
+  EXPECT_TRUE(registry.ResolveFirstParty(site, url::Origin::Create(site)).temporary_admission_closed);
+}
+
 TEST_F(EmbeddedStateTest, PerTabIsolatesSameOuterAndPreservesSameSiteReloads) {
   EmbeddedStateRegistry registry(profile_, StorageMode::kEncrypted,
                                  Scope::kPerTab, nullptr);

@@ -7,8 +7,10 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "base/functional/callback.h"
@@ -51,6 +53,7 @@ class EmbeddedState final : public base::RefCounted<EmbeddedState> {
       base::OnceCallback<std::unique_ptr<KeyedService>(RecordCapability)>;
 
   EmbeddedState(base::UnguessableToken profile);
+  explicit EmbeddedState(const RecordCapability& profile_settings);
   RecordCapability Capability(StorePurpose purpose) const;
   // Native instance identities (e.g. a partition) select distinct reserved
   // factory slots. Complete callback-bearing initialization inside the factory,
@@ -101,12 +104,21 @@ class EmbeddedStateRegistry final {
     // Distinguish revoked captured temporary authority from a principal for
     // which embedded backing was never applicable. Neither grants authority.
     bool temporary_admission_closed = false;
+    // Captured native first-party working-state lease. Unlike temporary
+    // backing it never changes the origin, StorageKey, nonce or cookie jar.
+    RecordCapability first_party;
+    // Native memory service slots for real-site sidecars (salts, origin
+    // trials, generated code). This is NOT temporary storage routing and does
+    // not supply a StorageKey nonce or a different cookie/NetworkContext.
+    scoped_refptr<EmbeddedState> first_party_state;
   };
 
   EmbeddedStateRegistry(base::UnguessableToken profile,
-                        StorageMode mode,
-                        EmbeddedStateScope scope,
-                        std::unique_ptr<EmbeddedFirstPartyPolicy> policy);
+                         StorageMode mode,
+                         EmbeddedStateScope scope,
+                         std::unique_ptr<EmbeddedFirstPartyPolicy> policy,
+                         std::optional<RecordCapability> profile_settings = {},
+                         base::RepeatingCallback<bool(std::string_view)> record_admitted = {});
   ~EmbeddedStateRegistry();
   EmbeddedStateRegistry(const EmbeddedStateRegistry&) = delete;
   EmbeddedStateRegistry& operator=(const EmbeddedStateRegistry&) = delete;
@@ -116,8 +128,14 @@ class EmbeddedStateRegistry final {
                        const url::Origin& document_origin);
   void CloseTab(base::UnguessableToken tab);
   Resolution Resolve(base::UnguessableToken tab,
-                     const GURL& frame_url,
-                     const url::Origin& frame_origin);
+                      const GURL& frame_url,
+                      const url::Origin& frame_origin);
+  Resolution ResolveFirstParty(const GURL& url, const url::Origin& origin);
+  // R13 closes admission before native teardown. The returned publication
+  // reopens admission only after the backend and record barriers complete.
+  // Captured old leases remain revoked, including pending navigations.
+  base::OnceClosure BeginFirstPartyRetirement(const GURL& url,
+                                             const url::Origin& origin);
   // Engine deletion/decay uses a trusted principal, canonicalized with R16.
   // Revoke this site in every outer/tab scope; deleting an outer also retires
   // its whole jar and tab admission. Siblings in other jars remain untouched.
@@ -151,6 +169,10 @@ class EmbeddedStateRegistry final {
   const StorageMode mode_;
   const EmbeddedStateScope scope_;
   const std::unique_ptr<EmbeddedFirstPartyPolicy> policy_;
+  const std::optional<RecordCapability> profile_settings_;
+  const base::RepeatingCallback<bool(std::string_view)> record_admitted_;
+  std::map<std::string, scoped_refptr<EmbeddedState>> first_party_;
+  std::set<std::string> retiring_first_party_;
   std::map<base::UnguessableToken, TabOwner> tabs_;
   std::map<base::UnguessableToken, PendingCommit> pending_commits_;
   // Per-operation reservations match pending_commits_: synchronous callbacks

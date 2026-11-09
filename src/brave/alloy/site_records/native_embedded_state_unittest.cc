@@ -39,6 +39,17 @@
 #include "chrome/browser/hid/hid_chooser_context.h"
 #include "chrome/browser/hid/hid_chooser_context_factory.h"
 #include "chrome/browser/history/history_service_factory.h"
+#include "chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.h"
+#include "chrome/browser/download/chrome_download_manager_delegate.h"
+#include "chrome/browser/download/download_core_service.h"
+#include "chrome/browser/download/download_core_service_factory.h"
+#include "components/history/core/browser/history_service.h"
+#include "content/browser/notifications/platform_notification_context_impl.h"
+#include "content/browser/media/cdm_storage_manager.h"
+#include "media/media_buildflags.h"
+#include "content/public/browser/notification_database_data.h"
+#include "content/public/test/mock_permission_manager.h"
+#include "content/test/mock_platform_notification_service.h"
 #include "chrome/browser/media/webrtc/media_device_salt_service_factory.h"
 #include "chrome/browser/permissions/chrome_permissions_client.h"
 #include "chrome/browser/serial/serial_chooser_context.h"
@@ -70,6 +81,7 @@
 #include "components/services/storage/public/mojom/service_worker_storage_control.mojom.h"
 #include "components/sync_preferences/pref_service_syncable.h"
 #include "content/browser/alloy_embedded_state.h"
+#include "content/public/browser/alloy_site_retirement.h"
 #include "content/browser/alloy_network_generation.h"
 #include "content/browser/blob_storage/chrome_blob_storage_context.h"
 #include "content/browser/buckets/alloy_embedded_bucket_storage.h"
@@ -820,6 +832,168 @@ TEST_F(NativeEmbeddedStateTest, NativeStorageKeysAndScopesSeparateTabs) {
       content::GetAlloyEmbeddedStateForDocument(first_->GetPrimaryMainFrame())
           .backing,
       Backing::kRealSite);
+}
+
+TEST_F(NativeEmbeddedStateTest, FirstPartyRetirementWithoutLoadedPartitionsCompletes) {
+  auto browser = TestingProfile::Builder().Build();
+  size_t loaded = 0;
+  browser->ForEachLoadedStoragePartition([&](content::StoragePartition*) { ++loaded; });
+  ASSERT_EQ(0u, loaded);
+  base::test::TestFuture<bool> retired;
+  content::RetireAlloyFirstPartyStores(browser.get(), GURL("https://alpha.test/"), retired.GetCallback());
+  EXPECT_FALSE(retired.IsReady());
+  EXPECT_TRUE(retired.Get());
+}
+
+TEST_F(NativeEmbeddedStateTest, FirstPartyLoadedStoresUseStandaloneNativeOwnership) {
+  // Build the production factory graph BEFORE constructing this profile so
+  // every native owner's preference defaults participate in registration.
+  ChromeBrowserMainExtraPartsProfiles::EnsureBrowserContextKeyedServiceFactoriesBuilt();
+  auto native = TestingProfile::Builder().Build();
+  RequestContextPolicy::AttachMemory(*native);
+  auto* original = native.get();
+  const auto state = original->lifecycle_state();
+  base::ScopedClosureRunner restore(base::BindOnce(
+      [](Profile* profile, Profile::LifecycleState state) { profile->set_lifecycle_state(state); },
+      original, state));
+  original->set_lifecycle_state(Profile::LifecycleState::kNotRegistered);
+  // The render-view harness has no process-wide DownloadStatusUpdater. Use
+  // the same explicit native delegate setup as Chromium's removal unit tests.
+  auto* downloads = DownloadCoreServiceFactory::GetForBrowserContext(native.get());
+  downloads->SetDownloadManagerDelegateForTesting(
+      std::make_unique<ChromeDownloadManagerDelegate>(native.get()));
+  base::ScopedClosureRunner release_delegate(base::BindOnce(
+      [](DownloadCoreService* downloads) {
+        downloads->SetDownloadManagerDelegateForTesting(nullptr);
+      }, downloads));
+  ASSERT_EQ(Profile::LifecycleState::kNotRegistered,
+            native->lifecycle_state());
+  ASSERT_TRUE(native->GetDefaultStoragePartition());
+  base::test::TestFuture<bool> retired;
+  content::RetireAlloyFirstPartyStores(native.get(), GURL("https://outer.test/"), retired.GetCallback());
+  EXPECT_TRUE(retired.Get());
+}
+
+TEST_F(NativeEmbeddedStateTest, FirstPartyMediaIdentityEndsWithRecordNotProfile) {
+  Navigate(second_.get(), "https://beta.test/");
+  auto* alpha = first_->GetPrimaryMainFrame();
+  auto* beta = second_->GetPrimaryMainFrame();
+  auto native_salt = [&](content::RenderFrameHost* frame) {
+    auto* service = MediaDeviceSaltServiceFactory::GetForFrame(frame);
+    EXPECT_TRUE(service);
+    base::test::TestFuture<const std::string&> result;
+    service->GetSalt(frame->GetStorageKey(), result.GetCallback());
+    return result.Take();
+  };
+  const auto a = native_salt(alpha), b = native_salt(beta);
+  ASSERT_FALSE(a.empty()); ASSERT_FALSE(b.empty());
+  base::test::TestFuture<const content::MediaDeviceSaltAndOrigin&> identity;
+  content::GetMediaDeviceSaltAndOrigin(alpha->GetGlobalId(), identity.GetCallback());
+  const auto held = identity.Take();
+  ASSERT_TRUE(held.HasStorageAdmission());
+  auto publication = content::BeginAlloyFirstPartyRetirement(*child_, GURL("https://outer.test/"));
+  EXPECT_FALSE(held.HasStorageAdmission());
+  EXPECT_EQ(nullptr, MediaDeviceSaltServiceFactory::GetForFrame(alpha));
+  EXPECT_EQ(b, native_salt(beta));
+  std::move(publication).Run();
+  EXPECT_EQ(nullptr, MediaDeviceSaltServiceFactory::GetForFrame(alpha));
+  auto fresh = content::WebContentsTester::CreateTestWebContents(child_, nullptr);
+  Navigate(fresh.get(), "https://outer.test/fresh");
+  EXPECT_NE(a, native_salt(fresh->GetPrimaryMainFrame()));
+  EXPECT_EQ(b, native_salt(beta));
+}
+
+#if BUILDFLAG(ENABLE_LIBRARY_CDMS)
+TEST_F(NativeEmbeddedStateTest, FirstPartyRetainedCdmFilesEndWithRecord) {
+  content::CdmStorageManager manager(base::FilePath{});
+  const media::CdmType type{1234, 5678};
+  const auto a = blink::StorageKey::CreateFromStringForTesting("https://alpha.test/");
+  const auto b = blink::StorageKey::CreateFromStringForTesting("https://beta.test/");
+  for (const auto& key : {a, b}) {
+    base::test::TestFuture<bool> written;
+    manager.WriteFile(key, type, "value", {1, 2, 3}, written.GetCallback());
+    ASSERT_TRUE(written.Get());
+  }
+  mojo::Remote<media::mojom::CdmStorage> old, other;
+  manager.OpenCdmStorage({a, type}, old.BindNewPipeAndPassReceiver());
+  manager.OpenCdmStorage({b, type}, other.BindNewPipeAndPassReceiver());
+  using Opened = base::test::TestFuture<media::mojom::CdmStorage::Status,
+      mojo::PendingAssociatedRemote<media::mojom::CdmFile>>;
+  Opened pending;
+  old->Open("value", pending.GetCallback());
+  ASSERT_EQ(media::mojom::CdmStorage::Status::kSuccess, pending.Get<0>());
+  mojo::AssociatedRemote<media::mojom::CdmFile> file(std::move(std::get<1>(pending.Take())));
+  base::test::TestFuture<bool> retired;
+  manager.RetireAlloyRecord("alpha.test", retired.GetCallback());
+  ASSERT_TRUE(retired.Get());
+  old.FlushForTesting();
+  EXPECT_FALSE(old.is_connected());
+  base::test::TestFuture<media::mojom::CdmFile::Status> late;
+  file->Write({9}, mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+      late.GetCallback(), media::mojom::CdmFile::Status::kFailure));
+  EXPECT_EQ(media::mojom::CdmFile::Status::kFailure, late.Get());
+  other.FlushForTesting();
+  EXPECT_TRUE(other.is_connected());
+  for (const auto& key : {a, b}) {
+    base::test::TestFuture<std::optional<std::vector<uint8_t>>> read;
+    manager.ReadFile(key, type, "value", read.GetCallback());
+    const auto value = read.Take();
+    ASSERT_TRUE(value);
+    EXPECT_EQ(key == b ? std::vector<uint8_t>({1, 2, 3}) : std::vector<uint8_t>(), *value);
+  }
+}
+#endif
+
+TEST_F(NativeEmbeddedStateTest, FirstPartyNotificationsRetireWithoutDeletingOtherOrigins) {
+  class NotificationProfile final : public TestingProfile {
+   public:
+    NotificationProfile() : platform(this) {}
+    content::PlatformNotificationService* GetPlatformNotificationService() override {
+      return &platform;
+    }
+    content::MockPlatformNotificationService platform;
+  } browser;
+  browser.SetPermissionControllerDelegate(
+      std::make_unique<testing::NiceMock<content::MockPermissionManager>>());
+  auto* displayed = &browser.platform;
+  auto context = base::MakeRefCounted<content::PlatformNotificationContextImpl>(
+      base::FilePath(), &browser, nullptr);
+  context->Initialize();
+  task_environment()->RunUntilIdle();
+  const GURL a("https://sub.alpha.test/"), b("https://beta.test/");
+  auto write = [&](const GURL& origin, int64_t id) {
+    content::NotificationDatabaseData data;
+    data.service_worker_registration_id = 42;
+    data.notification_data.title = u"record-value";
+    data.serialized_metadata["value"] = origin.spec();
+    base::test::TestFuture<bool, const std::string&> result;
+    context->WriteNotificationData(id, 42, origin, data, result.GetCallback());
+    EXPECT_TRUE(result.Get<0>());
+    return std::string(result.Get<1>());
+  };
+  const auto alpha = write(a, 1), beta = write(b, 2);
+  ASSERT_FALSE(alpha.empty()); ASSERT_FALSE(beta.empty());
+  auto read = [&](const GURL& origin) {
+    base::test::TestFuture<bool, const std::vector<content::NotificationDatabaseData>&> result;
+    context->ReadAllNotificationDataForServiceWorkerRegistration(origin, 42, result.GetCallback());
+    EXPECT_TRUE(result.Get<0>());
+    return std::get<1>(result.Take());
+  };
+  ASSERT_EQ(1u, read(a).size()); ASSERT_EQ(1u, read(b).size());
+  base::test::TestFuture<bool, size_t> retired;
+  context->RetireAlloyRecord("alpha.test", retired.GetCallback());
+  ASSERT_TRUE(retired.Get<0>());
+  EXPECT_EQ(1u, retired.Get<1>());
+  EXPECT_TRUE(read(a).empty());
+  const auto kept = read(b);
+  ASSERT_EQ(1u, kept.size());
+  EXPECT_EQ(b.spec(), kept.front().serialized_metadata.at("value"));
+  base::test::TestFuture<std::set<std::string>, bool> visible;
+  displayed->GetDisplayedNotifications(visible.GetCallback());
+  EXPECT_FALSE(visible.Get<0>().contains(alpha));
+  EXPECT_TRUE(visible.Get<0>().contains(beta));
+  context->Shutdown(); context.reset();
+  task_environment()->RunUntilIdle();
 }
 
 TEST_F(NativeEmbeddedStateTest, SameSiteReloadKeepsScopeMoveAndBackDoNot) {
@@ -5907,6 +6081,45 @@ TEST_F(NativeDiskEmbeddedOriginTrialsTest,
        OrdinaryRuntimeTrialSurvivesPersistedTokenClear) {
   CheckRuntimeProjection(Scope::kPerTab, true);
 }
+TEST_F(NativeDiskEmbeddedOriginTrialsTest, FirstPartyPersistentTrialEndsWithRecord) {
+  auto* child = TestingProfile::Builder().BuildOffTheRecord(profile(),
+      Profile::OTRProfileID::CreateUniqueForAlloy(ContextMode::Memory()));
+  auto tab = content::WebContentsTester::CreateTestWebContents(child, nullptr);
+  auto peer = content::WebContentsTester::CreateTestWebContents(child, nullptr);
+  const GURL enabled("https://enabled.example.com/");
+  const auto origin = url::Origin::Create(enabled);
+  auto* frame = Navigate(tab.get(), enabled, true);
+  auto* other = Navigate(peer.get(), GURL("https://beta.test/"), false);
+  auto* root = child->GetOriginTrialsControllerDelegate();
+  auto held = root->GetForStateOwner(content::AlloyDocumentStateOwner(frame));
+  auto beta = root->GetForStateOwner(content::AlloyDocumentStateOwner(other));
+  auto persisted = [&](const std::shared_ptr<content::OriginTrialsControllerDelegate>& delegate) {
+    return delegate->IsFeaturePersistedForOrigin(origin, origin,
+        blink::mojom::OriginTrialFeature::kOriginTrialsSampleAPIPersistentFeature,
+        base::Time::Now());
+  };
+  ASSERT_TRUE(held && held->IsStateAdmissionOpen());
+  ASSERT_TRUE(persisted(held));
+  auto old_host = Bind(frame);
+  auto publication = content::BeginAlloyFirstPartyRetirement(*child, enabled);
+  EXPECT_FALSE(held->IsStateAdmissionOpen());
+  EXPECT_FALSE(persisted(held));
+  Script(old_host, kToken);
+  EXPECT_FALSE(persisted(held));
+  EXPECT_TRUE(beta->IsStateAdmissionOpen());
+  std::move(publication).Run();
+  auto fresh = content::WebContentsTester::CreateTestWebContents(child, nullptr);
+  auto* replacement = Navigate(fresh.get(), enabled, false);
+  auto current = root->GetForStateOwner(content::AlloyDocumentStateOwner(replacement));
+  ASSERT_TRUE(current && current->IsStateAdmissionOpen());
+  EXPECT_FALSE(persisted(current));
+  auto new_host = Bind(replacement);
+  Script(new_host, kToken);
+  EXPECT_TRUE(persisted(current));
+  EXPECT_FALSE(persisted(held));
+  EXPECT_TRUE(beta->IsStateAdmissionOpen());
+}
+
 class NativeDiskEmbeddedFaviconTest : public ChromeRenderViewHostTestHarness {
  public:
   void Check(Scope scope) {
@@ -6013,6 +6226,55 @@ TEST_F(NativeDiskEmbeddedFaviconTest,
 TEST_F(NativeDiskEmbeddedFaviconTest,
        OuterSitePrimaryOwnsForeignIconAndRejectsEmbedded) {
   Check(Scope::kPerOuterSite);
+}
+
+TEST_F(NativeDiskEmbeddedFaviconTest, FirstPartyHistoryAndFaviconMappingsRetireTogether) {
+  RecordCapabilityIssuer issuer(profile()->UniqueToken(), base::UnguessableToken::Create(),
+      base::UnguessableToken::Create(), StorageMode::kEncrypted);
+  RequestContextPolicy::AttachEncrypted(*profile(), issuer.Issue(StorePurpose::kProfileSettings));
+  auto* history_service = static_cast<history::HistoryService*>(
+      HistoryServiceFactory::GetInstance()->SetTestingFactoryAndUse(
+          profile(), HistoryServiceFactory::GetDefaultFactory()));
+  auto* favicons = static_cast<favicon::FaviconService*>(
+      FaviconServiceFactory::GetInstance()->SetTestingFactoryAndUse(
+          profile(), FaviconServiceFactory::GetDefaultFactory()));
+  ASSERT_TRUE(history_service); ASSERT_TRUE(favicons);
+  EXPECT_TRUE(history_service->history_dir().empty());
+  const GURL a("https://sub.alpha.test/page"), b("https://beta.test/page");
+  const GURL unvisited("https://sub.alpha.test/unvisited");
+  const GURL icon("https://cdn.test/shared-icon");
+  for (const auto& url : {a, b}) history_service->AddPageWithDetails(
+      url, u"record-value", 1, 0, base::Time::Now(), false, history::VisitSource::SOURCE_BROWSED);
+  SkBitmap bitmap; bitmap.allocN32Pixels(16, 16); bitmap.eraseColor(SK_ColorBLUE);
+  favicons->SetFavicons({a, b, unvisited}, icon, favicon_base::IconType::kFavicon,
+                        gfx::Image::CreateFrom1xBitmap(bitmap));
+  base::test::TestFuture<void> seeded;
+  history_service->FlushForTest(seeded.GetCallback());
+  ASSERT_TRUE(seeded.Wait());
+  auto read = [&](const GURL& url) {
+    base::CancelableTaskTracker tracker;
+    base::test::TestFuture<history::QueryURLResult> result;
+    history_service->QueryURL(url, result.GetCallback(), &tracker);
+    return result.Take().success;
+  };
+  auto read_icon = [&](const GURL& page) {
+    base::CancelableTaskTracker tracker;
+    base::test::TestFuture<const favicon_base::FaviconRawBitmapResult&> result;
+    favicons->GetRawFaviconForPageURL(page, {favicon_base::IconType::kFavicon},
+        16, false, result.GetCallback(), &tracker);
+    return result.Take();
+  };
+  ASSERT_TRUE(read(a)); ASSERT_TRUE(read(b));
+  ASSERT_TRUE(read_icon(a).is_valid()); ASSERT_TRUE(read_icon(b).is_valid());
+  ASSERT_FALSE(read(unvisited)); ASSERT_TRUE(read_icon(unvisited).is_valid());
+  base::test::TestFuture<bool> retired;
+  history_service->RetireAlloyRecord("alpha.test", retired.GetCallback());
+  ASSERT_TRUE(retired.Get());
+  EXPECT_FALSE(read(a)); EXPECT_TRUE(read(b));
+  EXPECT_FALSE(read_icon(a).is_valid());
+  EXPECT_FALSE(read_icon(unvisited).is_valid());
+  const auto kept = read_icon(b);
+  EXPECT_TRUE(kept.is_valid()); EXPECT_EQ(icon, kept.icon_url);
 }
 
 }  // namespace

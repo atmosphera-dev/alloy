@@ -163,6 +163,8 @@ TEST_F(SitePrefStoreTest, DeletionRevokesNativePermissionAndGeneratedReferencesB
     EXPECT_EQ(CONTENT_SETTING_ALLOW, Permission(a_));
     EXPECT_FALSE(store_->IsConsideredFirstParty(a_, b_));
     EXPECT_TRUE(store_->IsConsideredFirstParty(a_, c_));
+    EXPECT_FALSE(store_->RecordWorkingStateAdmitted("beta.test"));
+    EXPECT_TRUE(store_->RecordWorkingStateAdmitted("alpha.test"));
     EXPECT_EQ(std::string::npos, Text(Shard(a_)).find("beta.test"));
     RecordInfo record;
     // R13 keeps admission closed throughout live teardown, even for lookup.
@@ -172,6 +174,7 @@ TEST_F(SitePrefStoreTest, DeletionRevokesNativePermissionAndGeneratedReferencesB
     for (const auto& live : records) EXPECT_NE("beta.test", live.domain);
   }, &deletion));
   EXPECT_TRUE(callback);
+  EXPECT_TRUE(store_->RecordWorkingStateAdmitted("beta.test"));
   RecordInfo absent;
   EXPECT_EQ(FileStatus::kNotFound, files_->ResolveRecord(b_, url::Origin::Create(b_), false, &absent));
   Reopen();

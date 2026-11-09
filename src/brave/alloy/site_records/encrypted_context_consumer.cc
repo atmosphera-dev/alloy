@@ -57,6 +57,8 @@ class LockReply final : public AlloyProfileLockCallback {
 class DeleteReply final : public AlloyRecordDeletionCallback {
  public:
   void OnComplete(alloy_site_settings_result_t result, bool pending) override {
+    std::printf("ENCRYPTED_EVENT {\"event\":\"deletion-result\",\"result\":%d,\"pending\":%s}\n",
+                static_cast<int>(result), pending ? "true" : "false");
     Check(result == ALLOY_SETTINGS_OK && !pending, "live record deletion complete");
     std::puts("ENCRYPTED_EVENT {\"event\":\"deleted\"}");
   }

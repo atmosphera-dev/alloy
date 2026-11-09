@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """NUC-only encrypted native Profile/CEF end-consumer proof on two real sites."""
 import argparse
+import base64
 import hashlib
 import http.server
 import json
@@ -19,6 +20,7 @@ from urllib.request import urlopen
 
 from workspace import PRIMARY, temp_path, validate_output, workspace_path
 import profile_system_cache as system_cache
+import profile_retirement
 from profile_probe import CDP_HELPERS, NOISE_FUNCTION
 
 REPO = Path(__file__).resolve().parents[1]
@@ -26,7 +28,7 @@ W = workspace_path(REPO)
 DRIVE = r'''
 import {readFile} from 'node:fs/promises';
 const [port,first,second,phase,eventLog]=process.argv.slice(1);
-''' + CDP_HELPERS + r'''
+''' + CDP_HELPERS + profile_retirement.HELPERS + r'''
 async function events(){return(await readFile(eventLog,'utf8')).split('\n')
   .filter(s=>s.startsWith('ENCRYPTED_EVENT ')).map(s=>JSON.parse(s.slice(16)))}
 const pages=await until(async()=>{const t=await pageTargets();
@@ -64,6 +66,9 @@ check(Math.abs(observations[0].zoom-(deleted?1:1.2))<.001,'first actual renderer
 check(Math.abs(observations[1].zoom-(allDeleted?1:1.44))<.001,'second actual renderer zoom '+JSON.stringify(observations));
 let live=null;
 if(phase==='live'){
+  const alphaRecord=await seedRecord(a),betaRecord=await seedRecord(b);
+  checkRetainedRecord(await readRecord(a),alphaRecord);
+  checkRetainedRecord(await readRecord(b),betaRecord);
   const alphaNoise=await noise(a),betaNoise=await noise(b);
   for(const identity of [alphaNoise,betaNoise])check(identity.first===identity.repeat&&identity.first===identity.worker,
     'native page/worker farbling identity inconsistent '+JSON.stringify(identity));
@@ -102,6 +107,13 @@ if(phase==='live'){
   check(ownedBefore.filter(t=>['worker','shared_worker','service_worker'].includes(t.type)).length>=4,
     'actual alpha workers did not start '+JSON.stringify(before));
   const retiredIds=new Set(ownedBefore.map(t=>t.id));
+  await value(a,`window.retirementWriter=setInterval(()=>{
+    const marker='record-'+location.hostname;
+    localStorage.setItem('record-value',marker);sessionStorage.setItem('record-value',marker);
+    document.cookie='record_value='+marker+'; Path=/; Secure; SameSite=Lax';
+    try{retainedRecordDb.transaction('values','readwrite').objectStore('values').put(marker,'value')}catch{}
+    retainedRecordCache.put('/record-cache',new Response(marker)).catch(()=>{});
+  },10);true`);
   await sendCommand(a,'delete');
   await until(async()=>(await events()).some(e=>e.event==='deleted'),'key/native teardown/unlink completion');
   const after=await(await fetch('http://127.0.0.1:'+port+'/json/list')).json();
@@ -129,7 +141,11 @@ if(phase==='live'){
   check(freshNoise.first!==alphaNoise.first,'deleted alpha farbling identity was reconstructed');
   const freshSettings=await value(fresh,"navigator.permissions.query({name:'geolocation'}).then(p=>({permission:p.state,zoom:devicePixelRatio}))");
   check(freshSettings.permission==='prompt'&&Math.abs(freshSettings.zoom-1)<.001,'fresh alpha inherited retired settings');
-  live={before,after,tree,beta,alphaNoise,betaNoise,retainedNoise,freshNoise,freshSettings,freshTarget};
+  const freshRecord=await readRecord(fresh),retainedRecord=await readRecord(b);
+  checkRetiredRecord(freshRecord,alphaRecord);
+  checkRetainedRecord(retainedRecord,betaRecord);
+  live={before,after,tree,beta,alphaNoise,betaNoise,retainedNoise,freshNoise,freshSettings,freshTarget,
+    alphaRecord,betaRecord,freshRecord,retainedRecord};
 }
 const reader=phase==='live'?b:a;
 let embeddedRouting=null;
@@ -150,7 +166,7 @@ for(const url of [first,second]){
   check(e.count===(deleted||phase==='live'?0:1),'embed cardinality '+JSON.stringify(embeds));
   if(!deleted&&phase!=='live')check(e.domain===(url===first?'beta.test':'alpha.test'),'canonical embed domain '+JSON.stringify(embeds));
 }
-await sendCommand(reader,'finish');
+await finishProfile(()=>sendCommand(reader,'finish'),events);
 for(const c of sockets)c.ws.close();
 console.log(JSON.stringify({phase,observations,embeds,live,embeddedRouting}));
 '''
@@ -166,6 +182,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if profile_retirement.respond(self):
+            return
         kind = 'text/html'
         body = b'''<!doctype html><body><script>document.body.dataset.site=location.hostname;
 onmessage=e=>{if(e.source===parent&&e.data==='read-list')parent.postMessage(
@@ -247,7 +265,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['encrypted', 'delete', 'keyring'], required=True)
     parser.add_argument('--sdk-case', choices=['guest'])
-    parser.add_argument('--phase', choices=['write'], help='Focused first browser phase only')
+    parser.add_argument('--phase', choices=['write', 'live'], help='Focused browser phase and its required setup')
     parser.add_argument('--inside', action='store_true')
     args = parser.parse_args()
     assert os.environ['TMPDIR'] == str(temp_path(W))
@@ -297,17 +315,26 @@ def main():
             subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-sha256', '-days', '1', '-subj', '/CN=alpha.test', '-keyout', str(key),
                 '-out', str(cert)], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30)
+        # The native HTTP cache refuses responses whose SSLInfo has a cert
+        # error, even when a blanket ignore switch allows navigation. Trust
+        # only this throwaway fixture key through Chromium's SPKI test path,
+        # which produces a successful verification result for these responses.
+        public_key = subprocess.check_output(
+            ['openssl', 'x509', '-in', str(cert), '-pubkey', '-noout'], timeout=10)
+        spki = subprocess.run(['openssl', 'pkey', '-pubin', '-outform', 'DER'],
+            input=public_key, capture_output=True, check=True, timeout=10).stdout
+        trusted_key = base64.b64encode(hashlib.sha256(spki).digest()).decode('ascii')
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(cert, key)
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         first, second = [f'https://{name}:{server.server_port}' for name in ('alpha.test', 'beta.test')]
-        phases = (('write', 'delete', 'after-delete', 'delete-all', 'after-delete-all') if args.check == 'delete' else
+        phases = (('write', 'delete', 'after-delete', 'live', 'after-live-delete', 'delete-all', 'after-delete-all') if args.check == 'delete' else
                   ('write', 'read', 'locked', 'wrong', 'delete', 'after-delete', 'live', 'after-live-delete',
                    'delete-all', 'after-delete-all'))
         if args.phase:
-            phases = (args.phase,)
+            phases = ('write', 'live') if args.phase == 'live' else (args.phase,)
         for phase in phases:
             root = evidence/phase
             root.mkdir()
@@ -330,8 +357,9 @@ def main():
                 port = reserve.getsockname()[1]
             argv = ['xvfb-run', '-a', '-s', '-screen 0 1280x720x24', str(binary),
                 '--alloy-no-disk', '--off-screen-rendering-enabled', '--ozone-platform=x11',
-                '--disable-gpu', '--ignore-certificate-errors', '--remote-debugging-port='+str(port),
-                '--host-resolver-rules=MAP alpha.test 127.0.0.1, MAP beta.test 127.0.0.1']
+                '--disable-gpu', '--ignore-certificate-errors-spki-list='+trusted_key,
+                '--remote-debugging-port='+str(port),
+                '--host-resolver-rules=MAP alpha.test 127.0.0.1, MAP beta.test 127.0.0.1, MAP cdn.test 127.0.0.1']
             env = dict(native_env, TMPDIR=str(temp_path(W)), HOME=str(owned['home']),
                 XDG_CACHE_HOME=str(xdg_cache), XDG_CONFIG_HOME=str(owned['config']),
                 XDG_DATA_HOME=str(owned['data']), XDG_RUNTIME_DIR=str(owned['runtime']),

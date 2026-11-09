@@ -10,6 +10,7 @@
 #include "base/memory/weak_ptr.h"
 #include "base/supports_user_data.h"
 #include "brave/alloy/site_records/request_context_policy.h"
+#include "brave/alloy/site_records/native_profile_configuration.h"
 #include "content/browser/back_forward_cache/back_forward_cache_disable.h"
 #include "content/browser/code_cache/generated_code_cache_context.h"
 #include "content/browser/renderer_host/frame_tree_node.h"
@@ -50,10 +51,14 @@ class ContextData final : public base::SupportsUserData::Data {
     }
     if (!registry_) {
       const auto* mode = RequestContextPolicy::Get(*context_);
+      const auto* input = alloy::site_records::NativeProfileConfiguration::Get(*context_);
       registry_ = std::make_unique<EmbeddedStateRegistry>(
           mode ? mode->profile() : context_->UniqueToken(),
           mode ? mode->storage_mode() : StorageMode::kEncrypted, scope_,
-          std::move(policy_));
+          std::move(policy_), input ? std::make_optional(input->original_generation())
+                                    : std::nullopt,
+          input ? input->record_working_state_admission()
+                : base::RepeatingCallback<bool(std::string_view)>());
     }
     return registry_.get();
   }
@@ -201,6 +206,10 @@ class Selection final : public base::SupportsUserData::Data {
 };
 
 AlloyEmbeddedResolution Admitted(AlloyEmbeddedResolution value) {
+  if (value.backing == Backing::kRealSite && !value.first_party.active()) {
+    value.backing = Backing::kNone;
+    value.temporary_admission_closed = true;
+  }
   if (value.backing == Backing::kTemporary &&
       (!value.temporary ||
        !value.temporary->Capability(StorePurpose::kDomStorage).active())) {
@@ -248,11 +257,14 @@ AlloyEmbeddedResolution Resolve(RenderFrameHost* frame,
   if (!frame->GetParentOrOuterDocument()) {
     if (!RequestContextPolicy::IsStateless(*frame->GetBrowserContext()) &&
         !alloy::site_records::RecordDomainForPrincipal(url, origin).empty()) {
-      result.backing = Backing::kRealSite;
+      result = registry->ResolveFirstParty(url, origin);
     }
   } else {
     result = registry->Resolve(tab->tab(), url, origin);
   }
+  // Unconfigured legacy contexts keep their ordinary native persistence.
+  if (!RequestContextPolicy::Get(*frame->GetBrowserContext()))
+    result.first_party_state.reset();
   if (!owner || !context_lifetime) {
     return {};
   }
@@ -367,6 +379,15 @@ void RevokeAlloyEmbeddedSite(BrowserContext& context,
           static_cast<ContextData*>(context.GetUserData(&kContextKey))) {
     data->RevokeSite(document_url, document_origin);
   }
+}
+
+base::OnceClosure BeginAlloyFirstPartyRetirement(BrowserContext& context,
+                                                const GURL& site) {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  auto* data = Context(context);
+  auto* registry = data ? data->registry() : nullptr;
+  return registry ? registry->BeginFirstPartyRetirement(site, url::Origin::Create(site))
+                  : base::OnceClosure();
 }
 
 AlloyEmbeddedResolution GetAlloyEmbeddedStateForDocument(

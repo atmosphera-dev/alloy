@@ -499,6 +499,12 @@ class SessionRouter final : public AlloySessionStorageRouter {
                                  base::OnceClosure(barrier)));
     }
   }
+  void RetireStorage(const blink::StorageKey& key,
+                     RetireStorageCallback callback) override {
+    // R13 separately destroys matching temporary graphs. This retires only
+    // the real-site key across the shared native namespaces.
+    real_->RetireStorage(key, std::move(callback));
+  }
   void CleanUpStorage(CleanUpStorageCallback callback) override {
     auto controls = Controls();
     auto barrier = base::BarrierClosure(controls.size(), std::move(callback));

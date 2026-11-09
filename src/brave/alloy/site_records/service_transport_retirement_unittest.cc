@@ -273,7 +273,7 @@ class ServiceTransportRetirementTest : public testing::Test {
   net::EmbeddedTestServer server_;
   std::unique_ptr<NetworkRetirementTestContext> network_;
   raw_ptr<network::NetworkContext> context_ = nullptr;
-  raw_ptr<net::MockHostResolver> resolver_ = nullptr;
+  raw_ptr<net::MockHostResolverBase> resolver_ = nullptr;
 };
 
 TEST_F(ServiceTransportRetirementTest,

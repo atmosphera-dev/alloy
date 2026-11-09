@@ -162,6 +162,34 @@ Unrelated records and user-selected external files are preserved. `LockAsync`
 revokes the original context's keys, native owners and preference caches before
 completion. Unlocking does not reauthorize an old context.
 
+### Native first-party working state
+
+Record deletion also retires the native working state of every attached request
+context, not just its encrypted files. A captured record lease closes admission
+before teardown. Replacement admission opens only after the native owners and
+the record coordinator finish; a context created during deletion observes the
+same shared admission block. Old documents, pending navigations and retained
+storage endpoints cannot adopt the replacement lease.
+
+| # | Native state | Retirement owner |
+|---|---|---|
+| 1 | Cookies, including partitioned cookies and bound script-cookie endpoints | Native network context and cookie store |
+| 2 | localStorage and sessionStorage, including namespace clones | DOM storage service; old area endpoints are disconnected |
+| 3 | IndexedDB, Cache Storage, OPFS, managed filesystems and quota metadata | Native quota clients, with deletion statuses joined |
+| 4 | Service workers, script resources and dependent background registrations | Existing worker teardown and native storage deletion |
+| 5 | HTTP and No-Vary-Search caches | Native resource and isolation-key ownership |
+| 6 | Generated code, media salts and persistent origin-trial working state | Record-owned native service instances |
+| 7 | HSTS, server properties, Reporting/NEL configuration, auth, DNS and client-certificate decisions | Typed native network owners; unrelated sites and proxy authentication are preserved |
+| 8 | History, visited-link projections, favicon mappings and download metadata | Native history, favicon and download owners; mappings without a history visit are included |
+| 9 | Notifications and CDM working files | Native endpoint and data retirement; this does not enable persistent CDM licenses |
+
+The existing targeted transport barrier drains old network writers before
+native data is removed. It also retires CORS preflight, shared-dictionary and
+connection state. Native failure or a dropped storage reply is not reported as
+successful deletion. Another site's own data remains intact, including shared
+favicon content still referenced by that site's pages. User-selected external
+files are never deleted by this operation.
+
 The profile and context embed-list accessors share the same encrypted owner;
 guest context accessors use memory only, and stateless access is refused. See
 [embed-list settings](embed-list-settings.md) for callback, validation and

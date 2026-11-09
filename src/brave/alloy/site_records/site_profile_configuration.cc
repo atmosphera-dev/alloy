@@ -26,6 +26,8 @@ std::unique_ptr<NativeProfileConfiguration> MakeSiteProfileConfiguration(
   CHECK(view && settings && view->source_owner() == settings.get());
   NativeProfileConfiguration::Bindings bindings;
   bindings.prefs = view;
+  bindings.record_working_state_admitted = base::BindRepeating(
+      &SitePrefStore::RecordWorkingStateAdmitted, settings);
   bindings.admitted = base::BindRepeating([](base::WeakPtr<NativePrefView> view,
       base::RepeatingCallback<bool()> consumer_admitted) {
     return view && view->CanStartServiceConstruction() &&

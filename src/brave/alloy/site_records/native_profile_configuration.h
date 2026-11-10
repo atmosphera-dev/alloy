@@ -26,6 +26,7 @@ class NativeProfileConfiguration final {
   struct Bindings {
     scoped_refptr<PersistentPrefStore> prefs;
     base::RepeatingCallback<bool()> admitted;
+    base::RepeatingCallback<bool(std::string_view)> record_working_state_admitted;
     base::OnceCallback<bool(base::OnceClosure)> begin_construction;
     base::RepeatingClosure construction_finished;
     base::OnceClosure finish_teardown;
@@ -39,6 +40,9 @@ class NativeProfileConfiguration final {
   NativeProfileConfiguration& operator=(const NativeProfileConfiguration&) = delete;
 
   bool admitted() const;
+  base::RepeatingCallback<bool(std::string_view)> record_working_state_admission() const {
+    return bindings_.record_working_state_admitted;
+  }
   bool BeginConstruction();
   void SetTeardownHandler(base::OnceClosure teardown);
   void ConstructionFinished();

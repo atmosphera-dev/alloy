@@ -82,6 +82,8 @@ network::mojom::NetworkContext* AlloyNetworkContextForStateOwner(
     BrowserContext* context) {
   if (!AlloyStateOwnerForContext(owner, context))
     return GetAlloyNetworkContextForDocument(nullptr);
+  if (AlloyEmbeddedStateForStateOwner(owner, context).temporary_admission_closed)
+    return GetAlloyNetworkContextForDocument(nullptr);
   auto* handle = static_cast<NavigationOrDocumentHandle*>(owner.get());
   if (auto* frame = handle->GetDocument()) {
     return GetAlloyNetworkContextForDocument(

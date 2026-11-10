@@ -22,6 +22,7 @@ class StoragePartitionImpl;
 
 // The caller supplies original browser-captured scope authority. A closed
 // selection returns no receiver set and must never fall through to real data.
+// Exhausted code-cache capacity also returns null without retiring other state.
 CONTENT_EXPORT CodeCacheHostImpl::ReceiverSet*
 GetAlloyEmbeddedCodeCacheReceivers(
     StoragePartitionImpl& partition,
@@ -43,7 +44,9 @@ CONTENT_EXPORT void ShutdownAlloyEmbeddedState(BrowserContext& context);
 // callers supply the trusted site principal, never a renderer-provided nonce.
 CONTENT_EXPORT void RevokeAlloyEmbeddedSite(BrowserContext& context,
                                             const GURL& document_url,
-                                            const url::Origin& document_origin);
+                                           const url::Origin& document_origin);
+CONTENT_EXPORT base::OnceClosure BeginAlloyFirstPartyRetirement(
+    BrowserContext& context, const GURL& site);
 
 // These resolve browser-owned principals and the canonical navigation/document
 // owner before binding any native store. The selection travels with content's

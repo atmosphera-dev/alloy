@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "content/browser/alloy_embedded_state.h"
 
+#include <atomic>
+#include <set>
 #include <utility>
 
 #include "base/check.h"
+#include "base/check_op.h"
 #include "base/functional/bind.h"
 #include "base/memory/raw_ref.h"
 #include "base/memory/weak_ptr.h"
 #include "base/supports_user_data.h"
 #include "brave/alloy/site_records/request_context_policy.h"
+#include "brave/alloy/site_records/native_profile_configuration.h"
 #include "content/browser/back_forward_cache/back_forward_cache_disable.h"
 #include "content/browser/code_cache/generated_code_cache_context.h"
 #include "content/browser/renderer_host/frame_tree_node.h"
@@ -39,6 +43,38 @@ using Backing = EmbeddedStateRegistry::Backing;
 const char kContextKey = 0;
 const char kSelectionKey = 0;
 
+// Admission-cap fallback for the cross-record entry-LRU follow-up. This is a
+// fixed process total, matching Chromium's 80 MiB default code-cache size, not
+// a sum that grows with visited sites. Entry LRU: github.com/atmosphera-dev/alloy/issues/13.
+// Each bundle reserves all four possible
+// native data budgets: JS, Wasm, the JS memory front-cache and persistent-cache
+// collection. Non-cache state is never evicted to make room.
+constexpr size_t kCodeCacheTotalBytes = 80 * 1024 * 1024;
+constexpr int kCodeCacheBackendBytes = 4 * 1024 * 1024;
+constexpr size_t kCodeCacheBundleBytes = 4 * kCodeCacheBackendBytes;
+std::atomic<size_t> g_code_cache_reserved_bytes{0};
+
+class CodeCacheReservation final {
+ public:
+  CodeCacheReservation(const CodeCacheReservation&) = delete;
+  CodeCacheReservation& operator=(const CodeCacheReservation&) = delete;
+  static std::unique_ptr<CodeCacheReservation> Acquire() {
+    size_t current = g_code_cache_reserved_bytes.load();
+    while (current <= kCodeCacheTotalBytes - kCodeCacheBundleBytes) {
+      if (g_code_cache_reserved_bytes.compare_exchange_weak(
+              current, current + kCodeCacheBundleBytes))
+        return std::unique_ptr<CodeCacheReservation>(new CodeCacheReservation);
+    }
+    return nullptr;
+  }
+  ~CodeCacheReservation() {
+    CHECK_GE(g_code_cache_reserved_bytes.fetch_sub(kCodeCacheBundleBytes),
+             kCodeCacheBundleBytes);
+  }
+ private:
+  CodeCacheReservation() = default;
+};
+
 class ContextData final : public base::SupportsUserData::Data {
  public:
   explicit ContextData(BrowserContext& context) : context_(context) {}
@@ -50,10 +86,21 @@ class ContextData final : public base::SupportsUserData::Data {
     }
     if (!registry_) {
       const auto* mode = RequestContextPolicy::Get(*context_);
+      const auto* input = alloy::site_records::NativeProfileConfiguration::Get(*context_);
       registry_ = std::make_unique<EmbeddedStateRegistry>(
           mode ? mode->profile() : context_->UniqueToken(),
           mode ? mode->storage_mode() : StorageMode::kEncrypted, scope_,
-          std::move(policy_));
+          std::move(policy_), input ? std::make_optional(input->original_generation())
+                                    : std::nullopt,
+          base::BindRepeating(
+              [](base::WeakPtr<ContextData> owner,
+                 base::RepeatingCallback<bool(std::string_view)> admitted,
+                 std::string_view site) {
+                return owner && !owner->retiring_sites_.contains(site) &&
+                    (!admitted || admitted.Run(site));
+              }, weak_factory_.GetWeakPtr(),
+              input ? input->record_working_state_admission()
+                    : base::RepeatingCallback<bool(std::string_view)>()));
     }
     return registry_.get();
   }
@@ -87,6 +134,19 @@ class ContextData final : public base::SupportsUserData::Data {
       registry_->RevokeSite(url, origin);
     }
   }
+  base::OnceClosure BeginFirstPartyRetirement(const GURL& site) {
+    if (closed_ || context_->ShutdownStarted()) return {};
+    const auto origin = url::Origin::Create(site);
+    if (registry_) return registry_->BeginFirstPartyRetirement(site, origin);
+    // Keep the pre-document configuration window open. A later registry uses
+    // the same context-owned admission block, even without profile settings.
+    const auto domain = alloy::site_records::RecordDomainForPrincipal(site, origin);
+    CHECK(!domain.empty());
+    CHECK(retiring_sites_.insert(domain).second);
+    return base::BindOnce([](base::WeakPtr<ContextData> owner, std::string domain) {
+      if (owner) owner->retiring_sites_.erase(domain);
+    }, weak_factory_.GetWeakPtr(), domain);
+  }
   base::WeakPtr<ContextData> GetWeakPtr() {
     return closed_ ? base::WeakPtr<ContextData>() : weak_factory_.GetWeakPtr();
   }
@@ -96,6 +156,7 @@ class ContextData final : public base::SupportsUserData::Data {
   EmbeddedStateScope scope_ = EmbeddedStateScope::kPerOuterSite;
   std::unique_ptr<EmbeddedFirstPartyPolicy> policy_;
   std::unique_ptr<EmbeddedStateRegistry> registry_;
+  std::set<std::string, std::less<>> retiring_sites_;
   bool closed_ = false;
   base::WeakPtrFactory<ContextData> weak_factory_{this};
 };
@@ -173,9 +234,15 @@ WEB_CONTENTS_USER_DATA_KEY_IMPL(TabData);
 
 class EmbeddedCodeCacheService final : public KeyedService {
  public:
-  EmbeddedCodeCacheService()
-      : context_(base::MakeRefCounted<GeneratedCodeCacheContext>()) {
-    context_->InitializeInMemory(20 * 1024 * 1024);
+  static std::unique_ptr<KeyedService> Create() {
+    auto reservation = CodeCacheReservation::Acquire();
+    if (!reservation) return nullptr;
+    return std::make_unique<EmbeddedCodeCacheService>(std::move(reservation));
+  }
+  explicit EmbeddedCodeCacheService(std::unique_ptr<CodeCacheReservation> reservation)
+      : reservation_(std::move(reservation)),
+        context_(base::MakeRefCounted<GeneratedCodeCacheContext>()) {
+    context_->InitializeInMemory(kCodeCacheBackendBytes);
     receivers_ = std::make_unique<CodeCacheHostImpl::ReceiverSet>(context_);
   }
   ~EmbeddedCodeCacheService() override { Shutdown(); }
@@ -183,13 +250,20 @@ class EmbeddedCodeCacheService final : public KeyedService {
     if (!context_)
       return;
     // Destruction and context teardown are ordered on the native cache runner.
+    auto runner = GeneratedCodeCacheContext::GetTaskRunner(context_);
     receivers_.reset();
     context_->Shutdown();
-    context_.reset();
+    // Do not make capacity reusable merely because shutdown was scheduled.
+    // The native shutdown task must first destroy the actual cache backends.
+    runner->PostTask(FROM_HERE, base::BindOnce(
+        [](scoped_refptr<GeneratedCodeCacheContext>,
+           std::unique_ptr<CodeCacheReservation>) {},
+        std::move(context_), std::move(reservation_)));
   }
   CodeCacheHostImpl::ReceiverSet* receivers() { return receivers_.get(); }
 
  private:
+  std::unique_ptr<CodeCacheReservation> reservation_;
   scoped_refptr<GeneratedCodeCacheContext> context_;
   std::unique_ptr<CodeCacheHostImpl::ReceiverSet> receivers_;
 };
@@ -201,6 +275,10 @@ class Selection final : public base::SupportsUserData::Data {
 };
 
 AlloyEmbeddedResolution Admitted(AlloyEmbeddedResolution value) {
+  if (value.backing == Backing::kRealSite && !value.first_party.active()) {
+    value.backing = Backing::kNone;
+    value.temporary_admission_closed = true;
+  }
   if (value.backing == Backing::kTemporary &&
       (!value.temporary ||
        !value.temporary->Capability(StorePurpose::kDomStorage).active())) {
@@ -248,11 +326,14 @@ AlloyEmbeddedResolution Resolve(RenderFrameHost* frame,
   if (!frame->GetParentOrOuterDocument()) {
     if (!RequestContextPolicy::IsStateless(*frame->GetBrowserContext()) &&
         !alloy::site_records::RecordDomainForPrincipal(url, origin).empty()) {
-      result.backing = Backing::kRealSite;
+      result = registry->ResolveFirstParty(url, origin);
     }
   } else {
     result = registry->Resolve(tab->tab(), url, origin);
   }
+  // Unconfigured legacy contexts keep their ordinary native persistence.
+  if (!RequestContextPolicy::Get(*frame->GetBrowserContext()))
+    result.first_party_state.reset();
   if (!owner || !context_lifetime) {
     return {};
   }
@@ -321,7 +402,7 @@ CodeCacheHostImpl::ReceiverSet* GetAlloyEmbeddedCodeCacheReceivers(
           base::BindOnce(
               [](alloy::site_records::RecordCapability)
                   -> std::unique_ptr<KeyedService> {
-                return std::make_unique<EmbeddedCodeCacheService>();
+                return EmbeddedCodeCacheService::Create();
               }),
           &partition));
   return service ? service->receivers() : nullptr;
@@ -367,6 +448,13 @@ void RevokeAlloyEmbeddedSite(BrowserContext& context,
           static_cast<ContextData*>(context.GetUserData(&kContextKey))) {
     data->RevokeSite(document_url, document_origin);
   }
+}
+
+base::OnceClosure BeginAlloyFirstPartyRetirement(BrowserContext& context,
+                                                const GURL& site) {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  auto* data = Context(context);
+  return data ? data->BeginFirstPartyRetirement(site) : base::OnceClosure();
 }
 
 AlloyEmbeddedResolution GetAlloyEmbeddedStateForDocument(

@@ -47,7 +47,11 @@ EmbeddedState::EmbeddedState(base::UnguessableToken profile)
     : issuer_(profile,
               base::UnguessableToken::Create(),
               base::UnguessableToken::Create(),
-              StorageMode::kMemory) {}
+               StorageMode::kMemory) {}
+
+EmbeddedState::EmbeddedState(const RecordCapability& profile_settings)
+    : issuer_(profile_settings, base::UnguessableToken::Create(),
+              base::UnguessableToken::Create(), StorageMode::kMemory) {}
 
 EmbeddedState::~EmbeddedState() {
   Retire();
@@ -125,11 +129,15 @@ EmbeddedStateRegistry::EmbeddedStateRegistry(
     base::UnguessableToken profile,
     StorageMode mode,
     EmbeddedStateScope scope,
-    std::unique_ptr<EmbeddedFirstPartyPolicy> policy)
+    std::unique_ptr<EmbeddedFirstPartyPolicy> policy,
+    std::optional<RecordCapability> profile_settings,
+    base::RepeatingCallback<bool(std::string_view)> record_admitted)
     : profile_(profile),
       mode_(mode),
       scope_(scope),
-      policy_(std::move(policy)) {
+      policy_(std::move(policy)),
+      profile_settings_(std::move(profile_settings)),
+      record_admitted_(std::move(record_admitted)) {
   CHECK(!profile_.is_empty());
   CHECK(scope_ == EmbeddedStateScope::kPerOuterSite ||
         scope_ == EmbeddedStateScope::kPerTab);
@@ -238,7 +246,7 @@ EmbeddedStateRegistry::Resolution EmbeddedStateRegistry::Resolve(
     return {};
   }
   if (frame_site == outer_site) {
-    return {Backing::kRealSite, nullptr};
+    return ResolveFirstParty(frame_url, frame_origin);
   }
   auto alive = weak_factory_.GetWeakPtr();
   const auto generation = outer->second.generation;
@@ -260,7 +268,9 @@ EmbeddedStateRegistry::Resolution EmbeddedStateRegistry::Resolve(
     return {};
   }
   if (listed) {
-    return {Backing::kRealSite, nullptr, true};
+    auto result = ResolveFirstParty(frame_url, frame_origin);
+    result.considered_first_party = result.backing == Backing::kRealSite;
+    return result;
   }
   const auto key = Key(tab, outer_site);
   auto [entry, created] = scopes_.try_emplace(key);
@@ -272,6 +282,43 @@ EmbeddedStateRegistry::Resolution EmbeddedStateRegistry::Resolve(
     state = base::MakeRefCounted<EmbeddedState>(profile_);
   }
   return {Backing::kTemporary, state};
+}
+
+EmbeddedStateRegistry::Resolution EmbeddedStateRegistry::ResolveFirstParty(
+    const GURL& url, const url::Origin& origin) {
+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+  const auto site = RecordDomainForPrincipal(url, origin);
+  if (closed_ || mode_ == StorageMode::kStateless || site.empty() ||
+      retiring_first_party_.contains(site) ||
+      (record_admitted_ && !record_admitted_.Run(site)) ||
+      (profile_settings_ && !profile_settings_->active())) {
+    return {.temporary_admission_closed = true};
+  }
+  auto& state = first_party_[site];
+  if (!state) {
+    state = profile_settings_ ? base::MakeRefCounted<EmbeddedState>(*profile_settings_)
+                              : base::MakeRefCounted<EmbeddedState>(profile_);
+  }
+  return {.backing = Backing::kRealSite,
+          .first_party = state->Capability(StorePurpose::kDocumentWorkingState),
+          .first_party_state = state};
+}
+
+base::OnceClosure EmbeddedStateRegistry::BeginFirstPartyRetirement(
+    const GURL& url, const url::Origin& origin) {
+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+  const auto site = RecordDomainForPrincipal(url, origin);
+  CHECK(!site.empty());
+  CHECK(retiring_first_party_.insert(site).second);
+  // Detach/revoke before any native callbacks. No old selection can resolve
+  // a replacement lease, and new selections remain closed until publication.
+  auto found = first_party_.extract(site);
+  auto publication = base::BindOnce([](base::WeakPtr<EmbeddedStateRegistry> owner,
+                           std::string site) {
+    if (owner) owner->retiring_first_party_.erase(site);
+  }, weak_factory_.GetWeakPtr(), site);
+  if (!found.empty()) found.mapped()->Retire();
+  return publication;
 }
 
 void EmbeddedStateRegistry::RevokeSite(const GURL& document_url,
@@ -355,6 +402,10 @@ void EmbeddedStateRegistry::Shutdown() {
     return;
   }
   closed_ = true;
+  auto first_party = std::move(first_party_);
+  first_party_.clear();
+  for (auto& [domain, state] : first_party) state->RevokeAdmission();
+  retiring_first_party_.clear();
   weak_factory_.InvalidateWeakPtrs();
   tabs_.clear();
   pending_commits_.clear();
@@ -363,6 +414,7 @@ void EmbeddedStateRegistry::Shutdown() {
   auto scopes = std::move(scopes_);
   scopes_.clear();
   std::vector<scoped_refptr<EmbeddedState>> retired;
+  for (auto& [domain, state] : first_party) retired.push_back(std::move(state));
   for (auto& [key, entry] : scopes) {
     entry->keepalive.Stop();
     for (auto& [site, state] : entry->sites) {

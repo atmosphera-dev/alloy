@@ -9,6 +9,8 @@
 #include "base/process/launch.h"
 #include "base/test/multiprocess_test.h"
 #include "base/test/task_environment.h"
+#include "base/test/bind.h"
+#include "base/test/test_future.h"
 #include "components/content_settings/core/browser/host_content_settings_map.h"
 #include "components/content_settings/core/common/content_settings.h"
 #include "components/content_settings/core/common/content_settings_types.h"
@@ -163,6 +165,8 @@ TEST_F(SitePrefStoreTest, DeletionRevokesNativePermissionAndGeneratedReferencesB
     EXPECT_EQ(CONTENT_SETTING_ALLOW, Permission(a_));
     EXPECT_FALSE(store_->IsConsideredFirstParty(a_, b_));
     EXPECT_TRUE(store_->IsConsideredFirstParty(a_, c_));
+    EXPECT_FALSE(store_->RecordWorkingStateAdmitted("beta.test"));
+    EXPECT_TRUE(store_->RecordWorkingStateAdmitted("alpha.test"));
     EXPECT_EQ(std::string::npos, Text(Shard(a_)).find("beta.test"));
     RecordInfo record;
     // R13 keeps admission closed throughout live teardown, even for lookup.
@@ -172,6 +176,7 @@ TEST_F(SitePrefStoreTest, DeletionRevokesNativePermissionAndGeneratedReferencesB
     for (const auto& live : records) EXPECT_NE("beta.test", live.domain);
   }, &deletion));
   EXPECT_TRUE(callback);
+  EXPECT_TRUE(store_->RecordWorkingStateAdmitted("beta.test"));
   RecordInfo absent;
   EXPECT_EQ(FileStatus::kNotFound, files_->ResolveRecord(b_, url::Origin::Create(b_), false, &absent));
   Reopen();
@@ -184,6 +189,46 @@ TEST_F(SitePrefStoreTest, DeletionRevokesNativePermissionAndGeneratedReferencesB
   ASSERT_TRUE(zooms);
   EXPECT_EQ(nullptr, zooms->Find("beta.test"));
   ASSERT_TRUE(zooms->Find("one.alpha.test"));
+}
+
+TEST_F(SitePrefStoreTest, NativeRetirementPublicationKeepsReentrantDeletionQueued) {
+  Populate();
+  bool published = false;
+  bool nested_teardown = false;
+  base::test::TestFuture<FileStatus, RecordDeletion> outer, nested;
+  store_->DeleteSiteWithTeardownAsync(b_, base::BindLambdaForTesting(
+      [&](SitePrefStore::Completion done) {
+        store_->DeferNativeRetirementNotification(base::BindLambdaForTesting([&] {
+          EXPECT_FALSE(store_->RecordWorkingStateAdmitted("beta.test"));
+          EXPECT_EQ(FileStatus::kBusy, store_->Flush());
+          // The durable filesystem deletion has finished, but native publication
+          // is still in progress. Even an independently recreated record must
+          // not start another coordinator teardown from this nested loop.
+          RecordInfo replacement;
+          ASSERT_EQ(FileStatus::kOk, files_->ResolveRecord(
+              b_, url::Origin::Create(b_), true, &replacement));
+          store_->DeleteSiteWithTeardownAsync(b_, base::BindLambdaForTesting(
+              [&](SitePrefStore::Completion resumed) {
+                nested_teardown = true;
+                EXPECT_TRUE(published);
+                std::move(resumed).Run(FileStatus::kOk);
+              }), nested.GetCallback());
+          tasks_.RunUntilIdle();
+          EXPECT_FALSE(nested_teardown);
+          EXPECT_FALSE(nested.IsReady());
+        }));
+        store_->DeferNativeRetirementNotification(base::BindLambdaForTesting([&] {
+          published = true;
+        }));
+        std::move(done).Run(FileStatus::kOk);
+      }), outer.GetCallback());
+  ASSERT_TRUE(outer.Wait());
+  EXPECT_EQ(FileStatus::kOk, outer.Get<0>());
+  ASSERT_TRUE(nested.Wait());
+  EXPECT_EQ(FileStatus::kOk, nested.Get<0>());
+  EXPECT_TRUE(published);
+  EXPECT_TRUE(nested_teardown);
+  EXPECT_TRUE(store_->RecordWorkingStateAdmitted("beta.test"));
 }
 
 TEST_F(SitePrefStoreTest, UnlistedCrossSitePermissionIsVolatileAndNeverCreatesAnEmbeddedRecord) {

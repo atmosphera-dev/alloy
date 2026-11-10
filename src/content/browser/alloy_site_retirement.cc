@@ -5,9 +5,17 @@
 #include <set>
 #include <vector>
 
+#include "base/barrier_closure.h"
 #include "base/functional/bind.h"
+#include "base/task/bind_post_task.h"
 #include "base/memory/ref_counted.h"
 #include "base/task/single_thread_task_runner.h"
+#include "components/services/storage/public/mojom/local_storage_control.mojom.h"
+#include "components/services/storage/public/mojom/session_storage_control.mojom.h"
+#include "content/browser/dom_storage/dom_storage_context_wrapper.h"
+#include "content/browser/notifications/platform_notification_context_impl.h"
+#include "content/browser/media/cdm_storage_manager.h"
+#include "media/media_buildflags.h"
 #include "content/browser/renderer_host/frame_tree.h"
 #include "content/browser/renderer_host/frame_tree_node.h"
 #include "content/browser/renderer_host/render_frame_host_impl.h"
@@ -18,6 +26,14 @@
 #include "content/browser/worker_host/dedicated_worker_host.h"
 #include "content/browser/worker_host/dedicated_worker_service_impl.h"
 #include "content/public/browser/browser_context.h"
+#include "content/public/browser/browser_task_traits.h"
+#include "content/public/browser/browser_thread.h"
+#include "content/public/browser/browsing_data_filter_builder.h"
+#include "content/public/browser/browsing_data_remover.h"
+#include "net/base/alloy_network_record_target.h"
+#include "mojo/public/cpp/bindings/callback_helpers.h"
+#include "services/network/public/mojom/network_context.mojom.h"
+#include "storage/browser/quota/quota_manager.h"
 #include "content/public/browser/permission_controller_delegate.h"
 #include "content/public/browser/dedicated_worker_service.h"
 #include "content/public/browser/shared_worker_service.h"
@@ -28,6 +44,161 @@
 
 namespace content {
 namespace {
+class FirstPartyStoresRetirement final : public BrowsingDataRemover::Observer {
+ public:
+  FirstPartyStoresRetirement(BrowserContext* context, std::string domain,
+                             base::OnceCallback<void(bool)> done)
+      : remover_(context->GetBrowsingDataRemover()), domain_(std::move(domain)),
+        done_(std::move(done)) {}
+  void Start(BrowserContext* context) {
+    context->ForEachLoadedStoragePartition([&](StoragePartition* partition) {
+      partitions_.push_back(partition->GetConfig());
+      auto* impl = static_cast<StoragePartitionImpl*>(partition);
+#if BUILDFLAG(ENABLE_LIBRARY_CDMS)
+      if (auto* cdm = static_cast<CdmStorageManager*>(impl->GetCdmStorageDataModel())) {
+        ++pending_;
+        cdm->RetireAlloyRecord(domain_, base::BindOnce(
+            &FirstPartyStoresRetirement::NativeDone, base::Unretained(this)));
+      }
+#endif
+      if (auto* notifications = impl->GetPlatformNotificationContext()) {
+        ++pending_;
+        notifications->RetireAlloyRecord(domain_, base::BindOnce(
+            [](FirstPartyStoresRetirement* self, bool success, size_t) {
+              self->NativeDone(success);
+            }, base::Unretained(this)));
+      }
+      impl->ForEachNetworkContext([&](network::mojom::NetworkContext* network,
+                                     cert_verifier::mojom::CertVerifierServiceUpdater*) {
+        ++pending_;
+        network->RetireAlloyRecordData(domain_, mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+            base::BindOnce(&FirstPartyStoresRetirement::NativeDone,
+                           base::Unretained(this)), false));
+      });
+      auto* dom = impl->GetDOMStorageContext();
+      ++pending_;
+      dom->GetLocalStorageControl()->GetUsage(mojo::WrapCallbackWithDropHandler(
+          base::BindOnce([](FirstPartyStoresRetirement* self,
+                            scoped_refptr<DOMStorageContextWrapper> dom,
+                            std::vector<storage::mojom::StorageUsageInfoPtr> entries) {
+            for (const auto& entry : entries) if (self->Owns(entry->storage_key)) {
+              ++self->pending_;
+              dom->GetLocalStorageControl()->RetireStorage(entry->storage_key,
+                  mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+                      base::BindOnce(&FirstPartyStoresRetirement::NativeDone,
+                                     base::Unretained(self)), false));
+            }
+            self->NativeDone(true);
+          }, base::Unretained(this), base::WrapRefCounted(dom)),
+          base::BindOnce(&FirstPartyStoresRetirement::NativeDone,
+                         base::Unretained(this), false)));
+      ++pending_;
+      dom->GetSessionStorageControl()->GetUsage(mojo::WrapCallbackWithDropHandler(
+          base::BindOnce([](FirstPartyStoresRetirement* self,
+                            scoped_refptr<DOMStorageContextWrapper> dom,
+                            std::vector<storage::mojom::SessionStorageUsageInfoPtr> entries) {
+            std::set<blink::StorageKey> keys;
+            for (const auto& entry : entries) if (self->Owns(entry->storage_key))
+              keys.insert(entry->storage_key);
+            for (const auto& key : keys) {
+              ++self->pending_;
+              dom->GetSessionStorageControl()->RetireStorage(key,
+                  mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+                      base::BindOnce(&FirstPartyStoresRetirement::NativeDone,
+                                     base::Unretained(self)), false));
+            }
+            self->NativeDone(true);
+          }, base::Unretained(this), base::WrapRefCounted(dom)),
+          base::BindOnce(&FirstPartyStoresRetirement::NativeDone,
+                         base::Unretained(this), false)));
+      // The ordinary ClearData path drops quota-client error statuses. R13
+      // instead checks the actual force-close/delete result for every bucket.
+      ++pending_;
+      scoped_refptr<storage::QuotaManager> quota = impl->GetQuotaManager();
+      auto ui = GetUIThreadTaskRunner({});
+      auto target = *net::AlloyNetworkRecordTarget::FromCanonicalDomain(domain_);
+      GetIOThreadTaskRunner({})->PostTask(FROM_HERE, base::BindOnce(
+          [](scoped_refptr<storage::QuotaManager> quota,
+             net::AlloyNetworkRecordTarget target, base::OnceCallback<void(bool)> done) {
+            quota->GetBucketsModifiedBetween(base::Time(), base::Time::Max(),
+                base::BindOnce([](scoped_refptr<storage::QuotaManager> quota,
+                                  net::AlloyNetworkRecordTarget target,
+                                  base::OnceCallback<void(bool)> done,
+                                  const std::set<storage::BucketLocator>& buckets) {
+                  std::vector<storage::BucketLocator> owned;
+                  for (const auto& bucket : buckets)
+                    if (target.Owns(bucket.storage_key.origin())) owned.push_back(bucket);
+                  auto success = std::make_shared<bool>(true);
+                  auto removed = base::BarrierClosure(owned.size(), base::BindOnce(
+                      [](std::shared_ptr<bool> success, base::OnceCallback<void(bool)> done) {
+                        std::move(done).Run(*success);
+                      }, success, std::move(done)));
+                  for (const auto& bucket : owned) quota->DeleteBucketData(bucket,
+                      storage::AllQuotaClientTypes(), base::BindOnce(
+                          [](std::shared_ptr<bool> success, base::OnceClosure removed,
+                             blink::mojom::QuotaStatusCode status) {
+                            *success = *success && status == blink::mojom::QuotaStatusCode::kOk;
+                            std::move(removed).Run();
+                          }, success, removed));
+                }, quota, target, std::move(done)));
+          }, quota, target, base::BindPostTask(ui,
+               base::BindOnce(&FirstPartyStoresRetirement::NativeDone,
+                              base::Unretained(this)))));
+    });
+    NativeDone(true);
+  }
+  bool Owns(const blink::StorageKey& key) const {
+    return net::AlloyRecordDomainForPrincipal(key.origin().GetURL(), key.origin()) == domain_;
+  }
+  void NativeDone(bool success) {
+    success_ = success_ && success;
+    if (--pending_) return;
+    remaining_ = partitions_.size();
+    if (!remaining_) { FinishSoon(); return; }
+    remover_->AddObserver(this);
+    for (const auto& partition : partitions_) {
+      auto filter = BrowsingDataFilterBuilder::Create(
+          BrowsingDataFilterBuilder::Mode::kDelete);
+      filter->AddRegisterableDomain(domain_);
+      if (!partition.is_default()) filter->SetStoragePartitionConfig(partition);
+      const uint64_t downloads = partition.is_default()
+          ? BrowsingDataRemover::DATA_TYPE_DOWNLOADS : 0;
+      remover_->RemoveWithFilterAndReply(base::Time(), base::Time::Max(),
+          BrowsingDataRemover::DATA_TYPE_DOM_STORAGE |
+              BrowsingDataRemover::DATA_TYPE_CACHE | downloads,
+          BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB |
+              BrowsingDataRemover::ORIGIN_TYPE_PROTECTED_WEB,
+          std::move(filter), this);
+    }
+  }
+  void OnBrowsingDataRemoverDone(uint64_t failed_data_types) override {
+    success_ = success_ && failed_data_types == 0;
+    if (--remaining_) return;
+    remover_->RemoveObserver(this);
+    FinishSoon();
+  }
+  void FinishSoon() {
+    // Keep completion asynchronous even for a context with no loaded stores.
+    // This also keeps a native synchronous reply from deleting our traversal.
+    GetUIThreadTaskRunner({})->PostTask(FROM_HERE, base::BindOnce(
+        &FirstPartyStoresRetirement::Finish, base::Unretained(this)));
+  }
+  void Finish() {
+    auto done = std::move(done_);
+    const bool success = success_;
+    delete this;
+    std::move(done).Run(success);
+  }
+ private:
+  const raw_ptr<BrowsingDataRemover> remover_;
+  const std::string domain_;
+  base::OnceCallback<void(bool)> done_;
+  std::vector<StoragePartitionConfig> partitions_;
+  size_t pending_ = 1;
+  size_t remaining_ = 0;
+  bool success_ = true;
+};
+
 class Retirement;
 class PageWatch final : public WebContentsObserver {
  public:
@@ -254,6 +425,17 @@ void PartitionWatch::StopShared() {
   shared_.clear();
 }
 }  // namespace
+void RetireAlloyFirstPartyStores(BrowserContext* context, const GURL& site,
+                                 base::OnceCallback<void(bool)> done) {
+  const auto target = net::AlloyNetworkRecordTarget::FromPrincipal(
+      site, url::Origin::Create(site));
+  CHECK(context); CHECK(target); CHECK(done);
+  // Self-owned through the remover's completion; the public bridge keeps the
+  // native request context alive through this entire second-stage barrier.
+  auto* retirement = new FirstPartyStoresRetirement(context, target->domain(), std::move(done));
+  retirement->Start(context);
+}
+
 base::OnceClosure PrepareAlloySiteRetirement(BrowserContext* context,
     base::RepeatingCallback<bool(const url::Origin&)> owns,
     base::RepeatingCallback<void(WebContents*)> close_page,

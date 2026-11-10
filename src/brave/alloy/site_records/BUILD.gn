@@ -329,6 +329,7 @@ test("alloy_site_records_unittests") {
     "document_object_grants_unittest.cc",
     "document_settings_unittest.cc",
     "embedded_state_unittest.cc",
+    "first_party_retirement_unittest.cc",
     "independent_prefs_unittest.cc",
     "permission_services_unittest.cc",
     "record_capability_unittest.cc",
@@ -363,6 +364,8 @@ test("alloy_site_records_unittests") {
     "test_main.cc",
   ]
   deps = [
+    ":network_retirement_test_support",
+    "//components/services/storage",
     ":capabilities",
     ":document_settings",
     ":embedded_state",

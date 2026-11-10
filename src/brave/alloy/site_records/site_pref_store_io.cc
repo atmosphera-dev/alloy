@@ -53,13 +53,12 @@ GURL HostUrl(std::string_view host) {
   return ContentSettingsPattern::FromString(host).ToRepresentativeUrl();
 }
 
-bool IsExceptionPref(std::string_view key) {
+const content_settings::WebsiteSettingsRegistry* Registry(
+    const content_settings::WebsiteSettingsRegistry* selected) {
+  if (selected) return selected;
   content_settings::ContentSettingsRegistry::GetInstance();
   content_settings::PermissionSettingsRegistry::GetInstance();
-  for (const auto* info : *content_settings::WebsiteSettingsRegistry::GetInstance()) {
-    if (key == info->pref_name() || key == info->partitioned_pref_name()) return true;
-  }
-  return false;
+  return content_settings::WebsiteSettingsRegistry::GetInstance();
 }
 
 // Preserve native pref keys (including dots) and nested dictionaries. A scalar
@@ -87,11 +86,12 @@ void WipeBuffers(std::map<std::string, std::string>* buffers) {
 }  // namespace
 
 SitePrefStore::SitePrefStore(std::shared_ptr<RecordFileSystem> files,
-                             RecordPrefStore::ErrorCallback on_error)
+                             RecordPrefStore::ErrorCallback on_error,
+                             const content_settings::WebsiteSettingsRegistry* registry)
     : files_(std::move(files)),
       profile_(files_ ? files_->ProfileCapability(StorePurpose::kProfileSettings)
                       : RecordCapability()),
-      on_error_(std::move(on_error)) {
+      on_error_(std::move(on_error)), registry_(registry) {
   CHECK(on_error_);
 }
 
@@ -182,7 +182,8 @@ void SitePrefStore::RemoveValuesByPrefixSilently(std::string_view prefix) {
 
 FileStatus SitePrefStore::Split(const PrefValueMap& values, std::string_view key, const base::Value& value,
                                 std::string_view excluding, Shards* shards,
-                                base::Value* retained) {
+                                base::Value* retained,
+                                const content_settings::WebsiteSettingsRegistry* registry) {
   *retained = value.Clone();
   if (key == kPreferredApps) {
     if (!value.is_list()) return FileStatus::kInvalid;
@@ -201,7 +202,8 @@ FileStatus SitePrefStore::Split(const PrefValueMap& values, std::string_view key
     *retained = base::Value(std::move(kept));
     return FileStatus::kOk;
   }
-  const bool exception = IsExceptionPref(key);
+  registry = Registry(registry);
+  const bool exception = IsRegisteredExceptionPref(key, registry);
   const bool protocol = key == kProtocolHandlers || key == kIgnoredHandlers;
   const auto* origin_dictionary = OriginDictionaryFor(key);
   const bool migration = key == "profile.content_settings.exceptions.migrate_geolocation" ||
@@ -298,7 +300,7 @@ FileStatus SitePrefStore::Split(const PrefValueMap& values, std::string_view key
         persistent = ConsideredFirstParty(values, pair.second.ToRepresentativeUrl(),
                                            pair.first.ToRepresentativeUrl());
       }
-      const auto* sharing = content_settings::WebsiteSettingsRegistry::GetInstance()->Get(
+      const auto* sharing = registry->Get(
           ContentSettingsType::FEDERATED_IDENTITY_SHARING);
       if (sharing && (key == sharing->pref_name() || key == sharing->partitioned_pref_name())) {
         if (!copy.is_dict()) return FileStatus::kInvalid;
@@ -333,13 +335,14 @@ FileStatus SitePrefStore::Split(const PrefValueMap& values, std::string_view key
 
 FileStatus SitePrefStore::Build(std::string_view excluding, Shards* shards,
                                 PrefValueMap* retained) const {
-  return BuildValues(values_, excluding, shards, retained);
+  return BuildValues(values_, excluding, shards, retained, registry_);
 }
 FileStatus SitePrefStore::BuildValues(const PrefValueMap& values, std::string_view excluding,
-                                      Shards* shards, PrefValueMap* retained) {
+                                      Shards* shards, PrefValueMap* retained,
+                                      const content_settings::WebsiteSettingsRegistry* registry) {
   for (const auto& [key, value] : values) {
     base::Value next;
-    const auto status = Split(values, key, value, excluding, shards, &next);
+    const auto status = Split(values, key, value, excluding, shards, &next, registry);
     if (status != FileStatus::kOk) return status;
     retained->SetValue(key, std::move(next));
   }
@@ -624,7 +627,7 @@ FileStatus SitePrefStore::PublishValue(std::string_view key, base::Value value,
   candidate.SetValue(key, std::move(value));
   Shards shards;
   PrefValueMap retained;
-  auto status = BuildValues(candidate, {}, &shards, &retained);
+  auto status = BuildValues(candidate, {}, &shards, &retained, registry_);
   std::map<std::string, std::string> buffers;
   std::vector<SettingsReplacement> replacements;
   if (status == FileStatus::kOk) status = Prepare(shards, {}, &buffers, &replacements);
@@ -651,7 +654,8 @@ FileStatus SitePrefStore::DeleteSite(const GURL& site, std::function<void()> tea
   return files_->FinishRecordDeletion(ticket, result);
 }
 
-FileStatus SitePrefStore::RetireSite(const GURL& site, base::UnguessableToken* ticket) {
+FileStatus SitePrefStore::RetireSite(const GURL& site, base::UnguessableToken* ticket,
+                                     const RecordInfo* expected) {
   scoped_refptr<SitePrefStore> keep_alive(this);
   if (!initialized_ || !Admitted()) return FileStatus::kDenied;
   const auto owner = Domain(site);
@@ -659,13 +663,15 @@ FileStatus SitePrefStore::RetireSite(const GURL& site, base::UnguessableToken* t
   RecordInfo record;
   auto status = files_->ResolveRecord(site, url::Origin::Create(site), false, &record);
   if (status != FileStatus::kOk) return status;
+  if (expected && record.id != expected->id) return FileStatus::kBusy;
   Shards shards;
   PrefValueMap retained;
   status = Build(owner, &shards, &retained);
   std::map<std::string, std::string> buffers;
   std::vector<SettingsReplacement> replacements;
   if (status == FileStatus::kOk) status = Prepare(shards, owner, &buffers, &replacements);
-  if (status == FileStatus::kOk) status = files_->RetireRecordWithSettings(record.id, replacements, ticket);
+  if (status == FileStatus::kOk) status = files_->RetireRecordWithSettings(record.id, replacements, ticket,
+      expected ? std::optional(expected->last_visit_us) : std::nullopt);
   if (status == FileStatus::kOk) {
     timer_.Stop();
     dirty_ = false;
@@ -675,10 +681,18 @@ FileStatus SitePrefStore::RetireSite(const GURL& site, base::UnguessableToken* t
     Install(&retained, true, true);
   }
   WipeBuffers(&buffers);
+  if (expected && (status == FileStatus::kBusy || status == FileStatus::kNotFound)) return status;
   return status == FileStatus::kOk ? status : Fail(status);
 }
 
-void SitePrefStore::InitializeRegistries() { IsExceptionPref({}); }
+bool SitePrefStore::IsRegisteredExceptionPref(std::string_view key,
+    const content_settings::WebsiteSettingsRegistry* registry) {
+  registry = Registry(registry);
+  for (const auto* info : *registry)
+    if (key == info->pref_name() || key == info->partitioned_pref_name()) return true;
+  return false;
+}
+void SitePrefStore::InitializeRegistries() { IsRegisteredExceptionPref({}); }
 
 FileStatus SitePrefStore::PruneSnapshot(base::DictValue values, std::string_view excluding,
                                        base::DictValue* retained) {

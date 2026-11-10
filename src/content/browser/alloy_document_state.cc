@@ -9,10 +9,20 @@
 #include "content/browser/renderer_host/navigation_request.h"
 #include "content/browser/renderer_host/render_frame_host_impl.h"
 #include "content/public/browser/browser_context.h"
+#include "content/public/browser/navigation_handle.h"
+#include "brave/alloy/site_records/native_profile_configuration.h"
 #include "components/keyed_service/core/service_creation_gate.h"
 #include "content/public/browser/storage_partition.h"
 
 namespace content {
+void RecordAlloyCommittedSiteVisit(NavigationHandle* navigation) {
+  if (!navigation || !navigation->HasCommitted() || !navigation->IsInPrimaryMainFrame() ||
+      navigation->IsSameDocument() || navigation->IsErrorPage()) return;
+  auto* frame = navigation->GetRenderFrameHost();
+  if (!AlloyDocumentStateAdmitted(frame)) return;
+  const auto* input = alloy::site_records::NativeProfileConfiguration::Get(*frame->GetBrowserContext());
+  if (input) input->DidCommitSiteVisit(navigation->GetURL(), frame->GetLastCommittedOrigin());
+}
 bool AlloyDocumentStateAdmitted(RenderFrameHost* frame) {
   return frame && !frame->GetBrowserContext()->ShutdownStarted() &&
          ServiceCreationGate::Allows(*frame->GetBrowserContext()) &&

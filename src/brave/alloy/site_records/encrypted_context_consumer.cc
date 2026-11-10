@@ -72,13 +72,19 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
       : phase_(std::move(phase)), first_(std::move(first)), second_(std::move(second)) {
     const bool keyring = std::getenv("ALLOY_ENCRYPTED_KEYRING") != nullptr;
     int keyring_result = ALLOY_KEYRING_FAILED;
-    profile_ = phase_ == "write" ? keyring ? AlloyCreateProfileWithKeyring(path, keyring_result)
+    profile_ = (phase_ == "write" || phase_ == "decay-seed" || phase_ == "decay-live") ? keyring ? AlloyCreateProfileWithKeyring(path, keyring_result)
         : AlloyCreateProfile(path, kPassword) : AlloyOpenProfile(path);
     Check(!!profile_, "profile create/open");
-    if (phase_ != "write" && phase_ != "locked") {
+    if (phase_ != "write" && phase_ != "decay-seed" && phase_ != "decay-live" && phase_ != "locked") {
       const bool unlocked = keyring && phase_ != "wrong" ? profile_->UnlockWithKeyring() == ALLOY_KEYRING_OK :
           profile_->UnlockWithPassword(phase_ == "wrong" ? "wrong-password" : kPassword);
       Check(unlocked == (phase_ != "wrong"), "profile password result");
+    }
+    if (phase_ == "decay-read") {
+      int64_t period = -1; int timebase = -1;
+      Check(profile_->GetDecaySettings(period, timebase) && period == 6 &&
+          timebase == ALLOY_DECAY_SINCE_LAST_VISIT, "persisted decay policy before native reads");
+      std::puts("ENCRYPTED_EVENT {\"event\":\"decay-policy-reopened\",\"seconds\":6}");
     }
   }
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
@@ -126,12 +132,26 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     const auto value = prefix+raw.substr(separator+1);
     if (value == "ALLOY_ENCRYPTED:write") Write();
     if (value == "ALLOY_ENCRYPTED:read") Read();
+    if (value == "ALLOY_ENCRYPTED:enable-decay") {
+      Check(phase_ == "decay-seed" || phase_ == "decay-live", "decay phase");
+      std::thread([profile = profile_] {
+        int64_t period = -1; int timebase = -1;
+        Check(profile->GetDecaySettings(period, timebase) && period == 0,
+              "no built-in decay default");
+        Check(profile->SetDecaySettings(6, ALLOY_DECAY_SINCE_LAST_VISIT), "decay setter durable");
+        Check(!profile->SetDecaySettings(-1, ALLOY_DECAY_SINCE_LAST_VISIT), "negative decay refused");
+        Check(!profile->SetDecaySettings(6, static_cast<alloy_decay_timebase_t>(9)), "unknown decay clock refused");
+        Check(profile->GetDecaySettings(period, timebase) && period == 6 && timebase == ALLOY_DECAY_SINCE_LAST_VISIT,
+              "decay policy readback");
+        std::puts("ENCRYPTED_EVENT {\"event\":\"decay-enabled\",\"seconds\":6}");
+      }).detach();
+    }
     if (value == "ALLOY_ENCRYPTED:delete") {
       Check(phase_ == "live", "live delete phase");
       Check(profile_->DeleteSiteRecord(first_, new DeleteReply), "live delete queued");
     }
     if (value == "ALLOY_ENCRYPTED:recreate") {
-      Check(phase_ == "live" && !recreated_, "fresh live navigation ordering");
+      Check((phase_ == "live" || phase_ == "decay-live") && !recreated_, "fresh live navigation ordering");
       recreated_ = true;
       CreateBrowserForSite(first_+"/page/fresh");
     }
@@ -213,7 +233,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     Check(CefBrowserHost::CreateBrowser(window, this, url, settings, nullptr, context_), "site browser");
   }
   void Write() {
-    Check((phase_ == "write" || phase_ == "live") && browsers_.size() == 2 && !written_, "write command ordering");
+    Check((phase_ == "write" || phase_ == "live" || phase_ == "decay-seed" || phase_ == "decay-live") && browsers_.size() == 2 && !written_, "write command ordering");
     written_ = true;
     WriteMetadata();
     context_->SetContentSetting(first_, first_, CEF_CONTENT_SETTING_TYPE_GEOLOCATION, CEF_CONTENT_SETTING_VALUE_ALLOW);

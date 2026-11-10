@@ -78,6 +78,10 @@ int main(int argc, char** argv) {
   Check(static_cast<bool>(profile), "create");
   if (!profile) return 1;
   Check(profile->GetState() == ALLOY_PROFILE_UNLOCKED, "created-state");
+  int64_t period = -1; int timebase = -1;
+  Check(profile->GetDecaySettings(period, timebase) && period == 0 &&
+      timebase == ALLOY_DECAY_SINCE_LAST_VISIT, "decay-no-default");
+  Check(profile->SetDecaySettings(86400, ALLOY_DECAY_SINCE_LAST_VISIT), "decay-persist");
   Check(profile->Lock(), "lock");
   Check(!profile->UnlockWithPassword("wrong-password"), "wrong-password");
   profile = nullptr;
@@ -86,6 +90,7 @@ int main(int argc, char** argv) {
   if (!profile) return 1;
   Check(profile->GetState() == ALLOY_PROFILE_LOCKED, "reopen-state");
   Check(profile->UnlockWithPassword(kPassword), "unicode-unlock");
+  Check(profile->GetDecaySettings(period, timebase) && period == 86400, "decay-cold-read");
   profile = nullptr;
 
   const std::string external_path = std::string(argv[1]) + "/cpp-external";

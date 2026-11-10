@@ -12,6 +12,7 @@
 #include "base/task/bind_post_task.h"
 #include "base/threading/thread_restrictions.h"
 #include "brave/alloy/site_records/site_pref_store_io.h"
+#include "brave/alloy/site_records/site_record_decay.h"
 #include "brave/alloy/site_records/native_pref_view.h"
 #include "brave/alloy/site_records/pref_cache_clear.h"
 #include "components/content_settings/core/common/content_settings_pattern.h"
@@ -61,16 +62,19 @@ struct SitePrefStore::State {
   std::map<std::string, RecordCapability> capabilities;
   base::UnguessableToken ticket;
   RecordDeletion deletion = RecordDeletion::kDeleted;
+  GURL retired_site;
 };
 
 struct SitePrefStore::Request {
-  enum Kind { kInitialize, kFlush, kEmbeds, kPreferred, kDelete, kQuery } kind;
+  enum Kind { kInitialize, kFlush, kEmbeds, kPreferred, kDelete, kQuery, kVisit, kDecay } kind;
   explicit Request(Kind kind) : kind(kind) {}
   base::UnguessableToken admission;
   uint64_t mutation = 0;
   PreferredVersion expected;
   PreferredVersion before;
   GURL site;
+  int64_t visit_us = 0;
+  base::OnceCallback<void(GURL, Completion)> decay_teardown;
   std::vector<GURL> embeds;
   apps::PreferredApps entries;
   base::OnceCallback<void(Completion)> teardown;
@@ -85,7 +89,7 @@ class SitePrefStore::IO {
       : files_(std::move(files)), store_(base::MakeRefCounted<internal::SitePrefStore>(
             files_, base::BindRepeating([](FileStatus) {}))) {}
   State Execute(Request::Kind kind, base::DictValue values, GURL site,
-                std::vector<GURL> embeds, apps::PreferredApps entries) {
+                std::vector<GURL> embeds, apps::PreferredApps entries, int64_t visit_us) {
     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
     if (!store_) return Capture(FileStatus::kCancelled);
     store_->ReadPrefs();
@@ -95,14 +99,29 @@ class SitePrefStore::IO {
       store_->ApplySnapshot(std::move(values));
       if (kind == Request::kEmbeds) status = store_->SetFirstPartyEmbeds(site, embeds);
       else if (kind == Request::kPreferred) status = store_->SetPreferredApps(entries);
-      else if (kind == Request::kDelete) {
-        status = store_->RetireSite(site, &ticket);
-        if (status == FileStatus::kOk) retiring_.emplace(ticket, Domain(site));
+      else if (kind == Request::kVisit) {
+        RecordInfo record;
+        status = files_->ResolveRecord(site, url::Origin::Create(site), true, &record);
+        if (status == FileStatus::kOk) status = files_->RecordVisit(record.id, visit_us);
+      }
+      else if (kind == Request::kDelete || kind == Request::kDecay) {
+        std::optional<RecordInfo> expired;
+        if (kind == Request::kDecay) {
+          status = NextDecayedRecord(*files_, DecayNowMicros(), &expired);
+          if (expired) site = HostUrl(expired->domain);
+        }
+        if (status == FileStatus::kOk && (kind == Request::kDelete || expired))
+          status = store_->RetireSite(site, &ticket,
+              expired ? &*expired : nullptr);
+        if (kind == Request::kDecay && (status == FileStatus::kBusy || status == FileStatus::kNotFound))
+          status = FileStatus::kOk;
+        if (status == FileStatus::kOk && !ticket.is_empty()) retiring_.emplace(ticket, Domain(site));
       }
       else status = store_->Flush();
     }
     auto state = Capture(status);
     state.ticket = ticket;
+    state.retired_site = std::move(site);
     return state;
   }
   State Finish(base::UnguessableToken ticket) {
@@ -390,7 +409,7 @@ void SitePrefStore::Pump() {
   auto entries = std::move(request->entries);
   ++pending_backend_calls_;
   io_.AsyncCall(&IO::Execute).WithArgs(kind, Snapshot(), std::move(site),
-      std::move(embeds), std::move(entries)).Then(base::BindOnce(
+      std::move(embeds), std::move(entries), request->visit_us).Then(base::BindOnce(
           &SitePrefStore::Complete, base::WrapRefCounted(this), std::move(request), true));
 }
 
@@ -419,6 +438,8 @@ void SitePrefStore::Retired(std::unique_ptr<Request> request, State state) {
   Install(&next, true, true);
   const auto ticket = state.ticket;
   auto teardown = std::move(request->teardown);
+  if (request->decay_teardown)
+    teardown = base::BindOnce(std::move(request->decay_teardown), request->site);
   // A synchronous native completion must unwind preparation before any owner
   // can publish notifications. The completion still represents real teardown.
   auto resume = base::BindPostTask(base::SequencedTaskRunner::GetCurrentDefault(),
@@ -447,9 +468,10 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     ClearPrefCache(state.values);
     state.capabilities.clear();
   }
-  if (request->kind == Request::kDelete && !state.ticket.is_empty()) {
+  if ((request->kind == Request::kDelete || request->kind == Request::kDecay) && !state.ticket.is_empty()) {
     // Key retirement is durable. UI teardown runs between two tasks on the
     // same I/O sequence, while the coordinator keeps admission closed.
+    request->site = state.retired_site;
     Retired(std::move(request), std::move(state));
     return;
   }
@@ -486,7 +508,7 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
       }
     } else if (request->kind == Request::kQuery) {
       status = GetFirstPartyEmbeds(request->site, &domains);
-    } else if (request->kind == Request::kDelete) {
+    } else if (request->kind == Request::kDelete || request->kind == Request::kDecay) {
       status = request->retired_status;
       if (status != FileStatus::kOk) Fail(status);
     }
@@ -499,7 +521,7 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     request->entries.clear(); request->embeds.clear(); request->site = GURL();
     request->teardown.Reset();
   }
-  if (request->kind == Request::kDelete)
+  if (request->kind == Request::kDelete || request->kind == Request::kDecay)
     PublishRetirementNotifications(status == FileStatus::kOk);
   status = CompletionStatus(*request, status);
   if (request->reply) std::move(request->reply).Run(status, published, state.deletion, std::move(domains));
@@ -758,6 +780,28 @@ FileStatus SitePrefStore::SetConsideredFirstParty(const GURL& outer, const GURL&
   for (const auto& domain : domains) if (domain != child) sites.push_back(HostUrl(domain));
   if (allowed) sites.push_back(embedded);
   return SetFirstPartyEmbeds(outer, sites);
+}
+void SitePrefStore::RecordVisitAsync(GURL site, int64_t now_us) {
+  if (Domain(site).empty()) return;
+  auto request = std::make_unique<Request>(Request::kVisit);
+  request->site = std::move(site); request->visit_us = now_us;
+  Enqueue(std::move(request));
+}
+void SitePrefStore::DecayNextAsync(base::OnceCallback<void(GURL, Completion)> teardown,
+                                  base::OnceCallback<void(FileStatus, bool)> completion) {
+  auto request = std::make_unique<Request>(Request::kDecay);
+  auto deleted = std::make_shared<bool>(false);
+  request->decay_teardown = base::BindOnce(
+      [](std::shared_ptr<bool> deleted, base::OnceCallback<void(GURL, Completion)> teardown,
+         GURL site, Completion done) {
+        *deleted = true; std::move(teardown).Run(std::move(site), std::move(done));
+      }, deleted, std::move(teardown));
+  request->reply = base::BindOnce(
+      [](std::shared_ptr<bool> deleted, base::OnceCallback<void(FileStatus, bool)> reply,
+         FileStatus status, PreferredVersion, RecordDeletion, std::vector<std::string>) {
+        std::move(reply).Run(status, *deleted);
+      }, deleted, std::move(completion));
+  Enqueue(std::move(request));
 }
 void SitePrefStore::DeleteSiteAsync(GURL site, base::OnceClosure teardown,
     base::OnceCallback<void(FileStatus, RecordDeletion)> completion) {

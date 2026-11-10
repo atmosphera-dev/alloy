@@ -6,10 +6,13 @@
 #include <map>
 #include <set>
 #include <vector>
+#include "base/memory/raw_ptr.h"
 
 #include "brave/alloy/site_records/embed_list_settings.h"
 #include "brave/alloy/site_records/record_pref_store.h"
 #include "brave/alloy/site_records/preferred_app_records.h"
+
+namespace content_settings { class WebsiteSettingsRegistry; }
 
 namespace alloy::site_records::internal {
 
@@ -20,7 +23,8 @@ class SitePrefStore final : public PersistentPrefStore {
   static constexpr auto& kEmbedList = embed_list::kPreference;
   static constexpr char kPreferredApps[] = "alloy.preferred_app_records";
   SitePrefStore(std::shared_ptr<RecordFileSystem> files,
-                RecordPrefStore::ErrorCallback on_error);
+                RecordPrefStore::ErrorCallback on_error,
+                const content_settings::WebsiteSettingsRegistry* registry = nullptr);
   bool GetValue(std::string_view key, const base::Value** result) const override;
   base::DictValue GetValues() const override;
   void AddObserver(PrefStore::Observer* observer) override;
@@ -60,12 +64,15 @@ class SitePrefStore final : public PersistentPrefStore {
                                  const apps::PreferredApps& entries, PreferredVersion* published);
   bool IsConsideredFirstParty(const GURL& outer, const GURL& embedded) const;
   FileStatus DeleteSite(const GURL& site, std::function<void()> teardown, RecordDeletion* result);
-  FileStatus RetireSite(const GURL& site, base::UnguessableToken* ticket);
+  FileStatus RetireSite(const GURL& site, base::UnguessableToken* ticket,
+                        const RecordInfo* expected = nullptr);
   // Flat native keys, unlike PrefStore::GetValues' expanded dictionary.
   base::DictValue Snapshot() const;
   void ApplySnapshot(base::DictValue values);
   const std::map<std::string, RecordCapability>& capabilities() const { return capabilities_; }
   static void InitializeRegistries();
+  static bool IsRegisteredExceptionPref(std::string_view key,
+      const content_settings::WebsiteSettingsRegistry* registry = nullptr);
   static FileStatus PruneSnapshot(base::DictValue values, std::string_view excluding,
                                   base::DictValue* retained);
 
@@ -76,10 +83,12 @@ class SitePrefStore final : public PersistentPrefStore {
   FileStatus Load();
   FileStatus Fail(FileStatus status);
   static FileStatus Split(const PrefValueMap& values, std::string_view key, const base::Value& value,
-                   std::string_view excluding, Shards* shards, base::Value* retained);
+                   std::string_view excluding, Shards* shards, base::Value* retained,
+                   const content_settings::WebsiteSettingsRegistry* registry);
   FileStatus Build(std::string_view excluding, Shards* shards, PrefValueMap* retained) const;
   static FileStatus BuildValues(const PrefValueMap& values, std::string_view excluding,
-                        Shards* shards, PrefValueMap* retained);
+                        Shards* shards, PrefValueMap* retained,
+                        const content_settings::WebsiteSettingsRegistry* registry = nullptr);
   FileStatus Prepare(const Shards& shards, std::string_view excluding,
                      std::map<std::string, std::string>* buffers,
                      std::vector<SettingsReplacement>* replacements);
@@ -96,6 +105,9 @@ class SitePrefStore final : public PersistentPrefStore {
   const std::shared_ptr<RecordFileSystem> files_;
   const RecordCapability profile_;
   const RecordPrefStore::ErrorCallback on_error_;
+  // Optional borrowed schema for a synchronous pre-CEF operation. Its owned
+  // graph must outlive this store; normal native owners use the global schema.
+  const raw_ptr<const content_settings::WebsiteSettingsRegistry> registry_;
   std::map<std::string, RecordCapability> capabilities_;
   PrefValueMap values_;
   Shards persisted_;

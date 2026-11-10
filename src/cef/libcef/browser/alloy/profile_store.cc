@@ -248,6 +248,11 @@ class SettingsOwner final : public CefBaseRefCounted {
   bool Matches(const std::shared_ptr<sr::RecordFileSystem>& files) const { return files == files_; }
   bool navigation_open() const { return !retiring_; }
   void StopNavigations() { CEF_REQUIRE_UIT(); retiring_ = true; }
+  std::function<void()> DecayHandler() {
+    auto post = base::BindPostTask(CEF_TASK_RUNNER<CEF_UIT>(), base::BindRepeating(
+        &SettingsOwner::RunDecay, weak_factory_.GetWeakPtr()));
+    return [post] { post.Run(); };
+  }
   scoped_refptr<sr::SitePrefStore> prefs() const { return prefs_; }
   sr::FileStatus failure() const { return failure_; }
   using FiltersReady = sr::ProfileFilterPreferences::Loaded;
@@ -295,6 +300,27 @@ class SettingsOwner final : public CefBaseRefCounted {
         }, CefRefPtr<SettingsOwner>(this), std::move(done)));
   }
  private:
+  void RunDecay() {
+    CEF_REQUIRE_UIT();
+    if (decay_running_ || !files_->unlocked() || !admitted_.Run()) return;
+    decay_running_ = true;
+    DecayNext();
+  }
+  void DecayNext() {
+    prefs_->DecayNextAsync(base::BindOnce(
+        [](scoped_refptr<sr::SitePrefStore> prefs, GURL site, sr::SitePrefStore::Completion done) {
+          RetireNativeSite(std::move(prefs), std::move(site), std::move(done));
+        }, prefs_), base::BindOnce(
+        [](base::WeakPtr<SettingsOwner> owner, sr::FileStatus status, bool deleted) {
+          if (!owner) return;
+          if (status == sr::FileStatus::kOk && deleted) owner->DecayNext();
+          else {
+            owner->decay_running_ = false;
+            if (status != sr::FileStatus::kOk && status != sr::FileStatus::kCancelled &&
+                status != sr::FileStatus::kDenied) owner->OnError(status);
+          }
+        }, weak_factory_.GetWeakPtr()));
+  }
   void FiltersLoaded(sr::FileStatus status, scoped_refptr<sr::ProfileFilterPreferences> filters) {
     CEF_REQUIRE_UIT(); filters_loading_ = false;
     if (status == sr::FileStatus::kOk) filters_ = std::move(filters);
@@ -321,6 +347,7 @@ class SettingsOwner final : public CefBaseRefCounted {
   scoped_refptr<sr::SitePrefStore> prefs_;
   scoped_refptr<sr::ProfileFilterPreferences> filters_;
   bool filters_loading_ = false;
+  bool decay_running_ = false;
   std::vector<FiltersReady> filters_ready_;
   sr::FileStatus failure_ = sr::FileStatus::kOk;
   bool retiring_ = false;
@@ -766,6 +793,20 @@ class AlloyProfileImpl final : public AlloyProfile {
         reason > ALLOY_LOCK_USER_SWITCH) return false;
     Runtime()->automatic->Signal(static_cast<sr::ProfileLockReason>(reason)); return true;
   }
+  bool SetDecaySettings(int64_t period_seconds, alloy_decay_timebase_t timebase) override {
+    if (lock_pending_->load() || period_seconds < 0 ||
+        period_seconds > std::numeric_limits<int64_t>::max() / 1000000 ||
+        timebase != ALLOY_DECAY_SINCE_LAST_VISIT) return false;
+    return profile_->SetDecayPolicy({period_seconds * 1000000, sr::DecayTimebase::kSinceLastVisit}) == sr::FileStatus::kOk;
+  }
+  bool GetDecaySettings(int64_t& period_seconds, int& timebase) override {
+    if (lock_pending_->load()) return false;
+    sr::DecayPolicy policy;
+    if (profile_->GetDecayPolicy(&policy) != sr::FileStatus::kOk) return false;
+    period_seconds = policy.period_us / 1000000;
+    timebase = ALLOY_DECAY_SINCE_LAST_VISIT;
+    return true;
+  }
   scoped_refptr<sr::SitePrefStore> SettingsProjection() {
     return ProjectionWithGeneration(nullptr);
   }
@@ -788,6 +829,7 @@ class AlloyProfileImpl final : public AlloyProfile {
                 if (auto runtime = weak.lock(); runtime && runtime->services_admitted == original)
                   runtime->AutomaticLock(sr::ProfileLockReason::kExplicit);
               }, std::weak_ptr<ProfileRuntime>(runtime), runtime->services_admitted));
+      profile_->BindNativeDecay(files, runtime->settings->DecayHandler());
     }
     runtime->has_settings = true;
     if (original) *original = files;

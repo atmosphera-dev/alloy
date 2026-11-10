@@ -6,6 +6,7 @@
 
 #include "base/check.h"
 #include "base/functional/bind.h"
+#include "brave/alloy/site_records/site_record_decay.h"
 
 namespace alloy::site_records {
 namespace {
@@ -41,6 +42,11 @@ std::unique_ptr<NativeProfileConfiguration> MakeSiteProfileConfiguration(
       &NativePrefView::ConstructionFinished, view);
   bindings.finish_teardown = base::BindOnce(&NativePrefView::FinishTeardown, view);
   bindings.attach_consumer = std::move(attach_consumer);
+  bindings.committed_visit = base::BindRepeating(
+      [](scoped_refptr<SitePrefStore> settings, const GURL& url, const url::Origin& origin) {
+        if (!RecordDomainForPrincipal(url, origin).empty())
+          settings->RecordVisitAsync(url, DecayNowMicros());
+      }, settings);
   auto input = std::make_unique<NativeProfileConfiguration>(
       std::move(original), std::move(bindings), std::move(release_owner));
   input->SetConsumerData(&kSiteProfileSettings, std::make_unique<SiteOwner>(std::move(settings)));

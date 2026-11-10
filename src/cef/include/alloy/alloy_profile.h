@@ -210,6 +210,25 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   virtual bool NotifyLockSignal(alloy_profile_lock_reason_t reason) = 0;
 
   ///
+  /// Persist the decay policy encrypted with this unlocked profile. Call on an
+  /// embedder background thread, like Lock. Zero disables decay; positive
+  /// |period_seconds| counts from the last committed top-level document visit.
+  /// New profiles have no decay. Invalid values leave the stored policy intact.
+  /// Every unlock applies the stored policy before admitting any record reads;
+  /// Alloy also enforces it periodically without an embedder settings UI.
+  ///
+  /*--cef()--*/
+  virtual bool SetDecaySettings(int64_t period_seconds, alloy_decay_timebase_t timebase) = 0;
+
+  ///
+  /// Read the encrypted policy on an embedder background thread. Requires an
+  /// unlocked profile. Outputs change only on success; |timebase| contains an
+  /// alloy_decay_timebase_t value. Zero period means decay is disabled.
+  ///
+  /*--cef()--*/
+  virtual bool GetDecaySettings(int64_t& period_seconds, int& timebase) = 0;
+
+  ///
   /// Read the explicit considered-first-party list belonging to |outer_url|'s
   /// record. Call on browser UI after CefInitialize. Returns true if queued,
   /// not a read result; |callback| reports the result asynchronously on UI.

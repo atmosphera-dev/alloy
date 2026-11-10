@@ -17,6 +17,9 @@ namespace content {
 class RenderFrameHost;
 class NavigationHandle;
 class BrowserContext;
+// R12: the final committed primary top-level document, never an embed/worker,
+// same-document update, failed navigation or intermediate redirect hop.
+CONTENT_EXPORT void RecordAlloyCommittedSiteVisit(NavigationHandle* navigation);
 
 using AlloyEmbeddedResolution =
     alloy::site_records::EmbeddedStateRegistry::Resolution;

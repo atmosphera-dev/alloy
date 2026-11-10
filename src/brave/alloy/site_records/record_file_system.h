@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,7 @@ struct RecordInfo {
   ObjectId directory{};
   std::string domain;
   int64_t created_us = 0;
+  int64_t last_visit_us = 0;
   std::vector<uint8_t> metadata;
 };
 
@@ -95,7 +97,11 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
                             RecordInfo* out);
   FileStatus ListRecords(std::vector<RecordInfo>* out);
   FileStatus SetRecordMetadata(base::UnguessableToken record,
-                               base::span<const uint8_t> metadata);
+                                base::span<const uint8_t> metadata);
+  // Only a browser-owned committed top-level document calls this. Reads,
+  // embedded frames, workers and background writes never refresh the clock.
+  FileStatus RecordVisit(base::UnguessableToken record, int64_t now_us);
+  FileStatus ClampFutureRecordTimes(int64_t now_us);
   RecordCapability Capability(base::UnguessableToken record,
                                StorePurpose purpose);
   // A separate profile-private tree uses profile-derived keys. It is not a
@@ -126,7 +132,8 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
   // opaque ticket keeps directory admission closed until FinishRecordDeletion;
   // no worker waits for UI and no caller can re-open the retired generation.
   FileStatus RetireRecordWithSettings(base::UnguessableToken record,
-      base::span<const SettingsReplacement> replacements, base::UnguessableToken* ticket);
+      base::span<const SettingsReplacement> replacements, base::UnguessableToken* ticket,
+      std::optional<int64_t> unchanged_visit = std::nullopt);
   FileStatus FinishRecordDeletion(base::UnguessableToken ticket, RecordDeletion* result);
 
   FileStatus OpenFile(const RecordCapability& capability,

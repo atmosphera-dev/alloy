@@ -210,6 +210,9 @@ for fontconfig indexes outside Alloy profiles.
 
 ## Verification consumers
 
+Persisted, embedder-configured decay and its unlock/periodic enforcement are
+described in [site-record decay](site-record-decay.md).
+
 `alloy_site_records_unittests` covers the hierarchy, production password source,
 official Argon2id known-answer vector, wrong-password/locked behavior, encrypted
 metadata/names, private-state persistence, real key clearing, provider reentry

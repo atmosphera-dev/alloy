@@ -1,0 +1,16 @@
+--- a/include/internal/cef_types.h
++++ b/include/internal/cef_types.h
+@@ -4286,5 +4286,13 @@
+   ALLOY_LOCK_USER_SWITCH = 5,
+ } alloy_profile_lock_reason_t;
+ 
++///
++/// EXPERIMENTAL: The clock used by the encrypted site-record decay policy.
++/// Only committed top-level document visits restart the period.
++///
++typedef enum {
++  ALLOY_DECAY_SINCE_LAST_VISIT = 0,
++} alloy_decay_timebase_t;
++
+ ///
+ /// EXPERIMENTAL: Secret Service result. MISSING includes a missing default

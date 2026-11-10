@@ -3,6 +3,9 @@
 #include "brave/alloy/site_records/encrypted_profile.h"
 
 #include <utility>
+#include <condition_variable>
+#include <algorithm>
+#include <chrono>
 
 namespace alloy::site_records {
 namespace {
@@ -17,8 +20,73 @@ FileStatus ParseBootstrap(base::span<const uint8_t> bootstrap,
 }
 }  // namespace
 
-EncryptedProfile::EncryptedProfile(base::FilePath path) : path_(std::move(path)) {}
-EncryptedProfile::~EncryptedProfile() { Lock(); }
+struct EncryptedProfile::DecayState {
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool stop = false;
+  std::shared_ptr<RecordFileSystem> files;
+  std::function<void()> native;
+};
+
+EncryptedProfile::EncryptedProfile(base::FilePath path)
+    : decay_(std::make_shared<DecayState>()), path_(std::move(path)) {}
+EncryptedProfile::~EncryptedProfile() {
+  {
+    std::lock_guard lock(decay_->mutex);
+    decay_->stop = true;
+    decay_->changed.notify_all();
+  }
+  if (decay_thread_.joinable()) decay_thread_.join();
+  Lock();
+}
+
+void EncryptedProfile::StartDecay(const std::shared_ptr<RecordFileSystem>& files) {
+  std::lock_guard lock(decay_->mutex);
+  decay_->files = files;
+  decay_->native = {};
+  decay_->changed.notify_all();
+  if (decay_thread_.joinable()) return;
+  decay_thread_ = std::thread([state = decay_] {
+    std::unique_lock lock(state->mutex);
+    while (!state->stop) {
+      DecayPolicy policy;
+      if (!state->files || !state->files->unlocked()) {
+        state->changed.wait(lock);
+        continue;
+      }
+      const auto policy_status = ReadDecayPolicy(*state->files, &policy);
+      if (policy_status != FileStatus::kOk) state->files->Lock();
+      if (policy_status != FileStatus::kOk || !policy.period_us) {
+        state->changed.wait(lock);
+        continue;
+      }
+      // The same engine timer runs before CefInitialize and without any UI.
+      // Binding native owners serializes against the standalone sweep here.
+      if (state->native) state->native();
+      else if (DecayBeforeAdmission(state->files) != FileStatus::kOk) state->files->Lock();
+      state->changed.wait_for(lock, std::chrono::microseconds(
+          std::min<int64_t>(policy.period_us, 60 * 1000000LL)));
+    }
+  });
+}
+
+FileStatus EncryptedProfile::SetDecayPolicy(DecayPolicy policy) {
+  std::lock_guard lock(mutex_);
+  if (!files_ || busy_ || locking_) return FileStatus::kDenied;
+  std::lock_guard decay_lock(decay_->mutex);
+  const auto status = WriteDecayPolicy(*files_, policy);
+  decay_->changed.notify_all();
+  return status;
+}
+FileStatus EncryptedProfile::GetDecayPolicy(DecayPolicy* policy) const {
+  std::lock_guard lock(mutex_);
+  return files_ && !busy_ && !locking_ ? ReadDecayPolicy(*files_, policy) : FileStatus::kDenied;
+}
+void EncryptedProfile::BindNativeDecay(const std::shared_ptr<RecordFileSystem>& files,
+                                       std::function<void()> handler) {
+  std::lock_guard lock(decay_->mutex);
+  if (decay_->files == files) decay_->native = std::move(handler);
+}
 
 FileStatus EncryptedProfile::Create(const base::FilePath& path, KeySource& source,
                                      std::unique_ptr<EncryptedProfile>* out) {
@@ -55,6 +123,7 @@ FileStatus EncryptedProfile::Create(const base::FilePath& path, KeySource& sourc
   status = RecordFileSystem::Create(path, std::move(profile_key),
                                       std::move(descriptor), &profile->files_);
   if (status == FileStatus::kOk) {
+    profile->StartDecay(profile->files_);
     *out = std::move(profile);
   }
   return status;
@@ -119,6 +188,9 @@ FileStatus EncryptedProfile::Unlock(KeySource& source) {
       opened.reset();
       return FileStatus::kIntegrity;
     }
+    // Opened is private to this operation until policy loading, reference
+    // pruning and key-first expiration have all completed successfully.
+    if (result == FileStatus::kOk) result = DecayBeforeAdmission(opened);
     return result;
   }();
   std::shared_ptr<RecordFileSystem> old_locked;
@@ -131,6 +203,7 @@ FileStatus EncryptedProfile::Unlock(KeySource& source) {
     if (status == FileStatus::kOk) {
       old_locked = std::move(locked_files_);
       files_ = std::move(opened);
+      StartDecay(files_);
     }
     cleanup_pending = static_cast<bool>(opened);
     if (!cleanup_pending) {

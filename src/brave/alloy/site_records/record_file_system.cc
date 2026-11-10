@@ -318,6 +318,7 @@ struct RecordFileSystem::Impl {
   base::UnguessableToken private_record;
   std::set<ObjectId> deleting;
   std::map<base::UnguessableToken, ObjectId> pending_deletions;
+  base::UnguessableToken site_deletion_fence;
   FileFault fault;
 
   FileStatus Admission() const {
@@ -431,7 +432,7 @@ struct RecordFileSystem::Impl {
   }
 
   FileStatus Check(const RecordCapability& cap, StorePurpose purpose,
-                    StorageAccess access, Record** out) {
+                    StorageAccess access, Record** out, bool retirement = false) {
     auto status = Admission();
     if (status != FileStatus::kOk) {
       return status;
@@ -444,6 +445,9 @@ struct RecordFileSystem::Impl {
       return FileStatus::kDenied;
     }
     *out = found->second.get();
+    if (!retirement && !site_deletion_fence.is_empty() &&
+        !found->second->profile_private && access == StorageAccess::kWriteRecordFiles)
+      return FileStatus::kBusy;
     return FileStatus::kOk;
   }
 
@@ -799,7 +803,7 @@ struct RecordFileSystem::Impl {
       }
       Record* record;
       auto status = Check(replacement.capability, replacement.purpose,
-                          StorageAccess::kWriteRecordFiles, &record);
+                          StorageAccess::kWriteRecordFiles, &record, !deleting_record.is_empty());
       if (status != FileStatus::kOk) return status;
       const auto tag = PersistentStoreTag(replacement.purpose);
       NamespaceEntry entry;
@@ -1101,6 +1105,7 @@ FileStatus RecordFileSystem::ResolveRecord(const GURL& url,
   if (!create) {
     return FileStatus::kNotFound;
   }
+  if (!impl_->site_deletion_fence.is_empty()) return FileStatus::kBusy;
   auto record = std::make_unique<Impl::Record>();
   record->info.id = base::UnguessableToken::Create();
   record->info.generation = base::UnguessableToken::Create();
@@ -1162,6 +1167,7 @@ FileStatus RecordFileSystem::RecordVisit(base::UnguessableToken id, int64_t now_
   const auto found = impl_->records.find(id);
   if (found == impl_->records.end()) return FileStatus::kNotFound;
   if (now_us <= 0 || found->second->profile_private) return FileStatus::kInvalid;
+  if (!impl_->site_deletion_fence.is_empty()) return FileStatus::kBusy;
   found->second->info.last_visit_us = now_us;
   found->second->dirty = true;
   return impl_->Observe(impl_->Commit());
@@ -1172,6 +1178,7 @@ FileStatus RecordFileSystem::ClampFutureRecordTimes(int64_t now_us) {
   const auto status = impl_->Admission();
   if (status != FileStatus::kOk) return status;
   if (now_us <= 0) return FileStatus::kInvalid;
+  if (!impl_->site_deletion_fence.is_empty()) return FileStatus::kBusy;
   bool changed = false;
   for (auto& [id, record] : impl_->records) {
     if (record->profile_private) continue;
@@ -1180,6 +1187,38 @@ FileStatus RecordFileSystem::ClampFutureRecordTimes(int64_t now_us) {
     }
   }
   return changed ? impl_->Observe(impl_->Commit()) : FileStatus::kOk;
+}
+
+FileStatus RecordFileSystem::BeginSiteDeletion(base::UnguessableToken* fence) {
+  if (!fence) return FileStatus::kInvalid;
+  std::lock_guard lock(impl_->mutex);
+  auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  if (!impl_->site_deletion_fence.is_empty() || !impl_->pending_deletions.empty())
+    return FileStatus::kBusy;
+  status = impl_->Observe(impl_->Commit());
+  if (status != FileStatus::kOk) return status;
+  *fence = impl_->site_deletion_fence = base::UnguessableToken::Create();
+  return FileStatus::kOk;
+}
+
+FileStatus RecordFileSystem::EndSiteDeletion(base::UnguessableToken fence) {
+  std::lock_guard lock(impl_->mutex);
+  const auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  if (fence.is_empty() || fence != impl_->site_deletion_fence) return FileStatus::kDenied;
+  if (!impl_->pending_deletions.empty()) return FileStatus::kBusy;
+  for (const auto& [id, record] : impl_->records)
+    if (!record->profile_private) return FileStatus::kBusy;
+  impl_->site_deletion_fence = {};
+  return FileStatus::kOk;
+}
+
+FileStatus RecordFileSystem::CheckAccess(const RecordCapability& capability,
+    StorePurpose purpose, StorageAccess access) {
+  std::lock_guard lock(impl_->mutex);
+  Impl::Record* record;
+  return impl_->Check(capability, purpose, access, &record);
 }
 
 FileStatus RecordFileSystem::SetRecordMetadata(
@@ -1193,6 +1232,8 @@ FileStatus RecordFileSystem::SetRecordMetadata(
   if (found == impl_->records.end()) {
     return FileStatus::kNotFound;
   }
+  if (!found->second->profile_private && !impl_->site_deletion_fence.is_empty())
+    return FileStatus::kBusy;
   if (metadata.size() > kMaxRecordMetadata) {
     return FileStatus::kInvalid;
   }
@@ -1804,13 +1845,14 @@ FileStatus RecordFile::Close() {
     return FileStatus::kOk;
   }
   RecordFileSystem::Impl::Record* record;
-  auto status = owner->impl_->CheckHandle(*this, StorageAccess::kWriteRecordFiles,
+  auto status = owner->impl_->CheckHandle(*this, StorageAccess::kReadRecordFiles,
                                           &record);
   closed_ = true;
   state_->locks.erase(this);
   --state_->handles;
   if (status == FileStatus::kOk && state_->dirty && state_->linked) {
-    status = owner->impl_->Commit();
+    status = owner->impl_->Check(capability_, purpose_, StorageAccess::kWriteRecordFiles, &record);
+    if (status == FileStatus::kOk) status = owner->impl_->Commit();
   }
   if (status == FileStatus::kOk && state_->handles == 0 &&
       (!state_->dirty || !state_->linked)) {

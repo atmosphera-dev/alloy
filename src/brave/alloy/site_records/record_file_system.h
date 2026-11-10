@@ -96,6 +96,16 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
                             bool create,
                             RecordInfo* out);
   FileStatus ListRecords(std::vector<RecordInfo>* out);
+  // Hold a profile-generation fence across whole-catalogue live retirement.
+  // Ordinary site creation/writes return kBusy; reads and profile-private files
+  // remain admitted. Only key/reference retirement may write through the fence.
+  FileStatus BeginSiteDeletion(base::UnguessableToken* fence);
+  // Lift only this fence, after the live site set and native retirement are empty.
+  FileStatus EndSiteDeletion(base::UnguessableToken fence);
+  // Non-mutating, authoritative admission for native adapters, including current
+  // fences. Capability lifetime alone does not imply writable backend access.
+  FileStatus CheckAccess(const RecordCapability& capability, StorePurpose purpose,
+                         StorageAccess access);
   FileStatus SetRecordMetadata(base::UnguessableToken record,
                                 base::span<const uint8_t> metadata);
   // Only a browser-owned committed top-level document calls this. Reads,

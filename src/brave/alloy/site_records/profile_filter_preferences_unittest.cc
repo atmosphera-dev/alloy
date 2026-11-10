@@ -55,6 +55,20 @@ TEST_F(ProfileFilterPreferencesTest, NativeProducerUsesOnlyItsOriginalContextAnd
   EXPECT_FALSE(ProfileFilterPreferences::Get(*profile())); EXPECT_FALSE(producer1.UpdateCustomFilters("revoked"));
   EXPECT_TRUE(producer1.GetCustomFilters().empty()); EXPECT_TRUE(errors.empty());
 }
+TEST_F(ProfileFilterPreferencesTest, AdmissionRefusalsDoNotLatchButRealFailuresStillDo) {
+  RequestContextPolicy::AttachMemory(*profile());
+  std::shared_ptr<ProfileFilterStorage> storage;
+  ASSERT_EQ(FileStatus::kOk, ProfileFilterStorage::Create(nullptr,
+      RequestContextPolicy::Get(*profile())->StorageCapability(StorePurpose::kProfileCustomFilters), &storage));
+  auto store = Load(storage); ASSERT_TRUE(store);
+  for (auto refused : {FileStatus::kBusy, FileStatus::kDenied, FileStatus::kCancelled}) {
+    store->ConsumerFailed(refused);
+    EXPECT_TRUE(store->available()); EXPECT_TRUE(errors.empty());
+  }
+  store->ConsumerFailed(FileStatus::kIo);
+  EXPECT_FALSE(store->available()); ASSERT_EQ(1u, errors.size()); EXPECT_EQ(FileStatus::kIo, errors[0]);
+}
+
 TEST_F(ProfileFilterPreferencesTest, CloseDrainsAcceptedNativeEditBeforeColdEncryptedReload) {
   base::ScopedTempDir temp; ASSERT_TRUE(temp.CreateUniqueTempDir()); auto path = temp.GetPath().AppendASCII("profile");
   std::shared_ptr<RecordFileSystem> files; ASSERT_EQ(FileStatus::kOk, RecordFileSystem::Create(path, PreferencesKey(), {}, &files));

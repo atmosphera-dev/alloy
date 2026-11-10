@@ -170,7 +170,7 @@ void ProfileFilterPreferences::Publish(std::string_view excluded) {
   if (!posted) Failed(FileStatus::kCancelled);
 }
 void ProfileFilterPreferences::Failed(FileStatus status) {
-  if (status == FileStatus::kOk || status_ != FileStatus::kOk) return;
+  if (status == FileStatus::kOk || IsAdmissionRefusal(status) || status_ != FileStatus::kOk) return;
   scoped_refptr<ProfileFilterPreferences> alive(this);
   status_ = status; error_.Run(status);
 }

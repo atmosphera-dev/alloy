@@ -1,0 +1,92 @@
+--- a/components/sync_preferences/dual_layer_user_pref_store.cc
++++ b/components/sync_preferences/dual_layer_user_pref_store.cc
+@@ -242,6 +242,10 @@
+ void DualLayerUserPrefStore::SetValue(std::string_view key,
+                                       base::Value value,
+                                       uint32_t flags) {
++  if (ReadOnly()) {
++    refused_prefs_.SetValue(key, std::move(value));
++    return;
++  }
+   const base::Value* initial_value = nullptr;
+   // Only notify if something actually changed.
+   // Note: `value` is still added to the stores in case `key` was missing from
+@@ -258,6 +262,9 @@
+ }
+ 
+ void DualLayerUserPrefStore::RemoveValue(std::string_view key, uint32_t flags) {
++  if (ReadOnly()) {
++    return;
++  }
+   // Only proceed if the pref exists.
+   if (!GetValue(key, nullptr)) {
+     return;
+@@ -282,6 +289,16 @@
+ 
+ bool DualLayerUserPrefStore::GetMutableValue(std::string_view key,
+                                              base::Value** result) {
++  if (ReadOnly()) {
++    if (!refused_prefs_.GetValue(key, result)) {
++      const base::Value* value = nullptr;
++      if (!GetValue(key, &value)) {
++        return false;
++      }
++      refused_prefs_.SetValue(key, value->Clone());
++    }
++    return refused_prefs_.GetValue(key, result);
++  }
+   const bool in_account = ShouldGetValueFromAccountStore(key);
+   const bool in_local = ShouldGetValueFromLocalStore(key);
+ 
+@@ -327,6 +344,9 @@
+ 
+ void DualLayerUserPrefStore::ReportValueChanged(std::string_view key,
+                                                 uint32_t flags) {
++  if (ReadOnly()) {
++    return;
++  }
+   {
+     base::AutoReset<bool> setting_prefs(&is_setting_prefs_, true);
+     const bool in_account = ShouldSetValueInAccountStore(key);
+@@ -404,11 +424,18 @@
+ void DualLayerUserPrefStore::SetValueSilently(std::string_view key,
+                                               base::Value value,
+                                               uint32_t flags) {
++  if (ReadOnly()) {
++    refused_prefs_.SetValue(key, std::move(value));
++    return;
++  }
+   DoSetValue(key, std::move(value), flags, /*notify=*/false);
+ }
+ 
+ void DualLayerUserPrefStore::RemoveValuesByPrefixSilently(
+     std::string_view prefix) {
++  if (ReadOnly()) {
++    return;
++  }
+   local_pref_store_->RemoveValuesByPrefixSilently(prefix);
+ 
+   // RemoveValuesByPrefixSilently() is not used for the account store since it
+@@ -1081,6 +1108,9 @@
+ void DualLayerUserPrefStore::SetValueInAccountStoreOnly(std::string_view key,
+                                                         base::Value value,
+                                                         uint32_t flags) {
++  if (ReadOnly()) {
++    return;
++  }
+   const base::Value* initial_value = nullptr;
+   // Only notify if the effective value actually changes.
+   bool should_notify =
+--- a/components/sync_preferences/dual_layer_user_pref_store.h
++++ b/components/sync_preferences/dual_layer_user_pref_store.h
+@@ -253,6 +253,10 @@
+   // Note: Marked as mutable to allow update by GetValue() method which is
+   // const.
+   mutable PrefValueMap merged_prefs_;
++  // Native mutable-pref callers require borrowed storage even when a backing
++  // store refuses writes. This scratch is never read as effective preferences,
++  // mirrored into another store, or published to observers.
++  PrefValueMap refused_prefs_;
+ 
+   // Observers for the two underlying pref stores, used to propagate pref-change
+   // notifications the this class's own observers.

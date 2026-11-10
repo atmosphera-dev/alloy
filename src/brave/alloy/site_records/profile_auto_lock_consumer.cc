@@ -222,6 +222,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     Check(AlloySetFirstPartyEmbeds(context_, "https://alpha.test", {"https://refused-during-lock.test"}, refused_list()),
           "context embed-list refusal queued");
     Check(profile_->DeleteSiteRecord("https://alpha.test", new RefusedDeletionReply), "profile deletion refusal queued");
+    Check(profile_->DeleteAllSiteRecords(new RefusedDeletionReply), "pending-lock delete-all refusal queued");
     pending_mutations_ = true; pending_write_ = true;
     Event("pending-writers-refused");
     Check(profile_->LockAsync(new LockReply), "second callback lock joins the first");

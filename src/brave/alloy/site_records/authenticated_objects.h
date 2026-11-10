@@ -39,6 +39,13 @@ enum class FileStatus {
   kCancelled,
 };
 
+// Expected lifecycle/admission refusals are not storage failures. Keep their
+// identity at native adapter boundaries; never infer this from a later fence.
+constexpr bool IsAdmissionRefusal(FileStatus status) {
+  return status == FileStatus::kDenied || status == FileStatus::kBusy ||
+      status == FileStatus::kCancelled;
+}
+
 constexpr size_t kRecordChunkSize = 4096;
 using ObjectId = std::array<uint8_t, 32>;
 using ObjectPage = std::array<uint8_t, kRecordChunkSize>;

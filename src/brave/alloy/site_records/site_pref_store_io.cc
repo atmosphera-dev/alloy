@@ -135,6 +135,7 @@ PersistentPrefStore::PrefReadError SitePrefStore::GetReadError() const {
 
 FileStatus SitePrefStore::Fail(FileStatus status) {
   if (status_ != FileStatus::kOk) return status_;
+  if (IsAdmissionRefusal(status)) return status;
   if (status != FileStatus::kOk) {
     status_ = status;
     timer_.Stop();

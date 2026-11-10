@@ -50,7 +50,7 @@ async function noise(c){return value(c,`(async()=>{
   const worker=await new Promise((resolve,reject)=>{const w=new Worker('/noise-worker.js');
     w.onmessage=e=>{w.terminate();resolve(e.data)};w.onerror=e=>{w.terminate();reject(Error(e.message))};w.postMessage('draw')});
   return {first,repeat,worker};})()`)}
-if(phase==='write'||phase==='live'){
+if(phase==='write'||phase==='live'||phase==='all-live'){
   await sendCommand(a,'write');
   await until(async()=>(await events()).some(e=>e.event==='written'),'two native settings/list durable completions');
 }
@@ -58,7 +58,7 @@ const observations=[];
 for(const c of sockets) observations.push(await value(c,`(async()=>({site:location.hostname,
   permission:(await navigator.permissions.query({name:'geolocation'})).state,
   zoom:devicePixelRatio}))()`));
-const allDeleted=phase==='after-delete-all';
+const allDeleted=phase==='after-delete-all'||phase==='after-all-live';
 const deleted=phase==='after-delete'||phase==='after-live-delete'||allDeleted;
 check(observations[0].permission===(deleted?'prompt':'granted'),'first native permission '+JSON.stringify(observations));
 check(observations[1].permission===(allDeleted?'prompt':'denied'),'second native permission '+JSON.stringify(observations));
@@ -147,9 +147,56 @@ if(phase==='live'){
   live={before,after,tree,beta,alphaNoise,betaNoise,retainedNoise,freshNoise,freshSettings,freshTarget,
     alphaRecord,betaRecord,freshRecord,retainedRecord};
 }
-const reader=phase==='live'?b:a;
+let allLive=null,allReader=null;
+if(phase==='all-live'){
+  async function catalogue(c){
+    const before=(await events()).filter(e=>e.event==='records').length;
+    await sendCommand(c,'list-records');
+    return until(async()=>{const found=(await events()).filter(e=>e.event==='records');
+      return found.length>before?found.at(-1).records:null},'public record catalogue');
+  }
+  const initial=await catalogue(a);
+  check(initial.length===2&&['alpha.test','beta.test'].every(domain=>initial.some(r=>r.domain===domain&&r.last_visit>0)),
+    'public domain/committed-last-visit metadata '+JSON.stringify(initial));
+  const seeded=[];
+  for(const c of [a,b]){
+    seeded.push(await seedRecord(c));
+    await value(c,`window.deleteAllWrites=0;window.deleteAllWriter=setInterval(()=>{
+      const marker='record-'+location.hostname;
+      localStorage.setItem('record-value',marker);sessionStorage.setItem('record-value',marker);
+      document.cookie='record_value='+marker+'; Path=/; Secure; SameSite=Lax';
+      try{retainedRecordDb.transaction('values','readwrite').objectStore('values').put(marker,'value')}catch{}
+      retainedRecordCache.put('/record-cache',new Response(marker)).catch(()=>{});
+      ++deleteAllWrites;
+    },10);true`);
+    await until(async()=>await value(c,'deleteAllWrites>=2'),'actual live tab writes');
+  }
+  const afterWrites=await catalogue(a);
+  for(const record of initial)check(afterWrites.some(r=>r.domain===record.domain&&r.last_visit===record.last_visit),
+    'listing, reads or background writes refreshed last visit');
+  const oldPages=pages.map(p=>p.id);
+  try{await sendCommand(a,'delete-all')}catch(error){if(!error.cdpTerminal)throw error}
+  const empty=await until(async()=>(await events()).find(e=>e.event==='all-empty'),'empty catalogue at delete-all completion');
+  check(empty.count===0,'delete-all acknowledged a nonempty catalogue');
+  check(!(await pageTargets()).some(t=>oldPages.includes(t.id)),'old live-writing document survived delete-all');
+  const fresh=[],readbacks=[];
+  for(let i=0;i<2;i++){
+    const url=[first,second][i]+'/page/after-all';
+    const target=await until(async()=>(await pageTargets()).find(t=>t.url===url),'explicit post-delete-all visit');
+    const c=await connect(target);sockets.push(c);fresh.push(c);
+    await until(async()=>await value(c,"document.readyState==='complete'&&document.body.dataset.site===location.hostname"),'fresh post-delete-all document');
+    const found=await readRecord(c);checkRetiredRecord(found,seeded[i]);readbacks.push(found);
+    const settings=await value(c,"navigator.permissions.query({name:'geolocation'}).then(p=>({permission:p.state,zoom:devicePixelRatio}))");
+    check(settings.permission==='prompt'&&Math.abs(settings.zoom-1)<.001,'fresh record retained deleted native settings');
+  }
+  const renewed=await catalogue(fresh[0]);
+  check(renewed.length===2&&initial.every(old=>renewed.some(r=>r.domain===old.domain&&r.last_visit>old.last_visit)),
+    'later visits did not create fresh public records with new visit times');
+  allReader=fresh[0];allLive={initial,afterWrites,empty,renewed,readbacks};
+}
+const reader=allReader??(phase==='live'?b:a);
 let embeddedRouting=null;
-if(phase!=='live'){
+if(phase!=='live'&&phase!=='all-live'){
   await value(b,"localStorage.setItem('alloy-list-route','real-beta-value');true");
   embeddedRouting=await value(a,`new Promise(resolve=>{const frame=document.createElement('iframe');
     const receive=e=>{if(e.source===frame.contentWindow&&e.origin===${JSON.stringify(new URL(second).origin)}
@@ -163,12 +210,12 @@ await sendCommand(reader,'read');
 const embeds=await until(async()=>{const e=(await events()).filter(e=>e.event==='embeds');return e.length===2?e:null},'both native-owner embed lists');
 for(const url of [first,second]){
   const e=embeds.find(e=>e.outer===url);check(e,'embed owner '+url);
-  check(e.count===(deleted||phase==='live'?0:1),'embed cardinality '+JSON.stringify(embeds));
-  if(!deleted&&phase!=='live')check(e.domain===(url===first?'beta.test':'alpha.test'),'canonical embed domain '+JSON.stringify(embeds));
+  check(e.count===(deleted||phase==='live'||phase==='all-live'?0:1),'embed cardinality '+JSON.stringify(embeds));
+  if(!deleted&&phase!=='live'&&phase!=='all-live')check(e.domain===(url===first?'beta.test':'alpha.test'),'canonical embed domain '+JSON.stringify(embeds));
 }
 await finishProfile(()=>sendCommand(reader,'finish'),events);
 for(const c of sockets)c.ws.close();
-console.log(JSON.stringify({phase,observations,embeds,live,embeddedRouting}));
+console.log(JSON.stringify({phase,observations,embeds,live,allLive,embeddedRouting}));
 '''
 DRIVE = DRIVE.replace('__NOISE_FUNCTION__', NOISE_FUNCTION)
 
@@ -265,7 +312,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['encrypted', 'delete', 'keyring'], required=True)
     parser.add_argument('--sdk-case', choices=['guest'])
-    parser.add_argument('--phase', choices=['write', 'live'], help='Focused browser phase and its required setup')
+    parser.add_argument('--phase', choices=['write', 'live', 'all-live'], help='Focused browser phase and its required setup')
     parser.add_argument('--inside', action='store_true')
     args = parser.parse_args()
     assert os.environ['TMPDIR'] == str(temp_path(W))
@@ -330,11 +377,11 @@ def main():
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         first, second = [f'https://{name}:{server.server_port}' for name in ('alpha.test', 'beta.test')]
-        phases = (('write', 'delete', 'after-delete', 'live', 'after-live-delete', 'delete-all', 'after-delete-all') if args.check == 'delete' else
+        phases = (('write', 'delete', 'after-delete', 'live', 'after-live-delete', 'all-live', 'after-all-live', 'delete-all', 'after-delete-all') if args.check == 'delete' else
                   ('write', 'read', 'locked', 'wrong', 'delete', 'after-delete', 'live', 'after-live-delete',
                    'delete-all', 'after-delete-all'))
         if args.phase:
-            phases = ('write', 'live') if args.phase == 'live' else (args.phase,)
+            phases = ('write', args.phase) if args.phase in ('live', 'all-live') else (args.phase,)
         for phase in phases:
             root = evidence/phase
             root.mkdir()

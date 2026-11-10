@@ -44,6 +44,17 @@ class ListReply final : public AlloySiteSettingsCallback {
   const Done done_;
   IMPLEMENT_REFCOUNTING(ListReply);
 };
+class RecordsReply final : public AlloySiteRecordsCallback {
+ public:
+  using Done = std::function<void(alloy_site_settings_result_t,
+      const std::vector<CefRefPtr<AlloySiteRecord>>&)>;
+  explicit RecordsReply(Done done) : done_(std::move(done)) {}
+  void OnComplete(alloy_site_settings_result_t status,
+      const std::vector<CefRefPtr<AlloySiteRecord>>& records) override { done_(status, records); }
+ private:
+  const Done done_;
+  IMPLEMENT_REFCOUNTING(RecordsReply);
+};
 class LockReply final : public AlloyProfileLockCallback {
  public:
   explicit LockReply(std::function<void(alloy_site_settings_result_t)> done) : done_(std::move(done)) {}
@@ -155,8 +166,24 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     Check(profiles_[0]->SetFirstPartyEmbeds(Url("alpha.test"), {Url("beta.test")}, new ListReply(
         [self = CefRefPtr<Consumer>(this)](auto status, const auto&) {
           Check(status == ALLOY_SETTINGS_OK, "directional list durable publication");
-          self->ReadLists([self] { self->StartBrowsers(); });
+          self->ReadLists([self] { self->CheckRecordList(0); });
         })), "initial list queued");
+  }
+  void CheckRecordList(int owner) {
+    Check(profiles_[owner]->ListSiteRecords(new RecordsReply(
+        [self = CefRefPtr<Consumer>(this), owner](auto status, const auto& records) {
+          Check(status == ALLOY_SETTINGS_OK && records.size() == (owner == 0 ? 2u : 1u),
+                "public catalogue includes only this profile's real site records");
+          bool alpha = false, beta = false;
+          for (const auto& record : records) {
+            const auto domain = record->GetDomain();
+            alpha |= domain == "alpha.test"; beta |= domain == "beta.test";
+            Check(record->GetLastVisit() == 0, "settings-only public record has no top-level visit");
+          }
+          Check(beta && alpha == (owner == 0), "canonical profile-isolated public record domains");
+          Event("records-listed", owner);
+          if (owner == 0) self->CheckRecordList(1); else self->StartBrowsers();
+        })), "public site catalogue queued");
   }
   void ReadLists(std::function<void()> done) {
     Check(AlloyGetFirstPartyEmbeds(contexts_[0], Url("alpha.test"), new ListReply(

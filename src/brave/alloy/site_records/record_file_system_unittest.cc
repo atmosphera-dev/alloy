@@ -82,6 +82,54 @@ class RecordFileSystemTest : public testing::Test {
   RecordCapability cap_;
 };
 
+TEST_F(RecordFileSystemTest, WholeCatalogueFenceRefusesEverySiteMutationUntilEmptyRetirement) {
+  std::shared_ptr<RecordFile> file;
+  ASSERT_EQ(FileStatus::kOk, fs_->OpenFile(cap_, kPurpose, "value", RecordOpen::kCreate, &file));
+  ASSERT_EQ(FileStatus::kOk, file->Write(0, base::as_byte_span(std::string_view("old"))));
+  const GURL beta("https://beta.test/");
+  RecordInfo sibling;
+  ASSERT_EQ(FileStatus::kOk, fs_->ResolveRecord(beta, url::Origin::Create(beta), true, &sibling));
+  const auto settings = fs_->Capability(sibling.id, StorePurpose::kSiteSettings);
+  base::UnguessableToken fence, nested;
+  ASSERT_EQ(FileStatus::kOk, fs_->BeginSiteDeletion(&fence));
+  EXPECT_EQ(FileStatus::kBusy, fs_->BeginSiteDeletion(&nested));
+  EXPECT_EQ("old", Read(file, 3));
+  EXPECT_EQ(FileStatus::kBusy, file->Write(0, base::as_byte_span(std::string_view("new"))));
+  EXPECT_EQ(FileStatus::kBusy, file->AppendBuffered(base::as_byte_span(std::string_view("new"))));
+  EXPECT_EQ(FileStatus::kBusy, file->SetLength(0));
+  EXPECT_EQ(FileStatus::kBusy, file->Sync());
+  EXPECT_EQ(FileStatus::kBusy, fs_->CreateDirectory(cap_, kPurpose, "blocked"));
+  EXPECT_EQ(FileStatus::kBusy, fs_->Rename(cap_, kPurpose, "value", "renamed"));
+  EXPECT_EQ(FileStatus::kBusy, fs_->Remove(cap_, kPurpose, "value"));
+  EXPECT_EQ(FileStatus::kBusy, fs_->SetRecordMetadata(record_.id, {}));
+  EXPECT_EQ(FileStatus::kBusy, fs_->RecordVisit(record_.id, 1234));
+  EXPECT_EQ(FileStatus::kBusy, fs_->ClampFutureRecordTimes(1234));
+  RecordInfo refused;
+  const GURL fresh("https://fresh.test/");
+  EXPECT_EQ(FileStatus::kBusy, fs_->ResolveRecord(fresh, url::Origin::Create(fresh), true, &refused));
+  const std::string replacement = "retained-settings";
+  const SettingsReplacement write{settings, StorePurpose::kSiteSettings, "prefs", base::as_byte_span(replacement)};
+  EXPECT_EQ(FileStatus::kBusy, fs_->ReplaceSettings(base::span_from_ref(write)));
+  const auto private_cap = fs_->ProfileCapability(StorePurpose::kProfileSettings);
+  std::shared_ptr<RecordFile> private_file;
+  ASSERT_EQ(FileStatus::kOk, fs_->OpenFile(private_cap, StorePurpose::kProfileSettings,
+      "profile-value", RecordOpen::kCreate, &private_file));
+  ASSERT_EQ(FileStatus::kOk, private_file->Write(0, base::as_byte_span(replacement)));
+  ASSERT_EQ(FileStatus::kOk, private_file->Close());
+  base::UnguessableToken first, second;
+  ASSERT_EQ(FileStatus::kOk, fs_->RetireRecordWithSettings(record_.id, base::span_from_ref(write), &first));
+  EXPECT_FALSE(cap_.active());
+  ASSERT_EQ(FileStatus::kOk, fs_->RetireRecordWithSettings(sibling.id, {}, &second));
+  EXPECT_EQ(FileStatus::kBusy, fs_->EndSiteDeletion(fence));
+  RecordDeletion deleted;
+  ASSERT_EQ(FileStatus::kOk, fs_->FinishRecordDeletion(first, &deleted));
+  ASSERT_EQ(FileStatus::kOk, fs_->FinishRecordDeletion(second, &deleted));
+  ASSERT_EQ(FileStatus::kOk, fs_->EndSiteDeletion(fence));
+  ASSERT_EQ(FileStatus::kOk, fs_->ResolveRecord(fresh, url::Origin::Create(fresh), true, &refused));
+  EXPECT_NE(record_.generation, refused.generation);
+  EXPECT_EQ(FileStatus::kDenied, fs_->EndSiteDeletion(fence));
+}
+
 TEST_F(RecordFileSystemTest, NativeNamespaceAndDurableCloseRoundTrip) {
   ASSERT_EQ(FileStatus::kOk,
             fs_->CreateDirectory(cap_, kPurpose, "db/journals", true));

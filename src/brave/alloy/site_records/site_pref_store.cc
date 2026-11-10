@@ -49,8 +49,11 @@ std::optional<RecordValueStoreBinding> SitePrefStore::BindManagedOrigin(const ur
 
 class SitePrefStore::NativeCache {
  public:
-  ~NativeCache() { ClearPrefCache(values); }
+  ~NativeCache() { ClearPrefCache(values); ClearPrefCache(refused); }
   PrefValueMap values;
+  // Native ScopedDictionaryPrefUpdate requires a mutable value even when its
+  // write is refused. Never let that borrowed scratch enter the accepted journal.
+  PrefValueMap refused;
   base::WeakPtrFactory<NativeCache> weak{this};
 };
 
@@ -62,10 +65,13 @@ struct SitePrefStore::State {
   base::UnguessableToken ticket;
   RecordDeletion deletion = RecordDeletion::kDeleted;
   GURL retired_site;
+  std::vector<RecordInfo> records;
+  bool all_empty = false;
 };
 
 struct SitePrefStore::Request {
-  enum Kind { kInitialize, kFlush, kEmbeds, kPreferred, kDelete, kQuery, kVisit, kDecay } kind;
+  enum Kind { kInitialize, kFlush, kEmbeds, kPreferred, kDelete, kQuery, kVisit, kDecay,
+              kList, kDeleteAll, kEndDeleteAll } kind;
   explicit Request(Kind kind) : kind(kind) {}
   base::UnguessableToken admission;
   uint64_t mutation = 0;
@@ -77,9 +83,12 @@ struct SitePrefStore::Request {
   std::vector<GURL> embeds;
   apps::PreferredApps entries;
   base::OnceCallback<void(Completion)> teardown;
+  base::RepeatingCallback<void(GURL, Completion)> all_teardown;
+  bool files_pending = false;
   FileStatus retired_status = FileStatus::kOk;
   base::OnceCallback<void(FileStatus, PreferredVersion, RecordDeletion,
                           std::vector<std::string>)> reply;
+  base::OnceCallback<void(FileStatus, std::vector<RecordInfo>)> records_reply;
 };
 
 class SitePrefStore::IO {
@@ -91,10 +100,35 @@ class SitePrefStore::IO {
                 std::vector<GURL> embeds, apps::PreferredApps entries, int64_t visit_us) {
     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
     if (!store_) return Capture(FileStatus::kCancelled);
+    if (kind == Request::kEndDeleteAll) {
+      if (all_fence_.is_empty()) return Capture(FileStatus::kOk);
+      const auto status = files_->EndSiteDeletion(all_fence_);
+      if (status == FileStatus::kOk) all_fence_ = {};
+      return Capture(status);
+    }
     store_->ReadPrefs();
     auto status = store_->last_status();
     base::UnguessableToken ticket;
-    if (status == FileStatus::kOk && kind != Request::kInitialize && kind != Request::kQuery) {
+    if (kind == Request::kDeleteAll) {
+      if (status == FileStatus::kOk && all_fence_.is_empty()) {
+        store_->ApplySnapshot(std::move(values));
+        status = store_->Flush();
+        if (status == FileStatus::kOk) status = files_->BeginSiteDeletion(&all_fence_);
+      }
+      std::vector<RecordInfo> records;
+      if (status == FileStatus::kOk) status = files_->ListRecords(&records);
+      if (status == FileStatus::kOk && !records.empty()) {
+        site = HostUrl(records.front().domain);
+        status = store_->RetireRecord(records.front(), &ticket);
+        if (status == FileStatus::kOk) retiring_.emplace(ticket, records.front().domain);
+      }
+      auto state = Capture(status);
+      state.ticket = ticket; state.retired_site = std::move(site);
+      state.all_empty = status == FileStatus::kOk && records.empty();
+      return state;
+    }
+    if (status == FileStatus::kOk && kind != Request::kInitialize &&
+        kind != Request::kQuery && kind != Request::kList) {
       store_->ApplySnapshot(std::move(values));
       if (kind == Request::kEmbeds) status = store_->SetFirstPartyEmbeds(site, embeds);
       else if (kind == Request::kPreferred) status = store_->SetPreferredApps(entries);
@@ -119,6 +153,11 @@ class SitePrefStore::IO {
       else status = store_->Flush();
     }
     auto state = Capture(status);
+    if (status == FileStatus::kOk && kind == Request::kList) {
+      state.status = files_->ListRecords(&state.records);
+      if (state.status != FileStatus::kOk && state.status != FileStatus::kDenied)
+        state.failure = state.status;
+    }
     state.ticket = ticket;
     state.retired_site = std::move(site);
     return state;
@@ -134,6 +173,12 @@ class SitePrefStore::IO {
   }
   State Checkpoint(base::DictValue edits, std::vector<std::string> removed, base::OnceClosure done) {
     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+    // The journal was flushed before the fence. Native preference mutations are
+    // refused while it is held, including shutdown attempts to replay old values.
+    if (!all_fence_.is_empty()) {
+      if (done) std::move(done).Run();
+      return Capture(FileStatus::kOk);
+    }
     if (!store_) {
       if (done) std::move(done).Run();
       return Capture(FileStatus::kCancelled);
@@ -185,6 +230,7 @@ class SitePrefStore::IO {
   const std::shared_ptr<RecordFileSystem> files_;
   scoped_refptr<internal::SitePrefStore> store_;
   std::map<base::UnguessableToken, std::string> retiring_;
+  base::UnguessableToken all_fence_;
   SEQUENCE_CHECKER(sequence_checker_);
 };
 
@@ -225,7 +271,7 @@ bool SitePrefStore::GetValue(std::string_view key, const base::Value** value) co
   return initialized_ && Admitted() && cache_->values.GetValue(key, value);
 }
 bool SitePrefStore::GetMutableValue(std::string_view key, base::Value** value) {
-  return initialized_ && Admitted() && cache_->values.GetValue(key, value);
+  return !deleting_all_ && initialized_ && Admitted() && cache_->values.GetValue(key, value);
 }
 base::DictValue SitePrefStore::GetValues() const {
   return initialized_ && Admitted() ? cache_->values.AsDict() : base::DictValue();
@@ -253,6 +299,7 @@ PersistentPrefStore::PrefReadError SitePrefStore::GetReadError() const {
 }
 FileStatus SitePrefStore::Fail(FileStatus status) {
   if (status_ != FileStatus::kOk) return status_;
+  if (IsAdmissionRefusal(status)) return status;
   if (status != FileStatus::kOk) {
     status_ = status;
     dirty_ = false; dirty_keys_.clear();
@@ -277,19 +324,19 @@ void SitePrefStore::Changed(std::string_view key, bool notify, bool persist) {
   if (notify) NotifyChange(key);
 }
 void SitePrefStore::SetValue(std::string_view key, base::Value value, uint32_t) {
-  if (initialized_ && Admitted()) NativeSetValue(key, std::move(value), true);
+  if (!deleting_all_ && initialized_ && Admitted()) NativeSetValue(key, std::move(value), true);
 }
 void SitePrefStore::SetValueSilently(std::string_view key, base::Value value, uint32_t) {
-  if (initialized_ && Admitted()) NativeSetValue(key, std::move(value), false);
+  if (!deleting_all_ && initialized_ && Admitted()) NativeSetValue(key, std::move(value), false);
 }
 void SitePrefStore::ReportValueChanged(std::string_view key, uint32_t) {
-  if (initialized_ && Admitted()) Changed(key, true);
+  if (!deleting_all_ && initialized_ && Admitted()) Changed(key, true);
 }
 void SitePrefStore::RemoveValue(std::string_view key, uint32_t) {
   if (initialized_ && Admitted()) NativeRemoveValue(key);
 }
 void SitePrefStore::RemoveValuesByPrefixSilently(std::string_view prefix) {
-  if (!initialized_ || !Admitted()) return;
+  if (deleting_all_ || !initialized_ || !Admitted()) return;
   std::vector<std::string> removed;
   for (const auto& [key, value] : cache_->values) if (base::StartsWith(key, prefix)) removed.push_back(key);
   cache_->values.ClearWithPrefix(prefix);
@@ -308,25 +355,39 @@ bool SitePrefStore::NativeGetValue(std::string_view key, const base::Value** out
   return cache_ && cache_->values.GetValue(key, out);
 }
 bool SitePrefStore::NativeGetMutableValue(std::string_view key, base::Value** out) {
-  return cache_ && cache_->values.GetValue(key, out);
+  if (!cache_) return false;
+  if (!deleting_all_) return cache_->values.GetValue(key, out);
+  if (!cache_->refused.GetValue(key, out)) {
+    const base::Value* value = nullptr;
+    if (!cache_->values.GetValue(key, &value)) return false;
+    cache_->refused.SetValue(key, value->Clone());
+  }
+  return cache_->refused.GetValue(key, out);
 }
 base::DictValue SitePrefStore::NativeGetValues() const {
   return cache_ ? cache_->values.AsDict() : base::DictValue();
 }
 bool SitePrefStore::NativeCanPersist() const {
-  return initialized_ && !closing_cache_ && Admitted();
+  return !deleting_all_ && initialized_ && !closing_cache_ && Admitted();
 }
 void SitePrefStore::NativeSetValue(std::string_view key, base::Value value, bool notify) {
+  if (deleting_all_) {
+    if (cache_) cache_->refused.SetValue(key, std::move(value));
+    return;
+  }
   if (cache_ && cache_->values.SetValue(key, std::move(value)))
     Changed(key, notify, NativeCanPersist());
 }
 void SitePrefStore::NativeReportValueChanged(std::string_view key, bool notify) {
+  if (deleting_all_) return;
   if (cache_) Changed(key, notify, NativeCanPersist());
 }
 void SitePrefStore::NativeRemoveValue(std::string_view key) {
+  if (deleting_all_) return;
   if (cache_ && cache_->values.RemoveValue(key)) Changed(key, true, NativeCanPersist());
 }
 void SitePrefStore::NativeRemovePrefix(std::string_view prefix) {
+  if (deleting_all_) return;
   if (!cache_) return;
   std::vector<std::string> removed;
   for (const auto& [key, value] : cache_->values)
@@ -376,6 +437,16 @@ void SitePrefStore::BackendClosed() {
 }
 
 void SitePrefStore::Enqueue(std::unique_ptr<Request> request) {
+  if (deleting_all_ && request->kind != Request::kDeleteAll && request->kind != Request::kEndDeleteAll &&
+      request->kind != Request::kList && request->kind != Request::kQuery &&
+      request->kind != Request::kInitialize && request->kind != Request::kFlush) {
+    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, base::BindOnce(
+        [](std::unique_ptr<Request> request) {
+          if (request->reply) std::move(request->reply).Run(FileStatus::kCancelled, {},
+              RecordDeletion::kDeleted, {});
+        }, std::move(request)));
+    return;
+  }
   request->admission = admission_;
   requests_.push_back(std::move(request));
   Pump();
@@ -437,7 +508,9 @@ void SitePrefStore::Retired(std::unique_ptr<Request> request, State state) {
   Install(&next, true, true);
   const auto ticket = state.ticket;
   auto teardown = std::move(request->teardown);
-  if (request->decay_teardown)
+  if (request->all_teardown)
+    teardown = base::BindOnce(request->all_teardown, request->site);
+  else if (request->decay_teardown)
     teardown = base::BindOnce(std::move(request->decay_teardown), request->site);
   // A synchronous native completion must unwind preparation before any owner
   // can publish notifications. The completion still represents real teardown.
@@ -467,17 +540,30 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     ClearPrefCache(state.values);
     state.capabilities.clear();
   }
-  if ((request->kind == Request::kDelete || request->kind == Request::kDecay) && !state.ticket.is_empty()) {
+  if ((request->kind == Request::kDelete || request->kind == Request::kDecay ||
+       request->kind == Request::kDeleteAll) && !state.ticket.is_empty()) {
     // Key retirement is durable. UI teardown runs between two tasks on the
     // same I/O sequence, while the coordinator keeps admission closed.
     request->site = state.retired_site;
     Retired(std::move(request), std::move(state));
     return;
   }
+  if (request->kind == Request::kDeleteAll && status == FileStatus::kOk &&
+      request->retired_status == FileStatus::kOk && state.failure == FileStatus::kOk && !state.all_empty) {
+    request->files_pending |= state.deletion == RecordDeletion::kDeletedFilesPending;
+    PublishRetirementNotifications(true, true);
+    request->mutation = mutation_;
+    ++pending_backend_calls_;
+    io_.AsyncCall(&IO::Execute).WithArgs(Request::kDeleteAll, Snapshot(), GURL(),
+        std::vector<GURL>(), apps::PreferredApps(), int64_t{0}).Then(base::BindOnce(
+            &SitePrefStore::Complete, base::WrapRefCounted(this), std::move(request), true));
+    return;
+  }
   // Native retirement publications may call observers that pump a nested loop.
   // Keep this transaction serialized until every context has published; queued
   // work must not start a second deletion against an unpublished native owner.
-  busy_ = request->kind == Request::kDelete || request->kind == Request::kDecay;
+  busy_ = request->kind == Request::kDelete || request->kind == Request::kDecay ||
+      request->kind == Request::kDeleteAll;
   PreferredVersion published;
   std::vector<std::string> domains;
   if (request->kind == Request::kInitialize && !initialized_) {
@@ -510,7 +596,8 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
       }
     } else if (request->kind == Request::kQuery) {
       status = GetFirstPartyEmbeds(request->site, &domains);
-    } else if (request->kind == Request::kDelete || request->kind == Request::kDecay) {
+    } else if (request->kind == Request::kDelete || request->kind == Request::kDecay ||
+               request->kind == Request::kDeleteAll) {
       status = request->retired_status;
       if (status != FileStatus::kOk) Fail(status);
     }
@@ -523,15 +610,34 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     request->entries.clear(); request->embeds.clear(); request->site = GURL();
     request->teardown.Reset();
   }
-  if (request->kind == Request::kDelete || request->kind == Request::kDecay)
+  if (request->kind == Request::kDelete || request->kind == Request::kDecay ||
+      request->kind == Request::kDeleteAll)
     PublishRetirementNotifications(status == FileStatus::kOk);
   status = CompletionStatus(*request, status);
+  if (request->kind == Request::kEndDeleteAll) {
+    deleting_all_ = false;
+    if (cache_) ClearPrefCache(cache_->refused);
+    if (status != FileStatus::kOk && status != FileStatus::kCancelled) Fail(status);
+  }
+  const bool end_all = request->kind == Request::kDeleteAll;
+  if (request->files_pending) state.deletion = RecordDeletion::kDeletedFilesPending;
+  if (request->records_reply) {
+    if (status != FileStatus::kOk) state.records.clear();
+    std::move(request->records_reply).Run(status, std::move(state.records));
+  }
   if (request->reply) std::move(request->reply).Run(status, published, state.deletion, std::move(domains));
+  if (end_all) Enqueue(std::make_unique<Request>(Request::kEndDeleteAll));
   if (!requests_.empty()) base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
       FROM_HERE, base::BindOnce(&SitePrefStore::Pump, base::WrapRefCounted(this)));
   MaybeCloseNativeCache();
 }
 
+void SitePrefStore::ListRecordsAsync(
+    base::OnceCallback<void(FileStatus, std::vector<RecordInfo>)> completion) {
+  auto request = std::make_unique<Request>(Request::kList);
+  request->records_reply = std::move(completion);
+  Enqueue(std::move(request));
+}
 void SitePrefStore::InitializeAsync(Completion completion) {
   auto request = std::make_unique<Request>(Request::kInitialize);
   request->reply = base::BindOnce([](Completion reply, FileStatus status, PreferredVersion,
@@ -548,7 +654,7 @@ FileStatus SitePrefStore::Wait(base::OnceCallback<void(Completion)> operation) {
   // Blocking compatibility callers (native tests/pre-init owners) still use
   // exactly the same I/O journal. Browser UI must use the asynchronous methods.
   base::AssertBlockingAllowed();
-  if (in_teardown_) return FileStatus::kBusy;
+  if (in_teardown_ || (deleting_all_ && busy_)) return FileStatus::kBusy;
   FileStatus status = FileStatus::kCancelled;
   base::RunLoop loop(base::RunLoop::Type::kNestableTasksAllowed);
   std::move(operation).Run(base::BindOnce([](FileStatus* result, base::OnceClosure quit, FileStatus value) {
@@ -648,7 +754,7 @@ void SitePrefStore::DeferNativeRetirementNotification(base::OnceClosure publicat
   CHECK(in_teardown_);
   if (publication) native_retirement_publications_.push_back(std::move(publication));
 }
-void SitePrefStore::PublishRetirementNotifications(bool success) {
+void SitePrefStore::PublishRetirementNotifications(bool success, bool keep_serialized) {
   auto publications = std::move(native_retirement_publications_);
   auto changed = std::move(retirement_notifications_);
   native_retirement_publications_.clear(); retirement_notifications_.clear();
@@ -659,7 +765,7 @@ void SitePrefStore::PublishRetirementNotifications(bool success) {
   // Synchronous compatibility calls return kBusy during native publication.
   // Ordinary notifications retain their existing reentrant mutation contract.
   in_teardown_ = false;
-  busy_ = false;
+  busy_ = keep_serialized;
   if (!success) return;
   for (const auto& key : changed) NotifyChange(key);
 }
@@ -817,6 +923,23 @@ void SitePrefStore::DeleteSiteAsync(GURL site, base::OnceClosure teardown,
         if (teardown) std::move(teardown).Run();
         std::move(resumed).Run(FileStatus::kOk);
       }, std::move(teardown)), std::move(completion));
+}
+void SitePrefStore::DeleteAllSitesWithTeardownAsync(
+    base::RepeatingCallback<void(GURL, Completion)> teardown,
+    base::OnceCallback<void(FileStatus, RecordDeletion)> completion) {
+  if (deleting_all_) {
+    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, base::BindOnce(
+        std::move(completion), FileStatus::kBusy, RecordDeletion::kDeleted));
+    return;
+  }
+  deleting_all_ = true;
+  auto request = std::make_unique<Request>(Request::kDeleteAll);
+  request->all_teardown = std::move(teardown);
+  request->reply = base::BindOnce([](base::OnceCallback<void(FileStatus, RecordDeletion)> reply,
+      FileStatus status, PreferredVersion, RecordDeletion deletion, std::vector<std::string>) {
+    std::move(reply).Run(status, deletion);
+  }, std::move(completion));
+  Enqueue(std::move(request));
 }
 void SitePrefStore::DeleteSiteWithTeardownAsync(GURL site,
     base::OnceCallback<void(Completion)> teardown,

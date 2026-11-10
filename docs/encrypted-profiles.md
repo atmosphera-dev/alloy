@@ -21,7 +21,8 @@ revokes admission and wipes keys. Releasing the last profile reference locks it.
 Operations are blocking and run on an embedder background thread. They can run
 before `CefInitialize`, so profile bootstrap does not require constructing an
 ordinary Chromium Profile or opening private preferences first. Browser-context
-and native-store binding use this foundation in their own integration layers.
+and native-store binding use the same original profile generation. See the
+[SDK index](experimental-api.md) and [mode selection](profile-modes.md).
 
 The states are LOCKED, UNLOCKED, TRANSITION and ERROR. LOCKED acknowledges that
 engine-owned keys and admitted file access are gone. An in-flight unlock keeps
@@ -162,6 +163,12 @@ Unrelated records and user-selected external files are preserved. `LockAsync`
 revokes the original context's keys, native owners and preference caches before
 completion. Unlocking does not reauthorize an old context.
 
+`ListSiteRecords` returns owned domain/last-visit snapshots; `DeleteAllSiteRecords`
+holds a write/create fence through whole-profile site retirement, not through
+navigation. Profile-wide configuration survives. See [site records](site-records.md)
+for callback ordering and the honest deletion boundary. [Decay](profile-decay.md)
+is persisted policy; [idle/auto-lock](profile-auto-lock.md) is runtime policy.
+
 ### Native first-party working state
 
 Record deletion also retires the native working state of every attached request
@@ -222,11 +229,14 @@ metadata/names, private-state persistence, real key clearing, provider reentry
 and cancellation. The inherited file-layer crash/integrity tests still run.
 
 `tools/profile_probe.py --check core` is the native API proof on the assigned
-build/test machine. It drives the generated C ABI and a C++ wrapper consumer
+build/test guest. It drives the generated C ABI and a C++ wrapper consumer
 before `CefInitialize`, including custom provider transport/refcounts, Unicode
 passwords, reopen, wrong credentials, cancellation, encrypted marker scans and
-a corrupted-root refusal that preserves the on-disk files. Store/browser probes
-are added with the corresponding integrations.
+a corrupted-root refusal that preserves the on-disk files. It also runs the
+generated C record-list callback after CEF initialization, including canonical
+domains, settings-only records, delete-all completion, owned snapshot lifetime,
+decay/idle configuration and locked cancellation.
+The C++ embedded-profile consumer exercises the same copied catalogue.
 
 `tools/profile_probe.py --check keyring` runs generated C ABI/C++ wrapper and
 cold-process native consumers in an explicitly owned throwaway gnome-keyring on
@@ -239,5 +249,7 @@ an absent provider is not activated. The storage unit suite can run through
 `tools/test_keyring.py --root <new-B-evidence-path> -- <suite argv...>` for actual
 provider, per-profile isolation, missing-key and key-wipe tests. Without that
 explicit private-session opt-in, tests requiring a provider skip rather than
-access a real user keyring. Item 6 adds browser store routing: this foundational
-probe does not yet prove cookie/localStorage/IndexedDB/browser-cache persistence.
+access a real user keyring. Browser-store routing is covered separately by
+`--check encrypted`, `--check embedded` and `--check delete`, not by the
+key-source-only test. Run acceptance on the assigned `alloy-do-build` guest,
+with its disk-backed workspace and TMPDIR, never on the source host.

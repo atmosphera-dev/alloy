@@ -101,7 +101,7 @@ if(trigger==='close'){
     check(receipts.filter(e=>e.event==='explicit-complete').length===2,'joined locks did not both complete');
     check(receipts.filter(e=>e.event==='callback'&&e.value===0).length===1,'joined locks duplicated retirement');
     check(receipts.some(e=>e.event==='pending-writers-refused'),'synchronous pending-lock mutation refusal missing');
-    check(receipts.filter(e=>e.event==='pending-mutation-refused').length===3,'pending-lock mutation callbacks did not all refuse');
+    check(receipts.filter(e=>e.event==='pending-mutation-refused').length===4,'pending-lock mutation callbacks did not all refuse');
   }
   stage('lock-acknowledged');
   const afterPids=await processes();

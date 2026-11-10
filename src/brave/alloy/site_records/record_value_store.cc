@@ -20,10 +20,14 @@ FileStatus CreateRecordValueStore(
   auto backend = std::make_unique<value_store::LazyLevelDb::Backend>();
   backend->options = env->Options();
   backend->env = std::move(env);
-  backend->admitted = base::BindRepeating([](RecordCapability cap, StorePurpose purpose) {
-    return cap.Allows(purpose, StorageAccess::kReadRecordFiles) &&
-        cap.Allows(purpose, StorageAccess::kWriteRecordFiles);
-  }, capability, purpose);
+  // Native reads may open/recover a LevelDB and therefore need writable
+  // admission too. This runs on the same FIFO as catalogue fences and retirement.
+  // Refuse before LevelDB can turn an expected fence into a sticky I/O error.
+  backend->admitted = base::BindRepeating([](std::shared_ptr<RecordFileSystem> files,
+      RecordCapability cap, StorePurpose purpose) {
+    return files->CheckAccess(cap, purpose, StorageAccess::kReadRecordFiles) == FileStatus::kOk &&
+        files->CheckAccess(cap, purpose, StorageAccess::kWriteRecordFiles) == FileStatus::kOk;
+  }, files, capability, purpose);
   backend->allow_recovery = false;
   backend->sync_writes = true;
   *out = std::make_unique<value_store::LeveldbValueStore>(

@@ -62,6 +62,7 @@ class RecordPrefStore final : public PersistentPrefStore {
  private:
   ~RecordPrefStore() override;
   bool Admitted() const;
+  bool Writable() const;
   FileStatus Load();
   FileStatus FlushImpl();
   FileStatus Fail(FileStatus status);
@@ -74,6 +75,7 @@ class RecordPrefStore final : public PersistentPrefStore {
   const std::string name_;
   const ErrorCallback on_error_;
   PrefValueMap prefs_;
+  PrefValueMap refused_;
   base::ObserverList<PrefStore::Observer, true> observers_;
   bool initialized_ = false;
   bool dirty_ = false;

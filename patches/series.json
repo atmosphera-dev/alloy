@@ -1042,6 +1042,11 @@
       "patch": "brave-core/0129-owned-settings-schema.patch",
       "root": "brave",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0131-pref-write-admission.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

@@ -120,6 +120,35 @@ TEST_F(RecordPrefStoreTest, LockDeniesRetainedReadsAndMutableWrites) {
   EXPECT_EQ(FileStatus::kDenied, store->Flush());
 }
 
+TEST_F(RecordPrefStoreTest, WholeCatalogueFenceRefusesAllNativeMutationsWithoutLatchingAnError) {
+  auto store = Open();
+  store->SetValue("permission", base::Value(1), 0);
+  ASSERT_EQ(FileStatus::kOk, store->Flush());
+  store->SetValue("accepted-before-fence", base::Value(7), 0);
+  base::UnguessableToken fence;
+  ASSERT_EQ(FileStatus::kOk, files_->BeginSiteDeletion(&fence));
+  EXPECT_TRUE(store->ReadOnly());
+  store->SetValue("permission", base::Value(2), 0);
+  store->SetValueSilently("permission", base::Value(3), 0);
+  store->RemoveValue("permission", 0);
+  store->RemoveValuesByPrefixSilently("permission");
+  store->ReportValueChanged("permission", 0);
+  base::Value* mutable_value = nullptr;
+  ASSERT_TRUE(store->GetMutableValue("permission", &mutable_value));
+  *mutable_value = base::Value(99);
+  store->ReportValueChanged("permission", 0);
+  const base::Value* value = nullptr;
+  ASSERT_TRUE(store->GetValue("permission", &value)); EXPECT_EQ(1, value->GetInt());
+  EXPECT_EQ(FileStatus::kBusy, store->Flush());
+  EXPECT_EQ(FileStatus::kOk, store->last_status()); EXPECT_TRUE(errors_.empty());
+  auto reader = Open(); // Clean read/close does not request write access.
+  ASSERT_TRUE(reader->GetValue("permission", &value)); EXPECT_EQ(1, value->GetInt());
+  RecordDeletion deleted;
+  ASSERT_EQ(FileStatus::kOk, files_->DeleteRecord(record_.id, [] {}, &deleted));
+  ASSERT_EQ(FileStatus::kOk, files_->EndSiteDeletion(fence));
+  EXPECT_EQ(FileStatus::kDenied, store->Flush()); EXPECT_TRUE(errors_.empty());
+}
+
 TEST_F(RecordPrefStoreTest, AuthenticatedInvalidJsonIsNotRepairedOrOverwritten) {
   const auto cap = files_->Capability(record_.id, StorePurpose::kSiteSettings);
   std::shared_ptr<RecordFile> file;

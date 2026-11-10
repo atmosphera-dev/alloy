@@ -12,6 +12,9 @@
 #include "base/task/single_thread_task_runner.h"
 #include "base/threading/thread_restrictions.h"
 #include "brave/alloy/site_records/site_pref_store.h"
+#include "chrome/browser/prefs/chrome_pref_model_associator_client.h"
+#include "components/prefs/in_memory_pref_store.h"
+#include "components/sync_preferences/dual_layer_user_pref_store.h"
 #include "brave/alloy/site_records/native_pref_view.h"
 #include "brave/alloy/site_records/site_profile_configuration.h"
 #include "brave/alloy/site_records/profile_filter_preferences.h"
@@ -242,6 +245,42 @@ TEST(ProfileAutoLockApiTest, BrowserCloseJoinsStandaloneLockWithAdoptedRuntime) 
 }
 TEST(ProfileAutoLockApiTest, BrowserCloseAdoptsRuntimeDuringStandaloneLock) {
   BrowserCloseOverlappingStandaloneLock(false);
+}
+
+TEST_F(ProfileSettingsLifecycleTest, FencedDualLayerWritersCannotPublishSyntheticChangesOrMirrorIntoAccount) {
+  auto view = store_->CreateNativeView(); ASSERT_TRUE(view);
+  ASSERT_TRUE(view->BeginConstruction(base::BindOnce([] {}))); view->ConstructionFinished();
+  auto account = base::MakeRefCounted<InMemoryPrefStore>();
+  auto dual = base::MakeRefCounted<sync_preferences::DualLayerUserPrefStore>(view, account,
+      base::MakeRefCounted<ChromePrefModelAssociatorClient>());
+  dual->SetValue(kNativeSetting, base::Value("accepted"), 0);
+  struct Observer final : PrefStore::Observer {
+    void OnInitializationCompleted(bool) override {}
+    void OnPrefValueChanged(std::string_view) override { ++changes; }
+    int changes = 0;
+  } observer;
+  dual->AddObserver(&observer);
+  bool completed = false;
+  store_->DeleteAllSitesWithTeardownAsync({}, base::BindLambdaForTesting(
+      [&](FileStatus status, RecordDeletion) {
+        EXPECT_EQ(FileStatus::kOk, status); EXPECT_TRUE(dual->ReadOnly());
+        dual->SetValue(kNativeSetting, base::Value("refused"), 0);
+        dual->SetValueSilently(kNativeSetting, base::Value("refused-silent"), 0);
+        dual->SetValueInAccountStoreOnly(kNativeSetting, base::Value("refused-account"), 0);
+        base::Value* scratch = nullptr;
+        ASSERT_TRUE(dual->GetMutableValue(kNativeSetting, &scratch));
+        *scratch = base::Value("refused-mutable"); dual->ReportValueChanged(kNativeSetting, 0);
+        dual->RemoveValue(kNativeSetting, 0); dual->RemoveValuesByPrefixSilently("");
+        const base::Value* value = nullptr;
+        ASSERT_TRUE(dual->GetValue(kNativeSetting, &value)); EXPECT_EQ("accepted", value->GetString());
+        EXPECT_FALSE(account->GetValue(kNativeSetting, &value)); EXPECT_EQ(0, observer.changes);
+        dual->SetValue("new.mutable.default", base::Value(base::Value::Type::DICT), 0);
+        ASSERT_TRUE(dual->GetMutableValue("new.mutable.default", &scratch));
+        scratch->GetDict().Set("late", true); dual->ReportValueChanged("new.mutable.default", 0);
+        EXPECT_FALSE(dual->GetValue("new.mutable.default", &value)); completed = true;
+      }));
+  tasks_.RunUntilIdle(); EXPECT_TRUE(completed);
+  dual->RemoveObserver(&observer); dual.reset(); view->FinishTeardown();
 }
 
 TEST_F(ProfileSettingsLifecycleTest, NativeEditBeforeLockSurvivesWithoutOwnerPumpingBeforeRevocation) {

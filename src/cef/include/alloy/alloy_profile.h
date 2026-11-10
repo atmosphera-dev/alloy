@@ -12,6 +12,45 @@
 
 #if CEF_API_ADDED(CEF_EXPERIMENTAL)
 ///
+/// EXPERIMENTAL: Immutable, copied site-record metadata. Retaining this snapshot
+/// does not retain record access or a key. The embedder owns clearing any copies
+/// it displays or stores after profile lock or record deletion.
+///
+/*--cef(source=library,added=experimental)--*/
+class AlloySiteRecord : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Return the canonical registrable domain, or the exact host for an IP or a
+  /// host without a registrable domain. Schemes and ports do not split records.
+  ///
+  /*--cef()--*/
+  virtual CefString GetDomain() = 0;
+
+  ///
+  /// Return the last committed top-level visit in microseconds since the Unix
+  /// epoch, or zero if never visited. Embedded loads and reads do not refresh it.
+  ///
+  /*--cef()--*/
+  virtual int64_t GetLastVisit() = 0;
+};
+
+///
+/// EXPERIMENTAL: Site-record enumeration completion on browser UI. On OK,
+/// |records| is a copied snapshot of the live site catalogue, not a subscription.
+/// Failure/cancellation returns an empty vector, never a partial catalogue.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloySiteRecordsCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete enumeration with |result| and copied |records|. May reenter.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result,
+                          const std::vector<CefRefPtr<AlloySiteRecord>>& records) = 0;
+};
+
+///
 /// EXPERIMENTAL: Completion of a profile embed-list operation, on browser UI.
 /// A successful read returns copied canonical record domains in |embedded|;
 /// writes and failed/cancelled reads return an empty vector. OK acknowledges
@@ -253,6 +292,17 @@ class AlloyProfile : public virtual CefBaseRefCounted {
                                    CefRefPtr<AlloySiteSettingsCallback> callback) = 0;
 
   ///
+  /// List this unlocked profile's live site records, excluding profile-wide
+  /// configuration. Browser UI after CefInitialize only. True means queued;
+  /// completion is asynchronous on UI. Wrong thread or missing callback returns
+  /// false without calling it. A locked/superseded generation reports CANCELLED.
+  /// Enumeration does not create a record or refresh its last visit. No order
+  /// is promised; the embedder may sort the copied snapshot for display.
+  ///
+  /*--cef()--*/
+  virtual bool ListSiteRecords(CefRefPtr<AlloySiteRecordsCallback> callback) = 0;
+
+  ///
   /// Delete the R16 record containing |site_url|. Browser UI only. True means
   /// queued; only callback OK acknowledges completed deletion. The engine first
   /// removes its wrapped key, then retires that site's documents/workers and
@@ -263,6 +313,19 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual bool DeleteSiteRecord(const CefString& site_url,
                                 CefRefPtr<AlloyRecordDeletionCallback> callback) = 0;
+
+  ///
+  /// Delete every site record in this profile through the same key-first/native
+  /// retirement lifecycle. Navigation admission remains open, but record creation
+  /// and writes are fenced until the set is empty and this callback returns.
+  /// Native preference mutations are also refused while their journal is fenced.
+  /// Reentrant enumeration is ordered before fence release; later visits create
+  /// fresh records. Profile-wide settings and key-source selection are preserved.
+  /// Thread, queueing, cancellation and files_pending semantics match deletion
+  /// of one record. A concurrent delete-all reports CONFLICT asynchronously.
+  ///
+  /*--cef()--*/
+  virtual bool DeleteAllSiteRecords(CefRefPtr<AlloyRecordDeletionCallback> callback) = 0;
 };
 
 ///

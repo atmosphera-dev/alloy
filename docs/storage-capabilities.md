@@ -3,9 +3,9 @@
 # Engine storage capabilities
 
 `brave/alloy/site_records/record_capability.h` defines the engine-only storage
-admission contract. It is groundwork for the experimental request-context and
-profile API, not a public CEF API or a claim that existing request contexts
-already enforce the three modes.
+admission contract used by the experimental request-context and profile API.
+It is an engine interface, not a public CEF API. Native adapters enforce it at
+their actual consumers; a capability declaration alone is not verification.
 
 The browser-side lifecycle owner issues a `RecordCapability` with an opaque
 profile identity, record identity, generation, mode and store purpose. These
@@ -37,8 +37,8 @@ publication and owner adapters are separate layers, not responsibilities of
 this value type. Embedded-memory/document issuers use transient identities;
 they do not authorize persistent records or decide embedded-storage exceptions.
 
-NUC-only unit verification, in `/home/builder/work/alloy` with
-`TMPDIR=/home/builder/work/tmp`:
+Unit verification inside the assigned `alloy-do-build` guest, in
+`/home/builder/work/alloy-b` with `TMPDIR=/home/builder/work/alloy-b/tmp`:
 
 ```sh
 python3 repo/tools/alloy_build.py --config release --target alloy_site_records_unittests

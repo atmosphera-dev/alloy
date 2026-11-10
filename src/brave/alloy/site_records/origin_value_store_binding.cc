@@ -19,7 +19,9 @@ struct OriginBinding {
   std::atomic<bool> enabled{true};
   bool Admitted() const {
     if (!profile.active() || !enabled.load(std::memory_order_acquire)) return false;
-    return !ready.load(std::memory_order_acquire) || record.active();
+    return !ready.load(std::memory_order_acquire) ||
+        files->CheckAccess(record, StorePurpose::kSiteSettings,
+            StorageAccess::kWriteRecordFiles) == FileStatus::kOk;
   }
 };
 }  // namespace

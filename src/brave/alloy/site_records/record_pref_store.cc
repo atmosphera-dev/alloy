@@ -43,6 +43,10 @@ bool RecordPrefStore::Admitted() const {
   return !invalidated_ && status_ == FileStatus::kOk && files_ &&
       capability_.Allows(purpose_, StorageAccess::kReadRecordFiles);
 }
+bool RecordPrefStore::Writable() const {
+  return Admitted() &&
+      files_->CheckAccess(capability_, purpose_, StorageAccess::kWriteRecordFiles) == FileStatus::kOk;
+}
 
 bool RecordPrefStore::GetValue(std::string_view key,
                                const base::Value** result) const {
@@ -54,7 +58,16 @@ base::DictValue RecordPrefStore::GetValues() const {
 }
 
 bool RecordPrefStore::GetMutableValue(std::string_view key, base::Value** result) {
-  return initialized_ && Admitted() && prefs_.GetValue(key, result);
+  if (!initialized_ || !Admitted()) return false;
+  if (Writable()) return prefs_.GetValue(key, result);
+  // Native mutable-pref transactions cannot represent a null write refusal.
+  // Give them disposable borrowed state, never an accepted journal mutation.
+  if (!refused_.GetValue(key, result)) {
+    const base::Value* value = nullptr;
+    if (!prefs_.GetValue(key, &value)) return false;
+    refused_.SetValue(key, value->Clone());
+  }
+  return refused_.GetValue(key, result);
 }
 
 void RecordPrefStore::AddObserver(PrefStore::Observer* observer) {
@@ -88,7 +101,7 @@ void RecordPrefStore::ScheduleWrite() {
 }
 
 void RecordPrefStore::ReportValueChanged(std::string_view key, uint32_t flags) {
-  if (!initialized_ || !Admitted()) return;
+  if (!initialized_ || !Writable()) return;
   dirty_ = true;
   ScheduleWrite();
   Notify(key);
@@ -97,29 +110,31 @@ void RecordPrefStore::ReportValueChanged(std::string_view key, uint32_t flags) {
 void RecordPrefStore::SetValue(std::string_view key, base::Value value,
                                uint32_t flags) {
   if (!initialized_ || !Admitted()) return;
+  if (!Writable()) { refused_.SetValue(key, std::move(value)); return; }
   if (prefs_.SetValue(key, std::move(value))) ReportValueChanged(key, flags);
 }
 
 void RecordPrefStore::SetValueSilently(std::string_view key, base::Value value,
                                        uint32_t flags) {
   if (!initialized_ || !Admitted()) return;
+  if (!Writable()) { refused_.SetValue(key, std::move(value)); return; }
   dirty_ |= prefs_.SetValue(key, std::move(value));
   if (dirty_) ScheduleWrite();
 }
 
 void RecordPrefStore::RemoveValue(std::string_view key, uint32_t flags) {
-  if (!initialized_ || !Admitted()) return;
+  if (!initialized_ || !Writable()) return;
   if (prefs_.RemoveValue(key)) ReportValueChanged(key, flags);
 }
 
 void RecordPrefStore::RemoveValuesByPrefixSilently(std::string_view prefix) {
-  if (!initialized_ || !Admitted()) return;
+  if (!initialized_ || !Writable()) return;
   prefs_.ClearWithPrefix(prefix);
   dirty_ = true;
   ScheduleWrite();
 }
 
-bool RecordPrefStore::ReadOnly() const { return !Admitted(); }
+bool RecordPrefStore::ReadOnly() const { return !Writable(); }
 
 FileStatus RecordPrefStore::last_status() const {
   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -135,6 +150,7 @@ PersistentPrefStore::PrefReadError RecordPrefStore::GetReadError() const {
 
 FileStatus RecordPrefStore::Fail(FileStatus status) {
   if (status_ != FileStatus::kOk) return status_;
+  if (IsAdmissionRefusal(status)) return status;
   if (status != FileStatus::kOk) {
     status_ = status;
     prefs_.Clear();
@@ -203,6 +219,8 @@ FileStatus RecordPrefStore::FlushImpl() {
   if (!initialized_ || !Admitted()) return last_status() == FileStatus::kOk ?
       FileStatus::kDenied : last_status();
   if (!dirty_) return FileStatus::kOk;
+  const auto admission = files_->CheckAccess(capability_, purpose_, StorageAccess::kWriteRecordFiles);
+  if (admission != FileStatus::kOk) return Fail(admission);
   base::DictValue flat;
   for (const auto& [key, entry] : prefs_) flat.Set(key, entry.Clone());
   std::string bytes;
@@ -240,6 +258,7 @@ void RecordPrefStore::Invalidate() {
   std::vector<std::string> changed;
   for (const auto& [key, value] : prefs_) changed.push_back(key);
   prefs_.Clear();
+  refused_.Clear();
   dirty_ = false;
   for (const auto& key : changed) Notify(key);
 }

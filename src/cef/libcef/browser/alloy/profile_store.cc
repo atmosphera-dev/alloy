@@ -333,9 +333,8 @@ class SettingsOwner final : public CefBaseRefCounted {
   }
   void OnError(sr::FileStatus status) {
     CEF_REQUIRE_UIT();
-    if (status == sr::FileStatus::kCancelled || status == sr::FileStatus::kDenied) return;
-    if (status != sr::FileStatus::kCancelled && status != sr::FileStatus::kDenied &&
-        failure_ == sr::FileStatus::kOk) failure_ = status;
+    if (sr::IsAdmissionRefusal(status)) return;
+    if (failure_ == sr::FileStatus::kOk) failure_ = status;
     // Storage failures use the same profile barrier, never wipe underneath a
     // live WebContents or a native service borrowing this generation's cache.
     CEF_POST_TASK(CEF_UIT, fail_closed_);
@@ -677,6 +676,19 @@ void RegisterLifecycle(const std::shared_ptr<ProfileLifecycle>& state) {
       }, std::weak_ptr<ProfileLifecycle>(state)));
 }
 
+class AlloySiteRecordImpl final : public AlloySiteRecord {
+ public:
+  explicit AlloySiteRecordImpl(const sr::RecordInfo& record)
+      : domain_(record.domain), last_visit_(record.last_visit_us) {}
+  CefString GetDomain() override { return domain_; }
+  int64_t GetLastVisit() override { return last_visit_; }
+ private:
+  ~AlloySiteRecordImpl() override = default;
+  const std::string domain_;
+  const int64_t last_visit_;
+  IMPLEMENT_REFCOUNTING(AlloySiteRecordImpl);
+};
+
 class AlloyProfileImpl final : public AlloyProfile {
  public:
   explicit AlloyProfileImpl(std::unique_ptr<sr::EncryptedProfile> profile)
@@ -923,6 +935,48 @@ class AlloyProfileImpl final : public AlloyProfile {
           if (status == sr::FileStatus::kOk && prefs->ReadOnly()) status = sr::FileStatus::kCancelled;
           callback->OnComplete(SettingsResult(status), {});
           std::move(release).Run();
+        }, RetainForReply(), prefs, std::move(callback)));
+    return true;
+  }
+  bool ListSiteRecords(CefRefPtr<AlloySiteRecordsCallback> callback) override {
+    if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !callback) return false;
+    auto prefs = SettingsProjection();
+    if (!prefs) {
+      CEF_POST_TASK(CEF_UIT, base::BindOnce([](base::OnceClosure release,
+          CefRefPtr<AlloySiteRecordsCallback> callback) {
+        callback->OnComplete(ALLOY_SETTINGS_CANCELLED, {}); std::move(release).Run();
+      }, RetainForReply(), std::move(callback)));
+      return true;
+    }
+    prefs->ListRecordsAsync(base::BindOnce(
+        [](base::OnceClosure release, scoped_refptr<sr::SitePrefStore> prefs,
+           CefRefPtr<AlloySiteRecordsCallback> callback, sr::FileStatus status,
+           std::vector<sr::RecordInfo> records) {
+          base::ScopedClosureRunner keepalive(std::move(release));
+          if (status == sr::FileStatus::kOk && prefs->ReadOnly()) status = sr::FileStatus::kCancelled;
+          std::vector<CefRefPtr<AlloySiteRecord>> result;
+          if (status == sr::FileStatus::kOk)
+            for (const auto& record : records) result.push_back(new AlloySiteRecordImpl(record));
+          callback->OnComplete(SettingsResult(status), result);
+        }, RetainForReply(), prefs, std::move(callback)));
+    return true;
+  }
+  bool DeleteAllSiteRecords(CefRefPtr<AlloyRecordDeletionCallback> callback) override {
+    if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !callback) return false;
+    auto prefs = SettingsProjection();
+    if (!prefs) {
+      CEF_POST_TASK(CEF_UIT, base::BindOnce([](base::OnceClosure release,
+          CefRefPtr<AlloyRecordDeletionCallback> callback) {
+        callback->OnComplete(ALLOY_SETTINGS_CANCELLED, false); std::move(release).Run();
+      }, RetainForReply(), std::move(callback)));
+      return true;
+    }
+    prefs->DeleteAllSitesWithTeardownAsync(base::BindRepeating(&RetireNativeSite, prefs),
+        base::BindOnce([](base::OnceClosure release, scoped_refptr<sr::SitePrefStore> prefs,
+            CefRefPtr<AlloyRecordDeletionCallback> callback, sr::FileStatus status, sr::RecordDeletion deleted) {
+          base::ScopedClosureRunner keepalive(std::move(release));
+          if (status == sr::FileStatus::kOk && prefs->ReadOnly()) status = sr::FileStatus::kCancelled;
+          callback->OnComplete(SettingsResult(status), deleted == sr::RecordDeletion::kDeletedFilesPending);
         }, RetainForReply(), prefs, std::move(callback)));
     return true;
   }

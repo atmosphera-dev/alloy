@@ -56,14 +56,28 @@ class LockReply final : public AlloyProfileLockCallback {
 };
 class DeleteReply final : public AlloyRecordDeletionCallback {
  public:
+  explicit DeleteReply(std::function<void()> done = {}) : done_(std::move(done)) {}
   void OnComplete(alloy_site_settings_result_t result, bool pending) override {
     std::printf("ENCRYPTED_EVENT {\"event\":\"deletion-result\",\"result\":%d,\"pending\":%s}\n",
                 static_cast<int>(result), pending ? "true" : "false");
     Check(result == ALLOY_SETTINGS_OK && !pending, "live record deletion complete");
     std::puts("ENCRYPTED_EVENT {\"event\":\"deleted\"}");
+    if (done_) done_();
   }
  private:
+  const std::function<void()> done_;
   IMPLEMENT_REFCOUNTING(DeleteReply);
+};
+class RecordsReply final : public AlloySiteRecordsCallback {
+ public:
+  using Done = std::function<void(alloy_site_settings_result_t,
+      const std::vector<CefRefPtr<AlloySiteRecord>>&)>;
+  explicit RecordsReply(Done done) : done_(std::move(done)) {}
+  void OnComplete(alloy_site_settings_result_t result,
+      const std::vector<CefRefPtr<AlloySiteRecord>>& records) override { done_(result, records); }
+ private:
+  const Done done_;
+  IMPLEMENT_REFCOUNTING(RecordsReply);
 };
 class Consumer final : public CefApp, public CefBrowserProcessHandler, public CefClient,
                        public CefRenderHandler, public CefLifeSpanHandler, public CefDisplayHandler {
@@ -132,6 +146,39 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     const auto value = prefix+raw.substr(separator+1);
     if (value == "ALLOY_ENCRYPTED:write") Write();
     if (value == "ALLOY_ENCRYPTED:read") Read();
+    if (value == "ALLOY_ENCRYPTED:list-records") {
+      Check(profile_->ListSiteRecords(new RecordsReply([](auto status, const auto& records) {
+        Check(status == ALLOY_SETTINGS_OK, "public record listing completed");
+        std::printf("ENCRYPTED_EVENT {\"event\":\"records\",\"records\":[");
+        bool comma = false;
+        for (const auto& record : records) {
+          std::printf("%s{\"domain\":\"%s\",\"last_visit\":%lld}", comma ? "," : "",
+              record->GetDomain().ToString().c_str(), static_cast<long long>(record->GetLastVisit()));
+          comma = true;
+        }
+        std::puts("]}");
+      })), "public record listing queued");
+    }
+    if (value == "ALLOY_ENCRYPTED:delete-all") {
+      Check(phase_ == "all-live", "live delete-all phase");
+      Check(profile_->DeleteAllSiteRecords(new DeleteReply([self = CefRefPtr<Consumer>(this)] {
+        Check(self->closed_ == static_cast<int>(self->browsers_.size()),
+              "all original profile documents retired before delete-all acknowledgement");
+        self->ReadMetadata();
+        Check(self->profile_->ListSiteRecords(new RecordsReply([self](auto status, const auto& records) {
+          Check(status == ALLOY_SETTINGS_OK && records.empty(), "delete-all completion has empty catalogue");
+          std::puts("ENCRYPTED_EVENT {\"event\":\"all-empty\",\"count\":0}");
+          // The first callback's read precedes release. This subsequent queued
+          // read follows release, so the fresh visits test the later generation
+          // rather than racing the explicitly protected completion snapshot.
+          Check(self->profile_->ListSiteRecords(new RecordsReply([self](auto result, const auto& empty) {
+            Check(result == ALLOY_SETTINGS_OK && empty.empty(), "post-fence catalogue remains empty");
+            self->CreateBrowserForSite(self->first_+"/page/after-all");
+            self->CreateBrowserForSite(self->second_+"/page/after-all");
+          })), "post-fence listing queued");
+        })), "completion-time empty catalogue read queued");
+      })), "live delete-all queued");
+    }
     if (value == "ALLOY_ENCRYPTED:enable-decay") {
       Check(phase_ == "decay-seed" || phase_ == "decay-live", "decay phase");
       std::thread([profile = profile_] {
@@ -233,7 +280,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     Check(CefBrowserHost::CreateBrowser(window, this, url, settings, nullptr, context_), "site browser");
   }
   void Write() {
-    Check((phase_ == "write" || phase_ == "live" || phase_ == "decay-seed" || phase_ == "decay-live") && browsers_.size() == 2 && !written_, "write command ordering");
+    Check((phase_ == "write" || phase_ == "live" || phase_ == "all-live" || phase_ == "decay-seed" || phase_ == "decay-live") && browsers_.size() == 2 && !written_, "write command ordering");
     written_ = true;
     WriteMetadata();
     context_->SetContentSetting(first_, first_, CEF_CONTENT_SETTING_TYPE_GEOLOCATION, CEF_CONTENT_SETTING_VALUE_ALLOW);

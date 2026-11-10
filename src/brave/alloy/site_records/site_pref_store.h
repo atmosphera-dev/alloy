@@ -59,6 +59,7 @@ class SitePrefStore final : public NativePrefSource {
   using Completion = base::OnceCallback<void(FileStatus)>;
   void InitializeAsync(Completion completion);
   void FlushAsync(Completion completion);
+  void ListRecordsAsync(base::OnceCallback<void(FileStatus, std::vector<RecordInfo>)> completion);
   void SetFirstPartyEmbedsAsync(GURL outer, std::vector<GURL> embedded, Completion completion);
   void GetFirstPartyEmbedsAsync(GURL outer,
       base::OnceCallback<void(FileStatus, std::vector<std::string>)> completion);
@@ -110,6 +111,11 @@ class SitePrefStore final : public NativePrefSource {
   void DeleteSiteWithTeardownAsync(GURL site,
       base::OnceCallback<void(Completion)> teardown,
       base::OnceCallback<void(FileStatus, RecordDeletion)> completion);
+  // One queue operation, with a coordinator fence held through every native
+  // barrier and the completion callback. Reentrant reads precede fence release.
+  void DeleteAllSitesWithTeardownAsync(
+      base::RepeatingCallback<void(GURL, Completion)> teardown,
+      base::OnceCallback<void(FileStatus, RecordDeletion)> completion);
   // Native contexts return publication separately from completed revocation.
   // The shared owner releases all publications after every context has drained.
   void DeferNativeRetirementNotification(base::OnceClosure publication);
@@ -157,7 +163,7 @@ class SitePrefStore final : public NativePrefSource {
                            std::string_view publication_key = kPreferredApps);
   void RetireAdmission();
   void NotifyChange(std::string_view key);
-  void PublishRetirementNotifications(bool success);
+  void PublishRetirementNotifications(bool success, bool keep_serialized = false);
 
   const std::shared_ptr<RecordFileSystem> files_;
   const RecordCapability profile_;
@@ -176,6 +182,7 @@ class SitePrefStore final : public NativePrefSource {
   std::vector<base::OnceClosure> close_callbacks_;
   bool reading_ = false;
   bool busy_ = false;
+  bool deleting_all_ = false;
   bool in_teardown_ = false;
   std::string retiring_record_;
   std::set<std::string> retirement_notifications_;

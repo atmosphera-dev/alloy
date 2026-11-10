@@ -52,6 +52,9 @@ bool NativeProfileConfiguration::SharesOwnerWith(
   return profile_settings_.profile() == other.profile_settings_.profile() &&
       profile_settings_.generation() == other.profile_settings_.generation();
 }
+void NativeProfileConfiguration::DidCommitSiteVisit(const GURL& url, const url::Origin& origin) const {
+  if (admitted() && bindings_.committed_visit) bindings_.committed_visit.Run(url, origin);
+}
 void NativeProfileConfiguration::SetConsumerData(
     const void* key, std::unique_ptr<base::SupportsUserData::Data> data) {
   CHECK(!construction_started_);

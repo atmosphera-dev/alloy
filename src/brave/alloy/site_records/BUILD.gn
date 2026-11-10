@@ -118,7 +118,7 @@ source_set("profiles") {
     "secret_service_key_source.cc",
     "secret_service_key_source.h",
   ]
-  public_deps = [ ":record_files" ]
+  public_deps = [ ":record_files", ":pref_files" ]
   deps = [
     "//brave/third_party/argon2",
     "//dbus",
@@ -144,6 +144,8 @@ source_set("pref_files") {
     "site_pref_store.h",
     "site_pref_store_io.cc",
     "site_pref_store_io.h",
+    "site_record_decay.cc",
+    "site_record_decay.h",
   ]
   public_deps = [ ":record_files", ":preferred_app_records", ":origin_value_stores", ":native_pref_view", "//components/prefs" ]
   deps = [ ":pref_cache", "//components/content_settings/core/browser" ]
@@ -341,6 +343,7 @@ test("alloy_site_records_unittests") {
     "encrypted_profile_unittest.cc",
     "profile_auto_lock_unittest.cc",
     "linux_lock_signals_unittest.cc",
+    "site_record_decay_unittest.cc",
     "secret_service_key_source_unittest.cc",
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",

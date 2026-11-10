@@ -192,6 +192,20 @@ TEST(RecordDomainTest, SchemeIndependentRegistrableDomainAndHostFallback) {
   }
 }
 
+TEST(RecordDomainTest, CanonicalPrincipalReconstructionPreservesRecordIdentity) {
+  for (const auto* domain : {"baz.com.", "localhost.", "[::1]", "127.0.0.1",
+                             "a.github.io", "xn--bcher-kva.example"}) {
+    const auto principal = RecordPrincipalForHost(domain);
+    ASSERT_TRUE(principal.is_valid()) << domain;
+    EXPECT_EQ(domain, RecordDomainForPrincipal(principal, url::Origin::Create(principal)));
+  }
+  for (const auto* invalid : {"", "[*.]baz.com", "baz.com/path", "BAZ.COM", "user@baz.com"})
+    EXPECT_TRUE(RecordPrincipalForHost(invalid).is_empty()) << invalid;
+  const auto subdomain = RecordPrincipalForHost("one.alpha.test");
+  EXPECT_EQ("one.alpha.test", subdomain.host());
+  EXPECT_EQ("alpha.test", RecordDomainForPrincipal(subdomain, url::Origin::Create(subdomain)));
+}
+
 TEST(RecordDomainTest, NonpersistentPrincipalsNeverShareAnEmptyDomainRecord) {
   EXPECT_TRUE(
       RecordDomainForPrincipal(GURL("https://example.test/"), url::Origin())

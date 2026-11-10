@@ -1027,6 +1027,21 @@
       "patch": "brave-core/0130-first-party-retirement.patch",
       "root": "brave",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0129-site-record-visits.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0129-site-record-decay.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "brave-core/0129-owned-settings-schema.patch",
+      "root": "brave",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

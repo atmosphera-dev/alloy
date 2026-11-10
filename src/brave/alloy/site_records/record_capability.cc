@@ -68,6 +68,12 @@ std::string RecordDomainForPrincipal(const GURL& principal_url,
   return net::AlloyRecordDomainForPrincipal(principal_url, origin);
 }
 
+GURL RecordPrincipalForHost(std::string_view host) {
+  const GURL principal("https://" + std::string(host) + "/");
+  if (host.empty() || !principal.is_valid() || principal.GetHost() != host) return {};
+  return principal;
+}
+
 RecordGeneration::RecordGeneration(base::UnguessableToken profile,
                                    base::UnguessableToken record,
                                    base::UnguessableToken generation,

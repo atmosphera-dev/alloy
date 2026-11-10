@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Alex Indigo
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "brave/alloy/site_records/site_pref_store.h"
+#include "brave/alloy/site_records/site_profile_configuration.h"
+#include "brave/alloy/site_records/site_record_decay.h"
 
 #include "base/files/file_util.h"
 #include "base/files/scoped_temp_dir.h"
@@ -54,6 +56,7 @@
 #include "content/public/browser/web_contents.h"
 #include "content/public/test/web_contents_tester.h"
 #include "content/public/test/navigation_simulator.h"
+#include "content/public/test/test_renderer_host.h"
 #include "services/device/public/cpp/test/fake_usb_device_manager.h"
 #include "services/device/public/cpp/test/fake_hid_manager.h"
 #include "services/device/public/cpp/test/fake_serial_port_manager.h"
@@ -86,6 +89,49 @@ class RetirementPrefObserver final : public PrefStore::Observer {
  private:
   base::RepeatingClosure changed_;
 };
+
+class SiteRecordVisitTest : public ChromeRenderViewHostTestHarness {};
+TEST_F(SiteRecordVisitTest, OnlyCommittedTopLevelDocumentsRefreshTheRecordClock) {
+  base::ScopedTempDir temp; ASSERT_TRUE(temp.CreateUniqueTempDir());
+  ObjectId key{}; key.fill(0x31);
+  std::shared_ptr<RecordFileSystem> files;
+  ASSERT_EQ(FileStatus::kOk, RecordFileSystem::Create(temp.GetPath().AppendASCII("profile"), SecretKey(key), {}, &files));
+  auto prefs = base::MakeRefCounted<SitePrefStore>(files, base::BindRepeating([](FileStatus) {}));
+  ASSERT_EQ(PersistentPrefStore::PREF_READ_ERROR_NONE, prefs->ReadPrefs());
+  auto configuration = MakeSiteProfileConfiguration(files->ProfileCapability(StorePurpose::kProfileSettings),
+      prefs->CreateNativeView(), prefs, {});
+  ASSERT_TRUE(configuration->BeginConstruction());
+  configuration->SetTeardownHandler(base::DoNothing());
+  configuration->Attach(*profile()); configuration->ConstructionFinished();
+  const GURL alpha("https://alpha.test/page"), beta("https://beta.test/page"), hop("https://hop.test/");
+  NavigateAndCommit(alpha); task_environment()->RunUntilIdle();
+  auto last = [&](const GURL& site) {
+    RecordInfo info;
+    EXPECT_EQ(FileStatus::kOk, files->ResolveRecord(site, url::Origin::Create(site), false, &info));
+    return info;
+  };
+  auto original = last(alpha); EXPECT_GT(original.last_visit_us, 0);
+  ASSERT_EQ(FileStatus::kOk, files->RecordVisit(original.id, 1));
+  auto same = content::NavigationSimulator::CreateRendererInitiated(GURL(alpha.spec()+"#fragment"), main_rfh());
+  same->CommitSameDocument(); task_environment()->RunUntilIdle();
+  EXPECT_EQ(1, last(alpha).last_visit_us);
+  auto* child = content::RenderFrameHostTester::For(main_rfh())->AppendChild("embedded");
+  content::NavigationSimulator::CreateRendererInitiated(beta, child)->Commit();
+  task_environment()->RunUntilIdle();
+  RecordInfo absent; EXPECT_EQ(FileStatus::kNotFound, files->ResolveRecord(beta, url::Origin::Create(beta), false, &absent));
+  EXPECT_EQ(1, last(alpha).last_visit_us);
+  content::NavigationSimulator::Reload(web_contents()); task_environment()->RunUntilIdle();
+  EXPECT_GT(last(alpha).last_visit_us, 1);
+  auto redirect = content::NavigationSimulator::CreateBrowserInitiated(hop, web_contents());
+  redirect->Start(); redirect->Redirect(beta); redirect->Commit(); task_environment()->RunUntilIdle();
+  EXPECT_GT(last(beta).last_visit_us, 0);
+  EXPECT_EQ(FileStatus::kNotFound, files->ResolveRecord(hop, url::Origin::Create(hop), false, &absent));
+  ASSERT_EQ(FileStatus::kOk, files->RecordVisit(original.id, 1));
+  content::NavigationSimulator::GoBack(web_contents()); task_environment()->RunUntilIdle();
+  EXPECT_GT(last(alpha).last_visit_us, 1);
+  ASSERT_EQ(FileStatus::kOk, files->Lock());
+  configuration.reset(); task_environment()->RunUntilIdle();
+}
 
 class SiteRetirementTest : public ChromeRenderViewHostTestHarness {
  protected:

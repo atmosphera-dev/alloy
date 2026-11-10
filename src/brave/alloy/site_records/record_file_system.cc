@@ -555,7 +555,7 @@ struct RecordFileSystem::Impl {
 
   FileStatus PutRecord(Record& record, ObjectRef* into) {
     Encoder value;
-    value.U32(record.profile_private ? 2 : 1);
+    value.U32(record.profile_private ? 2 : 3);
     value.Token(record.info.id);
     value.Token(record.info.generation);
     value.Text(record.info.domain);
@@ -563,6 +563,7 @@ struct RecordFileSystem::Impl {
     value.Blob(record.info.metadata);
     value.Blob(record.wrapped_key);
     value.Ref(record.names);
+    if (!record.profile_private) value.U64(record.info.last_visit_us);
     ObjectRef updated;
     const auto status = CatalogueTree().Put(*into, record.info.directory,
                                              value.bytes, &updated);
@@ -577,7 +578,7 @@ struct RecordFileSystem::Impl {
     auto record = std::make_unique<Record>();
     Decoder in(value);
     const auto kind = in.U32();
-    if (kind != 1 && kind != 2) {
+    if (kind != 1 && kind != 2 && kind != 3) {
       return FileStatus::kIntegrity;
     }
     record->profile_private = kind == 2;
@@ -591,6 +592,7 @@ struct RecordFileSystem::Impl {
     const auto wrapped = in.Blob(80);
     record->wrapped_key.assign(wrapped.begin(), wrapped.end());
     record->names = in.Ref();
+    if (kind == 3) record->info.last_visit_us = static_cast<int64_t>(in.U64());
     const auto expected = record->profile_private ? PrivateDirectory()
         : KeyedName(lookup_key, base::as_byte_span(record->info.domain));
     if (!in.Done() || record->info.domain.empty() != record->profile_private ||
@@ -1153,6 +1155,33 @@ FileStatus RecordFileSystem::ListRecords(std::vector<RecordInfo>* out) {
   return FileStatus::kOk;
 }
 
+FileStatus RecordFileSystem::RecordVisit(base::UnguessableToken id, int64_t now_us) {
+  std::lock_guard lock(impl_->mutex);
+  const auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  const auto found = impl_->records.find(id);
+  if (found == impl_->records.end()) return FileStatus::kNotFound;
+  if (now_us <= 0 || found->second->profile_private) return FileStatus::kInvalid;
+  found->second->info.last_visit_us = now_us;
+  found->second->dirty = true;
+  return impl_->Observe(impl_->Commit());
+}
+
+FileStatus RecordFileSystem::ClampFutureRecordTimes(int64_t now_us) {
+  std::lock_guard lock(impl_->mutex);
+  const auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  if (now_us <= 0) return FileStatus::kInvalid;
+  bool changed = false;
+  for (auto& [id, record] : impl_->records) {
+    if (record->profile_private) continue;
+    for (auto* time : {&record->info.created_us, &record->info.last_visit_us}) {
+      if (*time > now_us) { *time = now_us; record->dirty = changed = true; }
+    }
+  }
+  return changed ? impl_->Observe(impl_->Commit()) : FileStatus::kOk;
+}
+
 FileStatus RecordFileSystem::SetRecordMetadata(
     base::UnguessableToken id, base::span<const uint8_t> metadata) {
   std::lock_guard lock(impl_->mutex);
@@ -1247,7 +1276,7 @@ FileStatus RecordFileSystem::DeleteRecordWithSettings(
 
 FileStatus RecordFileSystem::RetireRecordWithSettings(
     base::UnguessableToken id, base::span<const SettingsReplacement> replacements,
-    base::UnguessableToken* ticket) {
+    base::UnguessableToken* ticket, std::optional<int64_t> unchanged_visit) {
   if (!ticket) return FileStatus::kInvalid;
   std::unique_lock lock(impl_->mutex);
   auto status = impl_->Admission();
@@ -1261,6 +1290,10 @@ FileStatus RecordFileSystem::RetireRecordWithSettings(
   if (found->second->profile_private) {
     return FileStatus::kDenied;
   }
+  // Selection and publication can race a qualifying visit. The shared commit
+  // barrier, not a timer's earlier snapshot, decides which operation won.
+  if (unchanged_visit && found->second->info.last_visit_us != *unchanged_visit)
+    return FileStatus::kBusy;
   status = impl_->StageSettings(replacements, id);
   if (status != FileStatus::kOk) return impl_->Observe(status);
   auto record = std::move(found->second);

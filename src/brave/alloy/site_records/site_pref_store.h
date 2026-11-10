@@ -113,6 +113,11 @@ class SitePrefStore final : public NativePrefSource {
   // Native contexts return publication separately from completed revocation.
   // The shared owner releases all publications after every context has drained.
   void DeferNativeRetirementNotification(base::OnceClosure publication);
+  // Browser-owned top-level commit only. Queued work retains this projection's
+  // admission and cannot mint a replacement after a deletion/lock barrier.
+  void RecordVisitAsync(GURL site, int64_t now_us);
+  void DecayNextAsync(base::OnceCallback<void(GURL, Completion)> teardown,
+                      base::OnceCallback<void(FileStatus, bool)> completion);
 
  private:
   ~SitePrefStore() override;

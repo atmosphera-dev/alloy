@@ -1,0 +1,21 @@
+--- a/chromium_src/components/content_settings/core/browser/content_settings_registry.cc
++++ b/chromium_src/components/content_settings/core/browser/content_settings_registry.cc
+@@ -9,5 +9,6 @@
+ #undef BRAVE_INIT
+ 
+ #include "base/containers/fixed_flat_map.h"
++#include "base/feature_list.h"
+ #include "brave/components/brave_shields/core/common/brave_shield_constants.h"
+ #include "brave/components/brave_shields/core/common/brave_shields_settings_values.h"
+@@ -243,6 +244,10 @@
+ 
+   Register(ContentSettingsType::BRAVE_REMEMBER_1P_STORAGE,
+            "brave_remember_1p_storage",
+-           net::features::kBraveForgetFirstPartyStorageByDefault.Get()
++           // Pre-CEF owned graphs only validate schema; they must not activate
++           // a runtime field trial. Normal native defaults still use Get().
++           (base::FeatureList::GetInstance()
++                ? net::features::kBraveForgetFirstPartyStorageByDefault.Get()
++                : net::features::kBraveForgetFirstPartyStorageByDefault.default_value)
+                ? CONTENT_SETTING_BLOCK
+                : CONTENT_SETTING_ALLOW,

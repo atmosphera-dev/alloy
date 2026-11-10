@@ -906,7 +906,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=['stateless', 'memory', 'encrypted', 'delete', 'core', 'keyring', 'embedded', 'autolock'], default='core')
+    parser.add_argument('--check', choices=['stateless', 'memory', 'encrypted', 'delete', 'core', 'keyring', 'embedded', 'autolock', 'decay'], default='core')
     parser.add_argument('--embedded-scope', choices=['both', 'per-tab', 'per-outer-site'],
                         default='both', help='Embedded implemented-storage slice only (default both scopes)')
     parser.add_argument('--exercise-files', action='store_true',
@@ -918,6 +918,9 @@ def main():
     if args.check == 'autolock':
         from profile_autolock import main as autolock_main
         return autolock_main()
+    if args.check == 'decay':
+        from profile_decay import main as decay_main
+        return decay_main()
     if args.check in ('encrypted', 'delete'):
         from profile_encrypted import main as encrypted_main
         return encrypted_main()

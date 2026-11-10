@@ -1523,6 +1523,32 @@ TEST_F(NativeDiskEmbeddedLocalStorageTest,
 }
 
 TEST_F(NativeDiskEmbeddedLocalStorageTest,
+       UnusedFirstPartyRetirementKeepsConfigurationAndAdmission) {
+  auto publication = content::BeginAlloyFirstPartyRetirement(
+      *profile(), GURL("https://alpha.test/"));
+  ASSERT_TRUE(publication);
+  EXPECT_TRUE(content::ConfigureAlloyEmbeddedStateScope(*profile(), Scope::kPerTab));
+  EXPECT_TRUE(content::ConfigureAlloyEmbeddedFirstPartyPolicy(*profile(),
+      EmbeddedFirstPartyPolicy::Bind(base::BindRepeating(
+          [](const GURL&, const GURL&) { return true; }))));
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(
+      GURL("https://alpha.test/"));
+  const auto closed = content::GetAlloyEmbeddedStateForDocument(
+      web_contents()->GetPrimaryMainFrame());
+  EXPECT_EQ(closed.backing, Backing::kNone);
+  EXPECT_TRUE(closed.temporary_admission_closed);
+  std::move(publication).Run();
+  // The document captured during retirement stays closed; only a new document
+  // may select the replacement generation after publication.
+  EXPECT_EQ(content::GetAlloyEmbeddedStateForDocument(
+      web_contents()->GetPrimaryMainFrame()).backing, Backing::kNone);
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(
+      GURL("https://alpha.test/fresh"));
+  EXPECT_EQ(content::GetAlloyEmbeddedStateForDocument(
+      web_contents()->GetPrimaryMainFrame()).backing, Backing::kRealSite);
+}
+
+TEST_F(NativeDiskEmbeddedLocalStorageTest,
        MemoryServiceWorkerContextEndsWithSiteOwner) {
   ASSERT_FALSE(profile()->IsOffTheRecord());
   ASSERT_TRUE(
@@ -5262,6 +5288,87 @@ class NativeDiskEmbeddedCodeCacheTest
   base::test::ScopedFeatureList features_;
   base::test::ScopedCommandLine command_line_;
 };
+
+TEST_F(NativeDiskEmbeddedCodeCacheTest,
+       FirstPartyCodeCacheAdmissionIsGloballyBounded) {
+  struct OtherState final : KeyedService { int value = 73; };
+  static const char kOtherState = 0;
+  EmbeddedStateRegistry records(profile()->UniqueToken(), StorageMode::kMemory,
+      Scope::kPerOuterSite, nullptr);
+  auto* partition = static_cast<content::StoragePartitionImpl*>(
+      profile()->GetDefaultStoragePartition());
+  size_t admitted = 0;
+  std::vector<scoped_refptr<EmbeddedState>> owners;
+  std::vector<OtherState*> other;
+  for (size_t i = 0; i < 32; ++i) {
+    const GURL site("https://site" + std::to_string(i) + ".test/");
+    auto selected = records.ResolveFirstParty(site, url::Origin::Create(site));
+    ASSERT_TRUE(selected.first_party_state);
+    owners.push_back(selected.first_party_state);
+    other.push_back(static_cast<OtherState*>(owners.back()->GetOrCreateService(
+        &kOtherState, StorePurpose::kOriginTrials,
+        base::BindOnce([](RecordCapability) -> std::unique_ptr<KeyedService> {
+          return std::make_unique<OtherState>();
+        }))));
+    ASSERT_TRUE(other.back());
+    if (content::GetAlloyEmbeddedCodeCacheReceivers(*partition, owners.back())) ++admitted;
+  }
+  // Fixed 80 MiB total, reserving 16 MiB for each complete native cache bundle.
+  EXPECT_LE(admitted, 5u);
+  EXPECT_GT(admitted, 0u);
+  for (size_t i = 0; i < owners.size(); ++i) {
+    EXPECT_TRUE(owners[i]->Capability(StorePurpose::kOriginTrials).active());
+    EXPECT_EQ(other[i]->value, 73);
+    EXPECT_EQ(owners[i]->GetOrCreateService(&kOtherState, StorePurpose::kOriginTrials,
+        base::BindOnce([](RecordCapability) -> std::unique_ptr<KeyedService> {
+          ADD_FAILURE() << "cache pressure recreated non-cache state";
+          return nullptr;
+        })), other[i]);
+  }
+  EmbeddedStateRegistry peer(profile()->UniqueToken(), StorageMode::kMemory,
+      Scope::kPerOuterSite, nullptr);
+  auto next = peer.ResolveFirstParty(GURL("https://peer.test/"),
+      url::Origin::Create(GURL("https://peer.test/")));
+  EXPECT_FALSE(content::GetAlloyEmbeddedCodeCacheReceivers(*partition, next.first_party_state));
+  records.Shutdown();
+  task_environment()->RunUntilIdle();
+  EXPECT_TRUE(content::GetAlloyEmbeddedCodeCacheReceivers(*partition, next.first_party_state));
+}
+
+TEST_F(NativeDiskEmbeddedCodeCacheTest,
+       FirstPartyCodeCacheEntriesEndWithRecord) {
+  RequestContextPolicy::AttachMemory(*profile());
+  const GURL site("https://alpha.test/");
+  const GURL resource("https://cdn.test/record-code.js");
+  const std::string bytes("first-party-record-code");
+  const auto key = blink::UrlToCodeCacheKey(resource);
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(site);
+  auto* frame = static_cast<content::RenderFrameHostImpl*>(
+      web_contents()->GetPrimaryMainFrame());
+  ASSERT_TRUE(content::GetAlloyEmbeddedStateForDocument(frame).first_party_state);
+  auto host = Bind(frame);
+  auto reader = Open(host, Type::kJavascript);
+  ASSERT_TRUE(reader);
+  host->DidGenerateCacheableMetadata(Type::kJavascript, resource, base::Time::Now(),
+      mojo_base::BigBuffer(base::as_byte_span(bytes)));
+  ASSERT_TRUE(Export(host, Type::kJavascript));
+  EXPECT_EQ(Read(reader, base::as_byte_span(key)).bytes, bytes);
+  auto publication = content::BeginAlloyFirstPartyRetirement(*profile(), site);
+  ASSERT_TRUE(publication);
+  auto retired = Read(reader, base::as_byte_span(key));
+  EXPECT_FALSE(retired.operational);
+  EXPECT_EQ(retired.error, persistent_cache::TransactionError::kConnectionError);
+  std::move(publication).Run();
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(
+      GURL("https://alpha.test/fresh"));
+  auto fresh_host = Bind(static_cast<content::RenderFrameHostImpl*>(
+      web_contents()->GetPrimaryMainFrame()));
+  auto fresh_reader = Open(fresh_host, Type::kJavascript);
+  ASSERT_TRUE(fresh_reader);
+  const auto fresh = Read(fresh_reader, base::as_byte_span(key));
+  EXPECT_TRUE(fresh.operational);
+  EXPECT_FALSE(fresh.hit);
+}
 
 TEST_F(NativeDiskEmbeddedCodeCacheTest,
        PerTabFrameCodeCacheExportsEndWithScope) {

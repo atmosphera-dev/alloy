@@ -190,6 +190,18 @@ successful deletion. Another site's own data remains intact, including shared
 favicon content still referenced by that site's pages. User-selected external
 files are never deleted by this operation.
 
+Generated-code caches currently use a bounded-admission fallback, not a global
+entry LRU. One process-wide pool reserves at most 80 MiB of native cache
+capacities, matching Chromium's default disk code-cache size. Each cache bundle
+reserves 16 MiB: a 4 MiB limit for each of JS, Wasm, the JS memory front-cache
+and the persistent/source-keyed collection. Thus at most five bundles are
+admitted across records, contexts and partitions. Capacity returns only after
+native cache shutdown runs. Additional caches are refused while full; pages
+still execute normally, without those optional cached compilations. This is
+cache-capacity accounting, not a total-process RSS bound. Other record state
+is neither evicted nor recreated to make room. Entry-level size-triggered LRU
+is tracked in [issue 13](https://github.com/atmosphera-dev/alloy/issues/13).
+
 The profile and context embed-list accessors share the same encrypted owner;
 guest context accessors use memory only, and stateless access is refused. See
 [embed-list settings](embed-list-settings.md) for callback, validation and

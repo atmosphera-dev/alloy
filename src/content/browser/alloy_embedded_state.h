@@ -22,6 +22,7 @@ class StoragePartitionImpl;
 
 // The caller supplies original browser-captured scope authority. A closed
 // selection returns no receiver set and must never fall through to real data.
+// Exhausted code-cache capacity also returns null without retiring other state.
 CONTENT_EXPORT CodeCacheHostImpl::ReceiverSet*
 GetAlloyEmbeddedCodeCacheReceivers(
     StoragePartitionImpl& partition,

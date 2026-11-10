@@ -14,10 +14,16 @@ async function command(client,name,event){
   const before=(await events()).length;await control(client,name);
   return until(async()=>(await events()).slice(before).find(e=>e.event===event),'new native '+event);
 }
+/**
+ * Dispatch a command that retires its target and await its native completion.
+ * Only a terminal CDP error is tolerated; dispatch and SDK acknowledgement remain required.
+ * @param {object} client CDP connection to the target being retired.
+ * @param {string} name Identified native command action.
+ * @param {string} event SDK completion event expected after dispatch.
+ * @returns {Promise<object>} The fresh SDK completion event.
+ */
 async function terminalCommand(client,name,event){
   const before=(await events()).length,request=profileControlRequest(name);
-  // Lock intentionally destroys its target. Require identified native dispatch
-  // and the new SDK completion, not a CDP reply from the retired document.
   try{await value(client,`document.title=${JSON.stringify(request.title)}`)}
   catch(error){if(!error.cdpTerminal)throw error}
   await profileControlReply(request);

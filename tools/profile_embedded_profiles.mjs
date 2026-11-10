@@ -14,6 +14,15 @@ async function command(client,name,event){
   const before=(await events()).length;await control(client,name);
   return until(async()=>(await events()).slice(before).find(e=>e.event===event),'new native '+event);
 }
+async function terminalCommand(client,name,event){
+  const before=(await events()).length,request=profileControlRequest(name);
+  // Lock intentionally destroys its target. Require identified native dispatch
+  // and the new SDK completion, not a CDP reply from the retired document.
+  try{await value(client,`document.title=${JSON.stringify(request.title)}`)}
+  catch(error){if(!error.cdpTerminal)throw error}
+  await profileControlReply(request);
+  return until(async()=>(await events()).slice(before).find(e=>e.event===event),'new native '+event);
+}
 function pass(name){observations.checks.push(name)}
 async function page(owner,host,label='initial'){
   const url=origin(host)+'/page/p'+owner+'/'+label;
@@ -144,12 +153,12 @@ if(phase==='read'){
   temporary(await frame(g0.c,'beta.test'),'deleted embedded temporary jar in another outer');
   check((await own(b1.c)).local===real1&&(await own(b1.c)).permission==='denied','embedded deletion crossed profiles');
   pass('embedded-record-delete-removes-generated-list-reference-and-live-frames');
-  await command(g0.c,'lock-zero','zero-locked');
+  await terminalCommand(g0.c,'lock-zero','zero-locked');
   const remaining=await pageTargets();
   check(!remaining.some(t=>t.url.includes('/page/p0/')),'acknowledged lock left profile zero browsers');
   check((await own(b1.c)).local===real1&&(await own(b1.c)).permission==='denied','lock retired a different profile');
   pass('profile-lock-revokes-original-list-context-and-browsers');
 }
-await control(g1.c,'finish');
+await terminalCommand(g1.c,'finish','finished');
 for(const c of sockets)c.ws.close();
 console.log(JSON.stringify(observations));

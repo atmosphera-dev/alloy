@@ -7,7 +7,6 @@
 
 #include "base/functional/bind.h"
 #include "brave/alloy/site_records/site_pref_store_io.h"
-#include "components/content_settings/core/common/content_settings_pattern.h"
 #include "components/content_settings/core/browser/owned_settings_registries.h"
 #include "url/gurl.h"
 
@@ -75,10 +74,15 @@ FileStatus NextDecayedRecord(RecordFileSystem& files, int64_t now_us,
 FileStatus DecayBeforeAdmission(std::shared_ptr<RecordFileSystem> files) {
   std::unique_ptr<content_settings::OwnedSettingsRegistries> registries;
   scoped_refptr<internal::SitePrefStore> prefs;
+  std::optional<RecordInfo> stalled;
   for (;;) {
     std::optional<RecordInfo> expired;
     auto status = NextDecayedRecord(*files, DecayNowMicros(), &expired);
     if (status != FileStatus::kOk || !expired) return status;
+    // A changed selection may be retried, but an unchanged expired record must
+    // never spin indefinitely or be ignored while unlock reports success.
+    if (stalled && stalled->id == expired->id &&
+        stalled->last_visit_us == expired->last_visit_us) return FileStatus::kBusy;
     if (!prefs) {
       registries = std::make_unique<content_settings::OwnedSettingsRegistries>();
       prefs = base::MakeRefCounted<internal::SitePrefStore>(files,
@@ -87,10 +91,13 @@ FileStatus DecayBeforeAdmission(std::shared_ptr<RecordFileSystem> files) {
       if (prefs->last_status() != FileStatus::kOk) return prefs->last_status();
     }
     base::UnguessableToken ticket;
-    status = prefs->RetireSite(ContentSettingsPattern::FromString(expired->domain).ToRepresentativeUrl(), &ticket,
-                               &*expired);
-    if (status == FileStatus::kBusy || status == FileStatus::kNotFound) continue;
+    status = prefs->RetireRecord(*expired, &ticket);
+    if (status == FileStatus::kBusy || status == FileStatus::kNotFound) {
+      stalled = std::move(expired);
+      continue;
+    }
     if (status != FileStatus::kOk) return status;
+    stalled.reset();
     RecordDeletion result;
     status = files->FinishRecordDeletion(ticket, &result);
     if (status != FileStatus::kOk) return status;

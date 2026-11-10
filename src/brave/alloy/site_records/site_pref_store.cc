@@ -15,7 +15,6 @@
 #include "brave/alloy/site_records/site_record_decay.h"
 #include "brave/alloy/site_records/native_pref_view.h"
 #include "brave/alloy/site_records/pref_cache_clear.h"
-#include "components/content_settings/core/common/content_settings_pattern.h"
 #include "url/gurl.h"
 
 namespace alloy::site_records {
@@ -24,7 +23,7 @@ std::string Domain(const GURL& url) {
   return RecordDomainForPrincipal(url, url::Origin::Create(url));
 }
 GURL HostUrl(std::string_view host) {
-  return ContentSettingsPattern::FromString(host).ToRepresentativeUrl();
+  return RecordPrincipalForHost(host);
 }
 }  // namespace
 
@@ -111,8 +110,8 @@ class SitePrefStore::IO {
           if (expired) site = HostUrl(expired->domain);
         }
         if (status == FileStatus::kOk && (kind == Request::kDelete || expired))
-          status = store_->RetireSite(site, &ticket,
-              expired ? &*expired : nullptr);
+          status = expired ? store_->RetireRecord(*expired, &ticket)
+                           : store_->RetireSite(site, &ticket);
         if (kind == Request::kDecay && (status == FileStatus::kBusy || status == FileStatus::kNotFound))
           status = FileStatus::kOk;
         if (status == FileStatus::kOk && !ticket.is_empty()) retiring_.emplace(ticket, Domain(site));
@@ -475,7 +474,10 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     Retired(std::move(request), std::move(state));
     return;
   }
-  busy_ = false;
+  // Native retirement publications may call observers that pump a nested loop.
+  // Keep this transaction serialized until every context has published; queued
+  // work must not start a second deletion against an unpublished native owner.
+  busy_ = request->kind == Request::kDelete || request->kind == Request::kDecay;
   PreferredVersion published;
   std::vector<std::string> domains;
   if (request->kind == Request::kInitialize && !initialized_) {
@@ -647,13 +649,18 @@ void SitePrefStore::DeferNativeRetirementNotification(base::OnceClosure publicat
   if (publication) native_retirement_publications_.push_back(std::move(publication));
 }
 void SitePrefStore::PublishRetirementNotifications(bool success) {
-  in_teardown_ = false;
   auto publications = std::move(native_retirement_publications_);
   auto changed = std::move(retirement_notifications_);
   native_retirement_publications_.clear(); retirement_notifications_.clear();
+  if (success) {
+    for (auto& publication : publications) std::move(publication).Run();
+    retiring_record_.clear();
+  }
+  // Synchronous compatibility calls return kBusy during native publication.
+  // Ordinary notifications retain their existing reentrant mutation contract.
+  in_teardown_ = false;
+  busy_ = false;
   if (!success) return;
-  retiring_record_.clear();
-  for (auto& publication : publications) std::move(publication).Run();
   for (const auto& key : changed) NotifyChange(key);
 }
 void SitePrefStore::Invalidate() {

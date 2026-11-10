@@ -50,7 +50,7 @@ std::string Domain(const GURL& url) {
 }
 
 GURL HostUrl(std::string_view host) {
-  return ContentSettingsPattern::FromString(host).ToRepresentativeUrl();
+  return RecordPrincipalForHost(host);
 }
 
 const content_settings::WebsiteSettingsRegistry* Registry(
@@ -656,22 +656,45 @@ FileStatus SitePrefStore::DeleteSite(const GURL& site, std::function<void()> tea
 
 FileStatus SitePrefStore::RetireSite(const GURL& site, base::UnguessableToken* ticket,
                                      const RecordInfo* expected) {
-  scoped_refptr<SitePrefStore> keep_alive(this);
   if (!initialized_ || !Admitted()) return FileStatus::kDenied;
-  const auto owner = Domain(site);
-  if (owner.empty()) return FileStatus::kInvalid;
+  if (Domain(site).empty()) return FileStatus::kInvalid;
   RecordInfo record;
-  auto status = files_->ResolveRecord(site, url::Origin::Create(site), false, &record);
+  const auto status = files_->ResolveRecord(site, url::Origin::Create(site), false, &record);
   if (status != FileStatus::kOk) return status;
   if (expected && record.id != expected->id) return FileStatus::kBusy;
+  return RetireSelectedRecord(record, ticket,
+      expected ? std::optional(expected->last_visit_us) : std::nullopt);
+}
+
+FileStatus SitePrefStore::RetireRecord(const RecordInfo& expected,
+                                      base::UnguessableToken* ticket) {
+  if (!initialized_ || !Admitted()) return FileStatus::kDenied;
+  std::vector<RecordInfo> records;
+  const auto status = files_->ListRecords(&records);
+  if (status != FileStatus::kOk) return status;
+  for (const auto& record : records) {
+    if (record.id != expected.id) continue;
+    if (record.domain != expected.domain || record.generation != expected.generation)
+      return FileStatus::kBusy;
+    return RetireSelectedRecord(record, ticket, expected.last_visit_us);
+  }
+  return FileStatus::kNotFound;
+}
+
+FileStatus SitePrefStore::RetireSelectedRecord(const RecordInfo& record,
+    base::UnguessableToken* ticket, std::optional<int64_t> unchanged_visit) {
+  scoped_refptr<SitePrefStore> keep_alive(this);
+  const auto& owner = record.domain;
+  const auto principal = RecordPrincipalForHost(owner);
+  if (principal.is_empty() || Domain(principal) != owner) return FileStatus::kInvalid;
   Shards shards;
   PrefValueMap retained;
-  status = Build(owner, &shards, &retained);
+  auto status = Build(owner, &shards, &retained);
   std::map<std::string, std::string> buffers;
   std::vector<SettingsReplacement> replacements;
   if (status == FileStatus::kOk) status = Prepare(shards, owner, &buffers, &replacements);
   if (status == FileStatus::kOk) status = files_->RetireRecordWithSettings(record.id, replacements, ticket,
-      expected ? std::optional(expected->last_visit_us) : std::nullopt);
+      unchanged_visit);
   if (status == FileStatus::kOk) {
     timer_.Stop();
     dirty_ = false;
@@ -681,7 +704,7 @@ FileStatus SitePrefStore::RetireSite(const GURL& site, base::UnguessableToken* t
     Install(&retained, true, true);
   }
   WipeBuffers(&buffers);
-  if (expected && (status == FileStatus::kBusy || status == FileStatus::kNotFound)) return status;
+  if (unchanged_visit && (status == FileStatus::kBusy || status == FileStatus::kNotFound)) return status;
   return status == FileStatus::kOk ? status : Fail(status);
 }
 

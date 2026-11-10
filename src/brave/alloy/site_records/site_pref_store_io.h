@@ -66,6 +66,9 @@ class SitePrefStore final : public PersistentPrefStore {
   FileStatus DeleteSite(const GURL& site, std::function<void()> teardown, RecordDeletion* result);
   FileStatus RetireSite(const GURL& site, base::UnguessableToken* ticket,
                         const RecordInfo* expected = nullptr);
+  // Decay selections retain their stored identity; never resolve them through
+  // a content-setting pattern or borrow a replacement with the same domain.
+  FileStatus RetireRecord(const RecordInfo& expected, base::UnguessableToken* ticket);
   // Flat native keys, unlike PrefStore::GetValues' expanded dictionary.
   base::DictValue Snapshot() const;
   void ApplySnapshot(base::DictValue values);
@@ -93,6 +96,8 @@ class SitePrefStore final : public PersistentPrefStore {
                      std::map<std::string, std::string>* buffers,
                      std::vector<SettingsReplacement>* replacements);
   FileStatus FlushImpl();
+  FileStatus RetireSelectedRecord(const RecordInfo& record, base::UnguessableToken* ticket,
+                                 std::optional<int64_t> unchanged_visit);
   FileStatus PublishValue(std::string_view key, base::Value value, PreferredVersion* published);
   FileStatus ReplaceFirstPartyEmbeds(const std::string& outer, base::ListValue embedded);
   static bool ConsideredFirstParty(const PrefValueMap& values, const GURL& outer, const GURL& embedded);

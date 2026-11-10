@@ -6,6 +6,7 @@
 #include "base/functional/bind.h"
 #include "base/test/bind.h"
 #include "base/test/task_environment.h"
+#include "base/test/test_future.h"
 #include "brave/alloy/site_records/site_pref_store.h"
 #include "brave/alloy/site_records/site_pref_store_io.h"
 #include "testing/gtest/include/gtest/gtest.h"
@@ -191,6 +192,9 @@ TEST_F(SiteRecordDecayTest, AtomicVisitGuardCannotDeleteANewerVisitOrItsSettings
   ASSERT_EQ(FileStatus::kOk, files_->RecordVisit(original.id, DecayNowMicros()));
   base::UnguessableToken ticket;
   EXPECT_EQ(FileStatus::kBusy, files_->RetireRecordWithSettings(original.id, {}, &ticket, 0));
+  auto selected = base::MakeRefCounted<internal::SitePrefStore>(files_, base::BindRepeating([](FileStatus) {}));
+  ASSERT_EQ(PersistentPrefStore::PREF_READ_ERROR_NONE, selected->ReadPrefs());
+  EXPECT_EQ(FileStatus::kBusy, selected->RetireRecord(original, &ticket));
   EXPECT_TRUE(ticket.is_empty()); EXPECT_TRUE(prefs->IsConsideredFirstParty(a_, b_));
   EXPECT_TRUE(files_->Capability(original.id, StorePurpose::kSiteSettings).active());
 }
@@ -220,6 +224,7 @@ TEST_F(SiteRecordDecayTest, ExpirationSnapshotCannotBorrowAReplacementGeneration
   EXPECT_EQ(original.last_visit_us, fresh.last_visit_us);
   base::UnguessableToken ticket;
   EXPECT_EQ(FileStatus::kBusy, prefs->RetireSite(a_, &ticket, &original));
+  EXPECT_EQ(FileStatus::kNotFound, prefs->RetireRecord(original, &ticket));
   EXPECT_TRUE(ticket.is_empty()); EXPECT_TRUE(prefs->IsConsideredFirstParty(a_, c_));
   EXPECT_TRUE(files_->Capability(fresh.id, StorePurpose::kSiteSettings).active());
 }
@@ -232,6 +237,57 @@ TEST_F(SiteRecordDecayTest, InvalidStoredPolicyRefusesUnlockInsteadOfIgnoringEnf
   EXPECT_EQ(FileStatus::kIntegrity, profile_->Unlock(source_));
   EXPECT_FALSE(profile_->files()); EXPECT_TRUE(profile_->KeysClearedForTesting());
 }
+TEST_F(SiteRecordDecayTest, NativeDecayPreservesDottedRecordIdentity) {
+  const GURL dotted("https://baz.com./"), plain("https://baz.com/");
+  const auto expired = Site(dotted), retained = Site(plain);
+  ASSERT_NE(expired.id, retained.id);
+  ASSERT_EQ("baz.com.", expired.domain);
+  const auto old = files_->Capability(expired.id, StorePurpose::kCookies);
+  const auto other = files_->Capability(retained.id, StorePurpose::kCookies);
+  ASSERT_EQ(FileStatus::kOk, files_->RecordVisit(expired.id, DecayNowMicros() - 10000000));
+  ASSERT_EQ(FileStatus::kOk, files_->RecordVisit(retained.id, DecayNowMicros()));
+  auto prefs = Prefs();
+  ASSERT_EQ(FileStatus::kOk, prefs->SetFirstPartyEmbeds(b_, {dotted, plain}));
+  ASSERT_TRUE(prefs->IsConsideredFirstParty(b_, dotted));
+  ASSERT_TRUE(prefs->IsConsideredFirstParty(b_, plain));
+  ASSERT_EQ(FileStatus::kOk, profile_->SetDecayPolicy({5000000}));
+  base::test::TestFuture<FileStatus, bool> result;
+  bool teardown = false;
+  prefs->DecayNextAsync(base::BindLambdaForTesting([&](GURL site, SitePrefStore::Completion done) {
+    teardown = true;
+    EXPECT_EQ(expired.domain, RecordDomainForPrincipal(site, url::Origin::Create(site)));
+    EXPECT_FALSE(old.active());
+    EXPECT_TRUE(other.active());
+    std::move(done).Run(FileStatus::kOk);
+  }), result.GetCallback());
+  ASSERT_TRUE(result.Wait());
+  EXPECT_EQ(FileStatus::kOk, result.Get<0>());
+  EXPECT_TRUE(result.Get<1>());
+  EXPECT_TRUE(teardown);
+  EXPECT_FALSE(old.active());
+  EXPECT_TRUE(other.active());
+  EXPECT_FALSE(prefs->IsConsideredFirstParty(b_, dotted));
+  EXPECT_TRUE(prefs->IsConsideredFirstParty(b_, plain));
+  RecordInfo absent;
+  EXPECT_EQ(FileStatus::kNotFound, files_->ResolveRecord(dotted, url::Origin::Create(dotted), false, &absent));
+}
+
+TEST_F(SiteRecordDecayTest, UnlockRetiresDottedRecordWithoutSelectingItsUndottedNeighbor) {
+  const GURL dotted("https://baz.com./"), plain("https://baz.com/");
+  const auto expired = Site(dotted), retained = Site(plain);
+  ASSERT_EQ(FileStatus::kOk, files_->RecordVisit(expired.id, DecayNowMicros() - 10000000));
+  ASSERT_EQ(FileStatus::kOk, files_->RecordVisit(retained.id, DecayNowMicros()));
+  ASSERT_EQ(FileStatus::kOk, profile_->SetDecayPolicy({5000000}));
+  ASSERT_EQ(FileStatus::kOk, profile_->Lock());
+  ASSERT_EQ(FileStatus::kOk, profile_->Unlock(source_));
+  files_ = profile_->files();
+  profile_->BindNativeDecay(files_, [] {});
+  std::vector<RecordInfo> records;
+  ASSERT_EQ(FileStatus::kOk, files_->ListRecords(&records));
+  ASSERT_EQ(1u, records.size());
+  EXPECT_EQ(retained.id, records[0].id);
+}
+
 TEST_F(SiteRecordDecayTest, NativeDecayUsesTheDeletionBarrierAndCancelsOldQueuedWriters) {
   auto prefs = Prefs(); ASSERT_EQ(FileStatus::kOk, prefs->SetFirstPartyEmbeds(a_, {b_}));
   const auto original = Site(a_); const auto old = files_->Capability(original.id, StorePurpose::kSiteSettings);
@@ -241,6 +297,10 @@ TEST_F(SiteRecordDecayTest, NativeDecayUsesTheDeletionBarrierAndCancelsOldQueued
   bool deleted = false, stale = false;
   prefs->DecayNextAsync(base::BindLambdaForTesting([&](GURL site, SitePrefStore::Completion done) {
     EXPECT_EQ("alpha.test", site.host()); EXPECT_FALSE(old.active()); resume = std::move(done);
+    prefs->DeferNativeRetirementNotification(base::BindLambdaForTesting([&] {
+      EXPECT_FALSE(prefs->RecordWorkingStateAdmitted("alpha.test"));
+      EXPECT_EQ(FileStatus::kBusy, prefs->Flush());
+    }));
   }), base::BindLambdaForTesting([&](FileStatus status, bool retired) {
     EXPECT_EQ(FileStatus::kOk, status); EXPECT_TRUE(retired); deleted = true;
   }));

@@ -51,6 +51,13 @@ writers cannot recreate the retired generation. Later explicit navigation can
 create a fresh record with a fresh key and generation. Unrelated sites and
 profile-private settings survive; the expired outer site's embed list does not.
 
+Expiration retires the selected record identity, not a record found by parsing
+its domain as a content-setting pattern. Exact hosts, including trailing dots,
+remain distinct during native teardown and reference cleanup. A stale selection
+cannot borrow a replacement record. If an unlock sweep repeatedly selects an
+unchanged record without retiring it, unlock fails rather than spinning or
+publishing success with that record still expired.
+
 ## Honest boundary and verification
 
 A locked profile retains expired ciphertext until its next successful unlock.

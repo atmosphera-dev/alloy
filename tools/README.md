@@ -1,7 +1,14 @@
 # Pinned Linux build
 
 The same builder-owned roots are also admitted on the on-demand DigitalOcean
-guest `alloy-do-build`. Its persistent ext4 volume is mounted at
+guest `alloy-do-build` and provisioned named guests `alloy-<task>`. Task names
+are 1-48 lowercase letters, digits or hyphens, start with a letter and end with
+a letter or digit. Named guests also require
+`/etc/alloy-build-prerequisites-ready`, the marker created by build-image
+provisioning: a root-owned regular file, not a symlink, with no group or other
+write permission. A matching hostname alone is not sufficient. The existing
+`wakaba-build` and `alloy-do-build` hosts remain admitted without that marker.
+Each guest's persistent ext4 volume is mounted at
 `/home/builder/work`; source and build outputs stay on that volume. Use
 `smoke.py --out src/out/Verify_Alloy --local-fixture` there to serve the repo's
 small page on loopback instead of accessing the NUC's Kiwix server. The tracker
@@ -415,8 +422,9 @@ inventories and native backing-owner checks remain necessary alongside it.
 Tools select their workspace from the delivered repository's location: either
 `/home/builder/work/alloy/repo/` (the original default) or
 `/home/builder/work/alloy-b/repo/`. There is no arbitrary-root override. Both
-roots must belong to `builder` on `wakaba-build`; symlinked workspace directories,
-foreign roots and the spike checkout are refused before taking locks or writing.
+roots must belong to `builder` on an admitted build host (see above); symlinked
+workspace directories, foreign roots and the spike checkout are refused before
+taking locks or writing.
 `--root` and `--out` must select that repository's own source/output tree.
 All pin, local-edit, full-apply and publication-journal checks remain in force.
 

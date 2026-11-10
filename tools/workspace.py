@@ -8,12 +8,30 @@ variable. Validation happens at entry points, before any locks or writes.
 import os
 from pathlib import Path
 import pwd
+import re
 import socket
+import stat
 
 PRIMARY = Path('/home/builder/work/alloy')
 SECONDARY = Path('/home/builder/work/alloy-b')
 APPROVED = (PRIMARY, SECONDARY)
 HOSTS = ('wakaba-build', 'alloy-do-build')
+DO_MARKER = Path('/etc/alloy-build-prerequisites-ready')
+
+
+def is_build_host():
+    """Admit named guests only with the provisioned image's protected marker."""
+    host = socket.gethostname()
+    if host in HOSTS:
+        return True
+    if not re.fullmatch(r'alloy-[a-z](?:[a-z0-9-]{0,46}[a-z0-9])?', host):
+        return False
+    try:
+        marker = DO_MARKER.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISREG(marker.st_mode) and marker.st_uid == 0 and
+            not marker.st_mode & 0o022)
 
 
 def workspace_path(repo):
@@ -40,8 +58,9 @@ def namespace_prefix(work):
 
 def validate_workspace(work, repo=None):
     """Reject foreign roots, symlink escapes and roots not owned by builder."""
-    if socket.gethostname() not in HOSTS or work not in APPROVED:
-        raise RuntimeError(f'Only the approved build workspaces {APPROVED} on {HOSTS} are supported')
+    if not is_build_host() or work not in APPROVED:
+        raise RuntimeError(f'Only the approved build workspaces {APPROVED} on {HOSTS} '
+                           'or provisioned alloy-<task> hosts are supported')
     owner = workspace_owner(work).pw_uid
     if os.geteuid() not in (0, owner):
         raise RuntimeError('Workspace tools must run as builder (or the network supervisor)')

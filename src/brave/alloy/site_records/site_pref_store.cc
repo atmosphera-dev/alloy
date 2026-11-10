@@ -453,7 +453,10 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     Retired(std::move(request), std::move(state));
     return;
   }
-  busy_ = false;
+  // Native retirement publications may call observers that pump a nested loop.
+  // Keep this transaction serialized until every context has published; queued
+  // work must not start a second deletion against an unpublished native owner.
+  busy_ = request->kind == Request::kDelete;
   PreferredVersion published;
   std::vector<std::string> domains;
   if (request->kind == Request::kInitialize && !initialized_) {
@@ -625,13 +628,18 @@ void SitePrefStore::DeferNativeRetirementNotification(base::OnceClosure publicat
   if (publication) native_retirement_publications_.push_back(std::move(publication));
 }
 void SitePrefStore::PublishRetirementNotifications(bool success) {
-  in_teardown_ = false;
   auto publications = std::move(native_retirement_publications_);
   auto changed = std::move(retirement_notifications_);
   native_retirement_publications_.clear(); retirement_notifications_.clear();
+  if (success) {
+    for (auto& publication : publications) std::move(publication).Run();
+    retiring_record_.clear();
+  }
+  // Synchronous compatibility calls return kBusy during native publication.
+  // Ordinary notifications retain their existing reentrant mutation contract.
+  in_teardown_ = false;
+  busy_ = false;
   if (!success) return;
-  retiring_record_.clear();
-  for (auto& publication : publications) std::move(publication).Run();
   for (const auto& key : changed) NotifyChange(key);
 }
 void SitePrefStore::Invalidate() {

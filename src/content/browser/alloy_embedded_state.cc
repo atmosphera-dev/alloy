@@ -235,18 +235,13 @@ WEB_CONTENTS_USER_DATA_KEY_IMPL(TabData);
 class EmbeddedCodeCacheService final : public KeyedService {
  public:
   static std::unique_ptr<KeyedService> Create() {
-    auto reservation = CodeCacheReservation::Acquire();
-    if (!reservation) return nullptr;
-    return std::make_unique<EmbeddedCodeCacheService>(std::move(reservation));
+    return std::make_unique<EmbeddedCodeCacheService>();
   }
-  explicit EmbeddedCodeCacheService(std::unique_ptr<CodeCacheReservation> reservation)
-      : reservation_(std::move(reservation)),
-        context_(base::MakeRefCounted<GeneratedCodeCacheContext>()) {
-    context_->InitializeInMemory(kCodeCacheBackendBytes);
-    receivers_ = std::make_unique<CodeCacheHostImpl::ReceiverSet>(context_);
-  }
+  EmbeddedCodeCacheService() = default;
   ~EmbeddedCodeCacheService() override { Shutdown(); }
   void Shutdown() override {
+    closed_ = true;
+    uncached_receivers_.reset();
     if (!context_)
       return;
     // Destruction and context teardown are ordered on the native cache runner.
@@ -260,12 +255,31 @@ class EmbeddedCodeCacheService final : public KeyedService {
            std::unique_ptr<CodeCacheReservation>) {},
         std::move(context_), std::move(reservation_)));
   }
-  CodeCacheHostImpl::ReceiverSet* receivers() { return receivers_.get(); }
+  CodeCacheHostImpl::ReceiverSet* receivers() {
+    if (closed_) return nullptr;
+    if (!context_) {
+      reservation_ = CodeCacheReservation::Acquire();
+      if (reservation_) {
+        context_ = base::MakeRefCounted<GeneratedCodeCacheContext>();
+        context_->InitializeInMemory(kCodeCacheBackendBytes);
+        receivers_ = std::make_unique<CodeCacheHostImpl::ReceiverSet>(context_);
+      }
+    }
+    if (context_) return receivers_.get();
+    // Cache admission is optional; the live protocol is not. Chromium's native
+    // null-context host replies with misses. Dropping this pipe instead leaves
+    // the default renderer's cache lookup (and its fetch response) unresolved.
+    if (!uncached_receivers_)
+      uncached_receivers_ = std::make_unique<CodeCacheHostImpl::ReceiverSet>(nullptr);
+    return uncached_receivers_.get();
+  }
 
  private:
   std::unique_ptr<CodeCacheReservation> reservation_;
   scoped_refptr<GeneratedCodeCacheContext> context_;
   std::unique_ptr<CodeCacheHostImpl::ReceiverSet> receivers_;
+  std::unique_ptr<CodeCacheHostImpl::ReceiverSet> uncached_receivers_;
+  bool closed_ = false;
 };
 class Selection final : public base::SupportsUserData::Data {
  public:

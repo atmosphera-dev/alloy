@@ -5290,13 +5290,71 @@ class NativeDiskEmbeddedCodeCacheTest
 };
 
 TEST_F(NativeDiskEmbeddedCodeCacheTest,
+       CachePressureStillCompletesLiveCacheProtocol) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(
+      GURL("https://cache.test/"));
+  auto* frame = static_cast<content::RenderFrameHostImpl*>(
+      web_contents()->GetPrimaryMainFrame());
+  auto* partition = static_cast<content::StoragePartitionImpl*>(
+      frame->GetStoragePartition());
+  EmbeddedStateRegistry records(profile()->UniqueToken(), StorageMode::kMemory,
+      Scope::kPerOuterSite, nullptr);
+  size_t misses = 0;
+  for (size_t i = 0; i < 12; ++i) {
+    const GURL site("https://pressure" + std::to_string(i) + ".test/");
+    const auto owner = records.ResolveFirstParty(site, url::Origin::Create(site));
+    auto* receivers = content::GetAlloyEmbeddedCodeCacheReceivers(
+        *partition, owner.first_party_state);
+    ASSERT_TRUE(receivers) << "live documents need protocol replies even without cache capacity";
+    Host host;
+    receivers->Add(frame->GetProcess()->GetID(),
+        frame->GetIsolationInfoForSubresources().network_isolation_key(),
+        frame->GetStorageKey(), host.BindNewPipeAndPassReceiver());
+    base::test::TestFuture<std::optional<persistent_cache::PendingBackend>> backend;
+    host->GetPendingBackend(Type::kJavascript, backend.GetCallback());
+    const auto pending = backend.Take();
+    ASSERT_TRUE(host.is_connected());
+    if (pending) continue;
+    ++misses;
+    // The ordinary non-persistent renderer path waits for this reply before
+    // completing even a fetch() response. Disconnection is not a cache miss.
+    base::test::TestFuture<base::Time, mojo_base::BigBuffer> fetched;
+    host->FetchCachedCode(Type::kWebAssembly, GURL("https://cache.test/data"),
+        fetched.GetCallback());
+    auto result = fetched.Take();
+    EXPECT_TRUE(std::get<0>(result).is_null());
+    EXPECT_EQ(0u, std::get<1>(result).size());
+    EXPECT_TRUE(host.is_connected());
+  }
+  EXPECT_GT(misses, 0u);
+}
+
+TEST_F(NativeDiskEmbeddedCodeCacheTest,
        FirstPartyCodeCacheAdmissionIsGloballyBounded) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(
+      GURL("https://cache.test/"));
+  auto* frame = static_cast<content::RenderFrameHostImpl*>(
+      web_contents()->GetPrimaryMainFrame());
   struct OtherState final : KeyedService { int value = 73; };
   static const char kOtherState = 0;
   EmbeddedStateRegistry records(profile()->UniqueToken(), StorageMode::kMemory,
       Scope::kPerOuterSite, nullptr);
   auto* partition = static_cast<content::StoragePartitionImpl*>(
       profile()->GetDefaultStoragePartition());
+  auto has_cache = [&](scoped_refptr<EmbeddedState> owner) {
+    auto* receivers = content::GetAlloyEmbeddedCodeCacheReceivers(*partition, owner);
+    EXPECT_TRUE(receivers);
+    if (!receivers) return false;
+    Host host;
+    receivers->Add(frame->GetProcess()->GetID(),
+        frame->GetIsolationInfoForSubresources().network_isolation_key(),
+        frame->GetStorageKey(), host.BindNewPipeAndPassReceiver());
+    base::test::TestFuture<std::optional<persistent_cache::PendingBackend>> result;
+    host->GetPendingBackend(Type::kJavascript, result.GetCallback());
+    const bool backed = result.Take().has_value();
+    EXPECT_TRUE(host.is_connected());
+    return backed;
+  };
   size_t admitted = 0;
   std::vector<scoped_refptr<EmbeddedState>> owners;
   std::vector<OtherState*> other;
@@ -5311,7 +5369,7 @@ TEST_F(NativeDiskEmbeddedCodeCacheTest,
           return std::make_unique<OtherState>();
         }))));
     ASSERT_TRUE(other.back());
-    if (content::GetAlloyEmbeddedCodeCacheReceivers(*partition, owners.back())) ++admitted;
+    if (has_cache(owners.back())) ++admitted;
   }
   // Fixed 80 MiB total, reserving 16 MiB for each complete native cache bundle.
   EXPECT_LE(admitted, 5u);
@@ -5329,10 +5387,10 @@ TEST_F(NativeDiskEmbeddedCodeCacheTest,
       Scope::kPerOuterSite, nullptr);
   auto next = peer.ResolveFirstParty(GURL("https://peer.test/"),
       url::Origin::Create(GURL("https://peer.test/")));
-  EXPECT_FALSE(content::GetAlloyEmbeddedCodeCacheReceivers(*partition, next.first_party_state));
+  EXPECT_FALSE(has_cache(next.first_party_state));
   records.Shutdown();
   task_environment()->RunUntilIdle();
-  EXPECT_TRUE(content::GetAlloyEmbeddedCodeCacheReceivers(*partition, next.first_party_state));
+  EXPECT_TRUE(has_cache(next.first_party_state));
 }
 
 TEST_F(NativeDiskEmbeddedCodeCacheTest,

@@ -197,8 +197,11 @@ reserves 16 MiB: a 4 MiB limit for each of JS, Wasm, the JS memory front-cache
 and the persistent/source-keyed collection. Thus at most five bundles are
 admitted across records, contexts and partitions. Capacity returns only after
 native cache shutdown runs. Additional caches are refused while full; pages
-still execute normally, without those optional cached compilations. This is
-cache-capacity accounting, not a total-process RSS bound. Other record state
+still execute normally, without those optional cached compilations. Chromium's
+native no-cache host acknowledges lookups as
+misses rather than disconnecting a live renderer. A later binding can acquire
+capacity released by native shutdown; existing no-cache bindings remain valid.
+This is cache-capacity accounting, not a total-process RSS bound. Other record state
 is neither evicted nor recreated to make room. Entry-level size-triggered LRU
 is tracked in [issue 13](https://github.com/atmosphera-dev/alloy/issues/13).
 

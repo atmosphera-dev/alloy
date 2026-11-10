@@ -431,6 +431,7 @@ struct RecordFileSystem::Impl {
     return live;
   }
 
+  /// Validate original capability and current fences; only retirement may bypass site writes.
   FileStatus Check(const RecordCapability& cap, StorePurpose purpose,
                     StorageAccess access, Record** out, bool retirement = false) {
     auto status = Admission();
@@ -786,6 +787,7 @@ struct RecordFileSystem::Impl {
   // Stage immutable ciphertext and COW namespace roots before publishing any
   // of them to live state. The enclosing coordinator mutex is the transaction
   // barrier; no other native adapter can publish an intermediate shard root.
+  /// Stage authenticated settings atomically, allowing reference pruning during retirement.
   FileStatus StageSettings(base::span<const SettingsReplacement> replacements,
                            base::UnguessableToken deleting_record = {}) {
     struct Update {
@@ -1080,6 +1082,7 @@ FileStatus RecordFileSystem::Sync() {
   return impl_->Observe(impl_->Commit());
 }
 
+/// Resolve a canonical site without admitting new records through a whole-set fence.
 FileStatus RecordFileSystem::ResolveRecord(const GURL& url,
                                             const url::Origin& origin,
                                             bool create, RecordInfo* out) {
@@ -1160,6 +1163,7 @@ FileStatus RecordFileSystem::ListRecords(std::vector<RecordInfo>* out) {
   return FileStatus::kOk;
 }
 
+/// Persist a top-level visit only while the site's generation remains writable.
 FileStatus RecordFileSystem::RecordVisit(base::UnguessableToken id, int64_t now_us) {
   std::lock_guard lock(impl_->mutex);
   const auto status = impl_->Admission();
@@ -1173,6 +1177,7 @@ FileStatus RecordFileSystem::RecordVisit(base::UnguessableToken id, int64_t now_
   return impl_->Observe(impl_->Commit());
 }
 
+/// Clamp future site clocks before decay, refusing mutation during whole-set retirement.
 FileStatus RecordFileSystem::ClampFutureRecordTimes(int64_t now_us) {
   std::lock_guard lock(impl_->mutex);
   const auto status = impl_->Admission();
@@ -1189,6 +1194,7 @@ FileStatus RecordFileSystem::ClampFutureRecordTimes(int64_t now_us) {
   return changed ? impl_->Observe(impl_->Commit()) : FileStatus::kOk;
 }
 
+/// Flush accepted writes and acquire exclusive site creation/write retirement ownership.
 FileStatus RecordFileSystem::BeginSiteDeletion(base::UnguessableToken* fence) {
   if (!fence) return FileStatus::kInvalid;
   std::lock_guard lock(impl_->mutex);
@@ -1202,6 +1208,7 @@ FileStatus RecordFileSystem::BeginSiteDeletion(base::UnguessableToken* fence) {
   return FileStatus::kOk;
 }
 
+/// Release the matching fence only after catalogue and pending retirement tickets are empty.
 FileStatus RecordFileSystem::EndSiteDeletion(base::UnguessableToken fence) {
   std::lock_guard lock(impl_->mutex);
   const auto status = impl_->Admission();
@@ -1214,6 +1221,7 @@ FileStatus RecordFileSystem::EndSiteDeletion(base::UnguessableToken fence) {
   return FileStatus::kOk;
 }
 
+/// Query authoritative coordinator admission without mutating or opening a backend.
 FileStatus RecordFileSystem::CheckAccess(const RecordCapability& capability,
     StorePurpose purpose, StorageAccess access) {
   std::lock_guard lock(impl_->mutex);
@@ -1221,6 +1229,7 @@ FileStatus RecordFileSystem::CheckAccess(const RecordCapability& capability,
   return impl_->Check(capability, purpose, access, &record);
 }
 
+/// Replace encrypted metadata only for an admitted writable record generation.
 FileStatus RecordFileSystem::SetRecordMetadata(
     base::UnguessableToken id, base::span<const uint8_t> metadata) {
   std::lock_guard lock(impl_->mutex);
@@ -1835,6 +1844,7 @@ FileStatus RecordFile::Sync() {
                                     : status;
 }
 
+/// Close clean handles under read admission; dirty linked handles still require writable commit.
 FileStatus RecordFile::Close() {
   const auto owner = owner_.lock();
   if (!owner) {

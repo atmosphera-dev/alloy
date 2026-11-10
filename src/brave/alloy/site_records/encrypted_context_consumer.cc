@@ -128,6 +128,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     ++closed_;
     std::printf("ENCRYPTED_EVENT {\"event\":\"browser-closed\",\"id\":%d}\n", browser->GetIdentifier());
   }
+  /// Dispatch each identified SDK command once and verify its native completion receipts.
   void OnTitleChange(CefRefPtr<CefBrowser>, const CefString& title) override {
     const auto raw = title.ToString();
     const std::string prefix = "ALLOY_ENCRYPTED:";
@@ -279,6 +280,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
     CefBrowserSettings settings;
     Check(CefBrowserHost::CreateBrowser(window, this, url, settings, nullptr, context_), "site browser");
   }
+  /// Seed real encrypted stores and native settings before deletion or decay proofs.
   void Write() {
     Check((phase_ == "write" || phase_ == "live" || phase_ == "all-live" || phase_ == "decay-seed" || phase_ == "decay-live") && browsers_.size() == 2 && !written_, "write command ordering");
     written_ = true;

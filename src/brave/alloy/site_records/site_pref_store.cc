@@ -96,6 +96,7 @@ class SitePrefStore::IO {
   explicit IO(std::shared_ptr<RecordFileSystem> files)
       : files_(std::move(files)), store_(base::MakeRefCounted<internal::SitePrefStore>(
             files_, base::BindRepeating([](FileStatus) {}))) {}
+  /// Execute one admitted journal request; whole-set retirement retains its fence across replies.
   State Execute(Request::Kind kind, base::DictValue values, GURL site,
                 std::vector<GURL> embeds, apps::PreferredApps entries, int64_t visit_us) {
     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -171,6 +172,7 @@ class SitePrefStore::IO {
     state.deletion = deletion;
     return state;
   }
+  /// Persist accepted native edits, never replaying snapshots through a delete-all fence.
   State Checkpoint(base::DictValue edits, std::vector<std::string> removed, base::OnceClosure done) {
     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
     // The journal was flushed before the fence. Native preference mutations are
@@ -270,6 +272,7 @@ bool SitePrefStore::Admitted() const {
 bool SitePrefStore::GetValue(std::string_view key, const base::Value** value) const {
   return initialized_ && Admitted() && cache_->values.GetValue(key, value);
 }
+/// Borrow accepted values only while client mutations are admitted.
 bool SitePrefStore::GetMutableValue(std::string_view key, base::Value** value) {
   return !deleting_all_ && initialized_ && Admitted() && cache_->values.GetValue(key, value);
 }
@@ -297,6 +300,7 @@ PersistentPrefStore::PrefReadError SitePrefStore::GetReadError() const {
       status == FileStatus::kDenied || status == FileStatus::kCancelled ?
       PREF_READ_ERROR_ACCESS_DENIED : PREF_READ_ERROR_FILE_OTHER;
 }
+/// Latch storage faults and revoke admission, but preserve ordinary client refusals.
 FileStatus SitePrefStore::Fail(FileStatus status) {
   if (status_ != FileStatus::kOk) return status_;
   if (IsAdmissionRefusal(status)) return status;
@@ -323,18 +327,22 @@ void SitePrefStore::Changed(std::string_view key, bool notify, bool persist) {
   }
   if (notify) NotifyChange(key);
 }
+/// Publish an admitted client replacement; fenced requests leave accepted state unchanged.
 void SitePrefStore::SetValue(std::string_view key, base::Value value, uint32_t) {
   if (!deleting_all_ && initialized_ && Admitted()) NativeSetValue(key, std::move(value), true);
 }
+/// Replace admitted client state without notifying observers.
 void SitePrefStore::SetValueSilently(std::string_view key, base::Value value, uint32_t) {
   if (!deleting_all_ && initialized_ && Admitted()) NativeSetValue(key, std::move(value), false);
 }
+/// Journal a completed mutable client edit only outside whole-set retirement.
 void SitePrefStore::ReportValueChanged(std::string_view key, uint32_t) {
   if (!deleting_all_ && initialized_ && Admitted()) Changed(key, true);
 }
 void SitePrefStore::RemoveValue(std::string_view key, uint32_t) {
   if (initialized_ && Admitted()) NativeRemoveValue(key);
 }
+/// Remove matching accepted client preferences without admitting fenced edits.
 void SitePrefStore::RemoveValuesByPrefixSilently(std::string_view prefix) {
   if (deleting_all_ || !initialized_ || !Admitted()) return;
   std::vector<std::string> removed;
@@ -354,6 +362,7 @@ bool SitePrefStore::NativeCacheAlive() const { return cache_ != nullptr; }
 bool SitePrefStore::NativeGetValue(std::string_view key, const base::Value** out) const {
   return cache_ && cache_->values.GetValue(key, out);
 }
+/// Give native mutable transactions disposable scratch while persistence is fenced.
 bool SitePrefStore::NativeGetMutableValue(std::string_view key, base::Value** out) {
   if (!cache_) return false;
   if (!deleting_all_) return cache_->values.GetValue(key, out);
@@ -367,9 +376,11 @@ bool SitePrefStore::NativeGetMutableValue(std::string_view key, base::Value** ou
 base::DictValue SitePrefStore::NativeGetValues() const {
   return cache_ ? cache_->values.AsDict() : base::DictValue();
 }
+/// Report writable native-journal admission separately from borrowed-cache lifetime.
 bool SitePrefStore::NativeCanPersist() const {
   return !deleting_all_ && initialized_ && !closing_cache_ && Admitted();
 }
+/// Route native replacements to accepted state or isolated refusal scratch, never both.
 void SitePrefStore::NativeSetValue(std::string_view key, base::Value value, bool notify) {
   if (deleting_all_) {
     if (cache_) cache_->refused.SetValue(key, std::move(value));
@@ -378,14 +389,17 @@ void SitePrefStore::NativeSetValue(std::string_view key, base::Value value, bool
   if (cache_ && cache_->values.SetValue(key, std::move(value)))
     Changed(key, notify, NativeCanPersist());
 }
+/// Publish native changes only when they did not target fenced scratch.
 void SitePrefStore::NativeReportValueChanged(std::string_view key, bool notify) {
   if (deleting_all_) return;
   if (cache_) Changed(key, notify, NativeCanPersist());
 }
+/// Refuse native removals during whole-set retirement without synthetic notifications.
 void SitePrefStore::NativeRemoveValue(std::string_view key) {
   if (deleting_all_) return;
   if (cache_ && cache_->values.RemoveValue(key)) Changed(key, true, NativeCanPersist());
 }
+/// Remove matching native values only outside the write fence.
 void SitePrefStore::NativeRemovePrefix(std::string_view prefix) {
   if (deleting_all_) return;
   if (!cache_) return;
@@ -436,6 +450,7 @@ void SitePrefStore::BackendClosed() {
   for (auto& callback : callbacks) if (callback) std::move(callback).Run();
 }
 
+/// Serialize requests and asynchronously refuse new mutations during delete-all.
 void SitePrefStore::Enqueue(std::unique_ptr<Request> request) {
   if (deleting_all_ && request->kind != Request::kDeleteAll && request->kind != Request::kEndDeleteAll &&
       request->kind != Request::kList && request->kind != Request::kQuery &&
@@ -491,6 +506,7 @@ FileStatus SitePrefStore::CompletionStatus(const Request& request, FileStatus st
   return status;
 }
 
+/// Publish key retirement to native owners before running their asynchronous drain barrier.
 void SitePrefStore::Retired(std::unique_ptr<Request> request, State state) {
   capabilities_ = std::move(state.capabilities);
   base::DictValue retained;
@@ -532,6 +548,7 @@ void SitePrefStore::FinishRetirement(std::unique_ptr<Request> request,
       &SitePrefStore::Complete, base::WrapRefCounted(this), std::move(request), true));
 }
 
+/// Complete only the original admission, keeping whole-set retirement serialized and fail-closed.
 void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend, State state) {
   scoped_refptr<SitePrefStore> alive(this);
   if (from_backend) { CHECK_GT(pending_backend_calls_, 0u); --pending_backend_calls_; }
@@ -599,7 +616,10 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
     } else if (request->kind == Request::kDelete || request->kind == Request::kDecay ||
                request->kind == Request::kDeleteAll) {
       status = request->retired_status;
-      if (status != FileStatus::kOk) Fail(status);
+      // A required native barrier is an owner obligation, not a refused client
+      // mutation. Preserve cancellation; other refusals cannot leave it usable.
+      if (status != FileStatus::kOk && status != FileStatus::kCancelled)
+        status = Fail(IsAdmissionRefusal(status) ? FileStatus::kIo : status);
     }
   }
   if (state.failure != FileStatus::kOk && state.failure != FileStatus::kDenied)
@@ -617,7 +637,8 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
   if (request->kind == Request::kEndDeleteAll) {
     deleting_all_ = false;
     if (cache_) ClearPrefCache(cache_->refused);
-    if (status != FileStatus::kOk && status != FileStatus::kCancelled) Fail(status);
+    if (status != FileStatus::kOk && status != FileStatus::kCancelled)
+      Fail(IsAdmissionRefusal(status) ? FileStatus::kIo : status);
   }
   const bool end_all = request->kind == Request::kDeleteAll;
   if (request->files_pending) state.deletion = RecordDeletion::kDeletedFilesPending;
@@ -632,6 +653,7 @@ void SitePrefStore::Complete(std::unique_ptr<Request> request, bool from_backend
   MaybeCloseNativeCache();
 }
 
+/// Queue copied catalogue metadata behind prior journal work without creating records.
 void SitePrefStore::ListRecordsAsync(
     base::OnceCallback<void(FileStatus, std::vector<RecordInfo>)> completion) {
   auto request = std::make_unique<Request>(Request::kList);
@@ -650,6 +672,7 @@ void SitePrefStore::FlushAsync(Completion completion) {
       RecordDeletion, std::vector<std::string>) { std::move(reply).Run(status); }, std::move(completion));
   Enqueue(std::move(request));
 }
+/// Bridge blocking callers to the same queue, refusing nested retirement waits.
 FileStatus SitePrefStore::Wait(base::OnceCallback<void(Completion)> operation) {
   // Blocking compatibility callers (native tests/pre-init owners) still use
   // exactly the same I/O journal. Browser UI must use the asynchronous methods.
@@ -754,6 +777,7 @@ void SitePrefStore::DeferNativeRetirementNotification(base::OnceClosure publicat
   CHECK(in_teardown_);
   if (publication) native_retirement_publications_.push_back(std::move(publication));
 }
+/// Release deferred native publications, optionally retaining whole-set queue ownership.
 void SitePrefStore::PublishRetirementNotifications(bool success, bool keep_serialized) {
   auto publications = std::move(native_retirement_publications_);
   auto changed = std::move(retirement_notifications_);
@@ -924,6 +948,7 @@ void SitePrefStore::DeleteSiteAsync(GURL site, base::OnceClosure teardown,
         std::move(resumed).Run(FileStatus::kOk);
       }, std::move(teardown)), std::move(completion));
 }
+/// Queue one fenced whole-catalogue retirement; overlapping requests complete busy.
 void SitePrefStore::DeleteAllSitesWithTeardownAsync(
     base::RepeatingCallback<void(GURL, Completion)> teardown,
     base::OnceCallback<void(FileStatus, RecordDeletion)> completion) {

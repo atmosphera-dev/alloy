@@ -308,6 +308,7 @@ def sdk_cases(out, evidence, cases=('guest', 'local-state-legacy', 'local-state-
 
 
 def main():
+    """Run isolated SDK/store phases and retain deletion, decay and lock boundary receipts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['encrypted', 'delete', 'keyring'], required=True)

@@ -169,6 +169,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
           self->ReadLists([self] { self->CheckRecordList(0); });
         })), "initial list queued");
   }
+  /// Check canonical, profile-isolated public snapshots before any top-level visit occurs.
   void CheckRecordList(int owner) {
     Check(profiles_[owner]->ListSiteRecords(new RecordsReply(
         [self = CefRefPtr<Consumer>(this), owner](auto status, const auto& records) {

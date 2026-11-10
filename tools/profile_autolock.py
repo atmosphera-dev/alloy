@@ -194,6 +194,7 @@ def wait_for(predicate, process, why, timeout=60):
 
 
 def main():
+    """Exercise native and trusted lock triggers with both embedder UI policies."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['autolock'], default='autolock')

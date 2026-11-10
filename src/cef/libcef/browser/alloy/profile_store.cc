@@ -331,6 +331,7 @@ class SettingsOwner final : public CefBaseRefCounted {
       std::move(callback).Run(result, result == sr::FileStatus::kOk ? filters_ : nullptr);
     }
   }
+  /// Route genuine settings faults through profile teardown, not ordinary write refusals.
   void OnError(sr::FileStatus status) {
     CEF_REQUIRE_UIT();
     if (sr::IsAdmissionRefusal(status)) return;
@@ -938,6 +939,7 @@ class AlloyProfileImpl final : public AlloyProfile {
         }, RetainForReply(), prefs, std::move(callback)));
     return true;
   }
+  /// Queue original-generation catalogue snapshots and report cancellation without partial data.
   bool ListSiteRecords(CefRefPtr<AlloySiteRecordsCallback> callback) override {
     if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !callback) return false;
     auto prefs = SettingsProjection();
@@ -961,6 +963,7 @@ class AlloyProfileImpl final : public AlloyProfile {
         }, RetainForReply(), prefs, std::move(callback)));
     return true;
   }
+  /// Retire every site through the native barrier while retaining profile and callback ownership.
   bool DeleteAllSiteRecords(CefRefPtr<AlloyRecordDeletionCallback> callback) override {
     if (!CONTEXT_STATE_VALID() || !CEF_CURRENTLY_ON_UIT() || !callback) return false;
     auto prefs = SettingsProjection();

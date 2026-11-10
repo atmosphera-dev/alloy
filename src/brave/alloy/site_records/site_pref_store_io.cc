@@ -133,6 +133,7 @@ PersistentPrefStore::PrefReadError SitePrefStore::GetReadError() const {
       status == FileStatus::kDenied ? PREF_READ_ERROR_ACCESS_DENIED : PREF_READ_ERROR_FILE_OTHER;
 }
 
+/// Close the backing journal on storage failure, never on ordinary admission refusal.
 FileStatus SitePrefStore::Fail(FileStatus status) {
   if (status_ != FileStatus::kOk) return status_;
   if (IsAdmissionRefusal(status)) return status;

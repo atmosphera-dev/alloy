@@ -169,6 +169,7 @@ void ProfileFilterPreferences::Publish(std::string_view excluded) {
           &ProfileFilterPreferences::Failed, base::WrapRefCounted(this)));
   if (!posted) Failed(FileStatus::kCancelled);
 }
+/// Latch and report real filter storage failures while preserving lifecycle refusal semantics.
 void ProfileFilterPreferences::Failed(FileStatus status) {
   if (status == FileStatus::kOk || IsAdmissionRefusal(status) || status_ != FileStatus::kOk) return;
   scoped_refptr<ProfileFilterPreferences> alive(this);

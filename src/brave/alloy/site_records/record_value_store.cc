@@ -6,6 +6,7 @@
 #include "brave/alloy/site_records/record_leveldb_env.h"
 
 namespace alloy::site_records {
+/// Bind native LevelDB to the original record and recheck coordinator admission before every use.
 FileStatus CreateRecordValueStore(
     std::shared_ptr<RecordFileSystem> files,
     RecordCapability capability,

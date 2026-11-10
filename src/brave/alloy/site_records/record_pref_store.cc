@@ -43,6 +43,7 @@ bool RecordPrefStore::Admitted() const {
   return !invalidated_ && status_ == FileStatus::kOk && files_ &&
       capability_.Allows(purpose_, StorageAccess::kReadRecordFiles);
 }
+/// Query current coordinator admission rather than assuming a live capability permits writes.
 bool RecordPrefStore::Writable() const {
   return Admitted() &&
       files_->CheckAccess(capability_, purpose_, StorageAccess::kWriteRecordFiles) == FileStatus::kOk;
@@ -57,6 +58,7 @@ base::DictValue RecordPrefStore::GetValues() const {
   return initialized_ && Admitted() ? prefs_.AsDict() : base::DictValue();
 }
 
+/// Borrow accepted values when writable, otherwise supply disposable native-update scratch.
 bool RecordPrefStore::GetMutableValue(std::string_view key, base::Value** result) {
   if (!initialized_ || !Admitted()) return false;
   if (Writable()) return prefs_.GetValue(key, result);
@@ -100,6 +102,7 @@ void RecordPrefStore::ScheduleWrite() {
       base::BindOnce([](RecordPrefStore* store) { store->Flush(); }, base::Unretained(this)));
 }
 
+/// Schedule persistence and notifications only for admitted mutable edits.
 void RecordPrefStore::ReportValueChanged(std::string_view key, uint32_t flags) {
   if (!initialized_ || !Writable()) return;
   dirty_ = true;
@@ -107,6 +110,7 @@ void RecordPrefStore::ReportValueChanged(std::string_view key, uint32_t flags) {
   Notify(key);
 }
 
+/// Replace accepted state or isolated scratch without publishing refused native writes.
 void RecordPrefStore::SetValue(std::string_view key, base::Value value,
                                uint32_t flags) {
   if (!initialized_ || !Admitted()) return;
@@ -114,6 +118,7 @@ void RecordPrefStore::SetValue(std::string_view key, base::Value value,
   if (prefs_.SetValue(key, std::move(value))) ReportValueChanged(key, flags);
 }
 
+/// Replace writable native values silently; fenced values never enter the journal.
 void RecordPrefStore::SetValueSilently(std::string_view key, base::Value value,
                                        uint32_t flags) {
   if (!initialized_ || !Admitted()) return;
@@ -122,11 +127,13 @@ void RecordPrefStore::SetValueSilently(std::string_view key, base::Value value,
   if (dirty_) ScheduleWrite();
 }
 
+/// Remove a native preference only while coordinator write admission is open.
 void RecordPrefStore::RemoveValue(std::string_view key, uint32_t flags) {
   if (!initialized_ || !Writable()) return;
   if (prefs_.RemoveValue(key)) ReportValueChanged(key, flags);
 }
 
+/// Remove matching native preferences without bypassing a lifecycle write fence.
 void RecordPrefStore::RemoveValuesByPrefixSilently(std::string_view prefix) {
   if (!initialized_ || !Writable()) return;
   prefs_.ClearWithPrefix(prefix);
@@ -148,6 +155,7 @@ PersistentPrefStore::PrefReadError RecordPrefStore::GetReadError() const {
       PREF_READ_ERROR_FILE_OTHER;
 }
 
+/// Latch actual storage faults while returning admission refusals without poisoning the store.
 FileStatus RecordPrefStore::Fail(FileStatus status) {
   if (status_ != FileStatus::kOk) return status_;
   if (IsAdmissionRefusal(status)) return status;
@@ -214,6 +222,7 @@ FileStatus RecordPrefStore::Flush() {
   return FlushImpl();
 }
 
+/// Serialize a dirty shard only after checking current native write admission.
 FileStatus RecordPrefStore::FlushImpl() {
   write_timer_.Stop();
   if (!initialized_ || !Admitted()) return last_status() == FileStatus::kOk ?
@@ -249,6 +258,7 @@ void RecordPrefStore::SchedulePendingLossyWrites() { Flush(); }
 void RecordPrefStore::OnStoreDeletionFromDisk() { Invalidate(); }
 bool RecordPrefStore::HasReadErrorDelegate() const { return false; }
 
+/// Stop writes and discard accepted and refused native values before notifying consumers.
 void RecordPrefStore::Invalidate() {
   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
   scoped_refptr<RecordPrefStore> keep_alive(this);

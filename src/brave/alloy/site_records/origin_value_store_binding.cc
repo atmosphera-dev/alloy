@@ -17,6 +17,7 @@ struct OriginBinding {
   RecordCapability record;  // Immutable after ready's release publication.
   std::atomic<bool> ready{false};
   std::atomic<bool> enabled{true};
+  /// Admit provisioning or an original writable record, never a fenced replacement.
   bool Admitted() const {
     if (!profile.active() || !enabled.load(std::memory_order_acquire)) return false;
     return !ready.load(std::memory_order_acquire) ||
@@ -26,6 +27,7 @@ struct OriginBinding {
 };
 }  // namespace
 
+/// Provision one original origin on its native FIFO and expose refusal-aware backend admission.
 RecordValueStoreBinding BindOriginValueStore(
     std::shared_ptr<RecordFileSystem> files, RecordCapability original_profile,
     url::Origin origin, scoped_refptr<base::SequencedTaskRunner> runner,

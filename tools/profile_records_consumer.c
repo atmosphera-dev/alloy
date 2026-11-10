@@ -10,9 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/// Abort the SDK fixture on a missing boundary outcome, retaining its diagnostic reason.
 static void check(int ok, const char* why) {
   if (!ok) { fprintf(stderr, "FAIL records-c %s\n", why); abort(); }
 }
+/// Convert borrowed UTF-8 to a caller-owned CEF string that the fixture must clear.
 static cef_string_t text(const char* value) {
   cef_string_t result = {0};
   check(cef_string_utf8_to_utf16(value, strlen(value), &result), "UTF-8 input");
@@ -43,9 +45,11 @@ static alloy_site_record_t* retained;
 static int stage;
 static cef_string_t site;
 
+/// Queue a generated-C record callback with one transferred counted reference.
 static void read_records(void) {
   check(profile->list_site_records(profile, PASS(records_reply)), "list queued");
 }
+/// Verify lock completion before exercising cancelled enumeration on the retained profile.
 static void CEF_CALLBACK locked(alloy_profile_lock_callback_t* self,
                                 alloy_site_settings_result_t result) {
   (void)self;
@@ -53,12 +57,14 @@ static void CEF_CALLBACK locked(alloy_profile_lock_callback_t* self,
   check(profile->get_state(profile) == ALLOY_PROFILE_LOCKED, "locked state");
   stage = 3; read_records();
 }
+/// Check delete-all acknowledgement and immediately enumerate its protected empty catalogue.
 static void CEF_CALLBACK deleted(alloy_record_deletion_callback_t* self,
     alloy_site_settings_result_t result, int files_pending) {
   (void)self;
   check(result == ALLOY_SETTINGS_OK && !files_pending, "delete-all acknowledged");
   stage = 2; read_records();
 }
+/// Drive empty, populated, deleted and locked catalogues while checking snapshot ownership.
 static void CEF_CALLBACK listed(alloy_site_records_callback_t* self,
     alloy_site_settings_result_t result, size_t count, alloy_site_record_t* const* records) {
   (void)self;
@@ -92,12 +98,14 @@ static void CEF_CALLBACK listed(alloy_site_records_callback_t* self,
     cef_quit_message_loop();
   }
 }
+/// Enumerate only after the settings-only record has been durably published.
 static void CEF_CALLBACK published(alloy_site_settings_callback_t* self,
     alloy_site_settings_result_t result, cef_string_list_t embedded) {
   (void)self;
   check(result == ALLOY_SETTINGS_OK && cef_string_list_size(embedded) == 0, "setting published");
   read_records();
 }
+/// Check UI-thread idle configuration and callback admission after CEF initialization.
 static void CEF_CALLBACK initialized(cef_browser_process_handler_t* self) {
   (void)self;
   check(!profile->list_site_records(profile, NULL), "missing callback refused unqueued");
@@ -106,9 +114,11 @@ static void CEF_CALLBACK initialized(cef_browser_process_handler_t* self) {
   check(profile->notify_user_activity(profile), "trusted input accepted");
   read_records();
 }
+/// Transfer the application-owned browser-process handler reference to CEF.
 static cef_browser_process_handler_t* CEF_CALLBACK get_process(cef_app_t* self) {
   (void)self; return PASS(process);
 }
+/// Run generated-C lifecycle, decay, idle and catalogue contracts with explicit ownership checks.
 int main(int argc, char** argv) {
   const char* hash = cef_api_hash(CEF_API_VERSION, 0);
   check(hash && !strcmp(hash, CEF_API_HASH_PLATFORM), "experimental API hash");

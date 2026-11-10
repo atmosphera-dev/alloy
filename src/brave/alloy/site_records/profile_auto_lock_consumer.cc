@@ -200,6 +200,7 @@ class Consumer final : public CefApp, public CefBrowserProcessHandler, public Ce
           }
         })), "encrypted context queued");
   }
+  /// Start lock reentrantly and verify every public mutation refuses pending-transition admission.
   void LockFromCallback(const char* returned_event) {
     inside_lock_callback_ = true;
     Check(profile_->LockAsync(new LockReply), "first callback lock accepted");

@@ -257,6 +257,24 @@ TEST_F(SitePrefStoreAsyncTest, DeleteAllFailedBarrierNeverAcknowledgesSuccessOrR
   EXPECT_EQ(FileStatus::kBusy, files_->ResolveRecord(b_, url::Origin::Create(b_), true, &refused));
 }
 
+TEST_F(SitePrefStoreAsyncTest, DeleteAllRefusedNativeBarrierFailsClosedWithOtherRecordsRemaining) {
+  Initialize(); ASSERT_EQ(FileStatus::kOk, store_->SetFirstPartyEmbeds(a_, {b_}));
+  ASSERT_EQ(FileStatus::kOk, store_->SetFirstPartyEmbeds(c_, {b_}));
+  bool replied = false;
+  store_->DeleteAllSitesWithTeardownAsync(base::BindLambdaForTesting(
+      [](GURL, SitePrefStore::Completion done) { std::move(done).Run(FileStatus::kBusy); }),
+      base::BindLambdaForTesting([&](FileStatus status, RecordDeletion) {
+        EXPECT_EQ(FileStatus::kIo, status); replied = true;
+      }));
+  tasks_.RunUntilIdle(); EXPECT_TRUE(replied);
+  EXPECT_EQ(FileStatus::kIo, store_->last_status()); EXPECT_TRUE(store_->ReadOnly());
+  store_->SetValue("appearance.theme", base::Value("must-not-appear-persisted"), 0);
+  const base::Value* value = nullptr;
+  EXPECT_FALSE(store_->GetValue("appearance.theme", &value));
+  std::vector<RecordInfo> records;
+  ASSERT_EQ(FileStatus::kOk, files_->ListRecords(&records)); EXPECT_EQ(1u, records.size());
+}
+
 TEST_F(SitePrefStoreAsyncTest, RecordListReturnsCommittedVisitsWithoutRefreshingThem) {
   Initialize(); ASSERT_EQ(FileStatus::kOk, store_->SetFirstPartyEmbeds(a_, {b_}));
   store_->RecordVisitAsync(a_, 123456789);

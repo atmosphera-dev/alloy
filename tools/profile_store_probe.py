@@ -19,6 +19,7 @@ WORK = workspace_path(REPO)
 
 
 def main():
+    """Compile generated-C consumers and prove SDK lifecycle, callback and key-source contracts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['core', 'keyring'], default='core')

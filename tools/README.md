@@ -185,6 +185,9 @@ cannot save changes. Only default-branch push, dispatch or schedule jobs save
 the disk. The job summary records command-step times and disk sizes; no large
 artifacts are uploaded. Ubuntu 24.04 gets a per-binary AppArmor user-namespace
 profile for the CI cefclient outputs; the Chromium sandbox stays enabled.
+Provider kernels without active AppArmor must pass a native userns check.
+The disposable runner also disables automatic fallback tunnels in new network
+namespaces, so the blocking probe retains its exact loopback-only check.
 
 To run CI by hand, select **Build and test on Blacksmith CI** in GitHub Actions
 and choose **Run workflow**, or use

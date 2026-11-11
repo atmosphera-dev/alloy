@@ -126,6 +126,12 @@ jobs:
             printf 'Kernel %s has no active AppArmor; checking native userns\n' "$(uname -r)"
             unshare --user --map-root-user true
           fi
+          # Provider kernels may create fallback tunnel devices in every netns.
+          # Keep those in init_net only, preserving the probe's exact lo-only gate.
+          # https://docs.kernel.org/admin-guide/sysctl/net.html#fb-tunnels-only-for-init-net
+          sudo sysctl -w net.core.fb_tunnels_only_for_init_net=1
+          sudo unshare --net --fork ip -j addr | python3 -c \
+            'import json,sys; links=json.load(sys.stdin); assert [i["ifname"] for i in links]==["lo"],links; print("OFFLINE_NAMESPACE_PREFLIGHT_OK")'
 
       - name: Apply Alloy
         working-directory: /home/runner/alloy

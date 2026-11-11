@@ -6,6 +6,14 @@ import re
 from analysis.dscp import classes
 
 TABLE = 'alloy_b_harness' if ROOT == SECONDARY else 'alloy_harness'
+CAPTURE_BUFFER_KIB = 64 * 1024
+
+
+def capture_command(interface, target, filters=()):
+    # Immediate-mode capture needs receive-ring headroom during drain delays.
+    return ['tcpdump', '--immediate-mode', '-U', '-n', '-s', '0',
+            '-B', str(CAPTURE_BUFFER_KIB), '-i', interface,
+            '-G', '300', '-w', target, *filters]
 
 
 def ipv4_settings():
@@ -114,6 +122,8 @@ def setup(d):
 
 
 def services(d, runtime):
+    save(d / 'capture-settings.json', dict(buffer_kib=CAPTURE_BUFFER_KIB,
+         buffer_bytes=CAPTURE_BUFFER_KIB * 1024))
     for l in LANES:
         lane = d / l['name']
         prefix = d.name + '-' + l['name']
@@ -122,8 +132,7 @@ def services(d, runtime):
                '--bind-interfaces', '--except-interface=lo', '--log-queries=extra', '--log-facility=-',
                '--cache-size=0', '--pid-file=', '--min-port=1024', '--max-port=60999']
         unit(prefix + '-dns', ['python3', SCRIPTS / 'common.py', 'stream', lane / 'dnsmasq.log', *dns], ROOT, user='root', runtime=runtime)
-        unit(prefix + '-pcap', ['tcpdump', '--immediate-mode', '-U', '-n', '-s', '0', '-i', l['veth'],
-             '-G', '300', '-w', lane / 'captures/all-%Y%m%dT%H%M%S.pcap'], ROOT, user='root',
+        unit(prefix + '-pcap', capture_command(l['veth'], lane / 'captures/all-%Y%m%dT%H%M%S.pcap'), ROOT, user='root',
              properties={'KillSignal': 'SIGINT', 'StandardOutput': 'append:' + str(lane / 'tcpdump.log'),
                          'StandardError': 'append:' + str(lane / 'tcpdump.log')}, runtime=runtime)
         if l['mode'] == 'observe':
@@ -139,8 +148,7 @@ def services(d, runtime):
         ('nflog', 'nflog:77', d / 'nflog-%Y%m%dT%H%M%S.pcap', []),
         ('uplink', 'eno1', d / 'uplink-%Y%m%dT%H%M%S.pcap',
          [f'ip and src host {json.loads((d / "nat-source.json").read_text())["ip"]} and (tcp or udp) and src portrange 62000-62999'])]:
-        unit(d.name + '-' + role, ['tcpdump', '--immediate-mode', '-U', '-n', '-s', '0', '-i', interface,
-             '-G', '300', '-w', target, *flt], ROOT, user='root',
+        unit(d.name + '-' + role, capture_command(interface, target, flt), ROOT, user='root',
              properties={'KillSignal': 'SIGINT', 'StandardOutput': 'append:' + str(d / (role + '.log')),
                          'StandardError': 'append:' + str(d / (role + '.log'))}, runtime=runtime)
     time.sleep(3)

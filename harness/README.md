@@ -121,6 +121,12 @@ Kiwix port8090 input; it is labelled Kiwix only for an HTTPS record query.
 Other names/subdomains and ordinary A/AAAA queries receive no such exclusion.
 The raw owner name and record type remain in the report.
 
+All lane, uplink and NFLOG capture providers request a 64 MiB receive buffer
+(`tcpdump -B 65536`) through the same launcher; `capture-settings.json` records
+the request. Immediate mode, full snap length and packet-flushed output remain
+enabled. Buffer headroom does not relax the zero-kernel-drop or exact final
+nft/capture reconciliation requirements.
+
 Each lane counts classes **before NAT**, captures all veth traffic (including
 Kiwix), and resets IPv4/IPv6 DSCP to zero in postrouting. A reserved per-lane NAT
 source-port range identifies namespace egress on an independent physical-uplink

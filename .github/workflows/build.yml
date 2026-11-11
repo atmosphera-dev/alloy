@@ -114,7 +114,18 @@ jobs:
             userns,
           }
           PROFILE
-          sudo apparmor_parser -r /etc/apparmor.d/alloy-ci-browser
+          if [[ -r /sys/module/apparmor/parameters/enabled ]] && \
+             [[ "$(cat /sys/module/apparmor/parameters/enabled)" == Y ]]; then
+            if ! mountpoint -q /sys/kernel/security; then
+              sudo mount -t securityfs securityfs /sys/kernel/security
+            fi
+            sudo apparmor_parser -r /etc/apparmor.d/alloy-ci-browser
+          else
+            # Some provider kernels omit AppArmor, so its userns restriction
+            # does not exist. Prove native userns availability, not a bypass.
+            printf 'Kernel %s has no active AppArmor; checking native userns\n' "$(uname -r)"
+            unshare --user --map-root-user true
+          fi
 
       - name: Apply Alloy
         working-directory: /home/runner/alloy

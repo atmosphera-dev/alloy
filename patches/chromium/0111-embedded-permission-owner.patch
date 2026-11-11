@@ -1,0 +1,976 @@
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -62,62 +62,101 @@
+ using content_settings::ProviderType;
+ 
+ namespace {
++using WorkingSettings = alloy::site_records::DocumentSettings;
++using Backing = alloy::site_records::EmbeddedStateRegistry::Backing;
++
++std::unique_ptr<WorkingSettings> MakeWorkingSettings(Profile* profile) {
++  auto settings = std::make_unique<WorkingSettings>(
++      profile->GetPrefs(),
++      base::BindRepeating(
++          &HostContentSettingsMap::OnContentSettingChanged,
++          scoped_refptr<HostContentSettingsMap>(
++              HostContentSettingsMapFactory::GetForProfile(profile))));
++  settings->settings().RegisterProvider(
++      ProviderType::kWebuiAllowlistProvider,
++      std::make_unique<WebUIAllowlistProvider>(
++          WebUIAllowlist::GetOrCreate(profile)));
++  settings->settings().RegisterProvider(
++      ProviderType::kRemoteListProvider,
++      std::make_unique<content_settings::RemoteListProvider>());
++  auto* family = supervised_user::FamilyLinkSettingsServiceFactory::GetForKey(
++      profile->GetProfileKey());
++  if (family) {
++    settings->settings().RegisterProvider(
++        ProviderType::kSupervisedProvider,
++        std::make_unique<
++            supervised_user::SupervisedUserContentSettingsProvider>(family));
++  }
++
++  return settings;
++}
++
+ class AlloyDocumentSettings final
+     : public content::DocumentUserData<AlloyDocumentSettings> {
+  public:
+-  alloy::site_records::DocumentSettings settings;
++  std::unique_ptr<WorkingSettings> settings;
+ 
+  private:
+   explicit AlloyDocumentSettings(content::RenderFrameHost* frame)
+       : DocumentUserData(frame),
+-        settings(
+-            Profile::FromBrowserContext(frame->GetBrowserContext())->GetPrefs(),
+-            base::BindRepeating(
+-                &HostContentSettingsMap::OnContentSettingChanged,
+-                scoped_refptr<HostContentSettingsMap>(
+-                    HostContentSettingsMapFactory::GetForProfile(
+-                        frame->GetBrowserContext())))) {
+-    settings.settings().RegisterProvider(
+-        ProviderType::kWebuiAllowlistProvider,
+-        std::make_unique<WebUIAllowlistProvider>(WebUIAllowlist::GetOrCreate(
+-            Profile::FromBrowserContext(frame->GetBrowserContext()))));
+-    settings.settings().RegisterProvider(
+-        ProviderType::kRemoteListProvider,
+-        std::make_unique<content_settings::RemoteListProvider>());
+-    auto* family = supervised_user::FamilyLinkSettingsServiceFactory::GetForKey(
+-        Profile::FromBrowserContext(frame->GetBrowserContext())
+-            ->GetProfileKey());
+-    if (family) {
+-      settings.settings().RegisterProvider(
+-          ProviderType::kSupervisedProvider,
+-          std::make_unique<
+-              supervised_user::SupervisedUserContentSettingsProvider>(family));
+-    }
+-  }
++        settings(MakeWorkingSettings(
++            Profile::FromBrowserContext(frame->GetBrowserContext()))) {}
+   friend class content::DocumentUserData<AlloyDocumentSettings>;
+   DOCUMENT_USER_DATA_KEY_DECL();
+ };
+ DOCUMENT_USER_DATA_KEY_IMPL(AlloyDocumentSettings);
++
++WorkingSettings* WorkingSettingsForFrame(content::RenderFrameHost* frame) {
++  if (!content::AlloyDocumentStateAdmitted(frame))
++    return nullptr;
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *frame->GetBrowserContext())) {
++    return AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)
++        ->settings.get();
++  }
++  auto selected = content::GetAlloyEmbeddedStateForDocument(frame);
++  if (selected.backing != Backing::kTemporary || !selected.temporary)
++    return nullptr;
++  static const int type = 0;
++  return static_cast<WorkingSettings*>(selected.temporary->GetOrCreateService(
++      &type, alloy::site_records::StorePurpose::kSiteSettings,
++      base::BindOnce(
++          [](Profile* profile, alloy::site_records::RecordCapability)
++              -> std::unique_ptr<KeyedService> {
++            return MakeWorkingSettings(profile);
++          },
++          Profile::FromBrowserContext(frame->GetBrowserContext()))));
++}
+ }  // namespace
++
++bool HostContentSettingsMapFactory::UsesScopedSettings(
++    content::RenderFrameHost* frame) {
++  if (!content::AlloyDocumentStateAdmitted(frame))
++    return true;
++  if (alloy::site_records::RequestContextPolicy::IsStateless(
++          *frame->GetBrowserContext()))
++    return true;
++  // Non-record legacy documents keep native profile settings. Managed
++  // contexts must not borrow that profile root for the same principals.
++  if (!alloy::site_records::RequestContextPolicy::Get(*frame->GetBrowserContext()) &&
++      alloy::site_records::RecordDomainForPrincipal(
++          frame->GetLastCommittedURL(), frame->GetLastCommittedOrigin()).empty())
++    return false;
++  if (!frame->GetParentOrOuterDocument())
++    return false;
++  return content::GetAlloyEmbeddedStateForDocument(frame).backing !=
++         Backing::kRealSite;
++}
+ 
+ HostContentSettingsMap* HostContentSettingsMapFactory::GetForFrame(
+     content::RenderFrameHost* frame) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  if (!frame) {
++  if (!content::AlloyDocumentStateAdmitted(frame))
+     return nullptr;
+-  }
+-  if (alloy::site_records::RequestContextPolicy::Get(*frame->GetBrowserContext()) &&
+-      !content::AlloyDocumentStateAdmitted(frame)) return nullptr;
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(
+-          *frame->GetBrowserContext())) {
++  if (!UsesScopedSettings(frame))
+     return GetForProfile(frame->GetBrowserContext());
+-  }
+-  if (!content::AlloyDocumentStateAdmitted(frame) ||
+-      frame->GetBrowserContext()->ShutdownStarted()) {
+-    return nullptr;
+-  }
+-  return &AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)
+-              ->settings.settings();
++  auto* owner = WorkingSettingsForFrame(frame);
++  return owner ? &owner->settings() : nullptr;
+ }
+ 
+ KeyedService* HostContentSettingsMapFactory::GetStatelessDocumentService(
+@@ -124,14 +159,11 @@
+     base::OnceCallback<std::unique_ptr<KeyedService>(HostContentSettingsMap*)>
+         factory) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  if (!content::AlloyDocumentStateAdmitted(frame) ||
+-      frame->GetBrowserContext()->ShutdownStarted()) {
++  if (!content::AlloyDocumentStateAdmitted(frame))
+     return nullptr;
+-  }
+-  CHECK(alloy::site_records::RequestContextPolicy::IsStateless(
+-      *frame->GetBrowserContext()));
+-  return AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)
+-      ->settings.GetOrCreateService(key, std::move(factory));
++  CHECK(UsesScopedSettings(frame));
++  auto* owner = WorkingSettingsForFrame(frame);
++  return owner ? owner->GetOrCreateService(key, std::move(factory)) : nullptr;
+ }
+ 
+ HostContentSettingsMapFactory::HostContentSettingsMapFactory()
+@@ -185,7 +217,7 @@
+ }
+ 
+ scoped_refptr<RefcountedKeyedService>
+-    HostContentSettingsMapFactory::BuildServiceInstanceFor(
++HostContentSettingsMapFactory::BuildServiceInstanceFor(
+     content::BrowserContext* context) const {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+ 
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.h
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.h
+@@ -22,7 +22,9 @@
+   static HostContentSettingsMap* GetForProfile(
+       content::BrowserContext* browser_context);
+   static HostContentSettingsMapFactory* GetInstance();
+-  // Stateless user decisions belong to the actual document, not its profile.
++  // Working decisions belong to the captured document/embedded scope.
++  // This query uses the existing canonical selection, including revoked owners.
++  static bool UsesScopedSettings(content::RenderFrameHost* frame);
+   static HostContentSettingsMap* GetForFrame(content::RenderFrameHost* frame);
+   static KeyedService* GetStatelessDocumentService(
+       content::RenderFrameHost* frame,
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -587,6 +587,7 @@
+   }
+ 
+   public_deps = [
++    "//brave/alloy/site_records:embedded_state",
+     "//base",
+     "//build:chromecast_buildflags",
+     "//components/download/public/common:public",
+--- a/chrome/browser/permissions/permission_actions_history_factory.cc
++++ b/chrome/browser/permissions/permission_actions_history_factory.cc
+@@ -25,7 +25,7 @@
+     return nullptr;
+   }
+   auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++  if (!HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
+     return GetForProfile(profile);
+   }
+   static const int type_key = 0;
+--- a/chrome/browser/permissions/permission_decision_auto_blocker_factory.cc
++++ b/chrome/browser/permissions/permission_decision_auto_blocker_factory.cc
+@@ -26,7 +26,7 @@
+     return nullptr;
+   }
+   auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(*profile)) {
++  if (!HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
+     return GetForProfile(profile);
+   }
+   static const int type_key = 0;
+--- a/chrome/browser/permissions/chrome_permissions_client.cc
++++ b/chrome/browser/permissions/chrome_permissions_client.cc
+@@ -294,17 +294,15 @@
+ }
+ 
+ HostContentSettingsMap* ChromePermissionsClient::GetSettingsMapForDocument(
+-    content::BrowserContext* browser_context,
++    content::BrowserContext* context,
+     content::RenderFrameHost* frame) {
+-  if (RequiresDocumentPermissionContext(browser_context) ||
+-      (frame && RequiresOriginalPermissionDocument(browser_context))) {
+-    if (!frame || frame->GetBrowserContext() != browser_context ||
+-        browser_context->ShutdownStarted()) {
+-      return nullptr;
+-    }
++  if (context->ShutdownStarted() ||
++      (frame && frame->GetBrowserContext() != context))
++    return nullptr;
++  if (frame)
+     return HostContentSettingsMapFactory::GetForFrame(frame);
+-  }
+-  return GetSettingsMap(browser_context);
++  return RequiresDocumentPermissionContext(context) ? nullptr
++                                                    : GetSettingsMap(context);
+ }
+ 
+ bool ChromePermissionsClient::RequiresDocumentPermissionContext(
+@@ -315,30 +314,30 @@
+ ChromePermissionsClient::GetPermissionActionsHistoryForDocument(
+     content::BrowserContext* context,
+     content::RenderFrameHost* frame) {
+-  if (!RequiresDocumentPermissionContext(context)) {
+-    return PermissionActionsHistoryFactory::GetForProfile(
+-        Profile::FromBrowserContext(context));
+-  }
+-  if (!frame || frame->GetBrowserContext() != context ||
+-      context->ShutdownStarted()) {
++  if (context->ShutdownStarted() ||
++      (frame && frame->GetBrowserContext() != context))
+     return nullptr;
+-  }
+-  return PermissionActionsHistoryFactory::GetForFrame(frame);
++  if (frame)
++    return PermissionActionsHistoryFactory::GetForFrame(frame);
++  return RequiresDocumentPermissionContext(context)
++             ? nullptr
++             : PermissionActionsHistoryFactory::GetForProfile(
++                   Profile::FromBrowserContext(context));
+ }
+ 
+ permissions::PermissionDecisionAutoBlocker*
+ ChromePermissionsClient::GetPermissionDecisionAutoBlockerForDocument(
+     content::BrowserContext* context,
+     content::RenderFrameHost* frame) {
+-  if (!RequiresDocumentPermissionContext(context)) {
+-    return PermissionDecisionAutoBlockerFactory::GetForProfile(
+-        Profile::FromBrowserContext(context));
+-  }
+-  if (!frame || frame->GetBrowserContext() != context ||
+-      context->ShutdownStarted()) {
++  if (context->ShutdownStarted() ||
++      (frame && frame->GetBrowserContext() != context))
+     return nullptr;
+-  }
+-  return PermissionDecisionAutoBlockerFactory::GetForFrame(frame);
++  if (frame)
++    return PermissionDecisionAutoBlockerFactory::GetForFrame(frame);
++  return RequiresDocumentPermissionContext(context)
++             ? nullptr
++             : PermissionDecisionAutoBlockerFactory::GetForProfile(
++                   Profile::FromBrowserContext(context));
+ }
+ 
+ void ChromePermissionsClient::SetPermissionSettingForDocument(
+@@ -347,22 +346,22 @@
+     ContentSettingsType type,
+     const PermissionSetting& setting,
+     const content_settings::ContentSettingConstraints& constraints) {
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(
+-          *browser_context)) {
++  auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
++  if (!frame || browser_context->ShutdownStarted() ||
++      frame->GetBrowserContext() != browser_context)
++    return;
++  if (!HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
+     return PermissionsClient::SetPermissionSettingForDocument(
+         browser_context, request, type, setting, constraints);
+   }
+-  auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
+-  if (!frame || browser_context->ShutdownStarted()) {
+-    return;
+-  }
+   auto document_constraints = constraints.Clone();
+-  // All decisions end with the document. Keep any shorter native expiry,
+-  // without a profile-wide one-time grant tracker or activity timestamps.
++  // Working decisions end with their document or embedded scope. Keep shorter
++  // native expiry, without profile-wide grant tracking or activity timestamps.
+   document_constraints.set_session_model(
+       content_settings::mojom::SessionModel::DURABLE);
+   document_constraints.set_track_last_visit_for_autoexpiration(false);
+-  if (auto* map = GetSettingsMapForDocument(browser_context, frame)) {
++  if (scoped_refptr<HostContentSettingsMap> map =
++          GetSettingsMapForDocument(browser_context, frame)) {
+     map->SetPermissionSettingDefaultScope(request.requesting_origin,
+                                           request.embedding_origin, type,
+                                           setting, document_constraints);
+--- a/components/permissions/permissions_client.cc
++++ b/components/permissions/permissions_client.cc
+@@ -78,22 +78,15 @@
+ content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
+     content::BrowserContext* context,
+     const PermissionRequestData& request) {
+-  if (RequiresOriginalPermissionDocument(context)) {
+-    auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
+-    return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
+-  }
+-  return content::RenderFrameHost::FromID(
+-      request.id.global_render_frame_host_id());
++  auto* frame = request.alloy_document.AsRenderFrameHostIfValid();
++  return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
+ }
+ 
+ content::RenderFrameHost* PermissionsClient::GetPermissionRequestDocument(
+     content::BrowserContext* context,
+     const PermissionRequest& request) {
+-  if (RequiresOriginalPermissionDocument(context)) {
+-    auto* frame = request.alloy_document().AsRenderFrameHostIfValid();
+-    return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
+-  }
+-  return content::RenderFrameHost::FromID(request.get_requesting_frame_id());
++  auto* frame = request.alloy_document().AsRenderFrameHostIfValid();
++  return frame && GetSettingsMapForDocument(context, frame) ? frame : nullptr;
+ }
+ 
+ PermissionActionsHistory*
+--- a/components/permissions/permission_context_base.cc
++++ b/components/permissions/permission_context_base.cc
+@@ -93,11 +93,13 @@
+ }  // namespace
+ 
+ // static
+-const char PermissionContextBase_ChromiumImpl::kPermissionsKillSwitchFieldStudy[] =
+-    "PermissionsKillSwitch";
++const char
++    PermissionContextBase_ChromiumImpl::kPermissionsKillSwitchFieldStudy[] =
++        "PermissionsKillSwitch";
+ // static
+-const char PermissionContextBase_ChromiumImpl::kPermissionsKillSwitchBlockedValue[] =
+-    "blocked";
++const char
++    PermissionContextBase_ChromiumImpl::kPermissionsKillSwitchBlockedValue[] =
++        "blocked";
+ 
+ PermissionContextBase_ChromiumImpl::PermissionContextBase_ChromiumImpl(
+     content::BrowserContext* browser_context,
+@@ -308,7 +310,8 @@
+   return true;
+ }
+ 
+-const PermissionRequest* PermissionContextBase_ChromiumImpl::FindPermissionRequest(
++const PermissionRequest*
++PermissionContextBase_ChromiumImpl::FindPermissionRequest(
+     const PermissionRequestID& id) const {
+   const auto request = pending_requests_.find(id.ToString());
+ 
+@@ -324,17 +327,15 @@
+   return PermissionUtil::GetLastCommittedOriginAsURL(rfh->GetMainFrame());
+ }
+ 
+-content::PermissionResult PermissionContextBase_ChromiumImpl::GetPermissionStatus(
++content::PermissionResult
++PermissionContextBase_ChromiumImpl::GetPermissionStatus(
+     const PermissionRequestData& request_data,
+     content::RenderFrameHost* render_frame_host) const {
+   auto* client = PermissionsClient::Get();
+-  if (client->RequiresOriginalPermissionDocument(browser_context_)) {
+-    render_frame_host =
+-        client->GetPermissionRequestDocument(browser_context_, request_data);
+-    if (!render_frame_host) {
+-      return content::PermissionResult(PermissionStatus::DENIED);
+-    }
+-  }
++  render_frame_host =
++      client->GetPermissionRequestDocument(browser_context_, request_data);
++  if (!render_frame_host)
++    return content::PermissionResult(PermissionStatus::DENIED);
+ 
+   std::unique_ptr<PermissionResolver> resolver =
+       CreatePermissionResolver(request_data.permission_descriptor);
+@@ -364,7 +365,8 @@
+   return native_result;
+ }
+ 
+-content::PermissionResult PermissionContextBase_ChromiumImpl::GetPermissionStatus(
++content::PermissionResult
++PermissionContextBase_ChromiumImpl::GetPermissionStatus(
+     const PermissionResolver& resolver,
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+@@ -516,7 +518,8 @@
+                                    retrieved_permission_data);
+ }
+ 
+-content::PermissionResult PermissionContextBase_ChromiumImpl::GetPermissionStatus(
++content::PermissionResult
++PermissionContextBase_ChromiumImpl::GetPermissionStatus(
+     const blink::mojom::PermissionDescriptorPtr& permission_descriptor,
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+@@ -541,8 +544,8 @@
+     // possible as this corresponds to the requirements of the secure contexts
+     // spec and matches what is implemented in blink. Right now we just check
+     // the top level and requesting origins.
+-    if (!PermissionsClient::Get()->BraveCanBypassEmbeddingOriginCheck(content_settings_type_, 
+-            requesting_origin, embedding_origin) &&
++    if (!PermissionsClient::Get()->BraveCanBypassEmbeddingOriginCheck(
++            content_settings_type_, requesting_origin, embedding_origin) &&
+         !network::IsUrlPotentiallyTrustworthy(embedding_origin)) {
+       return false;
+     }
+@@ -596,8 +599,9 @@
+   return result;
+ }
+ 
+-void PermissionContextBase_ChromiumImpl::ResetPermission(const GURL& requesting_origin,
+-                                            const GURL& embedding_origin) {
++void PermissionContextBase_ChromiumImpl::ResetPermission(
++    const GURL& requesting_origin,
++    const GURL& embedding_origin) {
+   if (!content_settings::WebsiteSettingsRegistry::GetInstance()->Get(
+           content_settings_type())) {
+     return;
+@@ -621,7 +625,8 @@
+   return param == kPermissionsKillSwitchBlockedValue;
+ }
+ 
+-PermissionSetting PermissionContextBase_ChromiumImpl::GetPermissionStatusInternal(
++PermissionSetting
++PermissionContextBase_ChromiumImpl::GetPermissionStatusInternal(
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
+@@ -644,15 +649,16 @@
+   // origin displayed in the prompt should never differ from the top-level
+   // origin. Storage access API requests are excluded as they are expected to
+   // request permissions from the frame origin needing access.
+-  DCHECK(PermissionsClient::Get()->BraveCanBypassEmbeddingOriginCheck(content_settings_type_, 
+-             request_data->requesting_origin, request_data->embedding_origin) ||
++  DCHECK(PermissionsClient::Get()->BraveCanBypassEmbeddingOriginCheck(
++             content_settings_type_, request_data->requesting_origin,
++             request_data->embedding_origin) ||
+          request_data->requesting_origin == request_data->embedding_origin ||
+          content_settings_type_ == ContentSettingsType::STORAGE_ACCESS);
+ 
+   auto* client = PermissionsClient::Get();
+   auto* rfh =
+       client->GetPermissionRequestDocument(browser_context_, *request_data);
+-  if (client->RequiresOriginalPermissionDocument(browser_context_) && !rfh) {
++  if (!rfh) {
+     std::move(callback).Run(
+         content::PermissionResult(PermissionStatus::DENIED));
+     return;
+@@ -672,10 +678,11 @@
+   }
+ 
+   auto decided_cb = base::BindRepeating(
+-      &PermissionContextBase_ChromiumImpl::PermissionDecided, weak_factory_.GetWeakPtr());
+-  auto cleanup_cb = base::BindOnce(&PermissionContextBase_ChromiumImpl::CleanUpRequest,
+-                                   weak_factory_.GetWeakPtr(), web_contents,
+-                                   request_data->id);
++      &PermissionContextBase_ChromiumImpl::PermissionDecided,
++      weak_factory_.GetWeakPtr());
++  auto cleanup_cb = base::BindOnce(
++      &PermissionContextBase_ChromiumImpl::CleanUpRequest,
++      weak_factory_.GetWeakPtr(), web_contents, request_data->id);
+   PermissionRequestID permission_request_id = request_data->id;
+ 
+   std::unique_ptr<PermissionRequest> request =
+@@ -698,11 +705,9 @@
+     const permissions::PermissionPromptDecision& decision,
+     const PermissionRequestData& request_data) {
+   if (retired_requests_.contains(request_data.id.ToString())) return;
+   const bool has_authority =
+-      !PermissionsClient::Get()->RequiresOriginalPermissionDocument(
+-          browser_context_) ||
+-      PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
+-                                                             request_data);
++      PermissionsClient::Get()->GetPermissionRequestDocument(
++          browser_context_, request_data) != nullptr;
+   if (has_authority) {
+     UserMadePermissionDecision(request_data.id, request_data.requesting_origin,
+                                request_data.embedding_origin,
+@@ -731,7 +736,8 @@
+                       persist, /*permission_result=*/nullptr, decision);
+ }
+ 
+-content::BrowserContext* PermissionContextBase_ChromiumImpl::browser_context() const {
++content::BrowserContext* PermissionContextBase_ChromiumImpl::browser_context()
++    const {
+   return browser_context_;
+ }
+ 
+@@ -806,7 +812,8 @@
+   }
+ }
+ 
+-content::PermissionResult PermissionContextBase_ChromiumImpl::ComputeNewPermissionResult(
++content::PermissionResult
++PermissionContextBase_ChromiumImpl::ComputeNewPermissionResult(
+     const PermissionRequestData& request_data,
+     const permissions::PermissionPromptDecision& decision) {
+   // Note that rfh may be null, see crbug.com/426909787.
+@@ -830,9 +837,7 @@
+     bool persist,
+     const content::PermissionResult* permission_result,
+     const permissions::PermissionPromptDecision& decision) {
+-  if (PermissionsClient::Get()->RequiresOriginalPermissionDocument(
+-          browser_context_) &&
+-      !PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
++  if (!PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_,
+                                                               request_data)) {
+     std::move(callback).Run(
+         content::PermissionResult(PermissionStatus::DENIED));
+@@ -871,7 +876,8 @@
+     content::WebContents* web_contents =
+         content::WebContents::FromRenderFrameHost(rfh);
+     request->second.first->set_request_finished_callback(base::BindOnce(
+-        &PermissionContextBase_ChromiumImpl::CleanUpRequestEmbeddedPermissionElement,
++        &PermissionContextBase_ChromiumImpl::
++            CleanUpRequestEmbeddedPermissionElement,
+         weak_factory_.GetWeakPtr(), web_contents, request_data.id,
+         std::move(callback), decision.overall_decision, new_permission_result));
+   } else {
+@@ -879,19 +885,21 @@
+   }
+ }
+ 
+-void PermissionContextBase_ChromiumImpl::CleanUpRequest(content::WebContents* web_contents,
+-                                           const PermissionRequestID& id) {
++void PermissionContextBase_ChromiumImpl::CleanUpRequest(
++    content::WebContents* web_contents,
++    const PermissionRequestID& id) {
+   retired_requests_.erase(id.ToString());
+   size_t success = pending_requests_.erase(id.ToString());
+   DCHECK(success == 1) << "Missing request " << id.ToString();
+ }
+ 
+-void PermissionContextBase_ChromiumImpl::CleanUpRequestEmbeddedPermissionElement(
+-    content::WebContents* web_contents,
+-    const PermissionRequestID& id,
+-    BrowserPermissionCallback callback,
+-    PermissionDecision decision,
+-    const content::PermissionResult& permission_result) {
++void PermissionContextBase_ChromiumImpl::
++    CleanUpRequestEmbeddedPermissionElement(
++        content::WebContents* web_contents,
++        const PermissionRequestID& id,
++        BrowserPermissionCallback callback,
++        PermissionDecision decision,
++        const content::PermissionResult& permission_result) {
+   // A request from an embedded permission element requires a notification
+   // `OnPermissionChanged` when changing the device status, which is currently
+   // unavailable. We compare the device status with the cached status and notify
+--- a/components/permissions/permission_request_manager.cc
++++ b/components/permissions/permission_request_manager.cc
+@@ -924,7 +924,8 @@
+   // has an initiated permission prompt. If a flow model is not created even
+   // though a permission prompt has been requested, it will cause a crash.
+   if (PermissionUtil::ShouldCurrentRequestUsePermissionElementSecondaryUI(
+-          this, web_contents()) && BRAVE_PERMISSION_REQUEST_MANAGER_RECREATE_VIEW) {
++          this, web_contents()) &&
++      BRAVE_PERMISSION_REQUEST_MANAGER_RECREATE_VIEW) {
+     if (!embedded_prompt_flow_model_) {
+       embedded_prompt_flow_model_ =
+           std::make_unique<EmbeddedPermissionPromptFlowModel>(web_contents(),
+@@ -1438,9 +1439,7 @@
+   }
+ 
+   for (auto& request : requests_) {
+-    if (PermissionsClient::Get()->RequiresDocumentPermissionContext(
+-            browser_context) &&
+-        !PermissionsClient::Get()->GetPermissionRequestDocument(browser_context,
++    if (!PermissionsClient::Get()->GetPermissionRequestDocument(browser_context,
+                                                                 *request)) {
+       continue;
+     }
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -3,8 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/dedicated_worker_host.h"
++#include "content/browser/alloy_embedded_state.h"
+ #include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+-#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <memory>
+ #include <optional>
+@@ -242,8 +242,8 @@
+     mojo::PendingReceiver<blink::mojom::LockManager> receiver) {
+   GetStoragePartitionImpl()->BindLockManager(
+       GetWorkerStorageKey(), GetToken().value(), std::move(receiver));
+-  GetStoragePartitionImpl()->GetLockManager()->AddLockObserver(GetToken().value(),
+-                                                            this);
++  GetStoragePartitionImpl()->GetLockManager()->AddLockObserver(
++      GetToken().value(), this);
+ }
+ 
+ bool DedicatedWorkerHost::OnLockContention() {
+@@ -561,7 +561,6 @@
+     worker_client_security_state_->cross_origin_embedder_policy =
+         result->main_script_load_params->response_head->parsed_headers
+             ->cross_origin_embedder_policy;
+-
+   }
+ 
+   // The worker global scope's document isolation policy is the same as its
+@@ -928,16 +927,17 @@
+     const url::Origin& origin,
+     mojo::PendingReceiver<blink::mojom::PermissionService> receiver) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  if (!alloy::site_records::RequestContextPolicy::IsStateless(
++  if (!GetWorkerStorageKey().nonce() &&
++      !alloy::site_records::RequestContextPolicy::IsStateless(
+           *GetProcessHost()->GetBrowserContext())) {
+     static_cast<RenderProcessHostImpl*>(GetProcessHost())
+         ->CreatePermissionService(origin, std::move(receiver));
+     return;
+   }
+   auto* owner = GetAncestorRenderFrameHost();
+-  if (!owner) {
+-    return;
+-  }
++  if (!owner || owner->GetStorageKey() != GetWorkerStorageKey() ||
++      !AlloyDocumentStateAdmitted(owner))
++    return;
+   PermissionServiceContext::GetOrCreateForWorkerDocument(owner,
+                                                          GetProcessHost())
+       ->CreateServiceForWorker(origin, std::move(receiver));
+@@ -1071,8 +1071,10 @@
+       GetWorkerStorageKey().origin().GetURL(), GetAncestorRenderFrameHostId(),
+       /*is_worker=*/true);
+   binding_context.document = ancestor_document_;
+-  manager->BindReceiver(WithAlloyBucketFileSystem(*storage_partition_impl,
+-      *this, std::move(binding_context)), std::move(receiver));
++  manager->BindReceiver(
++      WithAlloyBucketFileSystem(*storage_partition_impl, *this,
++                                std::move(binding_context)),
++      std::move(receiver));
+ }
+ 
+ #if BUILDFLAG(ENABLE_COMPUTE_PRESSURE)
+@@ -1227,11 +1229,12 @@
+ 
+ blink::mojom::PermissionStatus DedicatedWorkerHost::GetPermissionStatus(
+     blink::PermissionType permission_type) {
+-  if (alloy::site_records::RequestContextPolicy::IsStateless(
++  if (GetWorkerStorageKey().nonce() ||
++      alloy::site_records::RequestContextPolicy::IsStateless(
+           *GetProcessHost()->GetBrowserContext())) {
+     auto* owner = GetAncestorRenderFrameHost();
+-    if (!owner ||
+-        owner->GetLastCommittedOrigin() != GetWorkerStorageKey().origin()) {
++    if (!owner || !AlloyDocumentStateAdmitted(owner) ||
++        owner->GetStorageKey() != GetWorkerStorageKey()) {
+       return blink::mojom::PermissionStatus::DENIED;
+     }
+     return owner->GetBrowserContext()
+@@ -1271,7 +1274,8 @@
+   if (dip_reporter_) {
+     dip_reporter_->Clone(dip_reporter.InitWithNewPipeAndPassReceiver());
+   }
+-  BindAlloyBucketCacheStorage(*worker_process_host_, GetBucketStorageOwner(), GetBucketStorageKey(),
++  BindAlloyBucketCacheStorage(
++      *worker_process_host_, GetBucketStorageOwner(), GetBucketStorageKey(),
+       cross_origin_embedder_policy(), std::move(coep_reporter),
+       worker_client_security_state_->document_isolation_policy,
+       std::move(dip_reporter), bucket_locator, std::move(receiver));
+@@ -1282,7 +1286,8 @@
+     const std::vector<std::string>& directory_path_components,
+     blink::mojom::BucketHost::GetDirectoryCallback callback) {
+   GetAlloyWorkerBucketDirectory(*GetProcessHost(), *this,
+-      bucket.ToBucketLocator(), directory_path_components, std::move(callback));
++                                bucket.ToBucketLocator(),
++                                directory_path_components, std::move(callback));
+ }
+ 
+ storage::BucketClientInfo DedicatedWorkerHost::GetBucketClientInfo() const {
+--- a/chrome/browser/bluetooth/chrome_bluetooth_delegate.cc
++++ b/chrome/browser/bluetooth/chrome_bluetooth_delegate.cc
+@@ -81,9 +81,10 @@
+   if (result != AllowWebBluetoothResult::kAllow) {
+     return result;
+   }
+-  if (HostContentSettingsMapFactory::GetForFrame(frame)->GetContentSetting(
+-          requesting.GetURL(), embedding.GetURL(),
+-          ContentSettingsType::BLUETOOTH_GUARD) == CONTENT_SETTING_BLOCK) {
++  auto* map = HostContentSettingsMapFactory::GetForFrame(frame);
++  if (!map || map->GetContentSetting(requesting.GetURL(), embedding.GetURL(),
++                                     ContentSettingsType::BLUETOOTH_GUARD) ==
++                  CONTENT_SETTING_BLOCK) {
+     return AllowWebBluetoothResult::kBlockPolicy;
+   }
+   return result;
+@@ -94,10 +95,11 @@
+     content::RenderFrameHost* frame,
+     const url::Origin& requesting,
+     const url::Origin& embedding) {
+-  return IsBluetoothScanningBlocked(context, requesting, embedding) ||
+-         HostContentSettingsMapFactory::GetForFrame(frame)->GetContentSetting(
+-             requesting.GetURL(), embedding.GetURL(),
+-             ContentSettingsType::BLUETOOTH_SCANNING) == CONTENT_SETTING_BLOCK;
++  auto* map = HostContentSettingsMapFactory::GetForFrame(frame);
++  return !map || IsBluetoothScanningBlocked(context, requesting, embedding) ||
++         map->GetContentSetting(requesting.GetURL(), embedding.GetURL(),
++                                ContentSettingsType::BLUETOOTH_SCANNING) ==
++             CONTENT_SETTING_BLOCK;
+ }
+ 
+ void ChromeBluetoothDelegate::BlockBluetoothScanningForDocument(
+@@ -105,10 +107,12 @@
+     content::RenderFrameHost* frame,
+     const url::Origin& requesting,
+     const url::Origin& embedding) {
+-  HostContentSettingsMapFactory::GetForFrame(frame)
+-      ->SetContentSettingDefaultScope(requesting.GetURL(), embedding.GetURL(),
+-                                      ContentSettingsType::BLUETOOTH_SCANNING,
+-                                      CONTENT_SETTING_BLOCK);
++  if (scoped_refptr<HostContentSettingsMap> map =
++          HostContentSettingsMapFactory::GetForFrame(frame)) {
++    map->SetContentSettingDefaultScope(requesting.GetURL(), embedding.GetURL(),
++                                       ContentSettingsType::BLUETOOTH_SCANNING,
++                                       CONTENT_SETTING_BLOCK);
++  }
+ }
+ 
+ std::string ChromeBluetoothDelegate::GetWebBluetoothBlocklist() {
+--- a/components/content_settings/core/browser/host_content_settings_map.h
++++ b/components/content_settings/core/browser/host_content_settings_map.h
+@@ -85,7 +85,8 @@
+                          bool is_off_the_record,
+                          bool store_last_modified,
+                          bool restore_session,
+-                         bool should_record_metrics);
++                         bool should_record_metrics,
++                         bool isolated_document_state = false);
+ 
+   HostContentSettingsMap(const HostContentSettingsMap&) = delete;
+   HostContentSettingsMap& operator=(const HostContentSettingsMap&) = delete;
+--- a/components/content_settings/core/browser/host_content_settings_map.cc
++++ b/components/content_settings/core/browser/host_content_settings_map.cc
+@@ -287,7 +287,8 @@
+                                                bool is_off_the_record,
+                                                bool store_last_modified,
+                                                bool restore_session,
+-                                               bool should_record_metrics)
++                                               bool should_record_metrics,
++                                               bool isolated_document_state)
+     : RefcountedKeyedService(base::SingleThreadTaskRunner::GetCurrentDefault()),
+ #ifndef NDEBUG
+       used_from_thread_id_(base::PlatformThread::CurrentId()),
+@@ -307,7 +308,8 @@
+   policy_provider->AddObserver(this);
+ 
+   auto pref_provider_ptr = std::make_unique<content_settings::PrefProvider>(
+-      prefs_, is_off_the_record_, store_last_modified_, restore_session);
++      prefs_, is_off_the_record_, store_last_modified_, restore_session,
++      isolated_document_state);
+   pref_provider_ = pref_provider_ptr.get();
+   content_settings_providers_[ProviderType::kPrefProvider] =
+       std::move(pref_provider_ptr);
+--- a/components/content_settings/core/browser/content_settings_pref_provider.h
++++ b/components/content_settings/core/browser/content_settings_pref_provider.h
+@@ -38,7 +38,8 @@
+   PrefProvider(PrefService* prefs,
+                bool off_the_record,
+                bool store_last_modified,
+-               bool restore_session);
++               bool restore_session,
++               bool isolated = false);
+ 
+   PrefProvider(const PrefProvider&) = delete;
+   PrefProvider& operator=(const PrefProvider&) = delete;
+@@ -132,6 +133,7 @@
+   raw_ptr<PrefService> prefs_;
+ 
+   const bool off_the_record_;
++  const bool isolated_;
+   bool document_permission_state_ = false;
+ 
+   bool store_last_modified_;
+--- a/components/content_settings/core/browser/content_settings_pref_provider.cc
++++ b/components/content_settings/core/browser/content_settings_pref_provider.cc
+@@ -150,9 +150,11 @@
+ PrefProvider::PrefProvider(PrefService* prefs,
+                            bool off_the_record,
+                            bool store_last_modified,
+-                           bool restore_session)
++                           bool restore_session,
++                           bool isolated)
+     : prefs_(prefs),
+       off_the_record_(off_the_record),
++      isolated_(isolated),
+       store_last_modified_(store_last_modified),
+       clock_(base::DefaultClock::GetInstance()) {
+   TRACE_EVENT_BEGIN("startup", "PrefProvider::PrefProvider");
+@@ -179,13 +181,14 @@
+       continue;
+     }
+     content_settings_prefs_.insert(std::make_pair(
+-        info->type(), std::make_unique<ContentSettingsPref>(
+-                          info->type(), prefs_, &pref_change_registrar_,
+-                          info->pref_name(), off_the_record_, restore_session,
+-                          base::BindRepeating(&PrefProvider::Notify,
+-                                              base::Unretained(this)),
+-                          base::BindRepeating(&PrefProvider::PrepareDependentSettings,
+-                                              base::Unretained(this), info->type()))));
++        info->type(),
++        std::make_unique<ContentSettingsPref>(
++            info->type(), prefs_, &pref_change_registrar_, info->pref_name(),
++            off_the_record_, restore_session,
++            base::BindRepeating(&PrefProvider::Notify, base::Unretained(this)),
++            base::BindRepeating(&PrefProvider::PrepareDependentSettings,
++                                base::Unretained(this), info->type()),
++            !isolated_)));
+   }
+ 
+ #if !BUILDFLAG(IS_IOS)
+@@ -219,13 +222,14 @@
+                     ContentSettingsType::PERMISSION_ACTIONS_HISTORY}) {
+     const auto* info = WebsiteSettingsRegistry::GetInstance()->Get(type);
+     content_settings_prefs_.emplace(
+-        type, std::make_unique<ContentSettingsPref>(
+-                  type, prefs_, &pref_change_registrar_, info->pref_name(),
+-                  true, false,
+-                  base::BindRepeating(&PrefProvider::Notify,
+-                                      base::Unretained(this)),
+-                  base::BindRepeating(&PrefProvider::PrepareDependentSettings,
+-                                      base::Unretained(this), type)));
++        type,
++        std::make_unique<ContentSettingsPref>(
++            type, prefs_, &pref_change_registrar_, info->pref_name(), true,
++            false,
++            base::BindRepeating(&PrefProvider::Notify, base::Unretained(this)),
++            base::BindRepeating(&PrefProvider::PrepareDependentSettings,
++                                base::Unretained(this), type),
++            !isolated_));
+   }
+ }
+ 
+--- a/components/content_settings/core/browser/content_settings_pref.h
++++ b/components/content_settings/core/browser/content_settings_pref.h
+@@ -50,8 +50,9 @@
+                       const std::string& pref_name,
+                       bool off_the_record,
+                       bool restore_session,
+-                      NotifyObserversCallback notify_callback,
+-                      PrepareProjectionCallback prepare_callback = {});
++                      NotifyObserversCallback notify_callback,
++                      PrepareProjectionCallback prepare_callback = {},
++                      bool inherit_user_settings = true);
+ 
+   ContentSettingsPref(const ContentSettingsPref&) = delete;
+   ContentSettingsPref& operator=(const ContentSettingsPref&) = delete;
+@@ -124,6 +125,7 @@
+   const std::string pref_name_;
+ 
+   bool off_the_record_;
++  const bool inherit_user_settings_;
+ 
+   bool restore_session_;
+ 
+--- a/components/content_settings/core/browser/content_settings_pref.cc
++++ b/components/content_settings/core/browser/content_settings_pref.cc
+@@ -150,21 +150,24 @@
+     const std::string& pref_name,
+     bool off_the_record,
+     bool restore_session,
+-    NotifyObserversCallback notify_callback,
+-    PrepareProjectionCallback prepare_callback)
++    NotifyObserversCallback notify_callback,
++    PrepareProjectionCallback prepare_callback,
++    bool inherit_user_settings)
+     : content_type_(content_type),
+       prefs_(prefs),
+       registrar_(registrar),
+       pref_name_(pref_name),
+       off_the_record_(off_the_record),
++      inherit_user_settings_(inherit_user_settings),
+       restore_session_(restore_session),
+       updating_preferences_(false),
+       notify_callback_(notify_callback),
+       prepare_callback_(std::move(prepare_callback)),
+       clock_(base::DefaultClock::GetInstance()) {
+   DCHECK(prefs_);
+   content_settings::ContentSettingsRegistry::GetInstance();
+-  ReadContentSettingsFromPref();
++  if (inherit_user_settings_)
++    ReadContentSettingsFromPref();
+ 
+   registrar_->AddProjection(pref_name_,
+                   base::BindRepeating(&ContentSettingsPref::PreparePrefChange,
+@@ -200,8 +203,8 @@
+   DCHECK(thread_checker_.CalledOnValidThread());
+   DCHECK(prefs_);
+   DCHECK(primary_pattern != ContentSettingsPattern::Wildcard() ||
+-         BRAVE_SET_WEBSITE_SETTING
+-         secondary_pattern != ContentSettingsPattern::Wildcard());
++         BRAVE_SET_WEBSITE_SETTING secondary_pattern !=
++             ContentSettingsPattern::Wildcard());
+ 
+   // Update in memory value map.
+   auto* map_to_modify = &off_the_record_value_map_;
+@@ -347,7 +350,7 @@
+ 
+     // Get settings dictionary for the current pattern string, and read
+     // settings from the dictionary.
+-    if(!i.second.is_dict()) {
++    if (!i.second.is_dict()) {
+       LOG(ERROR) << "Invalid settings dictionary for pattern string: "
+                  << pattern_str << " with value: " << i.second.DebugString();
+       continue;
+@@ -480,6 +480,8 @@
+ }
+ 
+ base::OnceClosure ContentSettingsPref::PreparePrefChange() {
++  if (!inherit_user_settings_)
++    return {};
+   DCHECK(thread_checker_.CalledOnValidThread());
+ 
+   if (updating_preferences_)
+--- a/brave/components/content_settings/core/browser/brave_content_settings_pref_provider.h
++++ b/brave/components/content_settings/core/browser/brave_content_settings_pref_provider.h
+@@ -38,7 +38,8 @@
+   BravePrefProvider(PrefService* prefs,
+                     bool off_the_record,
+                     bool store_last_modified,
+-                    bool restore_session);
++                    bool restore_session,
++                    bool isolated = false);
+   BravePrefProvider(const BravePrefProvider&) = delete;
+   BravePrefProvider& operator=(const BravePrefProvider&) = delete;
+   ~BravePrefProvider() override;
+--- a/brave/components/content_settings/core/browser/brave_content_settings_pref_provider.cc
++++ b/brave/components/content_settings/core/browser/brave_content_settings_pref_provider.cc
+@@ -116,8 +116,13 @@
+ BravePrefProvider::BravePrefProvider(PrefService* prefs,
+                                      bool off_the_record,
+                                      bool store_last_modified,
+-                                     bool restore_session)
+-    : PrefProvider(prefs, off_the_record, store_last_modified, restore_session),
++                                     bool restore_session,
++                                     bool isolated)
++    : PrefProvider(prefs,
++                   off_the_record,
++                   store_last_modified,
++                   restore_session,
++                   isolated),
+       initialized_(false),
+       store_last_modified_(store_last_modified),
+       weak_factory_(this) {

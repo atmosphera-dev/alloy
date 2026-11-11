@@ -1,0 +1,933 @@
+--- a/components/sqlite_vfs/vfs_utils.h
++++ b/components/sqlite_vfs/vfs_utils.h
+@@ -17,6 +17,18 @@
+ 
+ enum class Client;
+ class SqliteVfsFileSet;
++
++// Anonymous native memory files only; unsupported platforms fail without a disk
++// or named shared-memory fallback. Exports use the same shared abandonment
++// locks.
++COMPONENT_EXPORT(SQLITE_VFS)
++base::expected<PendingFileSet, FileSetError> MakeMemoryFileSet(
++    bool single_connection,
++    bool journal_mode_wal);
++COMPONENT_EXPORT(SQLITE_VFS)
++base::expected<PendingFileSet, FileSetError> ShareMemoryConnection(
++    const SqliteVfsFileSet& file_set,
++    bool read_write);
+ 
+ // Creates a new pending file set for read-write access to a database at the
+ // location described by `directory` and `base_name`.
+--- a/components/sqlite_vfs/vfs_utils.cc
++++ b/components/sqlite_vfs/vfs_utils.cc
+@@ -16,6 +16,7 @@
+ #include "base/files/file_util.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/numerics/clamped_math.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/types/expected.h"
+ #include "base/uuid.h"
+ #include "build/build_config.h"
+@@ -31,6 +32,12 @@
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include <windows.h>
++#endif
++
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++#include <linux/memfd.h>
++#include <sys/syscall.h>
++#include <unistd.h>
+ #endif
+ 
+ namespace sqlite_vfs {
+@@ -430,6 +437,94 @@
+   return pending_file_set;
+ }
+ 
++base::expected<PendingFileSet, FileSetError> MakeMemoryFileSet(
++    bool single_connection,
++    bool journal_mode_wal) {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  auto make_file = [] {
++    return base::File(static_cast<int>(
++        syscall(__NR_memfd_create, "persistent-cache", MFD_CLOEXEC)));
++  };
++  PendingFileSet pending;
++  pending.db_file = make_file();
++  // A new WAL database first opens in rollback mode before SQLite switches it.
++  pending.journal_file = make_file();
++  if (journal_mode_wal) {
++    pending.wal_file = make_file();
++    if (!single_connection) {
++      pending.wal_index_file = make_file();
++      pending.wal_index_file_read_only =
++          base::File(base::FilePath("/proc/self/fd")
++                         .AppendASCII(base::NumberToString(
++                             pending.wal_index_file.GetPlatformFile())),
++                     base::File::FLAG_OPEN | base::File::FLAG_READ);
++    }
++  }
++  if (!pending.db_file.IsValid() || !pending.journal_file.IsValid() ||
++      (journal_mode_wal && !pending.wal_file.IsValid()) ||
++      (journal_mode_wal && !single_connection &&
++       (!pending.wal_index_file.IsValid() ||
++        !pending.wal_index_file_read_only.IsValid()))) {
++    return base::unexpected(FileSetError::kTransient);
++  }
++  if (!single_connection) {
++    pending.shared_lock = SharedLocks::CreateAnonymousRegion(journal_mode_wal);
++    if (!pending.shared_lock.IsValid()) {
++      return base::unexpected(FileSetError::kTransient);
++    }
++  }
++  pending.read_write = true;
++  pending.wal_mode = journal_mode_wal;
++  return pending;
++#else
++  return base::unexpected(FileSetError::kPermanent);
++#endif
++}
++
++base::expected<PendingFileSet, FileSetError> ShareMemoryConnection(
++    const SqliteVfsFileSet& file_set,
++    bool read_write) {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  CHECK(!file_set.is_single_connection());
++  CHECK(!read_write || !file_set.read_only());
++  auto share = [read_write, &file_set](const base::File& file) {
++    if (read_write || file_set.read_only()) {
++      return file.Duplicate();
++    }
++    // Reopen the same anonymous inode with reduced access, never a disk path.
++    return base::File(
++        base::FilePath("/proc/self/fd")
++            .AppendASCII(base::NumberToString(file.GetPlatformFile())),
++        base::File::FLAG_OPEN | base::File::FLAG_READ);
++  };
++  PendingFileSet pending;
++  pending.db_file = share(file_set.GetDbFile());
++  if (file_set.has_journal_file()) {
++    pending.journal_file = share(file_set.GetJournalFile());
++  }
++  if (file_set.has_wal_file()) {
++    pending.wal_file = share(file_set.GetWalJournalFile());
++    pending.wal_index_file = share(file_set.GetWalIndexFile());
++    if (read_write) {
++      pending.wal_index_file_read_only =
++          file_set.GetWalIndexFileReadOnly().Duplicate();
++    }
++  }
++  pending.shared_lock = file_set.GetSharedLock().Duplicate();
++  if (!pending.db_file.IsValid() || !pending.shared_lock.IsValid() ||
++      (file_set.has_journal_file() && !pending.journal_file.IsValid()) ||
++      (file_set.has_wal_file() &&
++       (!pending.wal_file.IsValid() || !pending.wal_index_file.IsValid() ||
++        (read_write && !pending.wal_index_file_read_only.IsValid())))) {
++    return base::unexpected(FileSetError::kTransient);
++  }
++  pending.read_write = read_write;
++  pending.wal_mode = file_set.wal_mode();
++  return pending;
++#else
++  return base::unexpected(FileSetError::kPermanent);
++#endif
++}
+ base::FilePath GetBaseName(const base::FilePath& file) {
+   return file.MatchesFinalExtension(kDbFileExtension)
+              ? file.BaseName().RemoveFinalExtension()
+--- a/components/sqlite_vfs/shared_locks.h
++++ b/components/sqlite_vfs/shared_locks.h
+@@ -31,6 +31,8 @@
+   // the shared locks. If `wal_mode` is true, the region is sized to hold the
+   // locks for a wal-mode database.
+   static base::UnsafeSharedMemoryRegion CreateRegion(bool wal_mode);
++  // Never creates a filesystem entry or falls back to a named region.
++  static base::UnsafeSharedMemoryRegion CreateAnonymousRegion(bool wal_mode);
+ 
+   // Maps `region` and returns a SharedLocks object backed by it. Returns no
+   // value in case of failure to map `region` into the process's address space.
+--- a/components/sqlite_vfs/shared_locks.cc
++++ b/components/sqlite_vfs/shared_locks.cc
+@@ -9,6 +9,7 @@
+ #include "base/check.h"
+ #include "base/check_op.h"
+ #include "base/notreached.h"
++#include "build/build_config.h"
+ #include "third_party/sqlite/sqlite3.h"
+ 
+ namespace sqlite_vfs {
+@@ -32,6 +33,19 @@
+ base::UnsafeSharedMemoryRegion SharedLocks::CreateRegion(bool wal_mode) {
+   size_t size = wal_mode ? sizeof(DatabaseAndWalLocks) : sizeof(DatabaseLock);
+   return base::UnsafeSharedMemoryRegion::Create(size);
++}
++
++// static
++base::UnsafeSharedMemoryRegion SharedLocks::CreateAnonymousRegion(
++    bool wal_mode) {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  const size_t size =
++      wal_mode ? sizeof(DatabaseAndWalLocks) : sizeof(DatabaseLock);
++  return base::UnsafeSharedMemoryRegion::Deserialize(
++      base::subtle::PlatformSharedMemoryRegion::CreateUnsafeAnonymous(size));
++#else
++  return {};
++#endif
+ }
+ 
+ // static
+--- a/components/persistent_cache/backend_storage.h
++++ b/components/persistent_cache/backend_storage.h
+@@ -15,7 +15,25 @@
+ #include "base/types/expected.h"
+ #include "components/persistent_cache/transaction_error.h"
+ 
++namespace base {
++class UnsafeSharedMemoryRegion;
++}
++
+ namespace persistent_cache {
++
++// Owns only the native shared abandonment locks, not cache keys or authority.
++// Registration and abandonment are synchronized across owner/cache sequences.
++class COMPONENT_EXPORT(PERSISTENT_CACHE) MemoryBackendLifetime {
++ public:
++  MemoryBackendLifetime();
++  ~MemoryBackendLifetime();
++  bool Register(const base::UnsafeSharedMemoryRegion& region, bool wal_mode);
++  void Abandon();
++
++ private:
++  class State;
++  std::unique_ptr<State> state_;
++};
+ 
+ class Backend;
+ enum class BackendType;
+@@ -109,6 +127,11 @@
+   BackendStorage& operator=(const BackendStorage&) = delete;
+   ~BackendStorage();
+ 
++  static BackendStorage CreateInMemory(
++      Client client,
++      std::shared_ptr<MemoryBackendLifetime> lifetime = nullptr);
++  bool in_memory() const { return in_memory_; }
++
+   Client client() const { return client_; }
+ 
+   // Returns the directory managed by the instance.
+@@ -177,6 +200,11 @@
+       int64_t target_footprint);
+ 
+  private:
++  BackendStorage(Client client,
++                 std::unique_ptr<Delegate> memory_delegate,
++                 std::shared_ptr<MemoryBackendLifetime> lifetime);
++  std::shared_ptr<MemoryBackendLifetime> memory_lifetime_;
++  const bool in_memory_ = false;
+   const Client client_;
+ 
+   // The delegate used to create/operate on backends.
+--- a/components/persistent_cache/backend_storage.cc
++++ b/components/persistent_cache/backend_storage.cc
+@@ -13,18 +13,56 @@
+ #include "base/files/file_enumerator.h"
+ #include "base/files/file_util.h"
+ #include "base/numerics/clamped_math.h"
++#include "base/synchronization/lock.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "components/persistent_cache/backend.h"
+ #include "components/persistent_cache/backend_type.h"
+ #include "components/persistent_cache/pending_backend.h"
+ #include "components/persistent_cache/persistent_cache.h"
++#include "components/sqlite_vfs/shared_locks.h"
+ 
+ #if !BUILDFLAG(IS_FUCHSIA)
+ #include "components/persistent_cache/sqlite/backend_storage_delegate.h"
+ #endif
+ 
+ namespace persistent_cache {
++
++class MemoryBackendLifetime::State {
++ public:
++  base::Lock lock;
++  bool abandoned = false;
++  std::vector<sqlite_vfs::SharedLocks> locks;
++};
++MemoryBackendLifetime::MemoryBackendLifetime()
++    : state_(std::make_unique<State>()) {}
++MemoryBackendLifetime::~MemoryBackendLifetime() {
++  Abandon();
++}
++bool MemoryBackendLifetime::Register(
++    const base::UnsafeSharedMemoryRegion& region,
++    bool wal_mode) {
++  auto mapped = sqlite_vfs::SharedLocks::Create(region, wal_mode);
++  if (!mapped)
++    return false;
++  base::AutoLock lock(state_->lock);
++  if (state_->abandoned) {
++    mapped->Abandon();
++    return false;
++  }
++  // Evicted caches already abandon their own exports; do not retain their maps.
++  std::erase_if(state_->locks,
++                [](const auto& item) { return item.IsAbandoned(); });
++  state_->locks.push_back(std::move(*mapped));
++  return true;
++}
++void MemoryBackendLifetime::Abandon() {
++  base::AutoLock lock(state_->lock);
++  state_->abandoned = true;
++  for (auto& item : state_->locks)
++    item.Abandon();
++  state_->locks.clear();
++}
+ 
+ namespace {
+ 
+@@ -68,7 +106,33 @@
+   is_valid_ = delegate_ && base::CreateDirectory(directory_);
+ }
+ 
+-BackendStorage::~BackendStorage() = default;
++BackendStorage::BackendStorage(Client client,
++                               std::unique_ptr<Delegate> memory_delegate,
++                               std::shared_ptr<MemoryBackendLifetime> lifetime)
++    : memory_lifetime_(std::move(lifetime)),
++      in_memory_(true),
++      client_(client),
++      delegate_(std::move(memory_delegate)),
++      is_valid_(!!delegate_) {}
++
++BackendStorage BackendStorage::CreateInMemory(
++    Client client,
++    std::shared_ptr<MemoryBackendLifetime> lifetime) {
++  if (!lifetime)
++    lifetime = std::make_shared<MemoryBackendLifetime>();
++#if !BUILDFLAG(IS_FUCHSIA)
++  auto delegate =
++      std::make_unique<sqlite::BackendStorageDelegate>(true, lifetime);
++  return BackendStorage(client, std::move(delegate), std::move(lifetime));
++#else
++  return BackendStorage(client, nullptr, std::move(lifetime));
++#endif
++}
++
++BackendStorage::~BackendStorage() {
++  if (memory_lifetime_)
++    memory_lifetime_->Abandon();
++}
+ 
+ base::expected<PendingBackend, TransactionError>
+ BackendStorage::MakePendingBackend(const base::FilePath& base_name,
+@@ -106,7 +170,7 @@
+ }
+ 
+ void BackendStorage::DeleteAllFiles() {
+-  if (is_valid_) {
++  if (is_valid_ && !in_memory_) {
+     // All files are opened with FLAG_WIN_SHARE_DELETE, so it is possible to
+     // delete them even if any are still open. The parent directory will not
+     // be deleted in this case, but that's okay.
+@@ -129,7 +193,7 @@
+ 
+ BackendStorage::FootprintReductionResult
+ BackendStorage::BringDownTotalFootprintOfFiles(int64_t target_footprint) {
+-  if (!is_valid_) {
++  if (!is_valid_ || in_memory_) {
+     return {0, 0};
+   }
+ 
+--- a/components/persistent_cache/sqlite/backend_storage_delegate.h
++++ b/components/persistent_cache/sqlite/backend_storage_delegate.h
+@@ -14,6 +14,9 @@
+ class COMPONENT_EXPORT(PERSISTENT_CACHE) BackendStorageDelegate
+     : public BackendStorage::Delegate {
+  public:
++  explicit BackendStorageDelegate(
++      bool in_memory = false,
++      std::shared_ptr<MemoryBackendLifetime> lifetime = nullptr);
+   // BackendStorage::Delegate:
+   base::expected<PendingBackend, TransactionError> MakePendingBackend(
+       Client client,
+@@ -45,6 +48,10 @@
+   int64_t DeleteFiles(Client client,
+                       const base::FilePath& directory,
+                       const base::FilePath& base_name) override;
++
++ private:
++  const bool in_memory_;
++  const std::shared_ptr<MemoryBackendLifetime> memory_lifetime_;
+ };
+ 
+ }  // namespace persistent_cache::sqlite
+--- a/components/persistent_cache/sqlite/backend_storage_delegate.cc
++++ b/components/persistent_cache/sqlite/backend_storage_delegate.cc
+@@ -20,6 +20,15 @@
+ #include "components/sqlite_vfs/vfs_utils.h"
+ 
+ namespace persistent_cache::sqlite {
++
++BackendStorageDelegate::BackendStorageDelegate(
++    bool in_memory,
++    std::shared_ptr<MemoryBackendLifetime> lifetime)
++    : in_memory_(in_memory),
++      memory_lifetime_(
++          in_memory ? (lifetime ? std::move(lifetime)
++                                : std::make_shared<MemoryBackendLifetime>())
++                    : nullptr) {}
+ 
+ namespace {
+ 
+@@ -45,6 +54,18 @@
+                                            const base::FilePath& base_name,
+                                            bool single_connection,
+                                            bool journal_mode_wal) {
++  if (in_memory_) {
++    CHECK(directory.empty());
++    ASSIGN_OR_RETURN(
++        auto memory_files,
++        sqlite_vfs::MakeMemoryFileSet(single_connection, journal_mode_wal),
++        &FileSetErrorToTransactionError);
++    if (!single_connection && !memory_lifetime_->Register(
++                                  memory_files.shared_lock, journal_mode_wal)) {
++      return base::unexpected(TransactionError::kConnectionError);
++    }
++    return PendingBackend(std::move(memory_files));
++  }
+   ASSIGN_OR_RETURN(auto pending_file_set,
+                    sqlite_vfs::MakePendingFileSet(
+                        VfsClientFromClient(client), directory, base_name,
+@@ -69,6 +90,16 @@
+     const base::FilePath& directory,
+     const base::FilePath& base_name,
+     const Backend& backend) {
++  if (in_memory_) {
++    CHECK(directory.empty());
++    ASSIGN_OR_RETURN(
++        auto memory_files,
++        sqlite_vfs::ShareMemoryConnection(
++            static_cast<const SqliteBackendImpl&>(backend).file_set(), false),
++        [](sqlite_vfs::FileSetError) { return std::nullopt; });
++    return PendingBackend(std::move(memory_files));
++  }
++
+   ASSIGN_OR_RETURN(
+       auto pending_file_set,
+       sqlite_vfs::ShareConnection(
+@@ -83,6 +114,16 @@
+     const base::FilePath& directory,
+     const base::FilePath& base_name,
+     const Backend& backend) {
++  if (in_memory_) {
++    CHECK(directory.empty());
++    ASSIGN_OR_RETURN(
++        auto memory_files,
++        sqlite_vfs::ShareMemoryConnection(
++            static_cast<const SqliteBackendImpl&>(backend).file_set(), true),
++        [](sqlite_vfs::FileSetError) { return std::nullopt; });
++    return PendingBackend(std::move(memory_files));
++  }
++
+   ASSIGN_OR_RETURN(
+       auto pending_file_set,
+       sqlite_vfs::ShareConnection(
+@@ -100,6 +141,10 @@
+ int64_t BackendStorageDelegate::DeleteFiles(Client client,
+                                             const base::FilePath& directory,
+                                             const base::FilePath& base_name) {
++  if (in_memory_) {
++    CHECK(directory.empty());
++    return 0;
++  }
+   return sqlite_vfs::DeleteFiles(VfsClientFromClient(client), directory,
+                                  base_name);
+ }
+--- a/components/persistent_cache/persistent_cache_collection.h
++++ b/components/persistent_cache/persistent_cache_collection.h
+@@ -56,6 +56,13 @@
+ class COMPONENT_EXPORT(PERSISTENT_CACHE) PersistentCacheCollection {
+  public:
+   static constexpr size_t kDefaultLruCacheCapacity = 100;
++  // No directory is created or read. Native read-only exports remain usable
++  // until this collection abandons them on clear, eviction or destruction.
++  static std::unique_ptr<PersistentCacheCollection> CreateInMemory(
++      int64_t target_footprint,
++      Client client,
++      size_t lru_capacity = kDefaultLruCacheCapacity,
++      std::shared_ptr<MemoryBackendLifetime> lifetime = nullptr);
+ 
+   // Constructs an instance that will use the default storage backend for file
+   // management within `top_directory`.
+@@ -110,6 +117,10 @@
+       const std::string& cache_id);
+ 
+  private:
++  PersistentCacheCollection(Client client,
++                            int64_t target_footprint,
++                            size_t lru_capacity,
++                            std::shared_ptr<MemoryBackendLifetime> lifetime);
+   using PersistentCacheLRUMap =
+       base::HashingLRUCache<std::string, std::unique_ptr<PersistentCache>>;
+ 
+--- a/components/persistent_cache/persistent_cache_collection.cc
++++ b/components/persistent_cache/persistent_cache_collection.cc
+@@ -16,6 +16,7 @@
+ #include "base/containers/span.h"
+ #include "base/feature.h"
+ #include "base/feature_list.h"
++#include "base/memory/ptr_util.h"
+ #include "base/strings/string_util.h"
+ #include "base/types/expected.h"
+ #include "base/types/expected_macros.h"
+@@ -63,7 +64,38 @@
+   ReduceFootPrint();
+ }
+ 
+-PersistentCacheCollection::~PersistentCacheCollection() = default;
++PersistentCacheCollection::PersistentCacheCollection(
++    Client client,
++    int64_t target_footprint,
++    size_t lru_capacity,
++    std::shared_ptr<MemoryBackendLifetime> lifetime)
++    : backend_storage_(
++          BackendStorage::CreateInMemory(client, std::move(lifetime))),
++      target_footprint_(target_footprint),
++      lru_capacity_(lru_capacity),
++      persistent_caches_(PersistentCacheLRUMap::NO_AUTO_EVICT) {
++  CHECK_GT(target_footprint_, 0);
++  CHECK_GT(lru_capacity_, 0u);
++  ReduceFootPrint();
++}
++
++std::unique_ptr<PersistentCacheCollection>
++PersistentCacheCollection::CreateInMemory(
++    int64_t target_footprint,
++    Client client,
++    size_t lru_capacity,
++    std::shared_ptr<MemoryBackendLifetime> lifetime) {
++  return base::WrapUnique(new PersistentCacheCollection(
++      client, target_footprint, lru_capacity, std::move(lifetime)));
++}
++
++PersistentCacheCollection::~PersistentCacheCollection() {
++  // Memory owners revoke exported readers. Disk caches retain their native
++  // close semantics, including when another connection still holds a lock.
++  if (backend_storage_.in_memory()) {
++    Clear();
++  }
++}
+ 
+ base::expected<std::optional<EntryMetadata>, TransactionError>
+ PersistentCacheCollection::Find(const std::string& cache_id,
+@@ -90,6 +120,12 @@
+     EntryMetadata metadata) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (backend_storage_.in_memory()) {
++    const uint64_t budget = target_footprint_;
++    if (content.size() > budget || key.size() > budget - content.size()) {
++      return base::unexpected(TransactionError::kTransient);
++    }
++  }
+   // Approximate the footprint of this insert to the size of the key and value
+   // combined. This is optimistic in some ways since it doesn't account for any
+   // overhead and pessimimistic as it assumes every single write is both new and
+--- a/content/browser/code_cache/generated_code_cache_context.h
++++ b/content/browser/code_cache/generated_code_cache_context.h
+@@ -7,6 +7,8 @@
+ 
+ #include <stdint.h>
+ 
++#include <atomic>
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -25,6 +27,7 @@
+ #include "content/common/content_export.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "mojo/public/cpp/base/big_buffer.h"
++#include "net/base/network_isolation_key.h"
+ 
+ #if !BUILDFLAG(IS_FUCHSIA)
+ #include "components/persistent_cache/entry_metadata.h"
+@@ -65,6 +68,14 @@
+   // Initialize is called on the UI thread when the StoragePartition is
+   // being setup.
+   void Initialize(const base::FilePath& path, int max_bytes);
++
++  void InitializeInMemory(int max_bytes);
++  bool is_memory_only() const { return memory_only_; }
++  bool is_shutdown() const { return shutdown_.load(); }
++  std::optional<std::string> ContextKeyForBacking(
++      std::string native_key,
++      const net::NetworkIsolationKey& nik,
++      bool wasm);
+ 
+   void Shutdown();
+ 
+@@ -155,6 +166,14 @@
+ 
+   // A handle that keeps a TaskRunner associated with this context's path alive
+   // for as long as this instance operates on files within that path.
++  const static size_t kMaxMemoryNamespaces = 16384;
++#if !BUILDFLAG(IS_FUCHSIA)
++  std::shared_ptr<persistent_cache::MemoryBackendLifetime> memory_lifetime_;
++#endif
++  bool memory_only_ = false;
++  std::atomic<bool> shutdown_{false};
++  std::map<net::NetworkIsolationKey, size_t> memory_namespaces_
++      GUARDED_BY_CONTEXT(sequence_checker_);
+   DedicatedTaskRunnerForResource task_runner_for_resource_;
+   scoped_refptr<base::SequencedTaskRunner> task_runner_;
+   SEQUENCE_CHECKER(sequence_checker_);
+--- a/content/browser/code_cache/generated_code_cache_context.cc
++++ b/content/browser/code_cache/generated_code_cache_context.cc
+@@ -132,10 +132,68 @@
+                                this, path, max_bytes));
+ }
+ 
++void GeneratedCodeCacheContext::InitializeInMemory(int max_bytes) {
++  CHECK_CURRENTLY_ON(BrowserThread::UI);
++  CHECK(!task_runner_);
++  memory_only_ = true;
++#if !BUILDFLAG(IS_FUCHSIA)
++  memory_lifetime_ =
++      std::make_shared<persistent_cache::MemoryBackendLifetime>();
++#endif
++  task_runner_ = base::ThreadPool::CreateSingleThreadTaskRunner(
++      {base::TaskPriority::USER_BLOCKING, base::MayBlock()});
++  RunOrPostTask(this, FROM_HERE,
++                base::BindOnce(&GeneratedCodeCacheContext::InitializeOnThread,
++                               this, base::FilePath(), max_bytes));
++}
++
++std::optional<std::string> GeneratedCodeCacheContext::ContextKeyForBacking(
++    std::string native_key,
++    const net::NetworkIsolationKey& nik,
++    bool wasm) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (is_shutdown())
++    return std::nullopt;
++  if (!memory_only_) {
++    if (nik.IsTransient() && !nik.IsEmpty())
++      return std::nullopt;
++    return native_key;
++  }
++  auto it = memory_namespaces_.find(nik);
++  if (it == memory_namespaces_.end()) {
++    if (memory_namespaces_.size() >= kMaxMemoryNamespaces)
++      return std::nullopt;
++    it = memory_namespaces_.emplace(nik, memory_namespaces_.size()).first;
++  }
++  return native_key + "\nmemory-nik-" + std::to_string(it->second) +
++         (wasm ? "/wasm" : "/js");
++}
++
+ void GeneratedCodeCacheContext::InitializeOnThread(const base::FilePath& path,
+                                                    int max_bytes) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (memory_only_) {
++    CHECK(path.empty());
++    const int budget = max_bytes > 0 ? max_bytes : 20 * 1024 * 1024;
++    generated_js_code_cache_ = std::make_unique<GeneratedCodeCache>(
++        base::FilePath(), budget,
++        GeneratedCodeCache::CodeCacheType::kJavaScript,
++        GeneratedCodeCache::Backing::kMemory);
++    generated_wasm_code_cache_ = std::make_unique<GeneratedCodeCache>(
++        base::FilePath(), budget,
++        GeneratedCodeCache::CodeCacheType::kWebAssembly,
++        GeneratedCodeCache::Backing::kMemory);
++#if !BUILDFLAG(IS_FUCHSIA)
++    persistent_cache_collection_ =
++        persistent_cache::PersistentCacheCollection::CreateInMemory(
++            budget, persistent_cache::Client::kCodeCache,
++            persistent_cache::PersistentCacheCollection::
++                kDefaultLruCacheCapacity,
++            memory_lifetime_);
++#endif
++    return;
++  }
+   int max_bytes_js = max_bytes;
+ 
+   base::FilePath generated_js_code_cache_path = path.AppendASCII("js");
+@@ -230,6 +288,12 @@
+ 
+ void GeneratedCodeCacheContext::Shutdown() {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
++  if (shutdown_.exchange(true))
++    return;
++#if !BUILDFLAG(IS_FUCHSIA)
++  if (memory_lifetime_)
++    memory_lifetime_->Abandon();
++#endif
+   RunOrPostTask(this, FROM_HERE,
+                 base::BindOnce(&GeneratedCodeCacheContext::ShutdownOnThread,
+                                this, std::move(task_runner_for_resource_)));
+@@ -238,8 +302,16 @@
+ 
+ void GeneratedCodeCacheContext::ShutdownForTesting(base::OnceClosure callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
++  if (shutdown_.exchange(true)) {
++    std::move(callback).Run();
++    return;
++  }
+   auto ui_callback = base::BindPostTaskToCurrentDefault(std::move(callback));
+ 
++#if !BUILDFLAG(IS_FUCHSIA)
++  if (memory_lifetime_)
++    memory_lifetime_->Abandon();
++#endif
+   RunOrPostTask(
+       this, FROM_HERE,
+       base::BindOnce(&GeneratedCodeCacheContext::ShutdownOnThreadForTesting,
+@@ -263,7 +335,7 @@
+     const std::string& context_key) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  if (persistent_cache_collection_) {
++  if (!is_shutdown() && persistent_cache_collection_) {
+     return persistent_cache_collection_->ShareReadOnlyConnection(context_key);
+   }
+ 
+@@ -277,7 +349,7 @@
+     persistent_cache::EntryMetadata metadata) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  if (!persistent_cache_collection_) {
++  if (is_shutdown() || !persistent_cache_collection_) {
+     return;
+   }
+ 
+@@ -296,7 +368,7 @@
+     base::span<const uint8_t> cache_key) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  if (!persistent_cache_collection_) {
++  if (is_shutdown() || !persistent_cache_collection_) {
+     return std::nullopt;
+   }
+ 
+@@ -388,19 +460,19 @@
+ 
+ GeneratedCodeCache* GeneratedCodeCacheContext::generated_js_code_cache() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return generated_js_code_cache_.get();
++  return is_shutdown() ? nullptr : generated_js_code_cache_.get();
+ }
+ 
+ GeneratedCodeCache* GeneratedCodeCacheContext::generated_wasm_code_cache()
+     const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return generated_wasm_code_cache_.get();
++  return is_shutdown() ? nullptr : generated_wasm_code_cache_.get();
+ }
+ 
+ GeneratedCodeCache* GeneratedCodeCacheContext::generated_webui_js_code_cache()
+     const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return generated_webui_js_code_cache_.get();
++  return is_shutdown() ? nullptr : generated_webui_js_code_cache_.get();
+ }
+ 
+ GeneratedCodeCacheContext::~GeneratedCodeCacheContext() = default;
+--- a/content/browser/renderer_host/code_cache_host_impl.cc
++++ b/content/browser/renderer_host/code_cache_host_impl.cc
+@@ -464,9 +470,12 @@
+         []() -> std::optional<std::string> { return std::nullopt; });
+ 
+     if (!origin_lock.is_empty()) {
+-      return GeneratedCodeCache::GetContextKey(
+-          origin_lock, network_isolation_key(),
+-          MojoCacheTypeToCodeCacheType(cache_type));
++      return generated_code_cache_context()->ContextKeyForBacking(
++          GeneratedCodeCache::GetContextKey(
++              origin_lock, network_isolation_key(),
++              MojoCacheTypeToCodeCacheType(cache_type)),
++          network_isolation_key(),
++          cache_type == blink::mojom::CodeCacheType::kWebAssembly);
+     }
+ 
+     // `origin_lock` will be empty if the renderer is not locked to an origin.
+@@ -509,10 +518,13 @@
+     static constexpr char kSharedContextKeyForRelaxedIsolationWebUi[] =
+         "_shared_context_for_relaxed_isolation_webui";
+ 
+-    return process_lock.MatchesScheme(content::kChromeUIScheme) ||
+-                   process_lock.MatchesScheme(content::kChromeUIUntrustedScheme)
+-               ? kSharedContextKeyForRelaxedIsolationWebUi
+-               : kSharedContextKeyForRelaxedIsolation;
++    return generated_code_cache_context()->ContextKeyForBacking(
++        process_lock.MatchesScheme(content::kChromeUIScheme) ||
++                process_lock.MatchesScheme(content::kChromeUIUntrustedScheme)
++            ? kSharedContextKeyForRelaxedIsolationWebUi
++            : kSharedContextKeyForRelaxedIsolation,
++        network_isolation_key(),
++        cache_type == blink::mojom::CodeCacheType::kWebAssembly);
+   }
+ #endif  // !BUILDFLAG(IS_FUCHSIA)
+ 
+@@ -712,6 +724,10 @@
+                               base::TimeTicks::Now() - start_time);
+     }
+ 
++    if (generated_code_cache_context()->is_shutdown()) {
++      std::move(callback).Run({}, {});
++      return;
++    }
+     if (data.size() > 0) {
+       base::UmaHistogramCustomCounts("SiteIsolatedCodeCache.DataSize",
+                                      data.size(), 1, 10000000, 100);
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -85,6 +85,7 @@
+ #include "content/common/frame.mojom.h"
+ #include "content/common/input/input_injector.mojom-forward.h"
+ #include "content/common/navigation_client.mojom.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/back_forward_cache.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -2005,7 +2006,8 @@
+   void CreateCodeCacheHostWithKeys(
+       mojo::PendingReceiver<blink::mojom::CodeCacheHost> receiver,
+       const net::NetworkIsolationKey& nik,
+-      const blink::StorageKey& storage_key);
++      const blink::StorageKey& storage_key,
++      const AlloyEmbeddedResolution* pending_owner = nullptr);
+ 
+ #if BUILDFLAG(IS_ANDROID) || (BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS))
+   void BindNFCReceiver(mojo::PendingReceiver<device::mojom::NFC> receiver);
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -14969,7 +14969,21 @@
+ void RenderFrameHostImpl::CreateCodeCacheHostWithKeys(
+     mojo::PendingReceiver<blink::mojom::CodeCacheHost> receiver,
+     const net::NetworkIsolationKey& nik,
+-    const blink::StorageKey& storage_key) {
++    const blink::StorageKey& storage_key,
++    const AlloyEmbeddedResolution* pending_owner) {
++  if (!pending_owner && (!IsActive() || !AlloyDocumentStateAdmitted(this)))
++    return;
++  const auto owner =
++      pending_owner ? *pending_owner : GetAlloyEmbeddedStateForDocument(this);
++  if (owner.temporary || owner.temporary_admission_closed) {
++    if (auto* scoped = GetAlloyEmbeddedCodeCacheReceivers(
++            *static_cast<StoragePartitionImpl*>(GetStoragePartition()),
++            owner.temporary)) {
++      scoped->Add(GetProcess()->GetID(), nik, storage_key, std::move(receiver),
++                  GetCodeCacheHostReceiverHandler());
++    }
++    return;
++  }
+   // Create a new CodeCacheHostImpl and bind it to the given receiver.
+   code_cache_host_receivers_.Add(GetProcess()->GetID(), nik, storage_key,
+                                  std::move(receiver),
+@@ -17459,17 +17473,19 @@
+   // `storage_key`. The final storage key is computed by the document loader
+   // taking into account the origin computed by the renderer.
+   auto& code_cache_storage_key = commit_params->storage_key;
++  const auto code_cache_owner = GetAlloyEmbeddedStateForNavigation(
++      navigation_request, navigation_request->GetOriginToCommit().value());
+   CreateCodeCacheHostWithKeys(
+       code_cache_host.InitWithNewPipeAndPassReceiver(),
+       navigation_request->isolation_info_for_subresources()
+           .network_isolation_key(),
+-      code_cache_storage_key);
++      code_cache_storage_key, &code_cache_owner);
+   if (base::FeatureList::IsEnabled(blink::features::kBackgroundResourceFetch)) {
+     CreateCodeCacheHostWithKeys(
+         code_cache_host_for_background.InitWithNewPipeAndPassReceiver(),
+         navigation_request->isolation_info_for_subresources()
+             .network_isolation_key(),
+-        code_cache_storage_key);
++        code_cache_storage_key, &code_cache_owner);
+   }
+ 
+   url::Origin origin_to_commit =
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -1017,6 +1017,16 @@
+ 
+ void DedicatedWorkerHost::CreateCodeCacheHost(
+     mojo::PendingReceiver<blink::mojom::CodeCacheHost> receiver) {
++  const auto owner = GetBucketStorageOwner();
++  if (owner.temporary || owner.temporary_admission_closed) {
++    if (auto* scoped = GetAlloyEmbeddedCodeCacheReceivers(
++            *GetStoragePartitionImpl(), owner.temporary)) {
++      scoped->Add(GetProcessHost()->GetID(),
++                  isolation_info_.network_isolation_key(),
++                  GetWorkerStorageKey(), std::move(receiver));
++    }
++    return;
++  }
+   // Create a new CodeCacheHostImpl and bind it to the given receiver.
+   RenderProcessHost* rph = GetProcessHost();
+   code_cache_host_receivers_.Add(rph->GetID(),
+--- a/components/persistent_cache/sqlite/sqlite_backend_impl.h
++++ b/components/persistent_cache/sqlite/sqlite_backend_impl.h
+@@ -72,6 +72,7 @@
+   explicit SqliteBackendImpl(sqlite_vfs::SqliteVfsFileSet vfs_file_set,
+                              Client client);
+   [[nodiscard]] base::expected<void, TransactionError> Initialize();
++  bool IsAbandoned() const;
+ 
+   // Returns a SQLite error code in case of failure.
+   base::expected<void, int> InitializeImpl() EXCLUSIVE_LOCKS_REQUIRED(lock_);
+--- a/components/persistent_cache/sqlite/sqlite_backend_impl.cc
++++ b/components/persistent_cache/sqlite/sqlite_backend_impl.cc
+@@ -211,10 +211,18 @@
+   return base::ok();
+ }
+ 
++bool SqliteBackendImpl::IsAbandoned() const {
++  return !vfs_file_set_.is_single_connection() &&
++         vfs_file_set_.GetSandboxedDbFile()->IsAbandoned();
++}
++
+ base::expected<std::optional<EntryMetadata>, TransactionError>
+ SqliteBackendImpl::Find(base::span<const uint8_t> key,
+                         BufferProvider buffer_provider) {
+   base::AutoLock lock(lock_, base::subtle::LockTracking::kEnabled);
++  if (IsAbandoned()) {
++    return base::unexpected(TransactionError::kConnectionError);
++  }
+   CHECK_GT(key.size(), 0ull);
+   TRACE_EVENT("persistent_cache", "Find");
+ 
+@@ -222,6 +230,9 @@
+                    [](int error_code) {
+                      return TranslateError(error_code);
+                    });
++  if (IsAbandoned()) {
++    return base::unexpected(TransactionError::kConnectionError);
++  }
+   return metadata;
+ }
+ 
+@@ -230,6 +241,9 @@
+     base::span<const uint8_t> content,
+     EntryMetadata metadata) {
+   base::AutoLock lock(lock_, base::subtle::LockTracking::kEnabled);
++  if (IsAbandoned()) {
++    return base::unexpected(TransactionError::kConnectionError);
++  }
+ 
+   CHECK_GT(key.size(), 0ull);
+   TRACE_EVENT("persistent_cache", "Insert");
+@@ -240,6 +254,9 @@
+   RETURN_IF_ERROR(InsertImpl(key, content, metadata.input_signature),
+                   [](int error_code) { return TranslateError(error_code); });
+ 
++  if (IsAbandoned()) {
++    return base::unexpected(TransactionError::kConnectionError);
++  }
+   return base::ok();
+ }
+ 

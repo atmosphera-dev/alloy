@@ -1,0 +1,76 @@
+--- a/include/test/cef_test_helpers.h
++++ b/include/test/cef_test_helpers.h
+@@ -98,6 +98,18 @@
+     CefRefPtr<CefBrowser> browser,
+     const CefString& origin,
+     CefRefPtr<CefCompletionCallback> callback);
++///
++/// Flushes setup persistence for an ordinary test-control browser. Returns
++/// false for an invalid/off-the-record browser, null callback or non-UI call.
++/// Otherwise callback runs on UI only after native profile preferences and
++/// NetworkContext persistent-state completion. Does not clear data. For fixture
++/// setup only.
++///
++/*--cef(added=experimental)--*/
++bool CefFlushBrowserPersistentStateForTests(
++    CefRefPtr<CefBrowser> browser,
++    CefRefPtr<CefCompletionCallback> callback);
++
+ #endif  // CEF_API_ADDED(CEF_EXPERIMENTAL)
+ 
+ #endif  // CEF_INCLUDE_TEST_CEF_TEST_HELPERS_H_
+--- a/libcef/browser/test/test_helpers_impl.cc
++++ b/libcef/browser/test/test_helpers_impl.cc
+@@ -2,6 +2,7 @@
+ // reserved. Use of this source code is governed by a BSD-style license that
+ // can be found in the LICENSE file.
+ 
++#include "base/barrier_closure.h"
+ #include "base/feature_list.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+@@ -17,8 +18,12 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "components/password_manager/core/browser/password_store/password_store_interface.h"
+ #include "components/password_manager/core/browser/password_store/smart_bubble_stats_store.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/storage_partition.h"
+ #include "net/base/features.h"
+ #include "services/network/public/cpp/features.h"
++#include "services/network/public/mojom/network_context.mojom.h"
+ #include "ui/views/widget/widget.h"
+ #include "url/gurl.h"
+ #include "url/origin.h"
+@@ -119,3 +124,31 @@
+           expected_origin),
+       base::Time(), base::Time::Max(), std::move(complete));
+ }
++
++bool CefFlushBrowserPersistentStateForTests(
++    CefRefPtr<CefBrowser> browser,
++    CefRefPtr<CefCompletionCallback> callback) {
++  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
++  CEF_REQUIRE_UIT_RETURN(false);
++  auto host = CefBrowserHostBase::FromBrowser(browser);
++  if (!host || !callback) {
++    return false;
++  }
++  auto* context = host->GetBrowserContext();
++  auto* profile = context ? Profile::FromBrowserContext(context) : nullptr;
++  if (!profile || profile->IsOffTheRecord()) {
++    return false;
++  }
++  auto done = base::BarrierClosure(
++      2, base::BindOnce(
++             [](CefRefPtr<CefBrowser> keep_alive,
++                CefRefPtr<CefCompletionCallback> callback) {
++               callback->OnComplete();
++             },
++             browser, callback));
++  profile->GetPrefs()->CommitPendingWrite(done);
++  context->GetDefaultStoragePartition()
++      ->GetNetworkContext()
++      ->FlushPersistentStateForTesting(done);
++  return true;
++}

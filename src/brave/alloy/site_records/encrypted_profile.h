@@ -5,9 +5,11 @@
 
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include "brave/alloy/site_records/key_source.h"
 #include "brave/alloy/site_records/record_file_system.h"
+#include "brave/alloy/site_records/site_record_decay.h"
 
 namespace alloy::site_records {
 
@@ -28,10 +30,20 @@ class EncryptedProfile {
   bool unlocked() const;
   ProfileState state() const;
   std::shared_ptr<RecordFileSystem> files() const;
+  FileStatus SetDecayPolicy(DecayPolicy policy);
+  FileStatus GetDecayPolicy(DecayPolicy* policy) const;
+  // Once native owners exist, their original settings queue owns the R13 UI
+  // barrier. The handler only schedules work and must never block on UI.
+  void BindNativeDecay(const std::shared_ptr<RecordFileSystem>& files,
+                       std::function<void()> handler);
   bool KeysClearedForTesting() const;
 
  private:
   explicit EncryptedProfile(base::FilePath path);
+  void StartDecay(const std::shared_ptr<RecordFileSystem>& files);
+  struct DecayState;
+  std::shared_ptr<DecayState> decay_;
+  std::thread decay_thread_;
   const base::FilePath path_;
   mutable std::mutex mutex_;
   bool busy_ = false;

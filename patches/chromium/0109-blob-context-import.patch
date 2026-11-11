@@ -1,0 +1,254 @@
+--- a/components/services/storage/public/mojom/blob_storage_context.mojom
++++ b/components/services/storage/public/mojom/blob_storage_context.mojom
+@@ -90,4 +90,10 @@
+ 
+   // Binds another Mojo connection to this context.
+   Clone(pending_receiver<BlobStorageContext> receiver);
++
++  // Imports a reference to a Blob's contents with this context's admission.
++  // The source keeps its own authority. Unscoped contexts clone it unchanged.
++  RegisterFromBlob(pending_receiver<blink.mojom.Blob> blob,
++                   pending_remote<blink.mojom.Blob> source,
++                   string content_type, uint64 size);
+ };
+--- a/storage/browser/blob/blob_storage_context.h
++++ b/storage/browser/blob/blob_storage_context.h
+@@ -274,6 +274,10 @@
+                        uint64_t expected_size,
+                        WriteBlobToFileCallback callback) override;
+   void Clone(mojo::PendingReceiver<mojom::BlobStorageContext> cloned) override;
++  void RegisterFromBlob(mojo::PendingReceiver<blink::mojom::Blob> blob,
++                        mojo::PendingRemote<blink::mojom::Blob> source,
++                        const std::string& content_type,
++                        uint64_t size) override;
+ 
+   const base::RepeatingCallback<bool()> storage_admission_;
+   base::FilePath profile_directory_;
+--- a/storage/browser/blob/blob_storage_context.cc
++++ b/storage/browser/blob/blob_storage_context.cc
+@@ -18,6 +18,7 @@
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/numerics/safe_math.h"
+ #include "base/strings/stringprintf.h"
+@@ -27,7 +28,10 @@
+ #include "base/time/time.h"
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/uuid.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "net/base/net_errors.h"
+ #include "storage/browser/blob/blob_data_builder.h"
+ #include "storage/browser/blob/blob_data_item.h"
+ #include "storage/browser/blob/blob_data_snapshot.h"
+@@ -42,6 +46,88 @@
+ namespace {
+ using ItemCopyEntry = BlobEntry::ItemCopyEntry;
+ using QuotaAllocationTask = BlobMemoryController::QuotaAllocationTask;
++
++// A remote data source remains a dependency, not authority for the receiving
++// context. The native BlobDataHandle/BlobReader enforces the latter's
++// admission.
++class RemoteBlobReadCompletion final : public blink::mojom::BlobReaderClient {
++ public:
++  RemoteBlobReadCompletion(uint64_t size,
++                           uint64_t length,
++                           base::OnceCallback<void(int)> callback)
++      : size_(size),
++        length_(length),
++        callback_(
++            mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(callback),
++                                                        net::ERR_FAILED)) {}
++  void OnCalculatedSize(uint64_t total_size,
++                        uint64_t expected_content_size) override {
++    valid_size_ = total_size == size_ && expected_content_size == length_;
++  }
++  void OnComplete(int32_t status, uint64_t data_length) override {
++    if (callback_) {
++      std::move(callback_).Run(status == net::OK &&
++                                       (!valid_size_ || data_length != length_)
++                                   ? net::ERR_FAILED
++                                   : status);
++    }
++  }
++
++ private:
++  const uint64_t size_;
++  const uint64_t length_;
++  bool valid_size_ = false;
++  base::OnceCallback<void(int)> callback_;
++};
++
++class RemoteBlobDataHandle final : public BlobDataItem::DataHandle {
++ public:
++  RemoteBlobDataHandle(mojo::PendingRemote<blink::mojom::Blob> source,
++                       uint64_t size,
++                       uint64_t side_data_size)
++      : source_(std::move(source)),
++        size_(size),
++        side_data_size_(side_data_size) {}
++  uint64_t GetSize() const override { return size_; }
++  uint64_t GetSideDataSize() const override { return side_data_size_; }
++  void Read(mojo::ScopedDataPipeProducerHandle producer,
++            uint64_t offset,
++            uint64_t length,
++            base::OnceCallback<void(int)> callback) override {
++    mojo::PendingRemote<blink::mojom::BlobReaderClient> completion;
++    mojo::MakeSelfOwnedReceiver(std::make_unique<RemoteBlobReadCompletion>(
++                                    size_, length, std::move(callback)),
++                                completion.InitWithNewPipeAndPassReceiver());
++    source_->ReadRange(offset, length, std::move(producer),
++                       std::move(completion));
++  }
++  void ReadSideData(
++      base::OnceCallback<void(int, mojo_base::BigBuffer)> callback) override {
++    source_->ReadSideData(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++        base::BindOnce(
++            [](base::OnceCallback<void(int, mojo_base::BigBuffer)> callback,
++               std::optional<mojo_base::BigBuffer> data) {
++              const int status =
++                  data && data->size() <= static_cast<size_t>(
++                                              std::numeric_limits<int>::max())
++                      ? static_cast<int>(data->size())
++                      : net::ERR_FAILED;
++              std::move(callback).Run(
++                  status, data ? std::move(*data) : mojo_base::BigBuffer());
++            },
++            std::move(callback)),
++        std::optional<mojo_base::BigBuffer>()));
++  }
++  void PrintTo(::std::ostream* os) const override {
++    *os << "<RemoteBlobDataHandle>";
++  }
++
++ private:
++  ~RemoteBlobDataHandle() override = default;
++  mojo::Remote<blink::mojom::Blob> source_;
++  const uint64_t size_;
++  const uint64_t side_data_size_;
++};
+ }  // namespace
+ 
+ BlobStorageContext::BlobStorageContext()
+@@ -720,6 +806,48 @@
+   BlobImpl::Create(std::move(handle), std::move(blob));
+ }
+ 
++void BlobStorageContext::RegisterFromBlob(
++    mojo::PendingReceiver<blink::mojom::Blob> blob,
++    mojo::PendingRemote<blink::mojom::Blob> source,
++    const std::string& content_type,
++    uint64_t size) {
++  if (!IsStorageAccessAllowed()) {
++    return;
++  }
++  mojo::Remote<blink::mojom::Blob> remote(std::move(source));
++  if (!storage_admission_) {
++    remote->Clone(std::move(blob));
++    return;
++  }
++  auto* input = remote.get();
++  input->ReadSideData(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      base::BindOnce(
++          [](base::WeakPtr<BlobStorageContext> context,
++             mojo::Remote<blink::mojom::Blob> source,
++             mojo::PendingReceiver<blink::mojom::Blob> blob,
++             std::string content_type, uint64_t size,
++             std::optional<mojo_base::BigBuffer> side_data) {
++            if (!context || !context->IsStorageAccessAllowed()) {
++              return;
++            }
++            if (side_data &&
++                side_data->size() >
++                    static_cast<size_t>(std::numeric_limits<int>::max())) {
++              return;
++            }
++            auto builder = std::make_unique<BlobDataBuilder>(
++                base::Uuid::GenerateRandomV4().AsLowercaseString());
++            builder->set_content_type(content_type);
++            builder->AppendReadableDataHandle(
++                base::MakeRefCounted<RemoteBlobDataHandle>(
++                    source.Unbind(), size, side_data ? side_data->size() : 0));
++            BlobImpl::Create(context->AddFinishedBlob(std::move(builder)),
++                             std::move(blob));
++          },
++          AsWeakPtr(), std::move(remote), std::move(blob), content_type, size),
++      std::optional<mojo_base::BigBuffer>()));
++}
++
+ void BlobStorageContext::WriteBlobToFile(
+     mojo::PendingRemote<::blink::mojom::Blob> pending_blob,
+     const base::FilePath& file_path,
+--- a/content/browser/indexed_db/instance/transaction.cc
++++ b/content/browser/indexed_db/instance/transaction.cc
+@@ -797,11 +797,20 @@
+ 
+         total_blob_size += info->size;
+ 
++        if (info->file && info->file->last_modified.ToDeltaSinceWindowsEpoch() <
++                              base::TimeDelta()) {
++          return false;
++        }
++        // Bind ownership before either backend retains or clones the remote.
++        // Ordinary contexts preserve the original Blob reference; scoped ones
++        // add their native admission without mutating the input's authority.
++        mojo::PendingRemote<blink::mojom::Blob> admitted_blob;
++        bucket_context_->blob_storage_context()->RegisterFromBlob(
++            admitted_blob.InitWithNewPipeAndPassReceiver(),
++            std::move(info->blob), base::UTF16ToUTF8(info->mime_type),
++            info->size);
++        info->blob = std::move(admitted_blob);
+         if (info->file) {
+-          if (info->file->last_modified.ToDeltaSinceWindowsEpoch() <
+-              base::TimeDelta()) {
+-            return false;
+-          }
+           (*external_objects)[i] = IndexedDBExternalObject(
+               std::move(info->blob), info->file->name, info->mime_type,
+               info->file->last_modified, info->size);
+@@ -1240,8 +1249,8 @@
+ 
+ void Transaction::SetState(State state) {
+   state_ = state;
+-    scheduling_priority_at_last_state_change_ =
+-        connection_->scheduling_priority();
++  scheduling_priority_at_last_state_change_ =
++      connection_->scheduling_priority();
+   if (!IsAcceptingRequests()) {
+     CloseOpenCursors();
+   }
+--- a/content/browser/indexed_db/instance/mock_blob_storage_context.h
++++ b/content/browser/indexed_db/instance/mock_blob_storage_context.h
+@@ -44,6 +44,10 @@
+                        WriteBlobToFileCallback callback) override;
+   void Clone(mojo::PendingReceiver<::storage::mojom::BlobStorageContext>
+                  receiver) override;
++  void RegisterFromBlob(mojo::PendingReceiver<blink::mojom::Blob> blob,
++                        mojo::PendingRemote<blink::mojom::Blob> source,
++                        const std::string& content_type,
++                        uint64_t size) override;
+ 
+   static BlobWriteCallback CreateBlobWriteCallback(
+       bool* succeeded,
+--- a/content/browser/indexed_db/instance/mock_blob_storage_context.cc
++++ b/content/browser/indexed_db/instance/mock_blob_storage_context.cc
+@@ -98,6 +98,15 @@
+   NOTREACHED();
+ }
+ 
++void MockBlobStorageContext::RegisterFromBlob(
++    mojo::PendingReceiver<blink::mojom::Blob> blob,
++    mojo::PendingRemote<blink::mojom::Blob> source,
++    const std::string& content_type,
++    uint64_t size) {
++  mojo::Remote<blink::mojom::Blob> remote(std::move(source));
++  remote->Clone(std::move(blob));
++}
++
+ void MockBlobStorageContext::WriteBlobToFile(
+     mojo::PendingRemote<::blink::mojom::Blob> blob,
+     const base::FilePath& path,

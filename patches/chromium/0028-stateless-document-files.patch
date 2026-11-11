@@ -239,16 +239,16 @@
                child_url.type() == storage::FileSystemType::kFileSystemTypeLocal
 --- a/content/browser/file_system_access/file_system_access_handle_base.cc
 +++ b/content/browser/file_system_access/file_system_access_handle_base.cc
-@@ -91,6 +91,9 @@
+@@ -92,6 +92,9 @@
  FileSystemAccessHandleBase::PermissionStatus
  FileSystemAccessHandleBase::GetReadPermissionStatus() {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  if (!manager()->IsBindingContextValid(context())) {
 +    return PermissionStatus::DENIED;
 +  }
-   return handle_state_.read_grant->GetStatus();
- }
- 
+   // In 3P contexts, user permission prompts are blocked and ambient origin
+   // permissions cannot be upgraded. Read access is permitted only if the
+   // handle already holds an active `GRANTED` capability minted for explicit
 @@ -107,6 +110,9 @@
  FileSystemAccessHandleBase::PermissionStatus
  FileSystemAccessHandleBase::GetWritePermissionStatus() {
@@ -836,15 +836,14 @@
  
    std::vector<blink::mojom::FileSystemAccessEntryPtr> result_entries;
    if (shared_handle_state.read_grant->GetStatus() !=
-@@ -2141,13 +2263,23 @@
+@@ -2222,7 +2344,17 @@
      const content::PathInfo& path_info,
      const blink::StorageKey& storage_key,
      HandleType handle_type,
 -    FileSystemAccessPermissionContext::AccessTrigger access_trigger) {
--  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +    FileSystemAccessPermissionContext::AccessTrigger access_trigger,
 +    const BindingContext* binding_context) {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  auto* document_permission_context = binding_context
 +                                          ? permission_context(*binding_context)
 +                                          : permission_context_.get();
@@ -854,10 +853,15 @@
 +        PermissionStatus::DENIED, path_info);
 +    return SharedHandleState(denied, denied);
 +  }
+-
++
    scoped_refptr<FileSystemAccessPermissionGrant> read_grant, write_grant;
--  if (permission_context_) {
+@@ -2241,9 +2373,9 @@
+     write_grant = base::MakeRefCounted<FixedFileSystemAccessPermissionGrant>(
+         PermissionStatus::DENIED, path_info);
+-  } else if (permission_context_) {
++  } else if (document_permission_context) {
 -    read_grant = permission_context_->GetReadPermissionGrant(
-+  if (document_permission_context) {
 +    read_grant = document_permission_context->GetReadPermissionGrant(
          storage_key.origin(), path_info, handle_type, access_trigger);
 -    write_grant = permission_context_->GetWritePermissionGrant(

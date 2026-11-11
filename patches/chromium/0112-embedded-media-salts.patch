@@ -1,0 +1,417 @@
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/chrome_content_browser_client.h"
++#include "content/public/browser/alloy_document_state.h"
+ 
+ #include <algorithm>
+ #include <iterator>
+@@ -4084,7 +4085,8 @@
+ #else  // !BUILDFLAG(IS_ANDROID)
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents->GetBrowserContext());
+-  if (profile->IsEnterpriseIsolatedModeProfile() && !security_principal.IsWebUI()) {
++  if (profile->IsEnterpriseIsolatedModeProfile() &&
++      !security_principal.IsWebUI()) {
+     preferred_color_scheme = blink::mojom::PreferredColorScheme::kLight;
+   } else if (profile->IsIncognitoProfile() && !security_principal.IsWebUI()) {
+     // Incognito contents follow the device color mode.
+@@ -7996,15 +7998,26 @@
+   scoped_refptr<content_settings::CookieSettings> cookie_settings =
+       CookieSettingsFactory::GetForProfile(
+           Profile::FromBrowserContext(browser_context));
+-  bool allowed = cookie_settings->IsFullCookieAccessAllowed(
+-      url, site_for_cookies, top_frame_origin, net::CookieSettingOverrides(),
+-      storage_key.ToCookiePartitionKey());
++  const auto owner = content::GetAlloyEmbeddedStateForDocument(rfh);
++  const bool temporary =
++      owner.backing ==
++      alloy::site_records::EmbeddedStateRegistry::Backing::kTemporary;
++  // A temporary owner uses native partitioned-storage permission, not
++  // permission to access an unpartitioned real cookie jar. It still obeys site
++  // storage blocks.
++  bool allowed = temporary ? cookie_settings->IsAnyStorageAccessAllowed(
++                                 url, site_for_cookies, top_frame_origin,
++                                 net::CookieSettingOverrides(),
++                                 storage_key.ToCookiePartitionKey())
++                           : cookie_settings->IsFullCookieAccessAllowed(
++                                 url, site_for_cookies, top_frame_origin,
++                                 net::CookieSettingOverrides(),
++                                 storage_key.ToCookiePartitionKey());
+   ChromeBrowsingDataModelDelegate::BrowsingDataAccessed(
+       rfh, storage_key,
+       ChromeBrowsingDataModelDelegate::StorageType::kMediaDeviceSalt, !allowed);
+   media_device_salt::MediaDeviceSaltService* salt_service =
+-      MediaDeviceSaltServiceFactory::GetInstance()->GetForBrowserContext(
+-          browser_context);
++      MediaDeviceSaltServiceFactory::GetForFrame(rfh);
+   if (!allowed || !salt_service) {
+     // Use ephemeral salt.
+     std::move(callback).Run(allowed, browser_context->UniqueId());
+@@ -8985,7 +8998,8 @@
+ 
+ bool ChromeContentBrowserClient::ShouldUseFirstPartyStorageKey(
+     const url::Origin& origin) {
+-  if (BraveShouldUseFirstPartyStorageKey(origin)) return true;
++  if (BraveShouldUseFirstPartyStorageKey(origin))
++    return true;
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   return origin.scheme() == extensions::kExtensionScheme;
+ #else
+--- a/chrome/browser/media/webrtc/media_device_salt_service_factory.cc
++++ b/chrome/browser/media/webrtc/media_device_salt_service_factory.cc
+@@ -5,9 +5,12 @@
+ #include "chrome/browser/media/webrtc/media_device_salt_service_factory.h"
+ 
+ #include "base/files/file_path.h"
++#include "base/functional/bind.h"
+ #include "components/media_device_salt/media_device_salt_service.h"
+ #include "components/user_prefs/user_prefs.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/render_frame_host.h"
+ 
+ MediaDeviceSaltServiceFactory* MediaDeviceSaltServiceFactory::GetInstance() {
+   static base::NoDestructor<MediaDeviceSaltServiceFactory> factory;
+@@ -19,6 +22,27 @@
+     content::BrowserContext* context) {
+   return static_cast<media_device_salt::MediaDeviceSaltService*>(
+       GetInstance()->GetServiceForBrowserContext(context, true));
++}
++
++media_device_salt::MediaDeviceSaltService*
++MediaDeviceSaltServiceFactory::GetForFrame(content::RenderFrameHost* frame) {
++  if (!content::AlloyDocumentStateAdmitted(frame))
++    return nullptr;
++  auto owner = content::GetAlloyEmbeddedStateForDocument(frame);
++  using Backing = alloy::site_records::EmbeddedStateRegistry::Backing;
++  if (owner.backing == Backing::kRealSite)
++    return GetForBrowserContext(frame->GetBrowserContext());
++  if (owner.backing != Backing::kTemporary || !owner.temporary)
++    return nullptr;
++  static const int type = 0;
++  return static_cast<media_device_salt::MediaDeviceSaltService*>(
++      owner.temporary->GetOrCreateService(
++          &type, alloy::site_records::StorePurpose::kMediaDeviceSalts,
++          base::BindOnce([](alloy::site_records::RecordCapability)
++                             -> std::unique_ptr<KeyedService> {
++            return std::make_unique<media_device_salt::MediaDeviceSaltService>(
++                nullptr, base::FilePath());
++          })));
+ }
+ 
+ MediaDeviceSaltServiceFactory::MediaDeviceSaltServiceFactory()
+--- a/chrome/browser/media/webrtc/media_device_salt_service_factory.h
++++ b/chrome/browser/media/webrtc/media_device_salt_service_factory.h
+@@ -7,6 +7,10 @@
+ 
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++namespace content {
++class RenderFrameHost;
++}
+ 
+ namespace media_device_salt {
+ class MediaDeviceSaltService;
+@@ -25,6 +29,10 @@
+   static media_device_salt::MediaDeviceSaltService* GetForBrowserContext(
+       content::BrowserContext* context);
+ 
++  // Captured native owner; temporary scopes never open the Profile service.
++  static media_device_salt::MediaDeviceSaltService* GetForFrame(
++      content::RenderFrameHost* frame);
++
+  private:
+   friend class base::NoDestructor<MediaDeviceSaltServiceFactory>;
+ 
+--- a/components/media_device_salt/media_device_salt_service.cc
++++ b/components/media_device_salt/media_device_salt_service.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/check.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/system/system_monitor.h"
+@@ -40,11 +41,15 @@
+     : fallback_salt_(CreateRandomSalt()),
+       fallback_salt_creation_time_(base::Time::Now()),
+       media_device_id_salt_(
+-          base::MakeRefCounted<MediaDeviceIDSalt>(pref_service)),
++          pref_service ? base::MakeRefCounted<MediaDeviceIDSalt>(pref_service)
++                       : nullptr),
+       pref_service_(pref_service),
+       db_(base::SequenceBound<MediaDeviceSaltDatabase>(
+           CreateDatabaseTaskRunner(),
+-          path)) {}
++          path)) {
++  // Isolated native memory owners have no Profile seed/configuration reader.
++  CHECK(pref_service || path.empty());
++}
+ 
+ MediaDeviceSaltService::~MediaDeviceSaltService() = default;
+ 
+@@ -129,11 +134,17 @@
+ }
+ 
+ std::string MediaDeviceSaltService::GetGlobalSalt() {
+-  return media_device_id_salt_->GetSalt();
++  return media_device_id_salt_ ? media_device_id_salt_->GetSalt()
++                               : fallback_salt_;
+ }
+ 
+ void MediaDeviceSaltService::ResetGlobalSalt() {
+-  MediaDeviceIDSalt::Reset(pref_service_);
++  if (pref_service_) {
++    MediaDeviceIDSalt::Reset(pref_service_);
++  } else {
++    fallback_salt_ = CreateRandomSalt();
++    fallback_salt_creation_time_ = base::Time::Now();
++  }
+ }
+ 
+ }  // namespace media_device_salt
+--- a/components/media_device_salt/media_device_salt_service.h
++++ b/components/media_device_salt/media_device_salt_service.h
+@@ -29,6 +29,7 @@
+ // Service that manages salts used to generate media device IDs.
+ class MediaDeviceSaltService : public KeyedService {
+  public:
++  // A null PrefService is only valid with an empty (native memory) DB path.
+   explicit MediaDeviceSaltService(PrefService* pref_service,
+                                   const base::FilePath& path);
+   ~MediaDeviceSaltService() override;
+--- a/content/browser/media/media_devices_util.cc
++++ b/content/browser/media/media_devices_util.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_tokenizer.h"
+ #include "base/strings/string_util.h"
++#include "brave/alloy/site_records/request_context_policy.h"
+ #include "content/browser/browser_main_loop.h"
+ #include "content/browser/renderer_host/frame_tree.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
+@@ -21,6 +22,8 @@
+ #include "content/browser/renderer_host/render_frame_host_delegate.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/common/features.h"
++#include "content/public/browser/alloy_document_state.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -30,6 +33,7 @@
+ #include "crypto/hmac.h"
+ #include "media/base/media_switches.h"
+ #include "media/capture/video/video_capture_device_descriptor.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "net/cookies/site_for_cookies.h"
+ #include "url/origin.h"
+ 
+@@ -45,6 +49,7 @@
+              bool has_focus,
+              bool is_background,
+              std::optional<ukm::SourceId> source_id,
++             std::optional<alloy::site_records::RecordCapability> admission,
+              MediaDeviceSaltAndOriginCallback callback,
+              bool are_persistent_device_ids_allowed,
+              const std::string& salt) {
+@@ -59,9 +64,9 @@
+   // thus appending a constant.
+   std::string group_id_salt = base::StrCat({salt, frame_salt, "group_id"});
+ 
+-  MediaDeviceSaltAndOrigin salt_and_origin(std::move(device_id_salt), origin,
+-                                           std::move(group_id_salt), has_focus,
+-                                           is_background, std::move(source_id));
++  MediaDeviceSaltAndOrigin salt_and_origin(
++      std::move(device_id_salt), origin, std::move(group_id_salt), has_focus,
++      is_background, std::move(source_id), std::move(admission));
+   std::move(callback).Run(salt_and_origin);
+ }
+ 
+@@ -103,13 +108,15 @@
+     std::string group_id_salt,
+     bool has_focus,
+     bool is_background,
+-    std::optional<ukm::SourceId> ukm_source_id)
++    std::optional<ukm::SourceId> ukm_source_id,
++    std::optional<alloy::site_records::RecordCapability> admission)
+     : device_id_salt_(std::move(device_id_salt)),
+       group_id_salt_(std::move(group_id_salt)),
+       origin_(std::move(origin)),
+       ukm_source_id_(std::move(ukm_source_id)),
+       has_focus_(has_focus),
+-      is_background_(is_background) {}
++      is_background_(is_background),
++      admission_(std::move(admission)) {}
+ 
+ MediaDeviceSaltAndOrigin::MediaDeviceSaltAndOrigin(
+     const MediaDeviceSaltAndOrigin& other) = default;
+@@ -124,8 +131,22 @@
+ MediaDeviceSaltAndOrigin::~MediaDeviceSaltAndOrigin() = default;
+ 
+ MediaDeviceSaltAndOrigin MediaDeviceSaltAndOrigin::Empty() {
+-  return MediaDeviceSaltAndOrigin(/*device_id_salt=*/std::string(),
+-                                  /*origin=*/url::Origin());
++  return MediaDeviceSaltAndOrigin(std::string(), url::Origin(), std::string(),
++                                  false, false, std::nullopt,
++                                  alloy::site_records::RecordCapability());
++}
++
++bool MediaDeviceSaltAndOrigin::HasStorageAdmission() const {
++  return !admission_ ||
++         admission_->Allows(
++             alloy::site_records::StorePurpose::kMediaDeviceSalts,
++             alloy::site_records::StorageAccess::kReadMemory);
++}
++const std::string& MediaDeviceSaltAndOrigin::device_id_salt() const {
++  return HasStorageAdmission() ? device_id_salt_ : base::EmptyString();
++}
++const std::string& MediaDeviceSaltAndOrigin::group_id_salt() const {
++  return HasStorageAdmission() ? group_id_salt_ : base::EmptyString();
+ }
+ 
+ void GetMediaDeviceSaltAndOrigin(GlobalRenderFrameHostId render_frame_host_id,
+@@ -133,7 +154,7 @@
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   RenderFrameHostImpl* frame_host =
+       RenderFrameHostImpl::FromID(render_frame_host_id);
+-  if (!frame_host) {
++  if (!frame_host || !AlloyDocumentStateAdmitted(frame_host)) {
+     std::move(callback).Run(MediaDeviceSaltAndOrigin::Empty());
+     return;
+   }
+@@ -153,18 +174,45 @@
+   bool is_background = web_contents && web_contents->IsNeverComposited();
+   std::string frame_salt = frame_host->GetMediaDeviceIDSaltBase();
+ 
++  std::optional<alloy::site_records::RecordCapability> admission;
++  if (!alloy::site_records::RequestContextPolicy::IsStateless(
++          *frame_host->GetBrowserContext())) {
++    auto owner = GetAlloyEmbeddedStateForDocument(frame_host);
++    using Backing = alloy::site_records::EmbeddedStateRegistry::Backing;
++    if (owner.backing == Backing::kTemporary && owner.temporary) {
++      admission = owner.temporary->Capability(
++          alloy::site_records::StorePurpose::kMediaDeviceSalts);
++    } else if (owner.backing == Backing::kNone &&
++               !alloy::site_records::RecordDomainForPrincipal(
++                    frame_host->GetLastCommittedURL(), origin)
++                    .empty()) {
++      admission = alloy::site_records::RecordCapability();
++    }
++  }
++  if (admission && !admission->active()) {
++    std::move(callback).Run(MediaDeviceSaltAndOrigin::Empty());
++    return;
++  }
++  auto reply = base::BindOnce(
++      &GotSalt, std::move(frame_salt), std::move(origin), has_focus,
++      is_background, std::move(source_id), admission, std::move(callback));
++  if (admission) {
++    // A scoped native service can end while its document/consumer still lives.
++    // Its weak reply may be dropped; complete that request with the SAME closed
++    // admission, not a Profile seed or another scope's identity.
++    reply = mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(reply), false,
++                                                        std::string());
++  }
+   GetContentClient()->browser()->GetMediaDeviceIDSalt(
+       frame_host, site_for_cookies, frame_host->GetStorageKey(),
+-      base::BindOnce(&GotSalt, std::move(frame_salt), std::move(origin),
+-                     has_focus, is_background, std::move(source_id),
+-                     std::move(callback)));
++      std::move(reply));
+ }
+ 
+ blink::WebMediaDeviceInfo TranslateMediaDeviceInfo(
+     bool has_permission,
+     const MediaDeviceSaltAndOrigin& salt_and_origin,
+     const blink::WebMediaDeviceInfo& device_info) {
+-  if (has_permission) {
++  if (has_permission && salt_and_origin.HasStorageAdmission()) {
+     return blink::WebMediaDeviceInfo(
+         GetHMACForRawMediaDeviceID(salt_and_origin, device_info.device_id),
+         device_info.label,
+@@ -184,6 +232,7 @@
+     bool has_permission,
+     const MediaDeviceSaltAndOrigin& salt_and_origin,
+     const blink::WebMediaDeviceInfoArray& device_infos) {
++  has_permission = has_permission && salt_and_origin.HasStorageAdmission();
+   blink::WebMediaDeviceInfoArray result;
+   for (const auto& device_info : device_infos) {
+     result.push_back(
+@@ -240,6 +289,8 @@
+     const MediaDeviceSaltAndOrigin& salt_and_origin,
+     const std::string& raw_device_id,
+     bool use_group_salt) {
++  if (!salt_and_origin.HasStorageAdmission())
++    return std::string();
+   if (raw_device_id.empty() ||
+       raw_device_id == media::AudioDeviceDescription::kDefaultDeviceId ||
+       raw_device_id == media::AudioDeviceDescription::kCommunicationsDeviceId) {
+@@ -261,6 +312,8 @@
+     const MediaDeviceSaltAndOrigin& salt_and_origin,
+     const std::string& hmac_device_id,
+     const std::string& raw_device_id) {
++  if (!salt_and_origin.HasStorageAdmission())
++    return false;
+   return GetHMACForRawMediaDeviceID(salt_and_origin, raw_device_id) ==
+          hmac_device_id;
+ }
+@@ -288,6 +341,11 @@
+     scoped_refptr<base::SequencedTaskRunner> task_runner,
+     OptionalDeviceIdCallback callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M160);
++  if (!salt_and_origin.HasStorageAdmission()) {
++    task_runner->PostTask(FROM_HERE,
++                          base::BindOnce(std::move(callback), std::nullopt));
++    return;
++  }
+   MediaDevicesManager::BoolDeviceTypes requested_types;
+   requested_types[static_cast<size_t>(device_type)] = true;
+   MediaStreamManager::GetInstance()->media_devices_manager()->EnumerateDevices(
+--- a/content/browser/media/media_devices_util.h
++++ b/content/browser/media/media_devices_util.h
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/functional/callback.h"
++#include "brave/alloy/site_records/record_capability.h"
+ #include "content/common/content_export.h"
+ #include "content/common/features.h"
+ #include "content/public/browser/global_routing_id.h"
+@@ -30,7 +31,9 @@
+       std::string group_id_salt = std::string(),
+       bool has_focus = false,
+       bool is_background = false,
+-      std::optional<ukm::SourceId> ukm_source_id = std::nullopt);
++      std::optional<ukm::SourceId> ukm_source_id = std::nullopt,
++      std::optional<alloy::site_records::RecordCapability> admission =
++          std::nullopt);
+ 
+   MediaDeviceSaltAndOrigin(const MediaDeviceSaltAndOrigin& other);
+   MediaDeviceSaltAndOrigin& operator=(const MediaDeviceSaltAndOrigin& other);
+@@ -42,8 +45,9 @@
+ 
+   static MediaDeviceSaltAndOrigin Empty();
+ 
+-  const std::string& device_id_salt() const { return device_id_salt_; }
+-  const std::string& group_id_salt() const { return group_id_salt_; }
++  bool HasStorageAdmission() const;
++  const std::string& device_id_salt() const;
++  const std::string& group_id_salt() const;
+   const url::Origin& origin() const { return origin_; }
+   const std::optional<ukm::SourceId>& ukm_source_id() const {
+     return ukm_source_id_;
+@@ -71,6 +75,8 @@
+   std::optional<ukm::SourceId> ukm_source_id_;
+   bool has_focus_;
+   bool is_background_;
++  // Copies carry the original generation. Setters cannot revive retired data.
++  std::optional<alloy::site_records::RecordCapability> admission_;
+ };
+ 
+ // Returns the current media device ID salt and security origin for the given

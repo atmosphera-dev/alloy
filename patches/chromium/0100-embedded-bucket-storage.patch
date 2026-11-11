@@ -1,0 +1,551 @@
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3642,6 +3642,8 @@
+   sources += [
+     "alloy_embedded_state.cc",
+     "alloy_embedded_state.h",
++    "buckets/alloy_embedded_bucket_storage.cc",
++    "buckets/alloy_embedded_bucket_storage.h",
+     "dom_storage/alloy_embedded_local_storage.cc",
+     "dom_storage/alloy_embedded_local_storage.h",
+   ]
+--- a/content/browser/buckets/bucket_context.h
++++ b/content/browser/buckets/bucket_context.h
+@@ -5,8 +5,10 @@
+ #ifndef CONTENT_BROWSER_BUCKETS_BUCKET_CONTEXT_H_
+ #define CONTENT_BROWSER_BUCKETS_BUCKET_CONTEXT_H_
+ 
++#include <utility>
+ #include "components/services/storage/privileged/cpp/bucket_client_info.h"
+ #include "content/common/content_export.h"
++#include "content/browser/alloy_embedded_state.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "third_party/blink/public/common/storage_key/storage_key.h"
+ #include "third_party/blink/public/mojom/cache_storage/cache_storage.mojom-forward.h"
+@@ -28,7 +30,16 @@
+ // created and used. This may correlate to a RenderFrame or a worker.
+ class CONTENT_EXPORT BucketContext {
+  public:
++  static AlloyEmbeddedResolution RealSiteStorageOwner() {
++    AlloyEmbeddedResolution value;
++    value.backing = alloy::site_records::EmbeddedStateRegistry::Backing::kRealSite;
++    return value;
++  }
++  explicit BucketContext(AlloyEmbeddedResolution owner = RealSiteStorageOwner())
++      : storage_owner_(std::move(owner)) {}
+   virtual ~BucketContext() = default;
++  virtual AlloyEmbeddedResolution GetBucketStorageOwner() { return storage_owner_; }
++
+ 
+   // Returns the StorageKey for the context.
+   virtual blink::StorageKey GetBucketStorageKey() = 0;
+@@ -52,6 +63,9 @@
+ 
+   // Returns the `BucketClientInfo` for this context.
+   virtual storage::BucketClientInfo GetBucketClientInfo() const = 0;
++
++ private:
++  const AlloyEmbeddedResolution storage_owner_;
+ };
+ 
+ }  // namespace content
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -2939,6 +2939,9 @@
+ 
+   // BucketContext:
+   blink::StorageKey GetBucketStorageKey() override;
++  AlloyEmbeddedResolution GetBucketStorageOwner() override {
++    return GetAlloyEmbeddedStateForDocument(this);
++  }
+   blink::mojom::PermissionStatus GetPermissionStatus(
+       blink::PermissionType permission_type) override;
+   void BindCacheStorageForBucket(
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/dedicated_worker_host.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <memory>
+ #include <optional>
+@@ -102,7 +103,9 @@
+     const base::UnguessableToken& creator_network_restrictions_id,
+     mojo::PendingReceiver<blink::mojom::DedicatedWorkerHost> host,
+     net::StorageAccessApiStatus storage_access_api_status)
+-    : service_(service),
++    : BucketContext(GetAlloyEmbeddedStateForDocument(
++          ancestor_document.AsRenderFrameHostIfValid())),
++      service_(service),
+       token_(token),
+       worker_process_host_(worker_process_host),
+       creator_(creator),
+--- a/content/browser/worker_host/shared_worker_host.h
++++ b/content/browser/worker_host/shared_worker_host.h
+@@ -96,7 +96,8 @@
+       scoped_refptr<SiteInstanceImpl> site_instance,
+       std::vector<network::mojom::ContentSecurityPolicyPtr>
+           content_security_policies,
+-      scoped_refptr<PolicyContainerHost> creator_policy_container_host);
++      scoped_refptr<PolicyContainerHost> creator_policy_container_host,
++      AlloyEmbeddedResolution storage_owner = RealSiteStorageOwner());
+ 
+   SharedWorkerHost(const SharedWorkerHost&) = delete;
+   SharedWorkerHost& operator=(const SharedWorkerHost&) = delete;
+--- a/content/browser/worker_host/shared_worker_host.cc
++++ b/content/browser/worker_host/shared_worker_host.cc
+@@ -180,8 +180,9 @@
+     scoped_refptr<SiteInstanceImpl> site_instance,
+     std::vector<network::mojom::ContentSecurityPolicyPtr>
+         content_security_policies,
+-    scoped_refptr<PolicyContainerHost> creator_policy_container_host)
+-    : service_(service),
++    scoped_refptr<PolicyContainerHost> creator_policy_container_host,
++    AlloyEmbeddedResolution storage_owner)
++    : BucketContext(std::move(storage_owner)), service_(service),
+       token_(blink::SharedWorkerToken()),
+       instance_(instance),
+       content_security_policies_(std::move(content_security_policies)),
+--- a/content/browser/worker_host/shared_worker_service_impl.cc
++++ b/content/browser/worker_host/shared_worker_service_impl.cc
+@@ -3,7 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/shared_worker_service_impl.h"
+ #include "content/public/browser/alloy_document_state.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <stddef.h>
+ 
+@@ -478,7 +479,8 @@
+       worker_hosts_.insert(std::make_unique<SharedWorkerHost>(
+           this, instance, std::move(site_instance),
+           std::move(content_security_policies),
+-          creator.policy_container_host()->Clone()));
++          creator.policy_container_host()->Clone(),
++          GetAlloyEmbeddedStateForDocument(&creator)));
+   CHECK(insertion_result.second, base::NotFatalUntil::M160);
+   SharedWorkerHost* host = insertion_result.first->get();
+   shared_worker_hosts_[host->token()] = host;
+--- a/content/browser/service_worker/service_worker_context_wrapper.h
++++ b/content/browser/service_worker/service_worker_context_wrapper.h
+@@ -8,6 +8,7 @@
+ #include <stdint.h>
+ 
+ #include <memory>
++#include "content/browser/buckets/bucket_context.h"
+ #include <optional>
+ #include <string>
+ #include <utility>
+@@ -100,7 +101,10 @@
+   using GetInstalledRegistrationOriginsCallback =
+       base::OnceCallback<void(const std::vector<url::Origin>& origins)>;
+ 
+-  explicit ServiceWorkerContextWrapper(BrowserContext* browser_context);
++  explicit ServiceWorkerContextWrapper(
++      BrowserContext* browser_context,
++      AlloyEmbeddedResolution storage_owner = BucketContext::RealSiteStorageOwner());
++  AlloyEmbeddedResolution bucket_storage_owner() const { return storage_owner_; }
+ 
+   ServiceWorkerContextWrapper(const ServiceWorkerContextWrapper&) = delete;
+   ServiceWorkerContextWrapper& operator=(const ServiceWorkerContextWrapper&) =
+@@ -600,6 +604,7 @@
+ 
+   // `browser_context_` is maintained to be valid within the lifetime of the
+   // browser context.
++  const AlloyEmbeddedResolution storage_owner_;
+   raw_ptr<BrowserContext, DanglingUntriaged> browser_context_;
+ 
+   const std::unique_ptr<ServiceWorkerProcessManager> process_manager_;
+--- a/content/browser/service_worker/service_worker_context_wrapper.cc
++++ b/content/browser/service_worker/service_worker_context_wrapper.cc
+@@ -297,11 +297,12 @@
+ }
+ 
+ ServiceWorkerContextWrapper::ServiceWorkerContextWrapper(
+-    BrowserContext* browser_context)
++    BrowserContext* browser_context, AlloyEmbeddedResolution storage_owner)
+     : core_observer_list_(
+           base::MakeRefCounted<ServiceWorkerContextObserverList>()),
+       core_sync_observer_list_(
+           base::MakeRefCounted<ServiceWorkerContextSynchronousObserverList>()),
++      storage_owner_(std::move(storage_owner)),
+       browser_context_(browser_context),
+       process_manager_(std::make_unique<ServiceWorkerProcessManager>()) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+--- a/content/browser/service_worker/service_worker_host.cc
++++ b/content/browser/service_worker/service_worker_host.cc
+@@ -48,7 +48,8 @@
+         host_receiver,
+     ServiceWorkerVersion& version,
+     base::WeakPtr<ServiceWorkerContextCore> context)
+-    : worker_process_id_(ChildProcessHost::kInvalidUniqueID),
++    : BucketContext(context->wrapper()->bucket_storage_owner()),
++      worker_process_id_(ChildProcessHost::kInvalidUniqueID),
+       version_(&version),
+       token_(blink::ServiceWorkerToken()),
+       broker_(this),
+--- a/content/browser/buckets/bucket_manager.h
++++ b/content/browser/buckets/bucket_manager.h
+@@ -14,6 +14,7 @@
+ #include "base/thread_annotations.h"
+ #include "base/types/pass_key.h"
+ #include "content/browser/buckets/bucket_manager_host.h"
++#include "content/browser/locks/lock_manager.h"
+ #include "content/common/content_export.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -33,7 +34,10 @@
+ // deleted, and have them mark their Bucket instance as closed.
+ class CONTENT_EXPORT BucketManager {
+  public:
+-  explicit BucketManager(StoragePartitionImpl* storage_partition);
++  explicit BucketManager(StoragePartitionImpl* storage_partition,
++      scoped_refptr<storage::QuotaManagerProxy> quota_manager_proxy = nullptr);
++  storage::QuotaManagerProxy* quota_manager_proxy();
++  LockManager<storage::BucketId>* lock_manager();
+   ~BucketManager();
+ 
+   BucketManager(const BucketManager&) = delete;
+@@ -68,6 +72,8 @@
+       GUARDED_BY_CONTEXT(sequence_checker_);
+ 
+   raw_ptr<StoragePartitionImpl> storage_partition_;
++  const scoped_refptr<storage::QuotaManagerProxy> quota_manager_proxy_;
++  std::unique_ptr<LockManager<storage::BucketId>> scoped_lock_manager_;
+ };
+ 
+ }  // namespace content
+--- a/content/browser/buckets/bucket_manager.cc
++++ b/content/browser/buckets/bucket_manager.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/buckets/bucket_manager.h"
++#include "content/browser/storage_partition_impl.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include "content/browser/buckets/bucket_context.h"
+ #include "content/browser/buckets/bucket_manager_host.h"
+@@ -11,8 +13,22 @@
+ 
+ namespace content {
+ 
+-BucketManager::BucketManager(StoragePartitionImpl* storage_partition)
+-    : storage_partition_(storage_partition) {}
++BucketManager::BucketManager(StoragePartitionImpl* storage_partition,
++    scoped_refptr<storage::QuotaManagerProxy> quota_manager_proxy)
++    : storage_partition_(storage_partition),
++      quota_manager_proxy_(std::move(quota_manager_proxy)) {
++  if (quota_manager_proxy_) {
++    scoped_lock_manager_ = std::make_unique<LockManager<storage::BucketId>>();
++  }
++}
++storage::QuotaManagerProxy* BucketManager::quota_manager_proxy() {
++  return quota_manager_proxy_ ? quota_manager_proxy_.get()
++                              : storage_partition_->GetQuotaManagerProxy();
++}
++LockManager<storage::BucketId>* BucketManager::lock_manager() {
++  return scoped_lock_manager_ ? scoped_lock_manager_.get()
++                             : storage_partition_->GetLockManager();
++}
+ 
+ BucketManager::~BucketManager() = default;
+ 
+@@ -23,6 +39,22 @@
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   CHECK(context, base::NotFatalUntil::M160);
+ 
++  const auto selected = context->GetBucketStorageOwner();
++  using Backing = alloy::site_records::EmbeddedStateRegistry::Backing;
++  if (selected.backing == Backing::kNone ||
++      (selected.backing == Backing::kTemporary &&
++       (!selected.temporary || !selected.temporary->Capability(
++          alloy::site_records::StorePurpose::kQuota).active()))) {
++    return;
++  }
++  if (selected.backing == Backing::kTemporary && !quota_manager_proxy_) {
++    auto* storage = GetAlloyEmbeddedBucketStorage(*storage_partition_, selected.temporary);
++    if (storage && storage->buckets()) {
++      storage->buckets()->BindReceiver(context, std::move(receiver),
++                                      std::move(bad_message_callback));
++    }
++    return;
++  }
+   blink::StorageKey storage_key = context->GetBucketStorageKey();
+   auto it = hosts_.find(storage_key);
+   if (it != hosts_.end()) {
+--- a/content/browser/buckets/bucket_manager_host.h
++++ b/content/browser/buckets/bucket_manager_host.h
+@@ -10,6 +10,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "content/browser/locks/lock_manager.h"
+ #include "base/sequence_checker.h"
+ #include "components/services/storage/public/cpp/quota_error_or.h"
+ #include "content/browser/buckets/bucket_context.h"
+@@ -76,6 +77,7 @@
+   void RemoveBucketHost(storage::BucketId id);
+ 
+   StoragePartitionImpl* GetStoragePartition();
++  LockManager<storage::BucketId>* GetLockManager();
+   storage::QuotaManagerProxy* GetQuotaManagerProxy();
+ 
+  private:
+--- a/content/browser/buckets/bucket_manager_host.cc
++++ b/content/browser/buckets/bucket_manager_host.cc
+@@ -171,7 +171,11 @@
+ }
+ 
+ storage::QuotaManagerProxy* BucketManagerHost::GetQuotaManagerProxy() {
+-  return manager_->storage_partition()->GetQuotaManagerProxy();
++  return manager_->quota_manager_proxy();
++}
++
++LockManager<storage::BucketId>* BucketManagerHost::GetLockManager() {
++  return manager_->lock_manager();
+ }
+ 
+ void BucketManagerHost::OnReceiverDisconnect() {
+--- a/content/browser/buckets/bucket_host.cc
++++ b/content/browser/buckets/bucket_host.cc
+@@ -208,7 +208,7 @@
+ 
+ void BucketHost::GetLockManager(
+     mojo::PendingReceiver<blink::mojom::LockManager> receiver) {
+-  bucket_manager_host_->GetStoragePartition()->GetLockManager()->BindReceiver(
++  bucket_manager_host_->GetLockManager()->BindReceiver(
+       bucket_id_, std::move(receiver));
+ }
+ 
+--- a/content/browser/quota/quota_context.h
++++ b/content/browser/quota/quota_context.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_BROWSER_QUOTA_QUOTA_CONTEXT_H_
+ 
+ #include <memory>
++#include "base/functional/callback.h"
+ 
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/ref_counted_delete_on_sequence.h"
+@@ -49,7 +50,9 @@
+       const base::FilePath& profile_path,
+       scoped_refptr<storage::SpecialStoragePolicy> special_storage_policy,
+       storage::GetQuotaSettingsFunc get_settings_function,
+-      bool report_static_storage_quota = false);
++      bool report_static_storage_quota = false,
++      base::RepeatingCallback<bool()> admission = {});
++  void Shutdown();
+ 
+   QuotaContext(const QuotaContext&) = delete;
+   QuotaContext& operator=(const QuotaContext&) = delete;
+@@ -82,6 +85,9 @@
+   // This is not const because of OverrideQuotaManagerForTesting().
+   scoped_refptr<storage::QuotaManager> quota_manager_;
+ 
++  const base::RepeatingCallback<bool()> admission_;
++  bool shut_down_ = false;
++
+   // Only accessed on the IO thread.
+   mojo::ReceiverSet<blink::mojom::QuotaManagerHost,
+                     std::unique_ptr<QuotaManagerHost>>
+--- a/content/browser/quota/quota_manager_host.h
++++ b/content/browser/quota/quota_manager_host.h
+@@ -5,6 +5,7 @@
+ #ifndef CONTENT_BROWSER_QUOTA_QUOTA_MANAGER_HOST_H_
+ #define CONTENT_BROWSER_QUOTA_QUOTA_MANAGER_HOST_H_
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "storage/browser/quota/quota_manager.h"
+@@ -35,7 +36,8 @@
+  public:
+   // The owner must guarantee that `quota_manager` outlives this instance.
+   QuotaManagerHost(const blink::StorageKey& storage_key,
+-                   storage::QuotaManager* quota_manager);
++                   storage::QuotaManager* quota_manager,
++                   base::RepeatingCallback<bool()> admission = {});
+ 
+   QuotaManagerHost(const QuotaManagerHost&) = delete;
+   QuotaManagerHost& operator=(const QuotaManagerHost&) = delete;
+@@ -61,6 +63,7 @@
+   // the QuotaManager is guaranteed to outlive this QuotaManagerHost.
+   const raw_ptr<storage::QuotaManager> quota_manager_;
+ 
++  const base::RepeatingCallback<bool()> admission_;
+   base::WeakPtrFactory<QuotaManagerHost> weak_factory_{this};
+ };
+ 
+--- a/content/browser/quota/quota_context.cc
++++ b/content/browser/quota/quota_context.cc
+@@ -28,7 +28,7 @@
+     const base::FilePath& profile_path,
+     scoped_refptr<storage::SpecialStoragePolicy> special_storage_policy,
+     storage::GetQuotaSettingsFunc get_settings_function,
+-    bool report_static_storage_quota)
++    bool report_static_storage_quota, base::RepeatingCallback<bool()> admission)
+     : base::RefCountedDeleteOnSequence<QuotaContext>(GetIOThreadTaskRunner({})),
+       io_thread_(GetIOThreadTaskRunner({})),
+       quota_manager_(base::MakeRefCounted<storage::QuotaManager>(
+@@ -37,16 +37,27 @@
+           io_thread_,
+           std::move(special_storage_policy),
+           std::move(get_settings_function),
+-          report_static_storage_quota)) {}
++          report_static_storage_quota)), admission_(std::move(admission)) {}
+ 
+ void QuotaContext::BindQuotaManagerHost(
+     const blink::StorageKey& storage_key,
+     mojo::PendingReceiver<blink::mojom::QuotaManagerHost> receiver) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (shut_down_ || (admission_ && !admission_.Run())) {
++    return;
++  }
+   io_thread_->PostTask(
+       FROM_HERE, base::BindOnce(&QuotaContext::BindQuotaManagerHostOnIOThread,
+                                 this, storage_key, std::move(receiver)));
++}
++
++void QuotaContext::Shutdown() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  shut_down_ = true;
++  io_thread_->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<QuotaContext> owner) {
++    owner->receivers_.Clear();
++  }, base::WrapRefCounted(this)));
+ }
+ 
+ QuotaContext::~QuotaContext() {
+@@ -58,9 +69,12 @@
+     mojo::PendingReceiver<blink::mojom::QuotaManagerHost> receiver) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M159);
+ 
++  if (admission_ && !admission_.Run()) {
++    return;
++  }
+   // The quota manager currently runs on the I/O thread.
+   auto host =
+-      std::make_unique<QuotaManagerHost>(storage_key, quota_manager_.get());
++      std::make_unique<QuotaManagerHost>(storage_key, quota_manager_.get(), admission_);
+   auto* host_ptr = host.get();
+   receivers_.Add(host_ptr, std::move(receiver), std::move(host));
+ }
+--- a/content/browser/quota/quota_manager_host.cc
++++ b/content/browser/quota/quota_manager_host.cc
+@@ -18,13 +18,19 @@
+ namespace content {
+ 
+ QuotaManagerHost::QuotaManagerHost(const blink::StorageKey& storage_key,
+-                                   storage::QuotaManager* quota_manager)
+-    : storage_key_(storage_key), quota_manager_(quota_manager) {
++                                   storage::QuotaManager* quota_manager,
++                                   base::RepeatingCallback<bool()> admission)
++    : storage_key_(storage_key), quota_manager_(quota_manager),
++      admission_(std::move(admission)) {
+   CHECK(quota_manager, base::NotFatalUntil::M159);
+ }
+ 
+ void QuotaManagerHost::QueryStorageUsageAndQuota(
+     QueryStorageUsageAndQuotaCallback callback) {
++  if (admission_ && !admission_.Run()) {
++    std::move(callback).Run(blink::mojom::QuotaStatusCode::kErrorAbort, 0, 0, nullptr);
++    return;
++  }
+   quota_manager_->GetUsageAndReportedQuotaWithBreakdown(
+       storage_key_,
+       base::BindOnce(&QuotaManagerHost::DidQueryStorageUsageAndQuota,
+@@ -37,6 +43,10 @@
+     int64_t usage,
+     int64_t quota,
+     blink::mojom::UsageBreakdownPtr usage_breakdown) {
++  if (admission_ && !admission_.Run()) {
++    std::move(callback).Run(blink::mojom::QuotaStatusCode::kErrorAbort, 0, 0, nullptr);
++    return;
++  }
+   std::move(callback).Run(status, usage, quota, std::move(usage_breakdown));
+ }
+ 
+--- a/content/browser/browser_interface_binders.cc
++++ b/content/browser/browser_interface_binders.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/browser_interface_binders.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include <concepts>
+ 
+@@ -444,10 +445,31 @@
+ void BindQuotaManagerHost(
+     RenderFrameHost* host,
+     mojo::PendingReceiver<blink::mojom::QuotaManagerHost> receiver) {
+-  RenderFrameHostImpl::From(host)
+-      ->GetStoragePartition()
+-      ->GetQuotaContext()
+-      ->BindQuotaManagerHost(host->GetStorageKey(), std::move(receiver));
++  auto* frame = RenderFrameHostImpl::From(host);
++  BindAlloyBucketQuotaManagerHost(
++      *static_cast<StoragePartitionImpl*>(frame->GetStoragePartition()),
++      *frame, std::move(receiver));
++}
++
++template <typename Host>
++void BindWorkerOwnedQuota(Host* host,
++    mojo::PendingReceiver<blink::mojom::QuotaManagerHost> receiver) {
++  BindAlloyBucketQuotaManagerHost(
++      *static_cast<StoragePartitionImpl*>(host->GetProcessHost()->GetStoragePartition()),
++      *host, std::move(receiver));
++}
++void BindServiceWorkerOwnedQuota(ServiceWorkerHost* host,
++    const ServiceWorkerVersionBaseInfo& info,
++    mojo::PendingReceiver<blink::mojom::QuotaManagerHost> receiver) {
++  if (info.storage_key != host->GetBucketStorageKey()) {
++    return;
++  }
++  auto* process = RenderProcessHost::FromID(host->worker_process_id());
++  if (process) {
++    BindAlloyBucketQuotaManagerHost(
++      *static_cast<StoragePartitionImpl*>(process->GetStoragePartition()),
++      *host, std::move(receiver));
++  }
+ }
+ 
+ void BindSharedWorkerConnector(
+@@ -1631,8 +1653,8 @@
+   map->Add<blink::mojom::IDBFactory>(
+       BindWorkerReceiverForStorageKeyAndBucketContext(
+           &RenderProcessHostImpl::BindIndexedDB, host));
+-  map->Add<blink::mojom::QuotaManagerHost>(BindWorkerReceiverForStorageKey(
+-      &RenderProcessHostImpl::BindQuotaManagerHost, host));
++  map->Add<blink::mojom::QuotaManagerHost>(base::BindRepeating(
++      &BindWorkerOwnedQuota<DedicatedWorkerHost>, base::Unretained(host)));
+   if (base::FeatureList::IsEnabled(
+           blink::features::kServiceWorkerInDedicatedWorker) &&
+       base::FeatureList::IsEnabled(
+@@ -1810,8 +1832,8 @@
+   map->Add<blink::mojom::IDBFactory>(
+       BindWorkerReceiverForStorageKeyAndBucketContext(
+           &RenderProcessHostImpl::BindIndexedDB, host));
+-  map->Add<blink::mojom::QuotaManagerHost>(BindWorkerReceiverForStorageKey(
+-      &RenderProcessHostImpl::BindQuotaManagerHost, host));
++  map->Add<blink::mojom::QuotaManagerHost>(base::BindRepeating(
++      &BindWorkerOwnedQuota<SharedWorkerHost>, base::Unretained(host)));
+   map->Add<blink::mojom::NotificationService>(BindNotificationService(
+       GlobalRenderFrameHostId(),
+       RenderProcessHost::NotificationServiceCreatorType::kSharedWorker, host));
+@@ -1984,9 +2006,8 @@
+           &RenderProcessHostImpl::BindFileSystemAccessManager, host));
+   map->Add<blink::mojom::LockManager>(BindServiceWorkerReceiverForStorageKey(
+       &RenderProcessHostImpl::CreateLockManager, host));
+-  map->Add<blink::mojom::QuotaManagerHost>(
+-      BindServiceWorkerReceiverForStorageKey(
+-          &RenderProcessHostImpl::BindQuotaManagerHost, host));
++  map->Add<blink::mojom::QuotaManagerHost>(base::BindRepeating(
++      &BindServiceWorkerOwnedQuota, base::Unretained(host)));
+   map->Add<blink::mojom::NotificationService>(BindNotificationService(host));
+   map->Add<blink::mojom::FileBackedBlobFactory>(
+       BindServiceWorkerReceiverForOrigin(

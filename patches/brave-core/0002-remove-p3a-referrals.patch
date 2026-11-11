@@ -4029,7 +4029,7 @@
      "//brave/ios/browser/api/ads",
 --- a/components/p3a/BUILD.gn
 +++ /dev/null
-@@ -1,137 +0,0 @@
+@@ -1,138 +0,0 @@
 -# Copyright (c) 2019 The Brave Authors. All rights reserved.
 -# This Source Code Form is subject to the terms of the Mozilla Public
 -# License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -4154,6 +4154,7 @@
 -    "//brave/components/p3a",
 -    "//brave/components/p3a_utils",
 -    "//components/cbor",
+-    "//components/component_updater:test_support",
 -    "//components/prefs:test_support",
 -    "//net",
 -    "//services/network:test_support",
@@ -8970,7 +8971,7 @@
 -#endif  // BRAVE_COMPONENTS_P3A_METRIC_LOG_TYPE_H_
 --- a/components/p3a/metric_names.h
 +++ /dev/null
-@@ -1,449 +0,0 @@
+@@ -1,482 +0,0 @@
 -/* Copyright (c) 2022 The Brave Authors. All rights reserved.
 - * This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -9255,14 +9256,47 @@
 -      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kDateOfActivation, MetricAttribute::kVersion, MetricAttribute::kYoi, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode, MetricAttribute::kWoi},
 -      .record_activation_date = true,
 -    }},
--    {"Brave.CaptchaCount.Cloudflare", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.Cloudflare.UserActivated", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.Google", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.Google.UserActivated", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.Total", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.Total.UserActivated", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.hCaptcha", MetricConfig{.ephemeral = true}},
--    {"Brave.CaptchaCount.hCaptcha.UserActivated", MetricConfig{.ephemeral = true}},
+-    // Please keep the names consistent with captcha_metrics.h
+-    {"Brave.CaptchaCount.Cloudflare", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.Cloudflare.UserActivated", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.Google", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.Google.UserActivated", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.Total", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.Total.UserActivated", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.hCaptcha", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
+-    {"Brave.CaptchaCount.hCaptcha.UserActivated", MetricConfig{
+-      .ephemeral = true,
+-      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kCustomAttribute, MetricAttribute::kChannel, MetricAttribute::kPlatform, MetricAttribute::kCountryCode},
+-      .custom_attributes = {"likely_bot"},
+-    }},
 -
 -    {"Brave.Core.IsDefaultDaily.2", MetricConfig{
 -      .attributes = MetricAttributes{MetricAttribute::kAnswerIndex, MetricAttribute::kChannel, MetricAttribute::kDateOfInstall, MetricAttribute::kDateOfActivation, MetricAttribute::kGeneralPlatform, MetricAttribute::kSubregion, MetricAttribute::kVersion},
@@ -11638,7 +11672,7 @@
 -}  // namespace p3a
 --- a/components/p3a/p3a_service.cc
 +++ /dev/null
-@@ -1,380 +0,0 @@
+@@ -1,381 +0,0 @@
 -/* Copyright (c) 2019 The Brave Authors. All rights reserved.
 - * This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -11771,6 +11805,7 @@
 -#endif  // !BUILDFLAG(IS_IOS)
 -  dynamic_metric_sample_callbacks_.clear();
 -  pref_change_registrar_.RemoveAll();
+-  component_update_service_ = nullptr;
 -}
 -
 -void P3AService::RegisterDynamicMetric(const std::string& histogram_name,
@@ -12238,7 +12273,7 @@
 -#endif  // BRAVE_COMPONENTS_P3A_P3A_SERVICE_H_
 --- a/components/p3a/p3a_service_unittest.cc
 +++ /dev/null
-@@ -1,158 +0,0 @@
+@@ -1,170 +0,0 @@
 -// Copyright (c) 2022 The Brave Authors. All rights reserved.
 -// This Source Code Form is subject to the terms of the Mozilla Public
 -// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -12253,6 +12288,7 @@
 -#include "base/time/time.h"
 -#include "brave/components/p3a/pref_names.h"
 -#include "brave/components/p3a_utils/custom_attributes.h"
+-#include "components/component_updater/mock_component_updater_service.h"
 -#include "components/prefs/testing_pref_service.h"
 -#include "content/public/test/browser_task_environment.h"
 -#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
@@ -12394,6 +12430,17 @@
 -  p3a_utils::SetCustomAttribute("foo", std::nullopt);
 -  EXPECT_FALSE(
 -      local_state_.GetDict(kCustomAttributesDictPref).FindString("foo"));
+-}
+-
+-TEST_F(P3AServiceTest, CanOutliveComponentUpdateServiceAfterTeardown) {
+-  CreateP3AService();
+-  auto component_update_service =
+-      std::make_unique<component_updater::MockComponentUpdateService>();
+-  p3a_service_->Init(nullptr, component_update_service.get());
+-
+-  p3a_service_->StartTeardown();
+-  component_update_service.reset();
+-  p3a_service_ = nullptr;
 -}
 -
 -}  // namespace p3a

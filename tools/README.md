@@ -1,5 +1,25 @@
 # Pinned Linux build
 
+The same builder-owned roots are also admitted on the on-demand DigitalOcean
+guest `alloy-do-build` and provisioned named guests `alloy-<task>`. Task names
+are 1-48 lowercase letters, digits or hyphens, start with a letter and end with
+a letter or digit. Named guests also require
+`/etc/alloy-build-prerequisites-ready`, the marker created by build-image
+provisioning: a root-owned regular file, not a symlink, with no group or other
+write permission. A matching hostname alone is not sufficient. The existing
+`wakaba-build` and `alloy-do-build` hosts remain admitted without that marker.
+Each guest's persistent ext4 volume is mounted at
+`/home/builder/work`; source and build outputs stay on that volume. Use
+`smoke.py --out src/out/Verify_Alloy --local-fixture` there to serve the repo's
+small page on loopback instead of accessing the NUC's Kiwix server. The tracker
+probe uses only its existing loopback-only namespace and needs no home-network
+routes, interfaces or DNS. Durable user units below apply to both machines;
+the DigitalOcean guest needs linger enabled for `builder`.
+Its Ubuntu image carries Chromium's per-executable AppArmor `userns` allowance
+for `cefclient` and `alloy_*` consumers under `/home/builder/work/*/src/out/*/`.
+The global unprivileged-userns restriction remains enabled, and the browser
+keeps its sandbox.
+
 Run these commands on the dedicated `wakaba-build` NUC, from
 `/home/builder/work/alloy`, with this repository delivered to `repo/`.
 `pins.json` fixes the source revisions and Node/pnpm versions. Brave's
@@ -163,7 +183,8 @@ checkouts skip initialization and builds are incremental. Blacksmith sticky-disk
 branch protection must stay enabled: PRs read the latest trusted snapshot but
 cannot save changes. Only default-branch push, dispatch or schedule jobs save
 the disk. The job summary records command-step times and disk sizes; no large
-artifacts are uploaded. First execution requires the embedder-data-dir change.
+artifacts are uploaded. Ubuntu 24.04 gets a per-binary AppArmor user-namespace
+profile for the CI cefclient outputs; the Chromium sandbox stays enabled.
 
 To run CI by hand, select **Build and test on Blacksmith CI** in GitHub Actions
 and choose **Run workflow**, or use
@@ -171,8 +192,8 @@ and choose **Run workflow**, or use
 On a Blacksmith runner, the
 workflow's commands run from `/home/runner/alloy`, with the repo in `repo/` and
 `TMPDIR=/home/runner/alloy/tmp`. This third workspace is accepted only with
-`GITHUB_ACTIONS=true` and must be owned by the invoking user. The pinned NUC
-workspace checks are unchanged.
+`GITHUB_ACTIONS=true` and must be owned by the invoking user. NUC, DigitalOcean
+and marker-gated named build-host checks are unchanged.
 
 ## Offline embedder-data consumers
 
@@ -428,8 +449,9 @@ inventories and native backing-owner checks remain necessary alongside it.
 Tools select their workspace from the delivered repository's location: either
 `/home/builder/work/alloy/repo/` (the original default) or
 `/home/builder/work/alloy-b/repo/`. There is no arbitrary-root override. Both
-roots must belong to `builder` on `wakaba-build`; symlinked workspace directories,
-foreign roots and the spike checkout are refused before taking locks or writing.
+roots must belong to `builder` on an admitted build host (see above); symlinked
+workspace directories, foreign roots and the spike checkout are refused before
+taking locks or writing.
 `--root` and `--out` must select that repository's own source/output tree.
 All pin, local-edit, full-apply and publication-journal checks remain in force.
 

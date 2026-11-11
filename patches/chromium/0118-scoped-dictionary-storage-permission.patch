@@ -1,0 +1,75 @@
+--- a/services/network/shared_dictionary/shared_dictionary_manager.h
++++ b/services/network/shared_dictionary/shared_dictionary_manager.h
+@@ -88,6 +88,10 @@
+   SharedDictionaryManager& operator=(const SharedDictionaryManager&) = delete;
+ 
+   ~SharedDictionaryManager() override;
++
++  // Backing admission, independent of complete key representation.
++  bool CanUseIsolationKey(
++      const net::SharedDictionaryIsolationKey& isolation_key) const;
+ 
+   // Returns a SharedDictionaryStorage for the `isolation_key`.
+   scoped_refptr<SharedDictionaryStorage> GetStorage(
+--- a/services/network/shared_dictionary/shared_dictionary_manager.cc
++++ b/services/network/shared_dictionary/shared_dictionary_manager.cc
+@@ -142,10 +142,15 @@
+   return pervasive_storage_;
+ }
+ 
++bool SharedDictionaryManager::CanUseIsolationKey(
++    const net::SharedDictionaryIsolationKey& isolation_key) const {
++  return !isolation_key.nonce() || allow_scoped_memory_nonce_;
++}
++
+ scoped_refptr<SharedDictionaryStorage> SharedDictionaryManager::GetStorage(
+     const net::SharedDictionaryIsolationKey& isolation_key) {
+   TRACE_EVENT("loading", "SharedDictionaryManager::GetStorage");
+-  if (isolation_key.nonce() && !allow_scoped_memory_nonce_) {
++  if (!CanUseIsolationKey(isolation_key)) {
+     return nullptr;
+   }
+   auto cached_storages_it = cached_storages_.Get(isolation_key);
+@@ -216,8 +221,7 @@
+     mojom::RequestDestination request_destination,
+     const std::optional<net::SharedDictionaryIsolationKey>& isolation_key,
+     const GURL& request_url) {
+-  if (!isolation_key ||
+-      (isolation_key->nonce() && !allow_scoped_memory_nonce_)) {
++  if (!isolation_key || !CanUseIsolationKey(*isolation_key)) {
+     return nullptr;
+   }
+   scoped_refptr<net::SharedDictionary> dict;
+--- a/services/network/shared_dictionary/shared_dictionary_access_checker.cc
++++ b/services/network/shared_dictionary/shared_dictionary_access_checker.cc
+@@ -9,6 +9,7 @@
+ #include "services/network/cookie_manager.h"
+ #include "services/network/cookie_settings.h"
+ #include "services/network/network_context.h"
++#include "services/network/shared_dictionary/shared_dictionary_manager.h"
+ 
+ namespace network {
+ 
+@@ -84,6 +85,22 @@
+     const net::SiteForCookies& site_for_cookies,
+     const net::IsolationInfo& isolation_info,
+     base::optional_ref<const net::CookiePartitionKey> cookie_partition_key) {
++  const auto key =
++      net::SharedDictionaryIsolationKey::MaybeCreate(isolation_info);
++  if (key && key->nonce()) {
++    const auto* manager = context_->GetSharedDictionaryManager();
++    if (!manager || !manager->CanUseIsolationKey(*key)) {
++      return false;
++    }
++    // A private nonced dictionary is ephemeral storage, not unpartitioned
++    // cookies. Preserve the original identity and let native storage policy
++    // honor site blocks.
++    return context_->cookie_manager()
++        ->cookie_settings()
++        .IsAnyStorageAccessAllowed(
++            url, site_for_cookies, isolation_info.top_frame_origin(),
++            net::CookieSettingOverrides(), cookie_partition_key);
++  }
+   return context_->cookie_manager()
+       ->cookie_settings()
+       .IsFullCookieAccessAllowed(

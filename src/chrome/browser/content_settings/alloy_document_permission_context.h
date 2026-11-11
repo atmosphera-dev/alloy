@@ -4,17 +4,29 @@
 #define CHROME_BROWSER_CONTENT_SETTINGS_ALLOY_DOCUMENT_PERMISSION_CONTEXT_H_
 
 #include <memory>
+#include <utility>
 
 #include "base/functional/bind.h"
 #include "brave/alloy/site_records/request_context_policy.h"
 #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
 #include "chrome/browser/profiles/profile.h"
 #include "content/public/browser/render_frame_host.h"
+#include "content/public/browser/alloy_document_state.h"
+#include "content/public/browser/weak_document_ptr.h"
 
 namespace alloy::site_records {
 
-// The native factory supplies its ordinary getter; only stateless documents
-// construct their own complete native grant context with the same map owner.
+inline base::RepeatingCallback<bool()> CaptureDocumentPermissionAdmission(
+    content::RenderFrameHost* frame, base::RepeatingCallback<bool()> record) {
+  const auto original = frame ? frame->GetWeakDocumentPtr() : content::WeakDocumentPtr();
+  return base::BindRepeating([](content::WeakDocumentPtr original,
+                              base::RepeatingCallback<bool()> record) {
+    return record.Run() && content::AlloyDocumentStateAdmitted(original.AsRenderFrameHostIfValid());
+  }, original, std::move(record));
+}
+
+// The native factory supplies its ordinary getter. Working-state documents and
+// embedded scopes construct complete native contexts with their map's owner.
 template <typename T>
 T* DocumentPermissionContext(content::RenderFrameHost* frame,
                              T* (*profile_getter)(Profile*)) {
@@ -22,7 +34,11 @@ T* DocumentPermissionContext(content::RenderFrameHost* frame,
     return nullptr;
   }
   auto* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
-  if (!RequestContextPolicy::IsStateless(*profile)) {
+  if (RequestContextPolicy::Get(*profile) &&
+      !content::AlloyDocumentStateAdmitted(frame)) {
+    return nullptr;
+  }
+  if (!HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
     return profile_getter(profile);
   }
   static const int type_key = 0;

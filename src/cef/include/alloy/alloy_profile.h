@@ -12,6 +12,63 @@
 
 #if CEF_API_ADDED(CEF_EXPERIMENTAL)
 ///
+/// EXPERIMENTAL: Immutable, copied site-record metadata. Retaining this snapshot
+/// does not retain record access or a key. The embedder owns clearing any copies
+/// it displays or stores after profile lock or record deletion.
+///
+/*--cef(source=library,added=experimental)--*/
+class AlloySiteRecord : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Return the canonical registrable domain, or the exact host for an IP or a
+  /// host without a registrable domain. Schemes and ports do not split records.
+  ///
+  /*--cef()--*/
+  virtual CefString GetDomain() = 0;
+
+  ///
+  /// Return the last committed top-level visit in microseconds since the Unix
+  /// epoch, or zero if never visited. Embedded loads and reads do not refresh it.
+  ///
+  /*--cef()--*/
+  virtual int64_t GetLastVisit() = 0;
+};
+
+///
+/// EXPERIMENTAL: Site-record enumeration completion on browser UI. On OK,
+/// |records| is a copied snapshot of the live site catalogue, not a subscription.
+/// Failure/cancellation returns an empty vector, never a partial catalogue.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloySiteRecordsCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete enumeration with |result| and copied |records|. May reenter.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result,
+                          const std::vector<CefRefPtr<AlloySiteRecord>>& records) = 0;
+};
+
+///
+/// EXPERIMENTAL: Completion of a profile embed-list operation, on browser UI.
+/// A successful read returns copied canonical record domains in |embedded|;
+/// writes and failed/cancelled reads return an empty vector. OK acknowledges
+/// durable publication for writes. Cancellation never reports a new generation
+/// as the result of an old operation. The callback may reenter or release owners.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloySiteSettingsCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete the accepted operation with |result| and copied |embedded| domains.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result,
+                          const std::vector<CefString>& embedded) = 0;
+};
+
+///
 /// EXPERIMENTAL: Lock completion on browser UI, after original-generation key
 /// revocation, native teardown, and destruction of the shared preference cache.
 ///
@@ -23,6 +80,50 @@ class AlloyProfileLockCallback : public virtual CefBaseRefCounted {
   ///
   /*--cef()--*/
   virtual void OnComplete(alloy_site_settings_result_t result) = 0;
+};
+
+///
+/// EXPERIMENTAL: Transient profile auto-lock events, delivered on browser UI.
+/// This handler owns UI policy only, never permission to postpone key revocation.
+/// The embedder may close its UI tabs or keep their shells and show its own
+/// locked page in a separate stateless context. Retired contexts cannot be reused.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyProfileLockHandler : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Lock has completed. OK acknowledges key wiping, native cache destruction
+  /// and page-process teardown. Other results report failure, not successful
+  /// locking. This callback also covers explicit runtime locks and may reenter.
+  ///
+  /*--cef()--*/
+  virtual void OnLocked(alloy_profile_lock_reason_t reason,
+                        alloy_site_settings_result_t result) = 0;
+
+  ///
+  /// Available native triggers changed. Each reason's bit is (1 << reason).
+  /// Browser close and engine-input idle are always available; absent Linux
+  /// providers are not proof of activity or an unlocked desktop. The embedder
+  /// chooses its unavailable-provider policy and may supply trusted signals.
+  ///
+  /*--cef()--*/
+  virtual void OnLockTriggersChanged(int available_triggers) = 0;
+};
+
+///
+/// EXPERIMENTAL: Record deletion completion on browser UI. OK means the wrapped
+/// key and generated references were durably removed and old live documents and
+/// workers retired. |files_pending| reports unreadable opaque objects awaiting
+/// later unlink; it never means their keys or live grants remain available.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyRecordDeletionCallback : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Complete deletion with |result| and opaque-file cleanup status.
+  ///
+  /*--cef()--*/
+  virtual void OnComplete(alloy_site_settings_result_t result, bool files_pending) = 0;
 };
 
 ///
@@ -56,6 +157,7 @@ class AlloyKeySource : public virtual CefBaseRefCounted {
 /// embedder background thread. The library uses one authenticated catalogue and
 /// encrypted file layer for all profile/record state. Store/browser-context
 /// binding is separate. Releasing the last reference locks and wipes the profile.
+/// Embed-list methods below instead queue asynchronous I/O from browser UI.
 ///
 /*--cef(source=library,added=experimental)--*/
 class AlloyProfile : public virtual CefBaseRefCounted {
@@ -101,7 +203,10 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   /// Queue lock from browser UI after CefInitialize. Completion is asynchronous
   /// on UI after keys are revoked, native owners retire and preference caches
   /// are destroyed. Until completion the state remains TRANSITION. Returns false
-  /// for a missing callback, wrong thread or another lifecycle transition.
+  /// for a missing callback, wrong thread or a standalone lifecycle transition.
+  /// Safe from observer/embedder callbacks: navigation admission stops immediately,
+  /// native teardown runs in a posted task, and repeated UI locks join it. Each
+  /// accepted callback receives the same final result; the first reason is kept.
   ///
   /*--cef()--*/
   virtual bool LockAsync(CefRefPtr<AlloyProfileLockCallback> callback) = 0;
@@ -113,7 +218,114 @@ class AlloyProfile : public virtual CefBaseRefCounted {
   /*--cef(default_retval=ALLOY_PROFILE_ERROR)--*/
   virtual alloy_profile_state_t GetState() = 0;
 
+  ///
+  /// Configure auto-lock on browser UI after CefInitialize. |idle_milliseconds|
+  /// must be nonnegative: zero disables only idle locking, not other triggers.
+  /// This runtime setting is embedder policy, not a persisted browser default.
+  /// Native input routed through this profile resets the engine's monotonic idle
+  /// timer. Set before creating a context to observe initial provider events.
+  /// Replacing |handler| releases the old one; NULL stops notifications only.
+  /// Returns false for invalid thread/state or a negative timeout.
+  ///
+  /*--cef(optional_param=handler)--*/
+  virtual bool SetAutoLock(int64_t idle_milliseconds,
+                          CefRefPtr<AlloyProfileLockHandler> handler) = 0;
 
+  ///
+  /// Report trusted embedder input outside its CEF surfaces. Browser UI only.
+  /// Page-script activity does not count. Does not unlock or reauthorize a
+  /// context. Returns false before CEF initialization or on the wrong thread.
+  ///
+  /*--cef()--*/
+  virtual bool NotifyUserActivity() = 0;
+
+  ///
+  /// Supply a trusted sleep, screen-lock or user-switch signal from the embedder
+  /// on browser UI. Native providers feed the same lock lifecycle. Returns false
+  /// for another reason, invalid initialization or thread. True means accepted,
+  /// not completed: OnLocked is the teardown acknowledgement. No signal unlocks.
+  ///
+  /*--cef()--*/
+  virtual bool NotifyLockSignal(alloy_profile_lock_reason_t reason) = 0;
+
+  ///
+  /// Persist the decay policy encrypted with this unlocked profile. Call on an
+  /// embedder background thread, like Lock. Zero disables decay; positive
+  /// |period_seconds| counts from the last committed top-level document visit.
+  /// New profiles have no decay. Invalid values leave the stored policy intact.
+  /// Every unlock applies the stored policy before admitting any record reads;
+  /// Alloy also enforces it periodically without an embedder settings UI.
+  ///
+  /*--cef()--*/
+  virtual bool SetDecaySettings(int64_t period_seconds, alloy_decay_timebase_t timebase) = 0;
+
+  ///
+  /// Read the encrypted policy on an embedder background thread. Requires an
+  /// unlocked profile. Outputs change only on success; |timebase| contains an
+  /// alloy_decay_timebase_t value. Zero period means decay is disabled.
+  ///
+  /*--cef()--*/
+  virtual bool GetDecaySettings(int64_t& period_seconds, int& timebase) = 0;
+
+  ///
+  /// Read the explicit considered-first-party list belonging to |outer_url|'s
+  /// record. Call on browser UI after CefInitialize. Returns true if queued,
+  /// not a read result; |callback| reports the result asynchronously on UI.
+  /// Returns false for the wrong thread or a missing callback, without calling
+  /// it. A locked profile or an operation losing admission reports CANCELLED.
+  /// No request context or global preference fallback is selected.
+  ///
+  /*--cef()--*/
+  virtual bool GetFirstPartyEmbeds(const CefString& outer_url,
+                                  CefRefPtr<AlloySiteSettingsCallback> callback) = 0;
+
+  ///
+  /// Replace that outer site's complete list using absolute URLs in |embedded|.
+  /// Inputs are copied; canonical duplicate domains collapse. An empty vector
+  /// clears the list. Validation is atomic and invalid input preserves the old
+  /// value. Thread/queue/completion semantics match GetFirstPartyEmbeds; only
+  /// the callback's OK means this replacement was durably published.
+  ///
+  /*--cef()--*/
+  virtual bool SetFirstPartyEmbeds(const CefString& outer_url,
+                                   const std::vector<CefString>& embedded,
+                                   CefRefPtr<AlloySiteSettingsCallback> callback) = 0;
+
+  ///
+  /// List this unlocked profile's live site records, excluding profile-wide
+  /// configuration. Browser UI after CefInitialize only. True means queued;
+  /// completion is asynchronous on UI. Wrong thread or missing callback returns
+  /// false without calling it. A locked/superseded generation reports CANCELLED.
+  /// Enumeration does not create a record or refresh its last visit. No order
+  /// is promised; the embedder may sort the copied snapshot for display.
+  ///
+  /*--cef()--*/
+  virtual bool ListSiteRecords(CefRefPtr<AlloySiteRecordsCallback> callback) = 0;
+
+  ///
+  /// Delete the R16 record containing |site_url|. Browser UI only. True means
+  /// queued; only callback OK acknowledges completed deletion. The engine first
+  /// removes its wrapped key, then retires that site's documents/workers and
+  /// native grants, then unlinks opaque objects. Other records remain intact.
+  /// A locked or superseded operation completes CANCELLED, never against a new
+  /// unlock generation. Wrong thread/missing callback returns false unqueued.
+  ///
+  /*--cef()--*/
+  virtual bool DeleteSiteRecord(const CefString& site_url,
+                                CefRefPtr<AlloyRecordDeletionCallback> callback) = 0;
+
+  ///
+  /// Delete every site record in this profile through the same key-first/native
+  /// retirement lifecycle. Navigation admission remains open, but record creation
+  /// and writes are fenced until the set is empty and this callback returns.
+  /// Native preference mutations are also refused while their journal is fenced.
+  /// Reentrant enumeration is ordered before fence release; later visits create
+  /// fresh records. Profile-wide settings and key-source selection are preserved.
+  /// Thread, queueing, cancellation and files_pending semantics match deletion
+  /// of one record. A concurrent delete-all reports CONFLICT asynchronously.
+  ///
+  /*--cef()--*/
+  virtual bool DeleteAllSiteRecords(CefRefPtr<AlloyRecordDeletionCallback> callback) = 0;
 };
 
 ///

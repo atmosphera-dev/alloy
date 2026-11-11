@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The approved NUC workspaces and the GitHub Actions sticky-disk workspace.
+"""The approved build-machine and GitHub Actions workspaces.
 
 Selection follows the delivered repository, not cwd or an arbitrary environment
 variable. Validation happens at entry points, before any locks or writes.
@@ -8,12 +8,31 @@ variable. Validation happens at entry points, before any locks or writes.
 import os
 from pathlib import Path
 import pwd
+import re
 import socket
+import stat
 
 PRIMARY = Path('/home/builder/work/alloy')
 SECONDARY = Path('/home/builder/work/alloy-b')
 APPROVED = (PRIMARY, SECONDARY)
 CI = Path('/home/runner/alloy')
+HOSTS = ('wakaba-build', 'alloy-do-build')
+DO_MARKER = Path('/etc/alloy-build-prerequisites-ready')
+
+
+def is_build_host():
+    """Admit named guests only with the provisioned image's protected marker."""
+    host = socket.gethostname()
+    if host in HOSTS:
+        return True
+    if not re.fullmatch(r'alloy-[a-z](?:[a-z0-9-]{0,46}[a-z0-9])?', host):
+        return False
+    try:
+        marker = DO_MARKER.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISREG(marker.st_mode) and marker.st_uid == 0 and
+            not marker.st_mode & 0o022)
 
 
 def workspace_path(repo):
@@ -46,8 +65,9 @@ def validate_workspace(work, repo=None):
     if work == CI:
         if os.environ.get('GITHUB_ACTIONS') != 'true':
             raise RuntimeError('The CI workspace requires GITHUB_ACTIONS=true')
-    elif socket.gethostname() != 'wakaba-build' or work not in APPROVED:
-        raise RuntimeError(f'Only the approved NUC workspaces {APPROVED} are supported')
+    elif not is_build_host() or work not in APPROVED:
+        raise RuntimeError(f'Only the approved build workspaces {APPROVED} on {HOSTS} '
+                           'or provisioned alloy-<task> hosts are supported')
     owner = workspace_owner(work).pw_uid
     if os.geteuid() not in (0, owner):
         raise RuntimeError('Workspace tools must run as the owner (or the network supervisor)')

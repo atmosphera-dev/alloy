@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,7 @@ struct RecordInfo {
   ObjectId directory{};
   std::string domain;
   int64_t created_us = 0;
+  int64_t last_visit_us = 0;
   std::vector<uint8_t> metadata;
 };
 
@@ -34,6 +36,16 @@ struct RecordFileInfo {
 struct RecordDirectoryEntry {
   std::string name;
   RecordFileInfo info;
+};
+
+// Borrowed bytes for a complete native settings-file replacement. The caller
+// retains them only for the synchronous transaction. No plaintext staging FD
+// or independently persisted cross-record dependency index is involved.
+struct SettingsReplacement {
+  RecordCapability capability;
+  StorePurpose purpose;
+  std::string name;
+  base::span<const uint8_t> bytes;
 };
 
 enum class RecordOpen { kOpen, kOpenOrCreate, kCreate, kCreateOrTruncate };
@@ -69,6 +81,9 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
   // emergency wipe, not a substitute for handling native Close/Sync errors.
   FileStatus Lock();
   bool unlocked() const;
+  // A publication error preserves its status, closes admission and wipes keys;
+  // only reopening the authenticated authoritative root can resume operation.
+  // Clearing a transient fault cannot publish a previously refused mutation.
   FileStatus Sync();
   base::UnguessableToken profile_id() const;
   std::vector<uint8_t> bootstrap() const;
@@ -81,8 +96,22 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
                             bool create,
                             RecordInfo* out);
   FileStatus ListRecords(std::vector<RecordInfo>* out);
+  // Hold a profile-generation fence across whole-catalogue live retirement.
+  // Ordinary site creation/writes return kBusy; reads and profile-private files
+  // remain admitted. Only key/reference retirement may write through the fence.
+  FileStatus BeginSiteDeletion(base::UnguessableToken* fence);
+  // Lift only this fence, after the live site set and native retirement are empty.
+  FileStatus EndSiteDeletion(base::UnguessableToken fence);
+  // Non-mutating, authoritative admission for native adapters, including current
+  // fences. Capability lifetime alone does not imply writable backend access.
+  FileStatus CheckAccess(const RecordCapability& capability, StorePurpose purpose,
+                         StorageAccess access);
   FileStatus SetRecordMetadata(base::UnguessableToken record,
-                               base::span<const uint8_t> metadata);
+                                base::span<const uint8_t> metadata);
+  // Only a browser-owned committed top-level document calls this. Reads,
+  // embedded frames, workers and background writes never refresh the clock.
+  FileStatus RecordVisit(base::UnguessableToken record, int64_t now_us);
+  FileStatus ClampFutureRecordTimes(int64_t now_us);
   RecordCapability Capability(base::UnguessableToken record,
                                StorePurpose purpose);
   // A separate profile-private tree uses profile-derived keys. It is not a
@@ -96,8 +125,26 @@ class RecordFileSystem : public std::enable_shared_from_this<RecordFileSystem> {
   // then remove data objects. No teardown callback precedes key destruction.
   // Admission for the same record directory stays closed through teardown.
   FileStatus DeleteRecord(base::UnguessableToken record,
-                           std::function<void()> teardown,
-                           RecordDeletion* result);
+                            std::function<void()> teardown,
+                            RecordDeletion* result);
+
+  // Native preferences and their R5 generated references commit through the
+  // same catalogue publication. Each replacement is settings-purpose scoped,
+  // <=64 MiB and fully authenticated before replacement. Existing open handles
+  // remain detached native snapshots; they cannot restore a replaced name.
+  FileStatus ReplaceSettings(base::span<const SettingsReplacement> replacements);
+  FileStatus DeleteRecordWithSettings(
+      base::UnguessableToken record,
+      base::span<const SettingsReplacement> replacements,
+      std::function<void()> teardown,
+      RecordDeletion* result);
+  // Split the same R13 transaction around asynchronous live teardown. The
+  // opaque ticket keeps directory admission closed until FinishRecordDeletion;
+  // no worker waits for UI and no caller can re-open the retired generation.
+  FileStatus RetireRecordWithSettings(base::UnguessableToken record,
+      base::span<const SettingsReplacement> replacements, base::UnguessableToken* ticket,
+      std::optional<int64_t> unchanged_visit = std::nullopt);
+  FileStatus FinishRecordDeletion(base::UnguessableToken ticket, RecordDeletion* result);
 
   FileStatus OpenFile(const RecordCapability& capability,
                       StorePurpose purpose,

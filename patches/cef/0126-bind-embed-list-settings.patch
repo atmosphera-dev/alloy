@@ -1,0 +1,33 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -1163,3 +1163,4 @@
+   sources += [ "libcef/browser/alloy/profile_store.cc" ]
++  deps += [ "//brave/alloy/site_records:embedded_state" ]
+   deps += [
+     "//brave/browser/brave_shields",
+--- a/libcef/browser/chrome/chrome_browser_context.cc
++++ b/libcef/browser/chrome/chrome_browser_context.cc
+@@ -5,6 +5,7 @@
+ #include "cef/libcef/browser/chrome/chrome_browser_context.h"
+ 
+ #include <memory>
++#include "cef/libcef/browser/alloy/profile_settings.h"
+ #include <set>
+ #include "base/unguessable_token.h"
+ #include "cef/libcef/browser/browser_host_base.h"
+@@ -272,6 +273,7 @@
+       }
+ 
+       browser_prefs::SetInitialProfilePrefs(profile_);
++      alloy::BindNativeEmbedListSettings(*profile_);
+     } else {
+       destroyed_ = true;
+     }
+@@ -329,6 +331,7 @@
+     auto* configuration = alloy::site_records::NativeProfileConfiguration::Get(*profile_);
+     CHECK(configuration);
+     if (configuration->admitted()) browser_prefs::SetInitialProfilePrefs(profile_);
++    if (configuration->admitted()) alloy::BindNativeEmbedListSettings(*profile_);
+     configuration->ConstructionFinished();
+   } else {
+     RetireEncryptedProfile();

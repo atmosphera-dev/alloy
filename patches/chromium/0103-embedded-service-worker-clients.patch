@@ -1,0 +1,312 @@
+--- a/content/browser/service_worker/service_worker_client.h
++++ b/content/browser/service_worker/service_worker_client.h
+@@ -17,6 +17,7 @@
+ #include "base/sequence_checker.h"
+ #include "base/time/time.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_metrics.h"
++#include "content/browser/alloy_embedded_state.h"
+ #include "content/browser/service_worker/service_worker_registration.h"
+ #include "content/common/content_export.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -420,6 +421,9 @@
+     return context_;
+   }
+   ServiceWorkerClientOwner& owner() { return *owner_; }
++  AlloyEmbeddedResolution GetAlloyStorageOwnerForRequest(const GURL& url) const;
++  bool RebindReservedStorageContext(base::PassKey<ServiceWorkerClientOwner>,
++                                    base::WeakPtr<ServiceWorkerContextCore> context);
+ 
+   // Implements blink::mojom::ServiceWorkerContainerHost and called from
+   // ServiceWorkerContainerHostForClient.
+@@ -538,7 +542,7 @@
+   // If it is still not ready to send, the features are buffered again.
+   void FlushFeatures();
+ 
+-  const base::WeakPtr<ServiceWorkerContextCore> context_;
++  base::WeakPtr<ServiceWorkerContextCore> context_;
+ 
+   // The `ServiceWorkerClientOwner` that owns `this`.
+   // On construction, `owner_` is the same as
+@@ -549,7 +553,7 @@
+   // - `owner_` remains the same and valid (the `ServiceWorkerClientOwner`
+   //   is now owned by the new `ServiceWorkerContextCore`), in order to
+   //   continue lifetime management of `this`.
+-  const raw_ref<ServiceWorkerClientOwner> owner_;
++  raw_ref<ServiceWorkerClientOwner> owner_;
+ 
+   // The corresponding container host.
+   // Always valid and non-null except for initialization/destruction.
+--- a/content/browser/service_worker/service_worker_client.cc
++++ b/content/browser/service_worker/service_worker_client.cc
+@@ -575,6 +575,50 @@
+   }
+ }
+ 
++bool ServiceWorkerClient::RebindReservedStorageContext(
++    base::PassKey<ServiceWorkerClientOwner>,
++    base::WeakPtr<ServiceWorkerContextCore> context) {
++  CHECK(!is_response_committed());
++  CHECK(!container_host_);
++  auto alive = AsWeakPtr();
++  SetControllerRegistration(nullptr, false);
++  if (!alive || !context) { return false; }
++  RemoveAllMatchingRegistrations();
++  if (!alive || !context) { return false; }
++  context_ = std::move(context);
++  owner_ = context_->service_worker_client_owner();
++  return true;
++}
++
++AlloyEmbeddedResolution ServiceWorkerClient::GetAlloyStorageOwnerForRequest(
++    const GURL& url) const {
++  if (!context_ || !context_->wrapper()->storage_partition()) { return {}; }
++  auto* partition = context_->wrapper()->storage_partition();
++  return std::visit(absl::Overload(
++      [&](GlobalRenderFrameHostId) -> AlloyEmbeddedResolution {
++        // Prefetch/download reserved clients have no live navigation node.
++        // Their browser-side creator supplies the captured context owner.
++        if (is_initiated_by_prefetch_ ||
++            ongoing_navigation_frame_tree_node_id_ == FrameTreeNodeId()) {
++          return context_->wrapper()->bucket_storage_owner();
++        }
++        auto* node = FrameTreeNode::GloballyFindByID(ongoing_navigation_frame_tree_node_id_);
++        auto* navigation = node ? node->navigation_request() : nullptr;
++        return navigation ? GetAlloyEmbeddedStateForNavigation(navigation, url::Origin::Create(url))
++                          : AlloyEmbeddedResolution();
++      },
++      [&](blink::DedicatedWorkerToken token) -> AlloyEmbeddedResolution {
++        auto* service = static_cast<DedicatedWorkerServiceImpl*>(partition->GetDedicatedWorkerService());
++        auto* host = service->GetDedicatedWorkerHostFromToken(token);
++        return host ? host->GetBucketStorageOwner() : AlloyEmbeddedResolution();
++      },
++      [&](blink::SharedWorkerToken token) -> AlloyEmbeddedResolution {
++        auto* service = static_cast<SharedWorkerServiceImpl*>(partition->GetSharedWorkerService());
++        auto* host = service->GetSharedWorkerHostFromToken(token);
++        return host ? host->GetBucketStorageOwner() : AlloyEmbeddedResolution();
++      }), client_info_);
++}
++
+ void ServiceWorkerClient::UpdateUrlsInternal(
+     const GURL& creation_url,
+     const std::optional<url::Origin>& top_frame_origin,
+--- a/content/browser/service_worker/service_worker_context_core.h
++++ b/content/browser/service_worker/service_worker_context_core.h
+@@ -186,6 +186,9 @@
+   // Should be only called when the old `context_` is about to be destroyed and
+   // the ownership of `this` is being moved to `new_context`.
+   void ResetContext(ServiceWorkerContextCore& new_context);
++  // Move an uncommitted native client without replacing its UUID or proxy.
++  bool TransferReservedClient(ServiceWorkerClient& client,
++                               ServiceWorkerContextCore& new_context);
+ 
+   // Returns an iterator for all service worker clients for the
+   // `key`. If `include_reserved_clients` is true, this includes clients that
+--- a/content/browser/service_worker/service_worker_context_core.cc
++++ b/content/browser/service_worker/service_worker_context_core.cc
+@@ -306,6 +306,30 @@
+   in_dtor_ = true;
+ }
+ 
++bool ServiceWorkerClientOwner::TransferReservedClient(
++    ServiceWorkerClient& client, ServiceWorkerContextCore& new_context) {
++  CHECK(!client.is_response_committed());
++  CHECK(&client.owner() == this);
++  CHECK(!in_dtor_);
++  if (&new_context.service_worker_client_owner() == this) { return true; }
++  auto target = new_context.AsWeakPtr();
++  const auto uuid = client.client_uuid();
++  if (!client.RebindReservedStorageContext(
++          base::PassKey<ServiceWorkerClientOwner>(), target)) {
++    return false;
++  }
++  // Rebinding may invoke native controller callbacks. From here to insertion
++  // there are no callbacks; the target weak context has been revalidated.
++  auto found = service_worker_clients_by_uuid_.find(uuid);
++  CHECK(found != service_worker_clients_by_uuid_.end());
++  CHECK(found->second.get() == &client);
++  auto owned = std::move(found->second);
++  service_worker_clients_by_uuid_.erase(found);
++  auto& destination = target->service_worker_client_owner();
++  CHECK(destination.service_worker_clients_by_uuid_.emplace(uuid, std::move(owned)).second);
++  return true;
++}
++
+ void ServiceWorkerClientOwner::ResetContext(
+     ServiceWorkerContextCore& new_context) {
+   context_ = new_context;
+--- a/content/browser/service_worker/service_worker_main_resource_handle.h
++++ b/content/browser/service_worker/service_worker_main_resource_handle.h
+@@ -74,6 +74,10 @@
+     return service_worker_accessed_callback_;
+   }
+ 
++  // Before any SW lookup or blob-controller inheritance, select the captured
++  // browser-owned context for this hop. Retired admission has no replacement.
++  bool PrepareContextForRequest(const GURL& url);
++
+   ServiceWorkerContextWrapper* context_wrapper() {
+     return context_wrapper_.get();
+   }
+@@ -137,7 +141,7 @@
+ 
+   const ServiceWorkerAccessedCallback service_worker_accessed_callback_;
+ 
+-  const scoped_refptr<ServiceWorkerContextWrapper> context_wrapper_;
++  scoped_refptr<ServiceWorkerContextWrapper> context_wrapper_;
+ 
+   base::WeakPtrFactory<ServiceWorkerMainResourceHandle> weak_factory_{this};
+ };
+--- a/content/browser/service_worker/service_worker_main_resource_handle.cc
++++ b/content/browser/service_worker/service_worker_main_resource_handle.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/service_worker/service_worker_main_resource_handle.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include <utility>
+ 
+@@ -76,11 +77,36 @@
+              : std::nullopt;
+ }
+ 
++bool ServiceWorkerMainResourceHandle::PrepareContextForRequest(const GURL& url) {
++  if (!service_worker_client() || !context_wrapper_->storage_partition()) { return false; }
++  auto alive = AsWeakPtr();
++  auto selected = GetAlloyServiceWorkerContextForOwner(
++      *context_wrapper_->storage_partition(),
++      service_worker_client()->GetAlloyStorageOwnerForRequest(url));
++  if (!alive) { return false; }
++  if (!selected || !selected->context() || !service_worker_client()) {
++    scoped_service_worker_client_.reset();
++    return false;
++  }
++  if (selected.get() != context_wrapper_.get()) {
++    auto client = service_worker_client();
++    const bool transferred = client->owner().TransferReservedClient(*client, *selected->context());
++    if (!alive) { return false; }
++    if (!transferred) {
++      scoped_service_worker_client_.reset();
++      return false;
++    }
++    if (!client) { return false; }
++    context_wrapper_ = std::move(selected);
++  }
++  return true;
++}
++
+ bool ServiceWorkerMainResourceHandle::InitializeForRequest(
+     const GURL& url,
+     std::optional<url::Origin> top_frame_origin,
+     const ServiceWorkerClient* client_for_prefetch) {
+-  CHECK(service_worker_client());
++  if (!PrepareContextForRequest(url)) { return false; }
+ 
+   // Update `isolation_info_`  to equal the net::IsolationInfo needed for any
+   // service worker intercepting this request. Here, `isolation_info_` directly
+@@ -105,7 +131,8 @@
+     // If top_frame_origin/key don't match, do not use the prefetch result.
+     // `this` remains unmodified, and `InitializeForRequest` will be called
+     // later in the non-prefetch code path.
+-    if (client_for_prefetch->top_frame_origin() != top_frame_origin ||
++    if (client_for_prefetch->context().get() != service_worker_client()->context().get() ||
++        client_for_prefetch->top_frame_origin() != top_frame_origin ||
+         client_for_prefetch->key() != key) {
+       return false;
+     }
+--- a/content/browser/service_worker/service_worker_main_resource_loader_interceptor.cc
++++ b/content/browser/service_worker/service_worker_main_resource_loader_interceptor.cc
+@@ -238,6 +238,10 @@
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
+   CHECK(handle_, base::NotFatalUntil::M159);
+ 
++  if (!handle_->PrepareContextForRequest(tentative_resource_request.url)) {
++    CompleteWithoutLoader(std::move(loader_callback), nullptr);
++    return;
++  }
+   ServiceWorkerContextCore* context_core =
+       handle_->context_wrapper()->context();
+   if (!context_core || !browser_context) {
+@@ -273,11 +277,14 @@
+     }
+   }
+ 
+-  CHECK(handle_->InitializeForRequest(
++  if (!handle_->InitializeForRequest(
+       tentative_resource_request.url,
+       ServiceWorkerMainResourceHandle::TopFrameOriginForInitializeForRequest(
+           tentative_resource_request),
+-      /*client_for_prefetch=*/nullptr));
++      /*client_for_prefetch=*/nullptr)) {
++    CompleteWithoutLoader(std::move(loader_callback), nullptr);
++    return;
++  }
+ 
+   // If we know there's no service worker for the storage key, let's skip asking
+   // the storage to check the existence.
+--- a/content/browser/worker_host/worker_script_fetcher.cc
++++ b/content/browser/worker_host/worker_script_fetcher.cc
+@@ -627,9 +627,23 @@
+   // Create a BrowserContext getter using |service_worker_context|.
+   // This context is aware of shutdown and safely returns a nullptr
+   // instead of a destroyed BrowserContext in that case.
+-  auto browser_context_getter =
+-      base::BindRepeating(&ServiceWorkerContextWrapper::browser_context,
+-                          std::move(service_worker_context));
++  auto browser_context_getter = base::BindRepeating(
++      [](base::WeakPtr<ServiceWorkerMainResourceHandle> handle, bool had_handle,
++         scoped_refptr<ServiceWorkerContextWrapper> fallback) -> BrowserContext* {
++        if (had_handle && !handle) { return nullptr; }
++        auto* current = handle ? handle->context_wrapper() : fallback.get();
++        if (!current || !current->context()) { return nullptr; }
++        const auto owner = current->bucket_storage_owner();
++        if (owner.backing == alloy::site_records::EmbeddedStateRegistry::Backing::kTemporary &&
++            (!owner.temporary || !owner.temporary->Capability(alloy::site_records::StorePurpose::kServiceWorkers)
++                 .Allows(alloy::site_records::StorePurpose::kServiceWorkers,
++                         alloy::site_records::StorageAccess::kReadMemory))) {
++          return nullptr;
++        }
++        return current->browser_context();
++      }, service_worker_handle ? service_worker_handle->AsWeakPtr()
++                               : base::WeakPtr<ServiceWorkerMainResourceHandle>(),
++      service_worker_handle != nullptr, std::move(service_worker_context));
+ 
+   // This fetcher will delete itself. See the class level comment.
+   // TODO(crbug.com/379869738) Remove FromUnsafeValue.
+--- a/content/browser/download/download_manager_impl.cc
++++ b/content/browser/download/download_manager_impl.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/download/download_manager_impl.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
++#include "content/browser/alloy_embedded_state.h"
+ 
+ #include <iterator>
+ #include <utility>
+@@ -1738,8 +1740,11 @@
+         params->url().SchemeIsHTTPOrHTTPS()) {
+       StoragePartitionImpl* storage_partition = GetStoragePartitionForConfig(
+           browser_context_, storage_partition_config);
+-      auto* sw_context = static_cast<ServiceWorkerContextWrapper*>(
+-          storage_partition->GetServiceWorkerContext());
++      scoped_refptr<ServiceWorkerContextWrapper> sw_context = rfh
++          ? GetAlloyServiceWorkerContextForOwner(
++                *static_cast<StoragePartitionImpl*>(storage_partition),
++                GetAlloyEmbeddedStateForDocument(rfh))
++          : static_cast<ServiceWorkerContextWrapper*>(storage_partition->GetServiceWorkerContext());
+       if (sw_context && sw_context->context()) {
+         std::unique_ptr<network::ResourceRequest> resource_request =
+             download::CreateResourceRequest(params.get());
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -6925,6 +6925,9 @@
+     return;
+   }
+ 
++  if (!GetURL().SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
+   StoragePartition* partition = GetStoragePartitionWithCurrentSiteInfo();
+   auto* service_worker_context = static_cast<ServiceWorkerContextWrapper*>(
+       partition->GetServiceWorkerContext());

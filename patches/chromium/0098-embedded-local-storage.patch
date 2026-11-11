@@ -1,0 +1,141 @@
+--- a/content/browser/dom_storage/dom_storage_context_wrapper.h
++++ b/content/browser/dom_storage/dom_storage_context_wrapper.h
+@@ -39,6 +39,7 @@
+ namespace content {
+ 
+ class SessionStorageNamespaceHandleImpl;
++class RenderFrameHostImpl;
+ class StoragePartitionImpl;
+ 
+ // This is owned by Storage Partition and encapsulates all its dom storage
+@@ -168,7 +169,8 @@
+       const blink::StorageKey& storage_key,
+       std::optional<blink::LocalFrameToken> local_frame_token,
+       ChildProcessSecurityPolicyImpl::Handle security_policy_handle,
+-      mojo::ReportBadMessageCallback bad_message_callback);
++      mojo::ReportBadMessageCallback bad_message_callback,
++      RenderFrameHostImpl** validated_frame = nullptr);
+ 
+   // Since the tab restore code keeps a reference to the session namespaces
+   // of recently closed tabs (see sessions::ContentPlatformSpecificTabData and
+--- a/content/browser/dom_storage/dom_storage_context_wrapper.cc
++++ b/content/browser/dom_storage/dom_storage_context_wrapper.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/dom_storage/dom_storage_context_wrapper.h"
++#include "content/browser/alloy_embedded_state.h"
++#include "content/browser/dom_storage/alloy_embedded_local_storage.h"
+ #include "content/public/browser/browser_context.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+ 
+@@ -35,6 +37,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/browser/permission_controller.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/session_storage_usage_info.h"
+ #include "content/public/browser/storage_usage_info.h"
+ #include "content/public/common/content_client.h"
+@@ -48,6 +51,27 @@
+ namespace content {
+ 
+ namespace {
++
++// Only the trusted browser ForProcess entry points omit LocalFrameToken. A key
++// supplied there may resolve an existing active native frame, never mint scope
++// authority from its serialized nonce or fall back after retirement.
++RenderFrameHostImpl* FindStorageFrame(
++    ChildProcessId process_id,
++    StoragePartitionImpl* partition,
++    const blink::StorageKey& key) {
++  auto* process = RenderProcessHost::FromID(process_id);
++  if (!process || process->GetStoragePartition() != partition) {
++    return nullptr;
++  }
++  RenderFrameHostImpl* result = nullptr;
++  process->ForEachRenderFrameHost([&](RenderFrameHost* frame) {
++    if (frame->IsActive() && frame->GetStorageKey() == key &&
++        frame->GetStoragePartition() == partition) {
++      result = static_cast<RenderFrameHostImpl*>(frame);
++    }
++  });
++  return result;
++}
+ 
+ void AdaptSessionStorageUsageInfo(
+     DOMStorageContextWrapper::GetSessionStorageUsageCallback callback,
+@@ -253,10 +277,37 @@
+     mojo::PendingReceiver<blink::mojom::StorageArea> receiver,
+     ChildProcessSecurityPolicyImpl::Handle security_policy_handle,
+     mojo::ReportBadMessageCallback bad_message_callback) {
++  const auto process_id = security_policy_handle.child_id();
++  RenderFrameHostImpl* frame = nullptr;
+   if (!IsRequestValid(StorageType::kLocalStorage, storage_key,
+                       local_frame_token, std::move(security_policy_handle),
+-                      std::move(bad_message_callback))) {
+-    return;
++                      std::move(bad_message_callback), &frame)) {
++    return;
++  }
++  if (partition_) {
++    if (!frame && storage_key.nonce()) {
++      frame = FindStorageFrame(process_id, partition_, storage_key);
++      if (!frame) {
++        return;
++      }
++    }
++    if (frame) {
++      const auto selected = GetAlloyEmbeddedStateForDocument(frame);
++      using Backing = alloy::site_records::EmbeddedStateRegistry::Backing;
++      if (selected.backing == Backing::kNone) {
++        return;
++      }
++      if (selected.backing == Backing::kTemporary) {
++        // Storage-access/entity/Shields permissions never change the backing
++        // authority or turn a temporary key into a first-party store lookup.
++        if (storage_key != frame->GetStorageKey()) {
++          return;
++        }
++        BindAlloyEmbeddedLocalStorage(*partition_, selected.temporary, storage_key,
++                                       std::move(receiver));
++        return;
++      }
++    }
+   }
+   CHECK(local_storage_control_, base::NotFatalUntil::M158);
+   local_storage_control_->BindStorageArea(storage_key, std::move(receiver));
+@@ -304,7 +355,11 @@
+     const blink::StorageKey& storage_key,
+     std::optional<blink::LocalFrameToken> local_frame_token,
+     ChildProcessSecurityPolicyImpl::Handle security_policy_handle,
+-    mojo::ReportBadMessageCallback bad_message_callback) {
++    mojo::ReportBadMessageCallback bad_message_callback,
++    RenderFrameHostImpl** validated_frame) {
++  if (validated_frame) {
++    *validated_frame = nullptr;
++  }
+   if (partition_) {
+   if (const auto* policy = alloy::site_records::RequestContextPolicy::Get(*partition_->browser_context());
+       policy && !policy->StorageCapability(alloy::site_records::StorePurpose::kDomStorage)
+@@ -315,8 +370,9 @@
+   }
+ 
+   bool host_storage_key_matched_or_missing = true;
++  RenderFrameHostImpl* host = nullptr;
+   if (local_frame_token) {
+-    RenderFrameHostImpl* host = RenderFrameHostImpl::FromFrameToken(
++    host = RenderFrameHostImpl::FromFrameToken(
+         security_policy_handle.child_id(), *local_frame_token,
+         &bad_message_callback);
+     if (!host) {
+@@ -349,6 +405,9 @@
+     // binding the DOM Storage. For now, we'll just fail to bind.
+     return false;
+   }
++  if (validated_frame) {
++    *validated_frame = host;
++  }
+   return true;
+ }
+ 

@@ -42,13 +42,14 @@ The embedder owns licensing and distribution of its selected data.
 
 ## Compiled-filter cache
 
-Without the switch, Alloy does not read Brave's legacy compiled DAT caches,
-including in a profile that previously used lists. Existing cache files are
-left intact.
+Without the switch, Alloy does not load compiled filters from legacy DAT or
+profile-owned snapshot caches, including in a profile that previously used
+lists. Existing cache files are left intact.
 
 With a directory, the legacy CEF service retains Brave's DAT cache behavior.
-When its default-enabled `AdblockDATCache` feature is on and the process permits disk
-storage, the service reads `adblock_cache/engine0.dat` and `engine1.dat` beneath
+When its default-enabled `AdblockDATCache` feature is on, AdBlock debug mode is
+off, and the process permits disk storage, the service reads
+`adblock_cache/engine0.dat` and `engine1.dat` beneath
 the initial profile directory in its user-data root at startup. A nonempty
 cache accepted by adblock-rust's deserializer is loaded immediately, before
 catalog/resource delivery. Missing

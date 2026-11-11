@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""NUC-only offline cefclient tracker probe in a loopback-only net namespace."""
+"""Offline cefclient tracker probe in a loopback-only net namespace."""
 import argparse
 import errno
 import functools
@@ -156,7 +156,6 @@ def has_sentinel_spelling_marker(node):
 
 
 def main():
-    """Observe filtering or startup refusal in an isolated workspace-owned browser."""
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--inside',action='store_true')
@@ -182,12 +181,12 @@ def main():
         p.error('--profile must be beneath the selected workspace evidence/')
     if not a.inside:
         command=namespace_prefix(WORK)+['unshare','--net','--fork','/bin/sh','-c',
-                 'owner=$1; shift; ip link set lo up && exec runuser -u "$owner" -- "$@"','alloy-offline',
-                 workspace_owner(WORK).pw_name,
-                 'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
-                 'GITHUB_ACTIONS='+os.environ.get('GITHUB_ACTIONS','false'),
-                 'xvfb-run','-a','-s','-screen 0 1280x720x24',
-                 'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
+                  'owner=$1; shift; ip link set lo up && exec runuser -u "$owner" -- "$@"','alloy-offline',
+                  workspace_owner(WORK).pw_name,
+                  'env','TMPDIR='+TMP,'PYTHONDONTWRITEBYTECODE=1',
+                  'GITHUB_ACTIONS='+os.environ.get('GITHUB_ACTIONS','false'),
+                  'xvfb-run','-a','-s','-screen 0 1280x720x24',
+                  'python3',str(Path(__file__).resolve()),*sys.argv[1:],'--inside']
         return subprocess.run(['timeout','--kill-after=20s',str(a.hold_seconds+150),*command],timeout=a.hold_seconds+180).returncode
     assert os.geteuid()!=0,'Browser must run as the workspace owner with its sandbox enabled'
     interfaces=json.loads(subprocess.check_output(['ip','-j','addr'],timeout=10))

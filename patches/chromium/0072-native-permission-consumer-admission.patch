@@ -1,0 +1,155 @@
+--- a/components/permissions/bluetooth_delegate_impl.cc
++++ b/components/permissions/bluetooth_delegate_impl.cc
+@@ -8,6 +8,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "components/permissions/contexts/bluetooth_chooser_context.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "device/bluetooth/bluetooth_device.h"
+ #include "device/bluetooth/public/cpp/bluetooth_uuid.h"
+ #include "third_party/blink/public/common/bluetooth/web_bluetooth_device_id.h"
+@@ -18,6 +19,14 @@
+ using device::BluetoothUUID;
+ 
+ namespace permissions {
++namespace {
++BluetoothChooserContext* AdmittedChooserContext(BluetoothDelegateImpl::Client* client,
++                                                RenderFrameHost* frame) {
++  return content::AlloyDocumentStateAdmitted(frame)
++      ? client->GetBluetoothChooserContext(frame) : nullptr;
++}
++}  // namespace
++
+ 
+ BluetoothDelegateImpl::BluetoothDelegateImpl(std::unique_ptr<Client> client)
+     : client_(std::move(client)) {}
+@@ -51,21 +60,30 @@
+ WebBluetoothDeviceId BluetoothDelegateImpl::GetWebBluetoothDeviceId(
+     RenderFrameHost* frame,
+     const std::string& device_address) {
+-  return client_->GetBluetoothChooserContext(frame)->GetWebBluetoothDeviceId(
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context->GetWebBluetoothDeviceId(
+       frame->GetMainFrame()->GetLastCommittedOrigin(), device_address);
+ }
+ 
+ std::string BluetoothDelegateImpl::GetDeviceAddress(
+     RenderFrameHost* frame,
+     const WebBluetoothDeviceId& device_id) {
+-  return client_->GetBluetoothChooserContext(frame)->GetDeviceAddress(
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context->GetDeviceAddress(
+       frame->GetMainFrame()->GetLastCommittedOrigin(), device_id);
+ }
+ 
+ WebBluetoothDeviceId BluetoothDelegateImpl::AddScannedDevice(
+     RenderFrameHost* frame,
+     const std::string& device_address) {
+-  return client_->GetBluetoothChooserContext(frame)->AddScannedDevice(
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context->AddScannedDevice(
+       frame->GetMainFrame()->GetLastCommittedOrigin(), device_address);
+ }
+ 
+@@ -73,7 +91,10 @@
+     RenderFrameHost* frame,
+     const device::BluetoothDevice* device,
+     const blink::mojom::WebBluetoothRequestDeviceOptions* options) {
+-  return client_->GetBluetoothChooserContext(frame)
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context
+       ->GrantServiceAccessPermission(
+           frame->GetMainFrame()->GetLastCommittedOrigin(), device, options);
+ }
+@@ -81,14 +102,20 @@
+ bool BluetoothDelegateImpl::HasDevicePermission(
+     RenderFrameHost* frame,
+     const WebBluetoothDeviceId& device_id) {
+-  return client_->GetBluetoothChooserContext(frame)->HasDevicePermission(
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context->HasDevicePermission(
+       frame->GetMainFrame()->GetLastCommittedOrigin(), device_id);
+ }
+ 
+ void BluetoothDelegateImpl::RevokeDevicePermissionWebInitiated(
+     RenderFrameHost* frame,
+     const WebBluetoothDeviceId& device_id) {
+-  client_->GetBluetoothChooserContext(frame)
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return;
++
++  context
+       ->RevokeDevicePermissionWebInitiated(
+           frame->GetMainFrame()->GetLastCommittedOrigin(), device_id);
+ }
+@@ -97,14 +124,20 @@
+     RenderFrameHost* frame,
+     const WebBluetoothDeviceId& device_id,
+     const BluetoothUUID& service) {
+-  return client_->GetBluetoothChooserContext(frame)->IsAllowedToAccessService(
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context->IsAllowedToAccessService(
+       frame->GetMainFrame()->GetLastCommittedOrigin(), device_id, service);
+ }
+ 
+ bool BluetoothDelegateImpl::IsAllowedToAccessAtLeastOneService(
+     RenderFrameHost* frame,
+     const WebBluetoothDeviceId& device_id) {
+-  return client_->GetBluetoothChooserContext(frame)
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context
+       ->IsAllowedToAccessAtLeastOneService(
+           frame->GetMainFrame()->GetLastCommittedOrigin(), device_id);
+ }
+@@ -113,7 +146,10 @@
+     RenderFrameHost* frame,
+     const WebBluetoothDeviceId& device_id,
+     uint16_t manufacturer_code) {
+-  return client_->GetBluetoothChooserContext(frame)
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
++
++  return context
+       ->IsAllowedToAccessManufacturerData(
+           frame->GetMainFrame()->GetLastCommittedOrigin(), device_id,
+           manufacturer_code);
+@@ -121,12 +157,14 @@
+ 
+ void BluetoothDelegateImpl::AddFramePermissionObserver(
+     FramePermissionObserver* observer) {
++  auto* context = AdmittedChooserContext(client_.get(), observer->GetRenderFrameHost());
++  if (!context) return;
+   std::unique_ptr<ChooserContextPermissionObserver>& chooser_observer =
+       chooser_observers_[observer->GetRenderFrameHost()];
+   if (!chooser_observer) {
+     chooser_observer = std::make_unique<ChooserContextPermissionObserver>(
+         this,
+-        client_->GetBluetoothChooserContext(observer->GetRenderFrameHost()));
++        context);
+   }
+ 
+   chooser_observer->AddFramePermissionObserver(observer);
+@@ -142,7 +180,8 @@
+ 
+ std::vector<blink::mojom::WebBluetoothDevicePtr>
+ BluetoothDelegateImpl::GetPermittedDevices(content::RenderFrameHost* frame) {
+-  auto* context = client_->GetBluetoothChooserContext(frame);
++  auto* context = AdmittedChooserContext(client_.get(), frame);
++  if (!context) return {};
+   std::vector<std::unique_ptr<ObjectPermissionContextBase::Object>> objects =
+       context->GetGrantedObjects(
+           frame->GetMainFrame()->GetLastCommittedOrigin());

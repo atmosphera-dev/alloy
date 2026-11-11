@@ -1,0 +1,210 @@
+diff --git a/chrome/browser/serial/chrome_serial_delegate.cc b/chrome/browser/serial/chrome_serial_delegate.cc
+index 013a652..13ba171 100644
+--- a/chrome/browser/serial/chrome_serial_delegate.cc
++++ b/chrome/browser/serial/chrome_serial_delegate.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/serial/chrome_serial_delegate.h"
+ 
+ #include <utility>
+ 
++#include "base/check.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/serial/serial_chooser_context.h"
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/serial/web_serial_chooser.h"
+ #include "chrome/browser/ui/serial/serial_chooser_controller.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/security_principal.h"
+ #include "content/public/browser/site_instance.h"
+@@ -27,9 +28,17 @@ SerialChooserContext* GetChooserContext(content::RenderFrameHost* frame) {
+ 
+ ChromeSerialDelegate::ChromeSerialDelegate() = default;
+ 
+-ChromeSerialDelegate::~ChromeSerialDelegate() = default;
++ChromeSerialDelegate::~ChromeSerialDelegate() {
++  auto observations = std::move(observations_);
++  for (auto& [observer, context] : observations) {
++    if (context)
++      context->RemovePortObserver(observer);
++  }
++}
+ 
+ bool ChromeSerialDelegate::MayUseSerial(content::RenderFrameHost* frame) {
++  if (!content::AlloyDocumentStateAdmitted(frame))
++    return false;
+   content::RenderFrameHost* main_rfh = frame->GetMainFrame();
+ 
+   // Because permission is scoped to the profile, guest contexts (like
+@@ -53,6 +62,10 @@ std::unique_ptr<content::SerialChooser> ChromeSerialDelegate::RunChooser(
+     std::vector<blink::mojom::SerialPortFilterPtr> filters,
+     std::vector<device::BluetoothUUID> allowed_bluetooth_service_class_ids,
+     content::SerialChooser::Callback callback) {
++  if (!MayUseSerial(frame) || !GetChooserContext(frame)) {
++    std::move(callback).Run(nullptr);
++    return nullptr;
++  }
+   return WebSerialChooser::Create(
+       frame,
+       std::make_unique<SerialChooserController>(
+@@ -66,7 +79,8 @@ bool ChromeSerialDelegate::CanRequestPortPermission(
+     return false;
+   }
+ 
+-  return GetChooserContext(frame)->CanRequestObjectPermission(
++  auto* context = GetChooserContext(frame);
++  return context && context->CanRequestObjectPermission(
+       frame->GetMainFrame()->GetLastCommittedOrigin());
+ }
+ 
+@@ -77,34 +91,50 @@ bool ChromeSerialDelegate::HasPortPermission(
+     return false;
+   }
+ 
+-  return GetChooserContext(frame)->HasPortPermission(
++  auto* context = GetChooserContext(frame);
++  return context && context->HasPortPermission(
+       frame->GetMainFrame()->GetLastCommittedOrigin(), port);
+ }
+ 
+ void ChromeSerialDelegate::RevokePortPermissionWebInitiated(
+     content::RenderFrameHost* frame,
+     const base::UnguessableToken& token) {
+-  return GetChooserContext(frame)->RevokePortPermissionWebInitiated(
+-      frame->GetMainFrame()->GetLastCommittedOrigin(), token);
++  if (auto* context = GetChooserContext(frame))
++    context->RevokePortPermissionWebInitiated(
++        frame->GetMainFrame()->GetLastCommittedOrigin(), token);
+ }
+ 
+ const device::mojom::SerialPortInfo* ChromeSerialDelegate::GetPortInfo(
+     content::RenderFrameHost* frame,
+     const base::UnguessableToken& token) {
+-  return GetChooserContext(frame)->GetPortInfo(token);
++  auto* context = GetChooserContext(frame);
++  return context ? context->GetPortInfo(token) : nullptr;
+ }
+ 
+ device::mojom::SerialPortManager* ChromeSerialDelegate::GetPortManager(
+     content::RenderFrameHost* frame) {
+-  return GetChooserContext(frame)->GetPortManager();
++  auto* context = GetChooserContext(frame);
++  return context ? context->GetPortManager() : nullptr;
+ }
+ 
+ void ChromeSerialDelegate::AddObserver(content::RenderFrameHost* frame,
+                                        Observer* observer) {
+-  return GetChooserContext(frame)->AddPortObserver(observer);
++  auto* context = GetChooserContext(frame);
++  if (!context)
++    return;
++  CHECK(observations_.try_emplace(observer, context->AsWeakPtr()).second);
++  context->AddPortObserver(observer);
+ }
+ 
+ void ChromeSerialDelegate::RemoveObserver(content::RenderFrameHost* frame,
+                                           Observer* observer) {
+-  return GetChooserContext(frame)->RemovePortObserver(observer);
++  // Cleanup consumes the original registration, not current admission. The
++  // registered context can still be alive after its document has retired.
++  auto found = observations_.find(observer);
++  if (found == observations_.end())
++    return;
++  auto original = std::move(found->second);
++  observations_.erase(found);
++  if (original)
++    original->RemovePortObserver(observer);
+ }
+diff --git a/chrome/browser/serial/chrome_serial_delegate.h b/chrome/browser/serial/chrome_serial_delegate.h
+index 25d8c5b..15c2231 100644
+--- a/chrome/browser/serial/chrome_serial_delegate.h
++++ b/chrome/browser/serial/chrome_serial_delegate.h
+@@ -6,10 +6,14 @@
+ #define CHROME_BROWSER_SERIAL_CHROME_SERIAL_DELEGATE_H_
+ 
+ #include <memory>
++#include <map>
+ #include <vector>
+ 
++#include "base/memory/weak_ptr.h"
+ #include "content/public/browser/serial_delegate.h"
+ 
++class SerialChooserContext;
++
+ class ChromeSerialDelegate : public content::SerialDelegate {
+  public:
+   ChromeSerialDelegate();
+@@ -42,6 +46,7 @@ class ChromeSerialDelegate : public content::SerialDelegate {
+ 
+  private:
+   bool MayUseSerial(content::RenderFrameHost* frame);
++  std::map<Observer*, base::WeakPtr<SerialChooserContext>> observations_;
+ };
+ 
+ #endif  // CHROME_BROWSER_SERIAL_CHROME_SERIAL_DELEGATE_H_
+diff --git a/content/browser/serial/serial_service.cc b/content/browser/serial/serial_service.cc
+index dc71fe0..059d879 100644
+--- a/content/browser/serial/serial_service.cc
++++ b/content/browser/serial/serial_service.cc
+@@ -22,6 +22,7 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_client.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "services/device/public/mojom/serial.mojom.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom.h"
+ #include "third_party/blink/public/mojom/frame/user_activation_notification_type.mojom.h"
+@@ -73,16 +74,20 @@ void SerialService::SetClient(
+ 
+ void SerialService::GetPorts(GetPortsCallback callback) {
+   SerialDelegate* delegate = GetContentClient()->browser()->GetSerialDelegate();
+-  if (!delegate) {
++  auto* manager = delegate ? delegate->GetPortManager(&render_frame_host())
++                           : nullptr;
++  if (!manager) {
+     std::move(callback).Run(std::vector<blink::mojom::SerialPortInfoPtr>());
+     return;
+   }
+ 
+-  delegate->GetPortManager(&render_frame_host())
+-      ->GetDevices(
++  manager->GetDevices(
+           /*allow_bluetooth_system_prompt=*/false,
+           base::BindOnce(&SerialService::FinishGetPorts,
+-                         weak_factory_.GetWeakPtr(), std::move(callback)));
++                         weak_factory_.GetWeakPtr(),
++                         mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++                             std::move(callback),
++                             std::vector<blink::mojom::SerialPortInfoPtr>())));
+ }
+ 
+ void SerialService::RequestPort(
+@@ -142,6 +147,12 @@ void SerialService::OpenPort(
+     return;
+   }
+ 
++  auto* manager = delegate->GetPortManager(&render_frame_host());
++  if (!manager) {
++    std::move(callback).Run(mojo::NullRemote());
++    return;
++  }
++
+   if (watchers_.empty()) {
+     auto* web_contents_impl = static_cast<WebContentsImpl*>(
+         WebContents::FromRenderFrameHost(&render_frame_host()));
+@@ -153,9 +164,11 @@ void SerialService::OpenPort(
+       watchers_.Add(this, watcher.InitWithNewPipeAndPassReceiver());
+   watcher_ids_.insert({token, receiver_id});
+ 
+-  delegate->GetPortManager(&render_frame_host())
+-      ->OpenPort(token, /*use_alternate_path=*/false, std::move(options),
+-                 std::move(client), std::move(watcher), std::move(callback));
++  manager->OpenPort(
++      token, /*use_alternate_path=*/false, std::move(options),
++      std::move(client), std::move(watcher),
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(callback),
++                                                 mojo::NullRemote()));
+ }
+ 
+ void SerialService::ForgetPort(const base::UnguessableToken& token,

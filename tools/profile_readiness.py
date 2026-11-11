@@ -1,22 +1,21 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""GDB-only native completion observer for the NUC profile fixture.
+"""GDB-only native completion observer for the approved profile workspace.
 
 No inferior calls, application-state writes or product instrumentation. Finish breakpoints
 observe the original parent's startup completion, PreferredApps write reply and
-blob-limit setup before the C consumer is permitted to create a stateless context.
+blob-limit setup. The shared probe then awaits the C consumer's explicit native
+control-persistence fence before baseline capture and no-disk context creation.
 The gesture observer acknowledges browser-native activation before fixture actions.
 """
 import json
 import os
 from pathlib import Path
-import socket
 import sys
 import time
 
 import gdb
 
-assert socket.gethostname() == 'wakaba-build'
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace import temp_path, validate_workspace, workspace_path
@@ -73,7 +72,7 @@ class Completed(gdb.FinishBreakpoint):
         completed.setdefault(self.name, observation)
         if len(completed) == 3 and not receipt.exists():
             save(receipt, dict(pid=gdb.selected_inferior().pid, completed=completed,
-                scope='Native parent completion; stateless context not yet created'))
+                scope='Native parent startup callbacks; control persistence fence still required'))
             for entry in entries:
                 if entry.phase == 'startup':
                     entry.enabled = False
@@ -132,7 +131,7 @@ for name, value in json.loads(os.environ['ALLOY_PROFILE_BROWSER_ENV']).items():
     gdb.execute('set environment '+name+' = '+value)
 for symbol, name in (
     ("'(anonymous namespace)::SetBrowserStartupIsComplete(StartupIsCompleteReason)'", 'startup'),
-    ('apps::PreferredAppsImpl::WriteCompleted()', 'preferred-apps-write'),
+    ('apps::PreferredAppsImpl::WriteCompleted', 'preferred-apps-write'),
     ('storage::BlobMemoryController::OnStorageLimitsCalculated(storage::BlobStorageLimits)',
      'blob-limit-setup')):
     entries.append(Observe(symbol, name))

@@ -297,7 +297,7 @@
  #include "base/alloy/storage_policy.h"
  
  #include "cef/include/alloy/alloy_request_context.h"
-+#include "cef/libcef/browser/alloy/profile_configuration.h"
++#include "cef/libcef/browser/alloy/profile_settings.h"
  #include "base/atomic_sequence_num.h"
  #include "base/logging.h"
  #include "base/strings/stringprintf.h"

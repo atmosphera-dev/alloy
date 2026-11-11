@@ -1,0 +1,248 @@
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -1663,6 +1663,41 @@
+ 
+ scoped_refptr<AlloyNetworkGeneration>
+ NavigationRequest::GetAlloyNetworkGeneration() {
++  auto* current = frame_tree_node_->current_frame_host();
++  if (!IsSameDocument() && frame_tree_node_->parent() &&
++      GetURL().SchemeIsHTTPOrHTTPS()) {
++    // HTTP request ownership uses the browser's destination URL before response
++    // processing, not GetOriginToCommit() (which CHECKs that a response
++    // exists). The same captured native selection is used again for storage at
++    // commit.
++    auto selected =
++        GetAlloyEmbeddedStateForNavigation(this, url::Origin::Create(GetURL()));
++    if (selected.temporary) {
++      alloy_network_generation_owned_ = false;
++      alloy_network_generation_ =
++          GetAlloyNetworkGenerationForDocument(current, &selected);
++      if (!alloy_network_generation_) {
++        alloy_network_generation_ =
++            base::MakeRefCounted<AlloyNetworkGeneration>();
++        alloy_network_generation_->Shutdown();
++      }
++      return alloy_network_generation_;
++    }
++    if (selected.temporary_admission_closed) {
++      // A canceled/revoked captured selection is not permission to use the
++      // partition's shared NetworkContext through a null-generation fallback.
++      alloy_network_generation_owned_ = false;
++      alloy_network_generation_ =
++          base::MakeRefCounted<AlloyNetworkGeneration>();
++      alloy_network_generation_->Shutdown();
++      return alloy_network_generation_;
++    }
++    // A cross-owner redirect must not retain the previous temporary selection.
++    // Borrowed scope generations are never retired by a navigation borrower.
++    if (alloy_network_generation_ && alloy_network_generation_->memory_only()) {
++      alloy_network_generation_.reset();
++    }
++  }
+   const auto* policy = alloy::site_records::RequestContextPolicy::Get(
+       *frame_tree_node_->current_frame_host()->GetBrowserContext());
+   if (!policy ||
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -2208,7 +2208,13 @@
+   network::mojom::NetworkContext* alloy_network_context() const {
+     return alloy_network_generation_
+                ? alloy_network_generation_->GetNetworkContext()
+-               : nullptr;
++               : AlloyNetworkContextForStateOwner(
++                     navigation_or_document_handle_->GetAlloyStateOwner(),
++                     navigation_or_document_handle_
++                         ->GetAlloyStateBrowserContext());
++  }
++  base::WeakPtr<base::SupportsUserData> alloy_state_owner() const {
++    return navigation_or_document_handle_->GetAlloyStateOwner();
+   }
+   const url::Origin& origin() const { return origin_; }
+   const net::IsolationInfo& isolation_info() const { return isolation_info_; }
+@@ -15229,7 +15235,10 @@
+       /*is_service_worker=*/false, GetProcess()->GetDeprecatedID(),
+       GetRoutingID(), prefer_bound_cookie_context, cookie_setting_overrides,
+       devtools_cookie_setting_overrides, std::move(receiver),
+-      CreateCookieAccessObserver(CookieAccessDetails::Source::kNonNavigation));
++      CreateCookieAccessObserver(CookieAccessDetails::Source::kNonNavigation),
++      SubresourceLoaderFactoriesConfig::ForPendingOrLastCommittedNavigation(
++          *this)
++          .alloy_state_owner());
+ }
+ 
+ void RenderFrameHostImpl::BindTrustTokenQueryAnswerer(
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -1711,15 +1711,21 @@
+     net::CookieSettingOverrides cookie_setting_overrides,
+     net::CookieSettingOverrides devtools_cookie_setting_overrides,
+     mojo::PendingReceiver<network::mojom::RestrictedCookieManager> receiver,
+-    mojo::PendingRemote<network::mojom::CookieAccessObserver> cookie_observer) {
++    mojo::PendingRemote<network::mojom::CookieAccessObserver> cookie_observer,
++    std::optional<base::WeakPtr<base::SupportsUserData>> owner_state) {
+   CHECK(initialized_, base::NotFatalUntil::M159);
+   if (!GetContentClient()->browser()->WillCreateRestrictedCookieManager(
+           role, browser_context_, origin, isolation_info, is_service_worker,
+           process_id, routing_id, prefer_bound_cookie_context, &receiver)) {
+-    GetNetworkContext()->GetRestrictedCookieManager(
+-        std::move(receiver), role, origin, isolation_info,
+-        cookie_setting_overrides, devtools_cookie_setting_overrides,
+-        prefer_bound_cookie_context, std::move(cookie_observer));
++    // Revalidate the ORIGINAL owner after the embedder hook, which can retire
++    // it synchronously. An expired supplied owner is distinct from no owner.
++    (owner_state
++         ? AlloyNetworkContextForStateOwner(*owner_state, browser_context_)
++         : GetNetworkContext())
++        ->GetRestrictedCookieManager(
++            std::move(receiver), role, origin, isolation_info,
++            cookie_setting_overrides, devtools_cookie_setting_overrides,
++            prefer_bound_cookie_context, std::move(cookie_observer));
+   }
+ }
+ 
+@@ -3528,15 +3534,17 @@
+ 
+ network::mojom::NetworkContextParamsPtr
+ StoragePartitionImpl::BuildNetworkContextParams(
+-    mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater>* verifier) {
++    mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater>* verifier,
++    bool memory_only) {
++  const bool in_memory = is_in_memory() || memory_only;
+   network::mojom::NetworkContextParamsPtr context_params =
+       network::mojom::NetworkContextParams::New();
+   cert_verifier::mojom::CertVerifierCreationParamsPtr
+       cert_verifier_creation_params =
+           cert_verifier::mojom::CertVerifierCreationParams::New();
+   if (!GetContentClient()->browser()->ConfigureNetworkContextParams(
+-      browser_context_, is_in_memory(), relative_partition_path_,
+-      context_params.get(), cert_verifier_creation_params.get())) {
++          browser_context_, in_memory, relative_partition_path_,
++          context_params.get(), cert_verifier_creation_params.get())) {
+     // Don't re-initialize the network context during shutdown.
+     return nullptr;
+   }
+@@ -3570,11 +3578,13 @@
+   cors_exempt_header_list_ = context_params->cors_exempt_header_list;
+ 
+ #if BUILDFLAG(ENABLE_DISK_CACHE_SQL_BACKEND)
+-  supports_renderer_accessible_http_cache_ =
+-      !context_params->enable_encrypted_http_cache &&
+-      context_params->file_paths &&
+-      context_params->file_paths->http_cache_directory &&
+-      disk_cache::InSqlBackendExperimentGroup();
++  if (!memory_only) {
++    supports_renderer_accessible_http_cache_ =
++        !context_params->enable_encrypted_http_cache &&
++        context_params->file_paths &&
++        context_params->file_paths->http_cache_directory &&
++        disk_cache::InSqlBackendExperimentGroup();
++  }
+ #endif  // ENABLE_DISK_CACHE_SQL_BACKEND
+ 
+   if (base::FeatureList::IsEnabled(
+@@ -3582,7 +3592,7 @@
+       GetContentClient()->browser()->AllowCompressionDictionaryTransport(
+           browser_context_)) {
+     context_params->shared_dictionary_enabled = true;
+-    if (!is_in_memory()) {
++    if (!in_memory) {
+       // Some callers may already initialize NetworkContextFilePaths, and we
+       // don't want to overwrite them.
+       if (!context_params->file_paths) {
+@@ -3594,7 +3604,7 @@
+     }
+     if (!context_params->shared_dictionary_cache_max_size.has_value()) {
+       CalculateAndSetSharedDictionaryCacheMaxSize(
+-          GetWeakPtr(), is_in_memory() ? base::FilePath() : partition_path_);
++          GetWeakPtr(), in_memory ? base::FilePath() : partition_path_);
+     }
+   }
+ 
+@@ -3608,14 +3618,24 @@
+   }
+ #endif
+ 
++  // A temporary scope cannot acquire a disk path even if an embedder supplied
++  // one while configuring its ordinary disk BrowserContext. Do this before
++  // creating any Network Service state, including on crash recreation.
++  if (memory_only) {
++    context_params->file_paths.reset();
++    context_params->persist_session_cookies = false;
++    context_params->restore_old_session_cookies = false;
++  }
+   return context_params;
+ }
+ 
+ scoped_refptr<AlloyNetworkGeneration>
+-StoragePartitionImpl::CreateAlloyNetworkGeneration() {
++StoragePartitionImpl::CreateAlloyNetworkGeneration(
++    std::optional<alloy::site_records::RecordCapability> memory_owner) {
+   std::erase_if(alloy_network_generations_,
+                 [](const auto& value) { return !value; });
+-  auto generation = base::MakeRefCounted<AlloyNetworkGeneration>();
++  auto generation =
++      base::MakeRefCounted<AlloyNetworkGeneration>(std::move(memory_owner));
+   InitializeAlloyNetworkGeneration(generation.get());
+   alloy_network_generations_.push_back(generation->GetWeakPtr());
+   return generation;
+@@ -3625,7 +3645,7 @@
+     AlloyNetworkGeneration* generation) {
+   mojo::Remote<network::mojom::NetworkContext> context;
+   mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater> verifier;
+-  auto params = BuildNetworkContextParams(&verifier);
++  auto params = BuildNetworkContextParams(&verifier, generation->memory_only());
+   if (!params) {
+     return;
+   }
+@@ -3687,9 +3707,15 @@
+   }
+   callback(GetNetworkContext(), GetCertVerifierServiceUpdater());
+   for (auto& lease : leases) {
++    auto admission = lease->GetWeakPtr();
++    if (!admission)
++      continue;
+     if (auto* context = lease->GetNetworkContext()) {
++      auto* verifier = lease->GetVerifier();
++      if (!admission)
++        continue;
+       retain(lease.get());
+-      callback(context, lease->GetVerifier());
++      callback(context, verifier);
+     }
+   }
+ }
+--- a/content/browser/storage_partition_impl.h
++++ b/content/browser/storage_partition_impl.h
+@@ -376,7 +376,9 @@
+ 
+   // Can return nullptr while `this` is being destroyed.
+   BrowserContext* browser_context() const;
+-  scoped_refptr<AlloyNetworkGeneration> CreateAlloyNetworkGeneration();
++  scoped_refptr<AlloyNetworkGeneration> CreateAlloyNetworkGeneration(
++      std::optional<alloy::site_records::RecordCapability> memory_owner =
++          std::nullopt);
+   void ForEachNetworkContext(
+       base::FunctionRef<void(network::mojom::NetworkContext*,
+                              cert_verifier::mojom::CertVerifierServiceUpdater*)>
+@@ -457,8 +459,9 @@
+       net::CookieSettingOverrides cookie_setting_overrides,
+       net::CookieSettingOverrides devtools_cookie_setting_overrides,
+       mojo::PendingReceiver<network::mojom::RestrictedCookieManager> receiver,
+-      mojo::PendingRemote<network::mojom::CookieAccessObserver>
+-          cookie_observer);
++      mojo::PendingRemote<network::mojom::CookieAccessObserver> cookie_observer,
++      std::optional<base::WeakPtr<base::SupportsUserData>> owner_state =
++          std::nullopt);
+ 
+   mojo::PendingRemote<network::mojom::CookieAccessObserver>
+   CreateCookieAccessObserverForServiceWorker();
+@@ -763,7 +766,8 @@
+   // first called or there is an error.
+   void InitNetworkContext();
+   network::mojom::NetworkContextParamsPtr BuildNetworkContextParams(
+-      mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater>* verifier);
++      mojo::Remote<cert_verifier::mojom::CertVerifierServiceUpdater>* verifier,
++      bool memory_only = false);
+   void InitializeAlloyNetworkGeneration(AlloyNetworkGeneration* generation);
+ 
+   bool is_in_memory() const { return config_.in_memory(); }

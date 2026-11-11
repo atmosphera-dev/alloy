@@ -25,9 +25,12 @@ provides the mechanisms, and the embedding application chooses the policy.
   - *memory-only*: nothing is written to disk;
   - *encrypted*: stored on disk, encrypted, and unlocked through a key
     source (password or OS keyring).
-- **Site records** (in progress): all state of a site lives in one encrypted
+- **Site records**: all state of a site lives in one encrypted
   record per registrable domain, which the user can see and delete, and which
   decays when unused.
+
+The [experimental SDK guide](docs/experimental-api.md) covers mode selection,
+key sources, record listing/deletion and auto-lock.
 
 ## Status
 
@@ -38,8 +41,9 @@ change.
 |---|---|---|
 | 1 | Network guard, no-logging product builds, offline list consumers | Done |
 | 2 | Stateless, memory-only and encrypted contexts; password and OS-keyring key sources | Done |
-| 3 | Site records: site settings, embedded-frame state | In progress |
-| 4 | Decay, auto-lock, complete API and docs | Planned |
+| 3 | Record-backed native storage/settings and memory-only embedded state | Implemented |
+| 4 | Auto-lock and native trigger availability | Implemented |
+| 5 | Decay, last-visit listing and fenced live delete-all | Experimental API |
 
 Limits:
 
@@ -61,18 +65,20 @@ Upstream versions are pinned in [`pins.json`](pins.json).
 
 ## Building
 
-See [`tools/README.md`](tools/README.md). The tools currently accept only the
-project's own build workspace: `/home/builder/work/alloy` on the host
-`wakaba-build`, with this repository delivered to `repo/`. From that workspace:
+See [`tools/README.md`](tools/README.md). Builds/tests run inside the assigned
+DigitalOcean guest `alloy-do-build`, not the source host. The tools support
+`/home/builder/work/alloy` and `/home/builder/work/alloy-b`, each with this
+repository delivered to its own `repo/`. For an already-prepared lane-B checkout,
+run inside that guest from `/home/builder/work/alloy-b`:
 
 ```sh
-export TMPDIR=/home/builder/work/tmp
-python3 repo/tools/alloy_checkout.py --root /home/builder/work/alloy/src
+export TMPDIR=/home/builder/work/alloy-b/tmp
+export PYTHONDONTWRITEBYTECODE=1
 python3 repo/tools/alloy_apply.py --root src --report evidence/apply.json
 python3 repo/tools/alloy_build.py --config release   # product build
-python3 repo/tools/smoke.py --out src/out/Release_Alloy
+python3 repo/tools/smoke.py --out src/out/Release_Alloy --local-fixture
 python3 repo/tools/alloy_build.py --config verify    # verification build
-python3 repo/tools/smoke.py --out src/out/Verify_Alloy
+python3 repo/tools/smoke.py --out src/out/Verify_Alloy --local-fixture
 ```
 
 A full build takes several hours; later builds are incremental.

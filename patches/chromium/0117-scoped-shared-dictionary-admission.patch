@@ -1,0 +1,321 @@
+--- a/net/shared_dictionary/shared_dictionary_isolation_key.h
++++ b/net/shared_dictionary/shared_dictionary_isolation_key.h
+@@ -6,6 +6,8 @@
+ #define NET_SHARED_DICTIONARY_SHARED_DICTIONARY_ISOLATION_KEY_H_
+ 
+ #include <optional>
++
++#include "base/unguessable_token.h"
+ 
+ #include "net/base/net_export.h"
+ #include "net/base/schemeful_site.h"
+@@ -20,13 +22,14 @@
+  public:
+   // Creates a SharedDictionaryIsolationKey. Returns nullopt when
+   // `frame_origin` or `top_frame_origin` of `isolation_info` is not set or
+-  // opaque, or `nonce` is set.
++  // opaque. A nonce is retained as identity; the backing owner decides
++  // admission.
+   static std::optional<SharedDictionaryIsolationKey> MaybeCreate(
+       const IsolationInfo& isolation_info);
+ 
+   // Creates a SharedDictionaryIsolationKey. Returns nullopt when
+   // `frame_origin` or `top_frame_origin` of `network_isolation_key` is not set
+-  // or opaque, or `nonce` of `network_isolation_key` is set.
++  // or opaque. A nonce is retained; it does not authorize persistent backing.
+   static std::optional<SharedDictionaryIsolationKey> MaybeCreate(
+       const NetworkIsolationKey& network_isolation_key,
+       const std::optional<url::Origin>& frame_origin);
+@@ -35,11 +38,15 @@
+   static const SharedDictionaryIsolationKey& GetPervasiveIsolationKey();
+ 
+   SharedDictionaryIsolationKey() = default;
+-  SharedDictionaryIsolationKey(const url::Origin& frame_origin,
+-                               const SchemefulSite& top_frame_site);
++  SharedDictionaryIsolationKey(
++      const url::Origin& frame_origin,
++      const SchemefulSite& top_frame_site,
++      std::optional<base::UnguessableToken> nonce = std::nullopt);
+ 
+   const url::Origin& frame_origin() const { return frame_origin_; }
+   const SchemefulSite& top_frame_site() const { return top_frame_site_; }
++
++  const std::optional<base::UnguessableToken>& nonce() const { return nonce_; }
+ 
+   ~SharedDictionaryIsolationKey();
+ 
+@@ -57,6 +64,7 @@
+  private:
+   url::Origin frame_origin_;
+   SchemefulSite top_frame_site_;
++  std::optional<base::UnguessableToken> nonce_;
+ };
+ 
+ }  // namespace net
+--- a/net/shared_dictionary/shared_dictionary_isolation_key.cc
++++ b/net/shared_dictionary/shared_dictionary_isolation_key.cc
+@@ -36,13 +36,13 @@
+       isolation_info.frame_origin()->opaque() ||
+       !isolation_info.top_frame_origin() ||
+       isolation_info.top_frame_origin()->opaque() ||
+-      isolation_info.nonce().has_value() ||
+       isolation_info.frame_origin()->host() == kPervasiveDomain) {
+     return std::nullopt;
+   }
+   return SharedDictionaryIsolationKey(
+       *isolation_info.frame_origin(),
+-      SchemefulSite(*isolation_info.top_frame_origin()));
++      SchemefulSite(*isolation_info.top_frame_origin()),
++      isolation_info.nonce());
+ }
+ 
+ // static
+@@ -53,18 +53,21 @@
+   if (!frame_origin || frame_origin->opaque() ||
+       !network_isolation_key.GetTopFrameSite() ||
+       network_isolation_key.GetTopFrameSite()->opaque() ||
+-      network_isolation_key.GetNonce().has_value() ||
+       frame_origin->host() == kPervasiveDomain) {
+     return std::nullopt;
+   }
+   return SharedDictionaryIsolationKey(*frame_origin,
+-                                      *network_isolation_key.GetTopFrameSite());
++                                      *network_isolation_key.GetTopFrameSite(),
++                                      network_isolation_key.GetNonce());
+ }
+ 
+ SharedDictionaryIsolationKey::SharedDictionaryIsolationKey(
+     const url::Origin& frame_origin,
+-    const SchemefulSite& top_frame_site)
+-    : frame_origin_(frame_origin), top_frame_site_(top_frame_site) {
++    const SchemefulSite& top_frame_site,
++    std::optional<base::UnguessableToken> nonce)
++    : frame_origin_(frame_origin),
++      top_frame_site_(top_frame_site),
++      nonce_(std::move(nonce)) {
+   CHECK(!frame_origin.opaque());
+   CHECK(!top_frame_site.opaque());
+ }
+--- a/services/network/shared_dictionary/shared_dictionary_manager.h
++++ b/services/network/shared_dictionary/shared_dictionary_manager.h
+@@ -68,7 +68,8 @@
+   // information in memory.
+   static std::unique_ptr<SharedDictionaryManager> CreateInMemory(
+       std::optional<base::ByteSize> cache_max_size,
+-      uint64_t cache_max_count);
++      uint64_t cache_max_count,
++      bool allow_scoped_memory_nonce = false);
+ 
+   // Returns a SharedDictionaryManager which keeps the dictionary information
+   // on disk.
+@@ -170,6 +171,8 @@
+   void DeletePreloadedDictionaries(
+       PreloadedDictionaries* preloaded_dictionaries);
+ 
++  // Immutable owner admission, enabled only by the memory factory.
++  bool allow_scoped_memory_nonce_ = false;
+   scoped_refptr<SharedDictionaryStorage> pervasive_storage_;
+ 
+   base::LRUCache<net::SharedDictionaryIsolationKey,
+--- a/services/network/shared_dictionary/shared_dictionary_manager.cc
++++ b/services/network/shared_dictionary/shared_dictionary_manager.cc
+@@ -36,9 +36,12 @@
+ std::unique_ptr<SharedDictionaryManager>
+ SharedDictionaryManager::CreateInMemory(
+     std::optional<base::ByteSize> cache_max_size,
+-    uint64_t cache_max_count) {
+-  return std::make_unique<SharedDictionaryManagerInMemory>(cache_max_size,
+-                                                           cache_max_count);
++    uint64_t cache_max_count,
++    bool allow_scoped_memory_nonce) {
++  auto manager = std::make_unique<SharedDictionaryManagerInMemory>(
++      cache_max_size, cache_max_count);
++  manager->allow_scoped_memory_nonce_ = allow_scoped_memory_nonce;
++  return manager;
+ }
+ 
+ class SharedDictionaryManager::PreloadedDictionaries
+@@ -142,6 +145,9 @@
+ scoped_refptr<SharedDictionaryStorage> SharedDictionaryManager::GetStorage(
+     const net::SharedDictionaryIsolationKey& isolation_key) {
+   TRACE_EVENT("loading", "SharedDictionaryManager::GetStorage");
++  if (isolation_key.nonce() && !allow_scoped_memory_nonce_) {
++    return nullptr;
++  }
+   auto cached_storages_it = cached_storages_.Get(isolation_key);
+   if (cached_storages_it != cached_storages_.end()) {
+     return cached_storages_it->second;
+@@ -210,20 +216,23 @@
+     mojom::RequestDestination request_destination,
+     const std::optional<net::SharedDictionaryIsolationKey>& isolation_key,
+     const GURL& request_url) {
+-  if (!isolation_key) {
++  if (!isolation_key ||
++      (isolation_key->nonce() && !allow_scoped_memory_nonce_)) {
+     return nullptr;
+   }
+   scoped_refptr<net::SharedDictionary> dict;
+   // Check the pervasive dictionary storage for a match first and fall back
+   // to the partitioned dictionary storage.
+   if (scoped_refptr<SharedDictionaryStorage> pervasive_storage =
+-          GetPervasiveStorage()) {
++          isolation_key->nonce() ? nullptr : GetPervasiveStorage()) {
+     dict =
+         pervasive_storage->GetDictionarySync(request_url, request_destination);
+   }
+   if (!dict) {
+-    dict = GetStorage(*isolation_key)
+-               ->GetDictionarySync(request_url, request_destination);
++    auto storage = GetStorage(*isolation_key);
++    if (storage) {
++      dict = storage->GetDictionarySync(request_url, request_destination);
++    }
+   }
+ 
+   // Disable preloaded dictionary usage if the PreloadedDictionaryConditionalUse
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -826,7 +826,8 @@
+     } else {
+       shared_dictionary_manager_ = SharedDictionaryManager::CreateInMemory(
+           params_->shared_dictionary_cache_max_size,
+-          shared_dictionary::kDictionaryMaxCountPerNetworkContext);
++          shared_dictionary::kDictionaryMaxCountPerNetworkContext,
++          params_->alloy_scoped_memory);
+     }
+   }
+ 
+--- a/services/network/public/mojom/shared_dictionary_isolation_key.mojom
++++ b/services/network/public/mojom/shared_dictionary_isolation_key.mojom
+@@ -4,6 +4,7 @@
+ 
+ module network.mojom;
+ 
++import "mojo/public/mojom/base/unguessable_token.mojom";
+ import "services/network/public/mojom/schemeful_site.mojom";
+ import "url/mojom/origin.mojom";
+ 
+@@ -13,4 +14,5 @@
+ struct SharedDictionaryIsolationKey {
+   url.mojom.Origin frame_origin;
+   SchemefulSite top_frame_site;
++  mojo_base.mojom.UnguessableToken? nonce;
+ };
+--- a/services/network/public/cpp/shared_dictionary_isolation_key_mojom_traits.h
++++ b/services/network/public/cpp/shared_dictionary_isolation_key_mojom_traits.h
+@@ -26,6 +26,11 @@
+     return obj.top_frame_site();
+   }
+ 
++  static const std::optional<base::UnguessableToken>& nonce(
++      const net::SharedDictionaryIsolationKey& obj) {
++    return obj.nonce();
++  }
++
+   static bool Read(network::mojom::SharedDictionaryIsolationKeyDataView data,
+                    net::SharedDictionaryIsolationKey* out);
+ };
+--- a/services/network/public/cpp/shared_dictionary_isolation_key_mojom_traits.cc
++++ b/services/network/public/cpp/shared_dictionary_isolation_key_mojom_traits.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "services/network/public/cpp/shared_dictionary_isolation_key_mojom_traits.h"
+ 
++#include "mojo/public/cpp/base/unguessable_token_mojom_traits.h"
+ #include "services/network/public/cpp/schemeful_site_mojom_traits.h"
+ #include "url/mojom/origin_mojom_traits.h"
+ 
+@@ -30,7 +31,12 @@
+     return false;
+   }
+ 
+-  *out = net::SharedDictionaryIsolationKey(frame_origin, top_frame_site);
++  std::optional<base::UnguessableToken> nonce;
++  if (!data.ReadNonce(&nonce)) {
++    return false;
++  }
++  *out = net::SharedDictionaryIsolationKey(frame_origin, top_frame_site,
++                                           std::move(nonce));
+   return true;
+ }
+ 
+--- a/services/network/cors/cors_url_loader.cc
++++ b/services/network/cors/cors_url_loader.cc
+@@ -891,7 +891,8 @@
+     SharedDictionaryStorage* dictionary_storage =
+         shared_dictionary_storage_.get();
+     scoped_refptr<SharedDictionaryStorage> pervasive_storage;
+-    if (dictionary_storage && response_head->is_shared_resource &&
++    if (dictionary_storage && !dictionary_storage->isolation_key().nonce() &&
++        response_head->is_shared_resource &&
+         context_->GetSharedDictionaryManager()) {
+       pervasive_storage =
+           context_->GetSharedDictionaryManager()->GetPervasiveStorage();
+--- a/services/network/shared_dictionary/shared_dictionary_manager_on_disk.cc
++++ b/services/network/shared_dictionary/shared_dictionary_manager_on_disk.cc
+@@ -530,6 +530,7 @@
+ SharedDictionaryManagerOnDisk::CreateStorage(
+     const net::SharedDictionaryIsolationKey& isolation_key,
+     SharedDictionaryStorageEvictionReason previous_eviction_reason) {
++  CHECK(!isolation_key.nonce());
+   return base::MakeRefCounted<SharedDictionaryStorageOnDisk>(
+       weak_factory_.GetWeakPtr(), isolation_key,
+       base::ScopedClosureRunner(
+@@ -581,6 +582,10 @@
+     const net::SharedDictionaryIsolationKey& isolation_key,
+     base::OnceCallback<
+         void(std::vector<network::mojom::SharedDictionaryInfoPtr>)> callback) {
++  if (isolation_key.nonce()) {
++    std::move(callback).Run({});
++    return;
++  }
+   metadata_store_.GetDictionaries(
+       isolation_key,
+       base::BindOnce(
+@@ -791,6 +796,10 @@
+ void SharedDictionaryManagerOnDisk::ClearDataForIsolationKey(
+     const net::SharedDictionaryIsolationKey& isolation_key,
+     base::OnceClosure callback) {
++  if (isolation_key.nonce()) {
++    std::move(callback).Run();
++    return;
++  }
+   PostSerializedTask(std::make_unique<ClearDataForIsolationKeyTaskInfo>(
+       isolation_key, std::move(callback)));
+   MaybePostExpiredDictionaryDeletionTask();
+--- a/services/network/shared_dictionary/shared_dictionary_storage_on_disk.cc
++++ b/services/network/shared_dictionary/shared_dictionary_storage_on_disk.cc
+@@ -102,6 +102,7 @@
+       on_deleted_closure_runner_(std::move(on_deleted_closure_runner)),
+       dictionary_cache_(dictionary_cache),
+       previous_eviction_reason_(previous_eviction_reason) {
++  CHECK(!isolation_key_.nonce());
+   manager_->metadata_store().GetDictionaries(
+       isolation_key_,
+       base::BindOnce(
+--- a/net/extras/sqlite/sqlite_persistent_shared_dictionary_store.cc
++++ b/net/extras/sqlite/sqlite_persistent_shared_dictionary_store.cc
+@@ -1777,6 +1777,7 @@
+     uint64_t max_count_per_site,
+     base::OnceCallback<void(RegisterDictionaryResultOrError)> callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(!isolation_key.nonce());
+   backend_->RegisterDictionary(
+       WrapCallbackWithWeakPtrCheck(GetWeakPtr(), std::move(callback)),
+       isolation_key, std::move(dictionary_info), max_size_per_site,
+@@ -1787,6 +1788,7 @@
+     const SharedDictionaryIsolationKey& isolation_key,
+     base::OnceCallback<void(DictionaryListOrError)> callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(!isolation_key.nonce());
+   backend_->GetDictionaries(
+       WrapCallbackWithWeakPtrCheck(GetWeakPtr(), std::move(callback)),
+       isolation_key);
+@@ -1838,6 +1840,7 @@
+     const SharedDictionaryIsolationKey& isolation_key,
+     base::OnceCallback<void(UnguessableTokenSetOrError)> callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(!isolation_key.nonce());
+   backend_->ClearDictionariesForIsolationKey(
+       WrapCallbackWithWeakPtrCheck(GetWeakPtr(), std::move(callback)),
+       isolation_key);

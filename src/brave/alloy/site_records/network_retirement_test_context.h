@@ -17,9 +17,12 @@ namespace alloy::site_records {
 class NetworkRetirementTestContext {
  public:
   explicit NetworkRetirementTestContext(
-      base::OnceCallback<void(net::URLRequestContextBuilder*)> configure = {}) {
+      base::OnceCallback<void(net::URLRequestContextBuilder*)> configure = {},
+      bool cache_dns = false) {
     service_ = network::NetworkService::CreateForTesting();
-    auto resolver = std::make_unique<net::MockHostResolver>();
+    std::unique_ptr<net::MockHostResolverBase> resolver;
+    if (cache_dns) resolver = std::make_unique<net::MockCachingHostResolver>();
+    else resolver = std::make_unique<net::MockHostResolver>();
     resolver_ = resolver.get();
     resolver_->rules()->AddRule("*", "127.0.0.1");
     service_->set_host_resolver_factory_for_testing(
@@ -38,7 +41,7 @@ class NetworkRetirementTestContext {
         std::move(configure));
   }
   network::NetworkContext& context() { return *context_; }
-  net::MockHostResolver& resolver() { return *resolver_; }
+  net::MockHostResolverBase& resolver() { return *resolver_; }
   mojo::Remote<network::mojom::NetworkContext>& remote() { return remote_; }
 
  private:
@@ -72,7 +75,7 @@ class NetworkRetirementTestContext {
   std::unique_ptr<network::NetworkService> service_;
   mojo::Remote<network::mojom::NetworkContext> remote_;
   std::unique_ptr<network::NetworkContext> context_;
-  raw_ptr<net::MockHostResolver> resolver_ = nullptr;
+  raw_ptr<net::MockHostResolverBase> resolver_ = nullptr;
 };
 }  // namespace alloy::site_records
 #endif  // BRAVE_ALLOY_SITE_RECORDS_NETWORK_RETIREMENT_TEST_CONTEXT_H_

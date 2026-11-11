@@ -1,0 +1,57 @@
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -4,5 +4,6 @@
+ 
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/browser/alloy_embedded_state.h"
++#include "content/public/browser/alloy_document_state.h"
+ 
+ #include <stddef.h>
+@@ -8278,5 +8279,6 @@
+ void WebContentsImpl::DidFinishNavigation(NavigationHandle* navigation_handle) {
+   TRACE_EVENT1("navigation", "WebContentsImpl::DidFinishNavigation",
+                "navigation_handle", navigation_handle);
++  RecordAlloyCommittedSiteVisit(navigation_handle);
+ 
+   {
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -134,5 +134,6 @@
+   deps = [
++    "//brave/alloy/site_records:native_profile_configuration",
+     "//components/keyed_service/core",
+     ":child_process_security_policy_impl",
+     "//base",
+     "//base:base_static",
+--- a/components/content_settings/core/browser/website_settings_registry.h
++++ b/components/content_settings/core/browser/website_settings_registry.h
+@@ -110,4 +110,5 @@
+  private:
++  friend class OwnedSettingsRegistries;
+   friend class ContentSettingsRegistryTest;
+   friend class WebsiteSettingsRegistryTest;
+   friend struct base::LazyInstanceTraitsBase<WebsiteSettingsRegistry>;
+--- a/components/content_settings/core/browser/permission_settings_registry.h
++++ b/components/content_settings/core/browser/permission_settings_registry.h
+@@ -74,4 +74,5 @@
+  private:
++  friend class OwnedSettingsRegistries;
+   friend class ContentSettingsRegistryTest;
+   friend struct base::LazyInstanceTraitsBase<PermissionSettingsRegistry>;
+ 
+--- a/components/content_settings/core/browser/content_settings_registry.h
++++ b/components/content_settings/core/browser/content_settings_registry.h
+@@ -53,4 +53,5 @@
+  private:
++  friend class OwnedSettingsRegistries;
+   friend class ContentSettingsRegistryTest;
+   friend struct base::LazyInstanceTraitsBase<ContentSettingsRegistry>;
+ 
+--- a/components/content_settings/core/browser/BUILD.gn
++++ b/components/content_settings/core/browser/BUILD.gn
+@@ -7,4 +7,5 @@
+ 
+ static_library("browser") {
+   sources = [
++    "owned_settings_registries.h",
+     "content_settings_default_provider.cc",

@@ -1,0 +1,493 @@
+--- a/content/public/browser/file_system_access_entry_factory.h
++++ b/content/public/browser/file_system_access_entry_factory.h
+@@ -6,6 +6,9 @@
+ #define CONTENT_PUBLIC_BROWSER_FILE_SYSTEM_ACCESS_ENTRY_FACTORY_H_
+ 
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "components/services/storage/public/cpp/buckets/bucket_locator.h"
++#include "third_party/blink/public/mojom/file_system_access/file_system_access_error.mojom.h"
+ #include "base/memory/ref_counted.h"
+ #include "content/common/content_export.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -58,6 +61,16 @@
+           url(url),
+           frame_id(worker_process_id, IPC::mojom::kRoutingIdNone),
+           is_worker(true) {}
++    using SandboxedCallback = base::OnceCallback<void(
++        blink::mojom::FileSystemAccessErrorPtr,
++        mojo::PendingRemote<blink::mojom::FileSystemAccessDirectoryHandle>)>;
++    using SandboxedDelegate = base::RepeatingCallback<void(
++        const BindingContext&, const std::optional<storage::BucketLocator>&,
++        const std::vector<std::string>&, SandboxedCallback)>;
++    // Browser-injected backing/lifetime inputs. External user-file pickers
++    // retain their original manager; only managed storage uses this delegate.
++    SandboxedDelegate sandboxed_delegate;
++    base::RepeatingCallback<bool()> storage_admission;
+     blink::StorageKey storage_key;
+     GURL url;
+     GlobalRenderFrameHostId frame_id;
+--- a/content/browser/file_system_access/file_system_access_manager_impl.h
++++ b/content/browser/file_system_access/file_system_access_manager_impl.h
+@@ -10,7 +10,7 @@
+ #include "base/containers/flat_set.h"
+ #include "base/containers/unique_ptr_adapters.h"
+ #include "base/files/file_path.h"
+-#include "base/functional/callback_forward.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/sequence_checker.h"
+@@ -110,7 +110,8 @@
+       scoped_refptr<storage::FileSystemContext> context,
+       scoped_refptr<ChromeBlobStorageContext> blob_context,
+       FileSystemAccessPermissionContext* permission_context,
+-      bool off_the_record);
++      bool off_the_record, base::RepeatingCallback<bool()> storage_admission = {});
++  void ShutdownStorageScope();
+   FileSystemAccessManagerImpl(const FileSystemAccessManagerImpl&) = delete;
+   FileSystemAccessManagerImpl& operator=(const FileSystemAccessManagerImpl&) =
+       delete;
+@@ -337,8 +338,15 @@
+                : nullptr;
+   }
+ 
++  bool IsStorageScopeActive() const {
++    return !storage_shutdown_ &&
++        (!storage_admission_ || storage_admission_.Run());
++  }
++
+   bool IsBindingContextValid(const BindingContext& binding_context) {
+-    return !document_context_required_ || permission_context(binding_context);
++    return IsStorageScopeActive() &&
++        (!binding_context.storage_admission || binding_context.storage_admission.Run()) &&
++        (!document_context_required_ || permission_context(binding_context));
+   }
+ 
+   FileSystemAccessWatcherManager& watcher_manager() {
+@@ -733,6 +741,8 @@
+       access_handle_host_receivers_ GUARDED_BY_CONTEXT(sequence_checker_);
+ 
+   const bool off_the_record_;
++  const base::RepeatingCallback<bool()> storage_admission_;
++  bool storage_shutdown_ = false;
+ 
+   // FileSystemAccessTransferTokenImpl owns a Transfer token receiver set and is
+   // removed from this map when all mojo connections are closed.
+--- a/content/browser/file_system_access/file_system_access_manager_impl.cc
++++ b/content/browser/file_system_access/file_system_access_manager_impl.cc
+@@ -564,7 +564,7 @@
+     scoped_refptr<storage::FileSystemContext> context,
+     scoped_refptr<ChromeBlobStorageContext> blob_context,
+     FileSystemAccessPermissionContext* permission_context,
+-    bool off_the_record)
++    bool off_the_record, base::RepeatingCallback<bool()> storage_admission)
+     : context_(std::move(context)),
+       blob_context_(std::move(blob_context)),
+       permission_context_(permission_context),
+@@ -573,10 +573,28 @@
+       lock_manager_(
+           base::MakeRefCounted<FileSystemAccessLockManager>(PassKey())),
+       watcher_manager_(this, PassKey()),
+-      off_the_record_(off_the_record) {
++      off_the_record_(off_the_record), storage_admission_(std::move(storage_admission)) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
+   CHECK(context_, base::NotFatalUntil::M159);
+   CHECK(blob_context_, base::NotFatalUntil::M159);
++}
++
++void FileSystemAccessManagerImpl::ShutdownStorageScope() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(storage_admission_);
++  if (storage_shutdown_) { return; }
++  storage_shutdown_ = true;
++  weak_factory_.InvalidateWeakPtrs();
++  receivers_.Clear();
++  internals_receivers_.Clear();
++  writer_receivers_.clear();
++  access_handle_host_receivers_.clear();
++  file_receivers_.Clear();
++  directory_receivers_.Clear();
++  transfer_tokens_.clear();
++  data_transfer_tokens_.clear();
++  file_ids_.clear();
++  directory_ids_.clear();
+ }
+ 
+ FileSystemAccessManagerImpl::~FileSystemAccessManagerImpl() {
+@@ -650,6 +668,18 @@
+     return;
+   }
+ 
++  if (binding_context.sandboxed_delegate) {
++    auto native_binding = binding_context;
++    native_binding.sandboxed_delegate.Reset();
++    binding_context.sandboxed_delegate.Run(native_binding, bucket,
++        directory_path_components, std::move(callback));
++    return;
++  }
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(file_system_access_error::FromFileError(
++        base::File::FILE_ERROR_SECURITY), mojo::NullRemote());
++    return;
++  }
+   auto response_callback = base::BindOnce(
+       [](base::WeakPtr<FileSystemAccessManagerImpl> manager,
+          const BindingContext& callback_binding_context,
+@@ -1504,6 +1534,7 @@
+   CHECK(url.is_valid(), base::NotFatalUntil::M159);
+ 
+   mojo::PendingRemote<blink::mojom::FileSystemAccessFileHandle> result;
++  if (!IsBindingContextValid(binding_context)) { return result; }
+   file_receivers_.Add(
+       std::make_unique<FileSystemAccessFileHandleImpl>(
+           this, binding_context, url, display_name, handle_state),
+@@ -1520,6 +1551,7 @@
+   DCHECK(url.is_valid());
+ 
+   mojo::PendingRemote<blink::mojom::FileSystemAccessDirectoryHandle> result;
++  if (!IsBindingContextValid(binding_context)) { return result; }
+   directory_receivers_.Add(
+       std::make_unique<FileSystemAccessDirectoryHandleImpl>(
+           this, binding_context, url, handle_state),
+@@ -1616,6 +1648,7 @@
+     download::QuarantineConnectionCallback quarantine_connection_callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (!IsBindingContextValid(binding_context)) { return {}; }
+   auto writer = std::make_unique<FileSystemAccessFileWriterImpl>(
+       this, PassKey(), binding_context, url, swap_url, std::move(lock),
+       std::move(swap_lock), handle_state, std::move(receiver),
+@@ -1642,6 +1675,7 @@
+ 
+   mojo::PendingRemote<blink::mojom::FileSystemAccessAccessHandleHost> result;
+   auto receiver = result.InitWithNewPipeAndPassReceiver();
++  if (!IsStorageScopeActive()) { return {}; }
+   auto access_handle_host =
+       std::make_unique<FileSystemAccessAccessHandleHostImpl>(
+           this, url, std::move(lock), PassKey(), std::move(receiver),
+@@ -1696,7 +1730,8 @@
+     FileSystemAccessTransferTokenImpl* resolved_token) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  if (!IsValidTransferToken(resolved_token,
++  if (!IsBindingContextValid(binding_context) ||
++      !IsValidTransferToken(resolved_token,
+                             binding_context.storage_key.origin(),
+                             HandleType::kFile)) {
+     // Fail silently. In practice, the FileSystemAccessManager should not
+@@ -1722,7 +1757,8 @@
+     FileSystemAccessTransferTokenImpl* resolved_token) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  if (!IsValidTransferToken(resolved_token,
++  if (!IsBindingContextValid(binding_context) ||
++      !IsValidTransferToken(resolved_token,
+                             binding_context.storage_key.origin(),
+                             HandleType::kDirectory)) {
+     // Fail silently. See comment above in
+@@ -1755,6 +1791,12 @@
+     const std::vector<std::string>& directory_path_components) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(file_system_access_error::FromStatus(
++        blink::mojom::FileSystemAccessStatus::kOperationAborted), mojo::NullRemote());
++    return;
++  }
++
+   if (result != base::File::FILE_OK) {
+     std::move(callback).Run(file_system_access_error::FromFileError(result),
+                             mojo::NullRemote());
+@@ -1795,6 +1837,12 @@
+     const storage::FileSystemURL& url,
+     base::File::Error result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++
++  if (!IsBindingContextValid(binding_context)) {
++    std::move(callback).Run(file_system_access_error::FromStatus(
++        blink::mojom::FileSystemAccessStatus::kOperationAborted), mojo::NullRemote());
++    return;
++  }
+ 
+   if (result != base::File::FILE_OK) {
+     std::move(callback).Run(file_system_access_error::FromFileError(result),
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -6,6 +6,7 @@
+ // channel. There will be one RenderProcessHost per renderer process.
+ 
+ #include "content/browser/renderer_host/render_process_host_impl.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+ 
+ #include <algorithm>
+@@ -2384,9 +2385,8 @@
+     return;
+   }
+ 
+-  storage_partition_impl_->BindIndexedDB(
+-      storage::BucketLocator::ForDefaultBucket(storage_key),
+-      bucket_context.GetBucketClientInfo(), std::move(receiver));
++  BindAlloyBucketIndexedDB(*storage_partition_impl_, bucket_context,
++      storage::BucketLocator::ForDefaultBucket(storage_key), std::move(receiver));
+ }
+ 
+ void RenderProcessHostImpl::BindBucketManagerHost(
+--- a/content/browser/buckets/bucket_host.cc
++++ b/content/browser/buckets/bucket_host.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/buckets/bucket_host.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include "base/functional/bind.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -169,9 +170,8 @@
+     return;
+   }
+ 
+-  bucket_manager_host_->GetStoragePartition()->BindIndexedDB(
+-      bucket_info_.ToBucketLocator(), bucket_context->GetBucketClientInfo(),
+-      std::move(receiver));
++  BindAlloyBucketIndexedDB(*bucket_manager_host_->GetStoragePartition(),
++      *bucket_context, bucket_info_.ToBucketLocator(), std::move(receiver));
+ }
+ 
+ void BucketHost::GetCaches(
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ #include "content/browser/alloy_embedded_state.h"
+ 
+ #include <algorithm>
+@@ -15137,7 +15138,7 @@
+   if (dip_reporter_) {
+     dip_reporter_->Clone(dip_reporter_remote.InitWithNewPipeAndPassReceiver());
+   }
+-  GetProcess()->BindCacheStorage(
++  BindAlloyBucketCacheStorage(*GetProcess(), GetBucketStorageOwner(), GetBucketStorageKey(),
+       cross_origin_embedder_policy(), std::move(coep_reporter_remote),
+       policy_container_host_->document_isolation_policy(),
+       std::move(dip_reporter_remote), bucket_locator, std::move(receiver));
+@@ -15304,8 +15305,9 @@
+   CHECK_CURRENTLY_ON(BrowserThread::UI);
+   auto* manager = GetStoragePartition()->GetFileSystemAccessManager();
+   manager->BindReceiver(
+-      FileSystemAccessManagerImpl::BindingContext(
+-          GetStorageKey(), GetLastCommittedURL(), GetGlobalId()),
++      WithAlloyBucketFileSystem(*static_cast<StoragePartitionImpl*>(GetStoragePartition()),
++          *this, FileSystemAccessManagerImpl::BindingContext(
++          GetStorageKey(), GetLastCommittedURL(), GetGlobalId())),
+       std::move(receiver));
+ }
+ 
+@@ -20217,8 +20219,9 @@
+     const std::vector<std::string>& directory_path_components,
+     blink::mojom::BucketHost::GetDirectoryCallback callback) {
+   GetStoragePartition()->GetFileSystemAccessManager()->GetSandboxedFileSystem(
+-      FileSystemAccessManagerImpl::BindingContext(
+-          GetStorageKey(), GetLastCommittedURL(), GetGlobalId()),
++      WithAlloyBucketFileSystem(*static_cast<StoragePartitionImpl*>(GetStoragePartition()),
++          *this, FileSystemAccessManagerImpl::BindingContext(
++          GetStorageKey(), GetLastCommittedURL(), GetGlobalId())),
+       bucket.ToBucketLocator(), directory_path_components, std::move(callback));
+ }
+ 
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/dedicated_worker_host.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ #include "content/browser/alloy_embedded_state.h"
+ 
+ #include <memory>
+@@ -1070,7 +1071,8 @@
+       GetWorkerStorageKey().origin().GetURL(), GetAncestorRenderFrameHostId(),
+       /*is_worker=*/true);
+   binding_context.document = ancestor_document_;
+-  manager->BindReceiver(binding_context, std::move(receiver));
++  manager->BindReceiver(WithAlloyBucketFileSystem(*storage_partition_impl,
++      *this, std::move(binding_context)), std::move(receiver));
+ }
+ 
+ #if BUILDFLAG(ENABLE_COMPUTE_PRESSURE)
+@@ -1269,7 +1271,7 @@
+   if (dip_reporter_) {
+     dip_reporter_->Clone(dip_reporter.InitWithNewPipeAndPassReceiver());
+   }
+-  worker_process_host_->BindCacheStorage(
++  BindAlloyBucketCacheStorage(*worker_process_host_, GetBucketStorageOwner(), GetBucketStorageKey(),
+       cross_origin_embedder_policy(), std::move(coep_reporter),
+       worker_client_security_state_->document_isolation_policy,
+       std::move(dip_reporter), bucket_locator, std::move(receiver));
+@@ -1279,7 +1281,7 @@
+     const storage::BucketInfo& bucket,
+     const std::vector<std::string>& directory_path_components,
+     blink::mojom::BucketHost::GetDirectoryCallback callback) {
+-  GetProcessHost()->GetSandboxedFileSystemForBucket(
++  GetAlloyWorkerBucketDirectory(*GetProcessHost(), *this,
+       bucket.ToBucketLocator(), directory_path_components, std::move(callback));
+ }
+ 
+--- a/content/browser/worker_host/shared_worker_host.cc
++++ b/content/browser/worker_host/shared_worker_host.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/shared_worker_host.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -614,7 +615,7 @@
+     dip_reporter_->Clone(dip_reporter.InitWithNewPipeAndPassReceiver());
+   }
+ 
+-  GetProcessHost()->BindCacheStorage(
++  BindAlloyBucketCacheStorage(*GetProcessHost(), GetBucketStorageOwner(), GetBucketStorageKey(),
+       cross_origin_embedder_policy(), std::move(coep_reporter),
+       worker_client_security_state_->document_isolation_policy,
+       std::move(dip_reporter), bucket_locator, std::move(receiver));
+@@ -658,7 +659,7 @@
+     const storage::BucketInfo& bucket,
+     const std::vector<std::string>& directory_path_components,
+     blink::mojom::BucketHost::GetDirectoryCallback callback) {
+-  GetProcessHost()->GetSandboxedFileSystemForBucket(
++  GetAlloyWorkerBucketDirectory(*GetProcessHost(), *this,
+       bucket.ToBucketLocator(), directory_path_components, std::move(callback));
+ }
+ 
+--- a/content/browser/service_worker/service_worker_host.cc
++++ b/content/browser/service_worker/service_worker_host.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/service_worker/service_worker_host.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include <utility>
+ 
+@@ -136,9 +137,8 @@
+         callback) {
+   auto* process = GetProcessHost();
+   if (process) {
+-    process->GetSandboxedFileSystemForBucket(bucket.ToBucketLocator(),
+-                                             directory_path_components,
+-                                             std::move(callback));
++    GetAlloyWorkerBucketDirectory(*process, *this, bucket.ToBucketLocator(),
++                                        directory_path_components, std::move(callback));
+   } else {
+     std::move(callback).Run(
+         file_system_access_error::FromStatus(
+--- a/content/browser/service_worker/embedded_worker_instance.cc
++++ b/content/browser/service_worker/embedded_worker_instance.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/service_worker/embedded_worker_instance.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -1192,7 +1193,9 @@
+         return;
+       }
+ 
+-      rph->BindCacheStorage(*coep, std::move(coep_reporter_remote), *dip,
++      BindAlloyBucketCacheStorage(*rph,
++          owner_version_->context()->wrapper()->bucket_storage_owner(),
++          owner_version_->key(), *coep, std::move(coep_reporter_remote), *dip,
+                             std::move(dip_reporter_remote), request.bucket,
+                             std::move(request.receiver));
+     }
+--- a/content/browser/browser_interface_binders.cc
++++ b/content/browser/browser_interface_binders.cc
+@@ -458,6 +458,20 @@
+       *static_cast<StoragePartitionImpl*>(host->GetProcessHost()->GetStoragePartition()),
+       *host, std::move(receiver));
+ }
++template <typename Host>
++void BindWorkerOwnedFileSystem(Host* host,
++    mojo::PendingReceiver<blink::mojom::FileSystemAccessManager> receiver) {
++  if (auto* process = host->GetProcessHost()) {
++    BindAlloyWorkerFileSystemAccess(*process, *host, std::move(receiver));
++  }
++}
++void BindServiceWorkerOwnedFileSystem(ServiceWorkerHost* host,
++    const ServiceWorkerVersionBaseInfo& info,
++    mojo::PendingReceiver<blink::mojom::FileSystemAccessManager> receiver) {
++  if (info.storage_key != host->GetBucketStorageKey()) { return; }
++  BindWorkerOwnedFileSystem(host, std::move(receiver));
++}
++
+ void BindServiceWorkerOwnedQuota(ServiceWorkerHost* host,
+     const ServiceWorkerVersionBaseInfo& info,
+     mojo::PendingReceiver<blink::mojom::QuotaManagerHost> receiver) {
+@@ -1824,9 +1838,8 @@
+       &RenderProcessHostImpl::BindWebrtcVideoPerfHistory, host));
+ 
+   // RenderProcessHost binders taking a StorageKey
+-  map->Add<blink::mojom::FileSystemAccessManager>(
+-      BindWorkerReceiverForStorageKey(
+-          &RenderProcessHostImpl::BindFileSystemAccessManager, host));
++  map->Add<blink::mojom::FileSystemAccessManager>(base::BindRepeating(
++      &BindWorkerOwnedFileSystem<SharedWorkerHost>, base::Unretained(host)));
+   map->Add<blink::mojom::FileSystemManager>(BindWorkerReceiverForStorageKey(
+       &RenderProcessHostImpl::BindFileSystemManager, host));
+   map->Add<blink::mojom::IDBFactory>(
+@@ -2001,9 +2014,8 @@
+   map->Add<blink::mojom::IDBFactory>(
+       BindServiceWorkerReceiverForStorageKeyAndBucketContext(
+           &RenderProcessHostImpl::BindIndexedDB, host));
+-  map->Add<blink::mojom::FileSystemAccessManager>(
+-      BindServiceWorkerReceiverForStorageKey(
+-          &RenderProcessHostImpl::BindFileSystemAccessManager, host));
++  map->Add<blink::mojom::FileSystemAccessManager>(base::BindRepeating(
++      &BindServiceWorkerOwnedFileSystem, base::Unretained(host)));
+   map->Add<blink::mojom::LockManager>(BindServiceWorkerReceiverForStorageKey(
+       &RenderProcessHostImpl::CreateLockManager, host));
+   map->Add<blink::mojom::QuotaManagerHost>(base::BindRepeating(
+--- a/content/browser/storage_access/storage_access_handle.cc
++++ b/content/browser/storage_access/storage_access_handle.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/storage_access/storage_access_handle.h"
++#include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ 
+ #include "base/byte_size.h"
+ #include "base/functional/callback_helpers.h"
+@@ -94,7 +95,7 @@
+     host.dip_reporter()->Clone(
+         dip_reporter_remote.InitWithNewPipeAndPassReceiver());
+   }
+-  host.GetProcess()->BindCacheStorage(
++  BindAlloyBucketCacheStorage(*host.GetProcess(), host.GetBucketStorageOwner(), host.GetBucketStorageKey(),
+       host.cross_origin_embedder_policy(), std::move(coep_reporter_remote),
+       host.policy_container_host()->policies().document_isolation_policy,
+       std::move(dip_reporter_remote),
+@@ -108,11 +109,14 @@
+       .GetStoragePartition()
+       ->GetFileSystemAccessManager()
+       ->GetSandboxedFileSystem(
+-          FileSystemAccessManagerImpl::BindingContext(
++          WithAlloyBucketFileSystem(
++              *static_cast<RenderFrameHostImpl&>(render_frame_host()).GetStoragePartition(),
++              static_cast<RenderFrameHostImpl&>(render_frame_host()),
++              FileSystemAccessManagerImpl::BindingContext(
+               blink::StorageKey::CreateFirstParty(
+                   render_frame_host().GetStorageKey().origin()),
+               render_frame_host().GetLastCommittedURL(),
+-              render_frame_host().GetGlobalId()),
++              render_frame_host().GetGlobalId())),
+           /*bucket=*/std::nullopt,
+           /*directory_path_components=*/{}, std::move(callback));
+ }

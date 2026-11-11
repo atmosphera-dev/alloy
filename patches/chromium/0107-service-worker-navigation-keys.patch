@@ -1,0 +1,36 @@
+--- a/content/browser/service_worker/service_worker_client.cc
++++ b/content/browser/service_worker/service_worker_client.cc
+@@ -678,6 +678,7 @@
+ // for https://crbug.com/1346450.
+ std::optional<blink::StorageKey> GetStorageKeyFromRenderFrameHost(
+     FrameTreeNodeId frame_tree_node_id,
++    const GURL& url,
+     const url::Origin& origin,
+     const base::UnguessableToken* nonce) {
+   FrameTreeNode* frame_tree_node =
+@@ -690,6 +691,16 @@
+     return std::nullopt;
+   }
+ 
++  if (auto* navigation = frame_tree_node->navigation_request()) {
++    // The handle's isolation nonce describes the initial request. Each pending
++    // navigation hop must derive its native key from that hop's browser-owned
++    // candidate, including native credentialless/fenced-frame nonce rules.
++    const auto isolation = frame_host->ComputeIsolationInfoForNavigation(
++        url, navigation->is_credentialless(),
++        navigation->ComputeFencedFrameNonce(), navigation);
++    return frame_host->CalculateStorageKey(
++        origin, base::OptionalToPtr(isolation.nonce()), navigation);
++  }
+   return frame_host->CalculateStorageKey(origin, nonce);
+ }
+ 
+@@ -751,7 +762,7 @@
+             // `render_frame_host_id` because this method is called before
+             // response commit.
+             return GetStorageKeyFromRenderFrameHost(
+-                ongoing_navigation_frame_tree_node_id_, origin,
++                ongoing_navigation_frame_tree_node_id_, url, origin,
+                 base::OptionalToPtr(isolation_info_from_handle.nonce()));
+           },
+           [&](blink::DedicatedWorkerToken dedicated_worker_token) {

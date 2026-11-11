@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""NUC-only native request-context storage, lifetime and TLS/network probe."""
+"""Approved-workspace native storage, lifetime and TLS/network probe."""
 import argparse
 from datetime import datetime, timezone
 import errno
@@ -20,11 +20,14 @@ import sys
 import threading
 import time
 import traceback
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
 sys.dont_write_bytecode = True
 from workspace import PRIMARY, temp_path, validate_output, workspace_path
+import profile_system_cache as system_cache
+from profile_control import CDP_CONTROL, page_control_script
+from profile_inventory import observe_tree
 
 REPO = Path(__file__).resolve().parents[1]
 W = workspace_path(REPO)
@@ -41,20 +44,39 @@ NOISE_FUNCTION = r'''function(canvas){
 }'''
 
 CDP_HELPERS = r'''
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function sleep(ms){
+  const deadline=performance.now()+ms;
+  for(let remaining=deadline-performance.now();remaining>0;remaining=deadline-performance.now())
+    await new Promise(resolve=>setTimeout(resolve,Math.ceil(remaining)));
+}
 const check=(ok,why)=>{if(!ok)throw Error(why)};
-async function until(fn,why){let last='';for(let n=0;n<200;n++){try{const v=await fn();if(v)return v}catch(e){last=String(e)}await sleep(100)}throw Error(why+' '+last)}
+async function until(fn,why){let last='';for(let n=0;n<200;n++){try{const v=await fn();if(v)return v}catch(e){if(e.cdpTerminal)throw e;last=String(e)}await sleep(100)}throw Error(why+' '+last)}
 async function pageTargets(){return(await(await fetch(`http://127.0.0.1:${port}/json/list`)).json()).filter(t=>t.type==='page')}
-function connect(target){return new Promise((resolve,reject)=>{
-  const ws=new WebSocket(target.webSocketDebuggerUrl),wait=new Map();let id=0;
-  ws.onerror=reject;
-  ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=wait.get(m.id);if(p){wait.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}}};
-  ws.onopen=()=>resolve({ws,send(method,params={}){return new Promise((resolve,reject)=>{const k=++id;wait.set(k,{resolve,reject});ws.send(JSON.stringify({id:k,method,params}))})}})
+function connect(target){const commandTimeout=120000;return new Promise((resolve,reject)=>{
+  const ws=new WebSocket(target.webSocketDebuggerUrl),wait=new Map();let id=0,opened=false,terminal=null;
+  function fail(why){
+    terminal??=Object.assign(Error('CDP '+target.id+' '+why),{cdpTerminal:true});
+    for(const pending of wait.values()){clearTimeout(pending.timer);pending.reject(terminal)}
+    wait.clear();if(!opened)reject(terminal);
+  }
+  ws.onerror=e=>fail('socket error '+(e.message??''));
+  ws.onclose=e=>fail('socket closed '+e.code+' '+e.reason);
+  ws.onmessage=e=>{
+    let m;try{m=JSON.parse(e.data)}catch(error){fail('invalid protocol response');return}
+    if(m.id){const pending=wait.get(m.id);if(pending){wait.delete(m.id);clearTimeout(pending.timer);m.error?pending.reject(Error(JSON.stringify(m.error))):pending.resolve(m.result)}}
+  };
+  ws.onopen=()=>{opened=true;resolve({ws,send(method,params={}){return new Promise((resolve,reject)=>{
+    if(terminal){reject(terminal);return}
+    if(ws.readyState!==WebSocket.OPEN){fail('socket not open');reject(terminal);return}
+    const k=++id,timer=setTimeout(()=>fail('command deadline '+method+' id='+k),commandTimeout);
+    wait.set(k,{resolve,reject,timer});
+    try{ws.send(JSON.stringify({id:k,method,params}))}catch(error){fail('send failed '+method+' '+error)}
+  })}})};
 })}
 async function value(c,expression){const r=await c.send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});check(!r.exceptionDetails,JSON.stringify(r.exceptionDetails));return r.result.value}
 async function committedHistory(c,url=null){return until(async()=>{const h=await c.send('Page.getNavigationHistory');const current=h.entries[h.currentIndex]?.url;return current&&(!url||current===url)?h:null},'native navigation entry commit')}
 async function nativeEvents(){return(await readFile(eventLog,'utf8')).split('\n').filter(l=>l.startsWith('PROFILE_EVENT ')).map(l=>JSON.parse(l.slice(14)))}
-'''
+''' + CDP_CONTROL
 
 DATALIST_HELPERS = r'''
 async function popupCount(){try{return JSON.parse(await readFile(popupReceipt,'utf8')).completed.length}catch(e){if(e.code==='ENOENT')return 0;throw e}}
@@ -135,7 +157,7 @@ const userAction=createNativeActionSequencer({
 const parentTarget=await until(async()=>{const t=await pageTargets();return t.length===1&&t[0].url==='about:blank'?t[0]:null},'ready parent browser');
 async function targets(){return(await pageTargets()).filter(t=>t.id!==parentTarget.id)}
 const parent=await connect(parentTarget);await parent.send('Page.enable');await committedHistory(parent);
-await value(parent,"document.title='ALLOY_PROFILE_PROBE:start-stateless'");
+await control(parent,'start-stateless');
 await until(async()=>{const t=await targets();const events=await nativeEvents();return t.length===2&&events.filter(e=>e.event==='created').length===2},'two native stateless browsers created');
 parent.ws.close();
 const list=await until(async()=>{const t=await targets();return t.length===2&&t.every(v=>v.url==='about:blank')?t:null},'two native blank tabs');
@@ -146,7 +168,7 @@ const start=performance.now(),proof={mode,checks:[],loads:[],parentTarget:parent
 function pass(name){proof.checks.push(name)}
 async function load(label,origin=base){const url=origin+'/page/'+label;const r=await main.send('Page.navigate',{url});check(!r.errorText,'navigation '+JSON.stringify(r));
   const state=await until(async()=>{const v=await value(main,'({ready:document.readyState,url:location.href,nonce:window.docNonce,title:document.title})');return v.ready==='complete'&&v.url===url&&v.nonce?v:null},'load '+label);
-  await committedHistory(main,url);proof.loads.push(state);return state}
+  await committedHistory(main,url);await pageControl(main);proof.loads.push(state);return state}
 async function echo(){return value(main,"fetch('/echo').then(r=>r.json())")}
 async function permission(c=main){return value(c,"navigator.permissions.query({name:'geolocation'}).then(p=>p.state)")}
 async function workerPermission(c=main){return value(c,`new Promise((resolve,reject)=>{
@@ -179,13 +201,13 @@ else if(certificateBase){
   const live=(await nativeEvents()).filter(e=>e.event==='certificate');
   check(live.length>0&&live.every(e=>e.held===0),'real certificate callback was bypassed');
   check((await echo()).connection,'accepted native certificate did not reach HTTP consumer');
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:hold-certificate'");
+  await control(main,'hold-certificate');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='certificate-hold-ready'),'certificate hold control');
   const pendingNavigation=main.send('Page.navigate',{url:certificateBase+'/page/certificate-held'})
     .then(result=>({result}),error=>({protocolError:String(error)}));
   const held=await until(async()=>(await nativeEvents()).find(e=>e.event==='certificate'&&e.held),'held native certificate callback');
   await load('certificate-replacement');
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:release-held-certificate'");
+  await control(main,'release-held-certificate');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='certificate-released'),'late certificate callback release');
   check(await value(main,'location.href')===base+'/page/certificate-replacement','late certificate callback retargeted the current document');
   const previous=(await nativeEvents()).filter(e=>e.event==='certificate').length;
@@ -279,7 +301,7 @@ else {
   proof.files.saved=saved.result.value;
   }
   const zoomBefore=await value(main,'devicePixelRatio'),peerZoom=await value(keeper,'devicePixelRatio');
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:zoom-set'");
+  await control(main,'zoom-set');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='zoom'&&e.level===1),'native zoom control');
   const zoomed=await until(async()=>{const valueNow=await value(main,'devicePixelRatio');return valueNow>zoomBefore+.1?valueNow:null},'renderer did not consume zoom');
   check(await value(keeper,'devicePixelRatio')===peerZoom,'document zoom leaked to sibling');
@@ -316,14 +338,14 @@ else {
   check(h.currentIndex===h.entries.length-1&&!h.entries.some(e=>e.url===base+'/page/c'),'forward stack not truncated');
   proof.history={back,forward,afterBranch:h};pass('url-only-back-forward');
   await load('permission-pending');
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:hold-permission'");
+  await control(main,'hold-permission');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='permission-hold-ready'),'native permission hold control');
   await value(main,`window.pendingLocation=new Promise(resolve=>navigator.geolocation.getCurrentPosition(
     ()=>resolve('granted'),()=>resolve('cancelled'),{timeout:15000}));true`);
   const held=await until(async()=>(await nativeEvents()).find(e=>e.event==='permission'&&e.held),'native pending permission');
   await load('permission-replacement');
   const dismissed=await until(async()=>(await nativeEvents()).find(e=>e.event==='permission-dismissed'&&e.prompt===held.prompt),'pending permission cancelled on navigation');
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:release-held-permission'");
+  await control(main,'release-held-permission');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='permission-released'&&e.prompt===held.prompt),'late native callback release');
   check(await permission()==='prompt'&&await workerPermission()==='prompt','expired grant authorized replacement document');
   const replacementPosition=await locate();
@@ -333,12 +355,12 @@ else {
   check(await permission(keeper)==='prompt','replacement grant leaked to sibling');
   proof.permissions.stale={held,dismissed,prompts,replacementPosition};pass('expired-permission-callback');
   if(filesEnabled){
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:hold-file'");
+  await control(main,'hold-file');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='file-hold-ready'),'native file hold control');
   await userAction(main,{expression:"window.pendingFile=showOpenFilePicker().catch(e=>e.name);true"});
   await until(async()=>(await nativeEvents()).some(e=>e.event==='file-picker'&&e.held),'native held file picker');
   await load('file-replacement');
-  await value(main,"document.title='ALLOY_PROFILE_PROBE:release-held-file'");
+  await control(main,'release-held-file');
   await until(async()=>(await nativeEvents()).some(e=>e.event==='file-released'),'late native file picker callback');
   const freshFile=await userAction(main,{awaitPromise:true,returnByValue:true,
     expression:"showOpenFilePicker().then(async([f])=>({permission:await f.queryPermission({mode:'read'}),text:await(await f.getFile()).text()}))"});
@@ -355,7 +377,7 @@ else {
   proof.tls={inside,ticket};pass('tls-session-boundary');
   const response=await fetch(`http://127.0.0.1:${port}/json/close/${list[0].id}`);check(response.ok,'native tab close refused');
   await until(async()=>{const t=await targets();return t.length===1&&!t.some(x=>x.id===list[0].id)},'tab did not close');
-  await value(keeper,`document.title='ALLOY_PROFILE_PROBE:open-tab-'+${JSON.stringify(secret)}`);
+  await control(keeper,'open-tab-'+secret);
   const reopened=await until(async()=>{const t=await targets();return t.length===2?t.find(x=>x.id!==list[1].id):null},'native tab reopen');
   const fresh=await connect(reopened);const empty=await committedHistory(fresh);
   check(empty.entries.length<=1&&empty.entries.every(e=>e.url==='about:blank'),'closed tab history retained '+JSON.stringify(empty));
@@ -384,7 +406,7 @@ const closed=await until(async()=>{
 const remaining=await pageTargets();
 check(remaining.length===1&&remaining[0].id===parentID,'unexpected remaining browser');
 const parent=await connect(remaining[0]);
-await value(parent,"document.title='ALLOY_PROFILE_PROBE:dispose-stateless'");
+await control(parent,'dispose-stateless');
 await until(async()=>(await nativeEvents()).some(e=>e.event==='stateless-released'),'native context references released');
 parent.ws.close();console.log(JSON.stringify({parent:parentID,closed}));
 '''
@@ -414,23 +436,63 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2)+'\n')
 
 
+def finalize_case(page_root, proof):
+    """Create the canonical case value only after its caller finishes enrichment."""
+    assert not (page_root/'proof.json').exists()
+    snapshot = json.loads(json.dumps(proof))
+    save(page_root/'proof.json', snapshot)
+    return snapshot
+
+
+def publish_case(evidence, page_root, results, proof):
+    """Publish one finalized value to both evidence views without shared aliases."""
+    assert page_root.parent == evidence
+    snapshot = finalize_case(page_root, proof)
+    results.append(snapshot)
+    save(evidence/'results.json', results)
+
+
 class Fixture(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, certificate, key, evidence):
+    def __init__(self, certificate, key, evidence, secure=True):
         super().__init__(('127.0.0.1', 0), Handler)
-        self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.tls.minimum_version = self.tls.maximum_version = ssl.TLSVersion.TLSv1_2
-        self.tls.load_cert_chain(certificate, key)
+        self.tls = None
+        if secure:
+            self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.tls.minimum_version = self.tls.maximum_version = ssl.TLSVersion.TLSv1_2
+            self.tls.load_cert_chain(certificate, key)
         self.connections = itertools.count(1)
         self.lock = threading.Lock()
         self.sockets = set()
         self.events = []
         self.evidence = evidence
+        self.trial_token = None
+
+    def origin_trial_token(self):
+        with self.lock:
+            if self.trial_token is None:
+                tool = W/'src/tools/origin_trials/generate_token.py'
+                # Chromium's published test key, never a production signing key.
+                import base64
+                public = base64.b64encode((tool.parent/'eftest.key').read_bytes()[32:]).decode()
+                assert public == 'dRCs+TocuKkocNKa0AtZ4awrt9XKH2SQCI6o4FY6BNA='
+                origin = 'https://localhost:'+str(self.server_port)
+                output = subprocess.check_output(['python3', str(tool), origin,
+                    'FrobulatePersistent', '--expire-timestamp=2000000000'], text=True, timeout=20)
+                tokens = [line for line in output.splitlines()
+                          if line and all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=' for c in line)]
+                self.trial_token = tokens[-1]
+                payload = json.loads(base64.b64decode(self.trial_token)[69:])
+                assert payload['origin'] == origin and payload['feature'] == 'FrobulatePersistent'
+                assert payload['expiry'] == 2000000000
+            return self.trial_token
 
     def get_request(self):
         connection, peer = super().get_request()
         connection.settimeout(20)
+        if self.tls is None:
+            return connection, peer
         return self.tls.wrap_socket(connection, server_side=True,
                                     do_handshake_on_connect=False), peer
 
@@ -466,17 +528,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        secure = isinstance(self.connection, ssl.SSLSocket)
         proof = dict(path=path, connection=self.connection_id,
-                     resumed=self.connection.session_reused,
-                     session=self.connection.session.id.hex(),
-                     cookie=self.headers.get('Cookie', ''))
+                     resumed=self.connection.session_reused if secure else False,
+                     session=self.connection.session.id.hex() if secure else '',
+                      cookie=self.headers.get('Cookie', ''))
+        if path in ('/embedded-cookie-write', '/embedded-network-echo', '/embedded-http-cache', '/embedded-origin-trial', '/embedded-sw.js'):
+            markers = parse_qs(urlsplit(self.path).query).get('marker', [])
+            if (len(markers) != 1 or not markers[0].startswith('ALLOY_STATE_') or
+                    len(markers[0]) != 44 or any(c not in '0123456789abcdef' for c in markers[0][12:])):
+                self.send_error(400, 'invalid embedded fixture marker')
+                return
+            proof['marker'] = markers[0]
+            if path == '/embedded-http-cache':
+                proof['cacheToken'] = secrets.token_hex(16)
+        if path == '/embedded-origin-trial':
+            query = parse_qs(urlsplit(self.path).query)
+            tag, = query['tag']
+            trial_kind, = query['kind']
+            assert tag and all(c in 'abcdefghijklmnopqrstuvwxyz-' for c in tag)
+            assert trial_kind in ('critical', 'script', 'invalid')
+            proof.update(trialTag=tag, trialKind=trial_kind)
+        if path in ('/ordinary-cdn.js', '/ordinary-sw.js'):
+            markers=parse_qs(urlsplit(self.path).query).get('marker',[])
+            assert len(markers)==1 and markers[0].startswith('ORDINARY_') and len(markers[0])==41
+            assert all(c in '0123456789abcdef' for c in markers[0][9:])
+            proof['marker']=markers[0]
+            if path == '/ordinary-cdn.js':
+                proof['cdnToken']=secrets.token_hex(16)
         with self.server.lock:
             self.server.events.append(proof)
             save(self.server.evidence / 'server.json', self.server.events)
         close = path.startswith('/ticket-') or '/page/ticket-' in path or path == '/close-pool'
         kind = 'application/json'
         body = json.dumps(proof).encode()
-        if path.startswith('/page/'):
+        if path in ('/embedded-storage-frame', '/embedded-origin-trial'):
+            from profile_embedded import frame_body
+            kind = 'text/html'
+            body = frame_body()
+            if path == '/embedded-origin-trial':
+                trial_token = self.server.origin_trial_token()
+                if trial_kind == 'invalid':
+                    trial_token = trial_token[:16]+('A' if trial_token[16] != 'A' else 'B')+trial_token[17:]
+                if trial_kind == 'script':
+                    meta = ('<meta http-equiv="origin-trial" content="'+trial_token+'">').encode()
+                    body = body.replace(b'<meta charset="utf-8">', b'<meta charset="utf-8">'+meta)
+        elif path.startswith('/page/'):
             label = path.rsplit('/', 1)[1]
             nonce = secrets.token_hex(8)
             kind = 'text/html'
@@ -484,16 +581,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = (f'<!doctype html><link rel="icon" href="data:,"><input id="saved" autocomplete="on">'
                     f'<div style="height:4000px">fixture</div><script>window.docNonce={json.dumps(nonce)};'
                     f'window.connectionProof={json.dumps(proof)};'
-                    f'document.title="ALLOY_PROFILE_PROBE:{label}_{nonce}";</script>{script}').encode()
+                    f'{page_control_script(label+"_"+nonce)}</script>{script}').encode()
         elif path == '/cache.js':
             kind = 'application/javascript'
             body = b'window.resourceLoaded = true;'
+        elif path == '/ordinary-cdn.js':
+            kind = 'application/javascript'
+            body = ('window.ordinaryCdnToken='+json.dumps(proof['cdnToken'])+';').encode()
         elif path == '/memory-cache':
             kind = 'text/plain'
             body = b'memory-http-value'
         elif path == '/sw.js':
             kind = 'application/javascript'
             body = b'self.addEventListener("fetch",()=>{});'
+        elif path in ('/embedded-sw.js', '/ordinary-sw.js'):
+            kind = 'application/javascript'
+            body = ("const marker="+json.dumps(proof['marker'])+";"
+                "self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));"
+                "self.addEventListener('activate',event=>event.waitUntil(self.clients.claim()));"
+                "self.addEventListener('message',event=>{if(event.data==='scope-value')"
+                "event.ports[0].postMessage({marker,scope:self.registration.scope})});").encode()
         elif path == '/worker.js':
             kind = 'application/javascript'
             body = ('self.onmessage=()=>postMessage(('+NOISE_FUNCTION+
@@ -505,7 +612,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'public,max-age=31536000' if path in ('/cache.js', '/memory-cache') else 'no-store')
+        self.send_header('Cache-Control', 'public,max-age=31536000' if path in
+                         ('/cache.js', '/memory-cache', '/embedded-http-cache', '/ordinary-cdn.js') else 'no-store')
+        if path == '/embedded-origin-trial' and trial_kind != 'script':
+            self.send_header('Origin-Trial', trial_token)
+            self.send_header('Critical-Origin-Trial', 'FrobulatePersistent')
+        if path == '/embedded-cookie-write':
+            self.send_header('Set-Cookie', 'embedded_http='+proof['marker']+
+                             '; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=31536000')
         if path.startswith('/page/'):
             self.send_header('Set-Cookie', 'alloy_http_probe=refused; SameSite=Lax')
         if close:
@@ -519,15 +633,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def inventory(root):
-    result = {}
-    for name in ('profile', 'home', 'cache', 'config', 'data'):
-        folder = root / name
-        if not folder.exists():
-            continue
-        for path in sorted(folder.rglob('*')):
-            relative = str(path.relative_to(root))
-            result[relative] = 'symlink' if path.is_symlink() else 'directory' if path.is_dir() else 'file'
-    return result
+    observed = observe_tree(root, ('profile', 'home', 'cache', 'config', 'data'), hashes=False,
+                            report_path=root/('inventory-observation-'+str(time.monotonic_ns())+'.json'))
+    return {name: value['kind'] for name, value in observed.items()}
 
 
 def await_parent_ready(root, process):
@@ -544,11 +652,8 @@ def await_parent_ready(root, process):
             if any(e['event'] == 'bootstrap-created' for e in events):
                 assert not any(e['event'] in ('stateless-start', 'created') for e in events)
                 assert [e['pid'] for e in events if e['event'] == 'process'] == [ready['pid']]
-                # Supporting assertions after the native callbacks, not a polling barrier.
-                preferred = json.loads((root/'profile/Default/PreferredApps').read_text())
-                assert preferred == {'preferred_apps': [], 'version': 1}
-                blobs = list((root/'profile/Default/blob_storage').iterdir())
-                assert len(blobs) == 1 and blobs[0].is_dir()
+                # Native completion is the barrier. Root inventories below test
+                # the no-files boundary without parsing Chromium store formats.
                 return ready
         time.sleep(.05)
     raise AssertionError('native parent startup/store callbacks did not complete')
@@ -578,7 +683,7 @@ def await_context_stopped(root, process, parent_id, port):
 
 def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1,
               exercise_files=False, certificate_base='', fixture=None, alternate_fixture=None,
-              memory=False, trusted_certificate=None):
+              memory=False, trusted_certificate=None, embedded_scope=None):
     root.mkdir()
     # An explicitly selected external user file is outside browser-owned roots.
     # Its original bytes must survive both grant lifetime and browser teardown.
@@ -588,6 +693,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
     roots = {name:root/name for name in ('profile', 'home', 'cache', 'config', 'data')}
     for path in roots.values():
         path.mkdir()
+    xdg_cache = system_cache.create(root)
     # R11 keeps the OS/NSS certificate store outside Alloy. Give the isolated
     # test user that external input before either page or no-page run, rather
     # than confusing its first-use OS-store initialization with site storage.
@@ -630,10 +736,15 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
                  ALLOY_PROFILE_OUTPUT_FILE=str(output_file),
                 ALLOY_PROFILE_READY=str(root/'native-ready.json'),
                 ALLOY_PROFILE_SYMBOLS=str(symbol_file),
-               XDG_CACHE_HOME=str(roots['cache']), XDG_CONFIG_HOME=str(roots['config']),
+               XDG_CACHE_HOME=str(xdg_cache), XDG_CONFIG_HOME=str(roots['config']),
                  XDG_DATA_HOME=str(roots['data']))
     if memory:
         env.update(ALLOY_PROFILE_MEMORY='1', ALLOY_PROFILE_OBSERVE_LIFETIME='1')
+    if embedded_scope is not None:
+        from profile_embedded import SCOPES
+        assert memory and embedded_scope in SCOPES
+        env['ALLOY_PROFILE_EMBEDDED_SCOPE'] = embedded_scope
+        argv.append('--origin-trial-public-key=dRCs+TocuKkocNKa0AtZ4awrt9XKH2SQCI6o4FY6BNA=')
     browser_environment = {name:env[name] for name in
                            ('HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME')}
     # The observer's own cache/config is evidence, never a browser-owned path.
@@ -652,12 +763,21 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
                                    stderr=subprocess.STDOUT, start_new_session=True)
         try:
             ready = await_parent_ready(root, process)
+            from profile_control_setup import complete as complete_control_setup
+            control_setup = complete_control_setup(root, process, port, CDP_HELPERS)
             save(root/'before-paths.json', inventory(root))
-            drive = DRIVE
+            from profile_browser_lifecycle import make_scenario, inspect_browser_lifecycle
+            phases = [('start-stateless', 2)]
+            if not memory and baseline < 0 and not certificate_base:
+                phases.append(('open-tab-', 1))
+            scenario = make_scenario(DRIVE, phases)
             if memory:
-                from profile_memory import DRIVE as MEMORY_DRIVE
-                drive = MEMORY_DRIVE.replace('__CDP_HELPERS__', CDP_HELPERS)
-            response = subprocess.run(['node', '--input-type=module', '-e', drive,
+                from profile_memory import build_scenario as memory_scenario
+                scenario = memory_scenario(CDP_HELPERS)
+                if embedded_scope is not None:
+                    from profile_embedded import build_scenario as embedded_scenario
+                    scenario = embedded_scenario(CDP_HELPERS, embedded_scope)
+            response = subprocess.run(['node', '--input-type=module', '-e', scenario['drive'],
                 str(port), base, mode, marker, str(baseline), str(root/'stdio.log'),
                   '1' if exercise_files else '0', certificate_base,
                   str(root/'native-popup-completed.json'),str(root/'native-gesture.json'),str(ready['pid']),
@@ -712,6 +832,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
     save(root/'process-final-paths.json', inventory(root))
+    system_cache.check(xdg_cache)
     nss_after = {p.name:hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in nss.iterdir() if p.is_file()}
     save(root/'nss-after.json', nss_after)
@@ -727,6 +848,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
     assert len(owners) == 1, owners
     proof.update(pid=owners[0], started=started, finished=time.time())
     proof['parentReadiness'] = ready
+    proof['parentPersistenceSetup'] = control_setup
     proof['memoryDestruction' if memory else 'statelessDestruction'] = stopped
     parent_events = [e for e in events if e['event'] == 'bootstrap-created']
     assert len(parent_events) == 1 and parent_events[0]['persistent_context'], parent_events
@@ -734,8 +856,8 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
     assert len([e for e in events if e['event'] == ('memory-start' if memory else 'stateless-start')]) == (2 if memory else 1)
     created = [v for v in events if v['event'] == 'created']
     closed = [v for v in events if v['event'] == 'closed']
-    expected = 7 if memory else 2 if baseline >= 0 or certificate_base else 3
-    assert len(created) == len(closed) == expected, events
+    proof['nativeBrowserLifecycle'] = inspect_browser_lifecycle(
+        events, scenario['browser_lifecycle'])
     assert {v['browser'] for v in created} == {v['browser'] for v in closed}
     assert all(v['shares_context'] and v['empty_cache_path'] and
                v['parent_preference_isolated'] for v in created), created
@@ -745,10 +867,10 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         file_events = [v for v in events if v['event'] == 'file-picker']
         assert [v['held'] for v in file_events] == ([0, 0, 1, 0] if exercise_files else []), file_events
         assert [v['save'] for v in file_events] == ([0, 1, 0, 0] if exercise_files else []), file_events
-        navigations = [v for v in events if v['event'] == 'navigation' and v['browser'] != parent_events[0]['browser']]
+        navigations = [v for v in events if v['event'] == 'history-state' and v['browser'] != parent_events[0]['browser']]
         assert any(v['can_back'] and v['can_forward'] for v in navigations), navigations
         assert any(v['can_back'] and not v['can_forward'] and
-                   v['token'].startswith('d_') for v in navigations), navigations
+                   v['url'].endswith('/page/d') for v in navigations), navigations
         assert not created[-1]['can_back'] and not created[-1]['can_forward'], created
         proof['checks'].append('native-history-flags')
     if baseline < 0 and certificate_base:
@@ -766,7 +888,7 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         changes = inventory_changes(before, json.loads((root/name).read_text()))
         proof['inventoryChanges'][name] = changes
         save(root/(name+'.difference.json'), changes)
-    save(root/'proof.json', proof)
+    save(root/'native-proof.json', proof)
     parent_changes = inventory_changes(before, json.loads((root/'process-final-paths.json').read_text()))
     proof['parentProcessTeardownChanges'] = parent_changes
     save(root/'process-final-paths.json.difference.json', parent_changes)
@@ -777,28 +899,42 @@ def run_case(out, executable, root, mode, base, marker, symbol_file, baseline=-1
         proof['afterNormalParityTeardownChanges'] = inventory_changes(
             after_parity, json.loads((root/'process-final-paths.json').read_text()))
     proof['normal_shutdown'] = True
-    save(root / 'proof.json', proof)
+    save(root / 'native-proof.json', proof)
     return proof
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=['stateless', 'memory', 'core', 'keyring'], default='core')
+    parser.add_argument('--check', choices=['stateless', 'memory', 'encrypted', 'delete', 'core', 'keyring', 'embedded', 'autolock', 'decay'], default='core')
+    parser.add_argument('--embedded-scope', choices=['both', 'per-tab', 'per-outer-site'],
+                        default='both', help='Embedded implemented-storage slice only (default both scopes)')
     parser.add_argument('--exercise-files', action='store_true',
                         help='Additionally enable Brave FileSystemAccessAPI for native file-grant checks')
     parser.add_argument('--exercise-certificates', action='store_true',
                         help='Run real certificate callbacks and late decisions without ignoring certificate errors')
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.check == 'autolock':
+        from profile_autolock import main as autolock_main
+        return autolock_main()
+    if args.check == 'decay':
+        from profile_decay import main as decay_main
+        return decay_main()
+    if args.check in ('encrypted', 'delete'):
+        from profile_encrypted import main as encrypted_main
+        return encrypted_main()
     if args.check in ('core', 'keyring'):
         from profile_store_probe import main as store_main
-        return store_main()
+        result = store_main()
+        if result or args.check == 'core':
+            return result
+        from profile_encrypted import main as encrypted_main
+        return encrypted_main()
     if args.exercise_files and args.exercise_certificates:
         parser.error('file and certificate consumer matrices are separate runs')
-    if args.check == 'memory' and (args.exercise_files or args.exercise_certificates):
+    if args.check in ('memory', 'embedded') and (args.exercise_files or args.exercise_certificates):
         parser.error('memory uses its native storage and context-lifetime matrix')
-    assert socket.gethostname() == 'wakaba-build'
     assert os.environ['TMPDIR'] == str(temp_path(W))
     out = args.out.resolve()
     validate_output(W, out, REPO)
@@ -814,6 +950,8 @@ def main():
             command.append('--exercise-files')
         if args.exercise_certificates:
             command.append('--exercise-certificates')
+        if args.check == 'embedded':
+            command.extend(['--embedded-scope', args.embedded_scope])
         print('PROFILE_WAIT shared namespace locks', flush=True)
         return subprocess.run(['timeout', '--kill-after=30', '4500', *command], timeout=4540).returncode
     assert os.geteuid() == 1000
@@ -870,26 +1008,59 @@ def main():
             threading.Thread(target=alternate_fixture.serve_forever, daemon=True).start()
             certificate_base = 'https://127.0.0.1:'+str(alternate_fixture.server_port)
         results = []
-        for mode in (('keep',) if args.check == 'memory' else ('keep', 'cut')):
+        cases = [(mode, None) for mode in (('keep',) if args.check == 'memory' else ('keep', 'cut'))]
+        if args.check == 'embedded':
+            from profile_embedded import SCOPES
+            cases = [('keep', scope) for scope in
+                     (SCOPES if args.embedded_scope == 'both' else (args.embedded_scope,))]
+        for mode, embedded_scope in cases:
             marker = 'ALLOY_STATE_'+secrets.token_hex(16)
             before = len(fixture.events)
             alternate_before = len(alternate_fixture.events) if alternate_fixture else 0
-            page_root, baseline_root = evidence/(mode+'-page'), evidence/(mode+'-no-page')
+            case_name = mode if embedded_scope is None else mode+'-'+embedded_scope
+            page_root, baseline_root = evidence/(case_name+'-page'), evidence/(case_name+'-no-page')
             proof = run_case(out, executable, page_root, mode, base, marker, symbol_file,
                                exercise_files=args.exercise_files, certificate_base=certificate_base,
                                fixture=fixture, alternate_fixture=alternate_fixture,
-                               memory=args.check == 'memory',
-                               trusted_certificate=cert if args.check == 'memory' else None)
+                                memory=args.check in ('memory', 'embedded'),
+                                trusted_certificate=cert if args.check in ('memory', 'embedded') else None,
+                                embedded_scope=embedded_scope)
             events = fixture.events[before:proof['statelessServerEnd']]
-            if args.check == 'memory':
+            if args.check in ('memory', 'embedded'):
                 cache_requests = [v for v in events if v['path'] == '/memory-cache']
                 assert len(cache_requests) == 3, cache_requests
                 proof['httpCacheRequests'] = cache_requests
+                if args.check == 'embedded':
+                    network = proof['observations']['embeddedNetwork']
+                    requests = [v for v in events if v['path'] == '/embedded-http-cache' and v.get('marker') == marker]
+                    expected = 5 if embedded_scope == 'per-tab' else 3
+                    assert len(requests) == expected, requests
+                    assert len({v['cacheToken'] for v in requests}) == expected
+                    assert {v['cacheToken'] for v in requests} == {
+                        sample['cache'][0]['cacheToken'] for sample in
+                        (network['original'], network['peer'], network['held'], network['fresh'],
+                         proof['observations']['embeddedExpiry']['networkBefore'])}
+                    proof['embeddedHttpCacheRequests'] = requests
+                    trial_requests = [v for v in events if v['path'] == '/embedded-origin-trial' and v.get('marker') == marker]
+                    counts = {tag:sum(v['trialTag'] == tag for v in trial_requests)
+                              for tag in {v['trialTag'] for v in trial_requests}}
+                    ordinary = {'ordinary-invalid':1, 'ordinary-header':2, 'ordinary-repeat':1,
+                                'ordinary-script':1, 'ordinary-after-script':1}
+                    assert {k:counts.get(k) for k in ordinary} == ordinary, ('ordinary signed trial fixture control', counts)
+                    expected_trials = dict(ordinary, original=2, peer=2 if embedded_scope == 'per-tab' else 1,
+                        **{'original-repeat':1, 'script':1, 'after-script':1,
+                           'held':2 if embedded_scope == 'per-tab' else 1, 'fresh':2,
+                           'expired':2, 'expired-repeat':1})
+                    assert counts == expected_trials, ('native critical-restart scope consumer', embedded_scope, counts, expected_trials)
+                    proof['observations']['embeddedOriginTrials']['criticalRequestCounts'] = counts
+                    proof['embeddedOriginTrialRequests'] = trial_requests
+                    proof['checks'].extend(['origin-trial-ordinary-signed-control',
+                        'embedded-origin-trial-native-critical-scope', 'embedded-origin-trial-script-retention',
+                        'embedded-origin-trial-retirement'])
                 assert all(not change['added'] for change in proof['inventoryChanges'].values()), \
                     'memory context added paths: '+json.dumps(proof['inventoryChanges'])
                 proof['checks'].extend(['memory-context-http-cache', 'memory-context-no-added-paths'])
-                results.append(proof)
-                save(evidence/'results.json', results)
+                publish_case(evidence, page_root, results, proof)
                 for check in proof['checks']:
                     print('PASS', check, flush=True)
                 continue
@@ -899,9 +1070,10 @@ def main():
             assert sum(v['path']=='/cache.js' for v in events) >= (3 if args.exercise_certificates else 7), events
             assert not any(v['cookie'] for v in events), events
             baseline = run_case(out, executable, baseline_root, mode, base,
-                                 marker, symbol_file, proof['driveSeconds'],
-                                  exercise_files=args.exercise_files, certificate_base=certificate_base,
-                                  fixture=fixture, alternate_fixture=alternate_fixture)
+                                  marker, symbol_file, proof['driveSeconds'],
+                                   exercise_files=args.exercise_files, certificate_base=certificate_base,
+                                   fixture=fixture, alternate_fixture=alternate_fixture)
+            baseline = finalize_case(baseline_root, baseline)
             proof['blankControl'] = baseline
             # Keep the completed blank control even when the actual inventory fails.
             save(evidence/(mode+'-controls.json'), dict(page=proof, blank=baseline))
@@ -912,14 +1084,33 @@ def main():
                     if path.is_file() and not path.is_symlink():
                         assert marker.encode() not in path.read_bytes(), 'state marker on disk: '+str(path)
             proof['checks'].extend(['http-cache-refetched', 'no-files-beyond-baseline'])
-            results.append(proof)
-            save(evidence/'results.json', results)
+            publish_case(evidence, page_root, results, proof)
             for check in proof['checks']:
                 print('PASS', check, mode, flush=True)
+        ordinary=None
+        if args.check == 'embedded':
+            from profile_embedded_restart import run as run_restart
+            from profile_embedded import SCOPES
+            scopes = SCOPES if args.embedded_scope == 'both' else (args.embedded_scope,)
+            ordinary_root = evidence/'process-restart'
+            ordinary = run_restart(out, ordinary_root, Fixture, CDP_HELPERS, scopes)
+            assert ordinary['pass_'] and ordinary['ordinary_functional_and_restart']
+            assert not ordinary['encrypted_profile_verified']
+            save(evidence/'ordinary-persistent.json',dict(root=str(ordinary_root),result=ordinary))
+            from profile_embedded_profiles import run as run_profiles
+            profiles = run_profiles(out, evidence/'encrypted-list-composition', CDP_HELPERS, scopes)
+            assert len(profiles) == 5*len(scopes)
+        coverage = dict(embedded_storage_only=False, embedded_network_slice_only=True,
+                          ordinary_persistent_exercised=ordinary is not None,
+                          encrypted_profile_verified=True,
+                          directional_list_delete_and_explicit_lock_verified=True,
+                          decay_verified=False, autolock_verified=False,
+                         all_mode_kernel_proof=False,
+                        full_item6E_gate=False) if args.check == 'embedded' else {}
         save(evidence/'result.json', dict(pass_=True, config=out.name, results=results,
-             exercise_files=args.exercise_files,
-             exercise_certificates=args.exercise_certificates,
-             timestamp=datetime.now(timezone.utc).isoformat()))
+              exercise_files=args.exercise_files,
+              exercise_certificates=args.exercise_certificates,
+              timestamp=datetime.now(timezone.utc).isoformat(), **coverage))
         return 0
     except BaseException:
         (evidence/'failure.txt').write_text(traceback.format_exc())

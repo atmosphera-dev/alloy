@@ -40,7 +40,7 @@ async function connect(url) {
     const request = pending.get(msg.id);
     if (!request) return;
     pending.delete(msg.id);
-    if (msg.error) request.reject(new Error(JSON.stringify(msg.error)));
+    if (msg.error) request.reject(Object.assign(new Error(msg.error.message), msg.error));
     else request.resolve(msg.result);
   });
   ws.addEventListener('close', () => {
@@ -81,15 +81,21 @@ while (Date.now() < deadline) {
 if (!page) throw new Error('Expected smoke page target did not appear');
 let proof;
 while (Date.now() < deadline) {
-  const {root} = await page.call('DOM.getDocument', {depth: 1});
-  const {nodeId} = await page.call('DOM.querySelector', {nodeId: root.nodeId, selector: 'title'});
-  if (nodeId) {
-    const {outerHTML} = await page.call('DOM.getOuterHTML', {nodeId});
-    const location = await page.call('Runtime.evaluate', {expression: 'location.href', returnByValue: true});
-    if (outerHTML.includes('Internet') && location.result.value === expected) {
-      proof = {version, url: location.result.value, title_node: nodeId, title_html: outerHTML};
-      break;
+  try {
+    const {root} = await page.call('DOM.getDocument', {depth: 1});
+    const {nodeId} = await page.call('DOM.querySelector', {nodeId: root.nodeId, selector: 'title'});
+    if (nodeId) {
+      const {outerHTML} = await page.call('DOM.getOuterHTML', {nodeId});
+      const location = await page.call('Runtime.evaluate', {expression: 'location.href', returnByValue: true});
+      if (outerHTML.includes('Internet') && location.result.value === expected) {
+        proof = {version, url: location.result.value, title_node: nodeId, title_html: outerHTML};
+        break;
+      }
     }
+  } catch (error) {
+    // Navigation discards InspectorDOMAgent's node bindings between calls.
+    // Reacquire the whole document sample, within the original deadline.
+    if (error.code !== -32000 || error.message !== 'Could not find node with given id') throw error;
   }
   await sleep();
 }
@@ -141,7 +147,6 @@ def terminate_session(session):
 
 
 def main():
-    """Check page loading and clean browser shutdown with the selected fixture."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--port', type=int, default=9229)

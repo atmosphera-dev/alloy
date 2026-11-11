@@ -17,6 +17,7 @@ import time
 
 sys.dont_write_bytecode = True
 from workspace import workspace_path, temp_path, validate_workspace
+import profile_system_cache as system_cache
 
 REPO = Path(__file__).resolve().parents[1]
 WORK = workspace_path(REPO)
@@ -66,9 +67,10 @@ def main():
         root.mkdir(mode=0o700)
         for name in ('home', 'data', 'config', 'cache', 'runtime', 'control'):
             (root / name).mkdir(mode=0o700)
+        xdg_cache = system_cache.create(root)
         env = dict(os.environ, HOME=str(root / 'home'),
             XDG_DATA_HOME=str(root / 'data'), XDG_CONFIG_HOME=str(root / 'config'),
-            XDG_CACHE_HOME=str(root / 'cache'), XDG_RUNTIME_DIR=str(root / 'runtime'),
+            XDG_CACHE_HOME=str(xdg_cache), XDG_RUNTIME_DIR=str(root / 'runtime'),
             TMPDIR=str(temp_path(WORK)), PYTHONDONTWRITEBYTECODE='1',
             ALLOY_TEST_KEYRING=str(root / 'home'),
             ALLOY_TEST_KEYRING_WORKSPACE=str(WORK),
@@ -134,6 +136,7 @@ def main():
                     daemon.wait(timeout=5)
                 receipt['provider_exit'] = daemon.returncode
             (root / 'session.json').write_text(json.dumps(receipt, indent=2) + '\n')
+            system_cache.check(root / 'system-cache')
 
 
 if __name__ == '__main__':

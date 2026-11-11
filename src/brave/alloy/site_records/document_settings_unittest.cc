@@ -183,5 +183,72 @@ TEST(DocumentSettingsTest,
   // The ending document's final flush cannot reenter consumers/new documents.
   EXPECT_EQ(0, notifications);
 }
+
+TEST(DocumentSettingsTest,
+     ConstructingClientRetirementClosesAdmissionBeforeNativeMapShutdown) {
+  base::test::TaskEnvironment tasks;
+  auto registry = base::MakeRefCounted<user_prefs::PrefRegistrySyncable>();
+  HostContentSettingsMap::RegisterProfilePrefs(registry.get());
+  auto user = base::MakeRefCounted<InMemoryPrefStore>();
+  sync_preferences::PrefServiceSyncableFactory factory;
+  factory.set_user_prefs(user);
+  factory.SetAccountPrefStore(base::MakeRefCounted<InMemoryPrefStore>());
+  auto configuration = factory.CreateSyncable(registry);
+  int notifications = 0;
+  auto owner = std::make_unique<DocumentSettings>(
+      configuration.get(),
+      base::BindLambdaForTesting(
+          [&](const ContentSettingsPattern&, const ContentSettingsPattern&,
+              ContentSettingsTypeSet) { ++notifications; }));
+  const auto before = user->GetValues();
+  bool shutdown = false, destroyed = false;
+  static const int key = 0;
+  auto* result = owner->GetOrCreateService(
+      &key,
+      base::BindLambdaForTesting(
+          [&](HostContentSettingsMap* map) -> std::unique_ptr<KeyedService> {
+            auto client = std::make_unique<NativeSettingsClient>(map, &shutdown,
+                                                                 &destroyed);
+            owner.reset();
+            return client;
+          }));
+  EXPECT_EQ(result, nullptr);
+  EXPECT_TRUE(shutdown);
+  EXPECT_TRUE(destroyed);
+  EXPECT_EQ(notifications, 0);
+  EXPECT_EQ(user->GetValues(), before);
+}
+TEST(DocumentSettingsTest, WorkingMapsNeverImportProfilePermissionRules) {
+  base::test::TaskEnvironment tasks;
+  auto registry = base::MakeRefCounted<user_prefs::PrefRegistrySyncable>();
+  HostContentSettingsMap::RegisterProfilePrefs(registry.get());
+  auto user = base::MakeRefCounted<InMemoryPrefStore>();
+  sync_preferences::PrefServiceSyncableFactory factory;
+  factory.set_user_prefs(user);
+  factory.SetAccountPrefStore(base::MakeRefCounted<InMemoryPrefStore>());
+  auto configuration = factory.CreateSyncable(registry);
+  auto real = base::MakeRefCounted<HostContentSettingsMap>(
+      configuration.get(), false, false, false, false);
+  const GURL site("https://real-permission.test/");
+  constexpr auto type = ContentSettingsType::MEDIASTREAM_MIC;
+  real->SetContentSettingDefaultScope(site, site, type, CONTENT_SETTING_BLOCK);
+  {
+    DocumentSettings temporary(
+        configuration.get(),
+        base::BindLambdaForTesting([](const ContentSettingsPattern&,
+                                      const ContentSettingsPattern&,
+                                      ContentSettingsTypeSet) {}));
+    EXPECT_EQ(temporary.settings().GetContentSetting(site, site, type),
+              CONTENT_SETTING_ASK);
+    real->SetContentSettingDefaultScope(site, site, type,
+                                        CONTENT_SETTING_ALLOW);
+    EXPECT_EQ(temporary.settings().GetContentSetting(site, site, type),
+              CONTENT_SETTING_ASK);
+    temporary.settings().SetContentSettingDefaultScope(site, site, type,
+                                                       CONTENT_SETTING_BLOCK);
+    EXPECT_EQ(real->GetContentSetting(site, site, type), CONTENT_SETTING_ALLOW);
+  }
+  real->ShutdownOnUIThread();
+}
 }  // namespace
 }  // namespace alloy::site_records

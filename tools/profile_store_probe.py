@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""NUC-only encrypted profile API consumer (no browser stores bound yet)."""
+"""Encrypted profile SDK consumers on the assigned build guest."""
 import argparse
 import hashlib
 import json
@@ -19,6 +19,7 @@ WORK = workspace_path(REPO)
 
 
 def main():
+    """Compile generated-C consumers and prove SDK lifecycle, callback and key-source contracts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=['core', 'keyring'], default='core')
@@ -64,6 +65,16 @@ def main():
         text = run('cpp-api', [out / 'alloy_profile_cpp_consumer', roots])
         if 'PASS profile-api-cpp-wrapper' not in text:
             raise RuntimeError('C++ wrapper consumer result missing')
+        records_binary = out / 'alloy_profile_records_c_consumer'
+        run('compile-records-c', ['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+            '-D_GNU_SOURCE', '-DUSING_CEF_SHARED',
+            '-I', WORK / 'src', '-I', WORK / 'src/cef', '-I', out / 'gen/cef',
+            REPO / 'tools/profile_records_consumer.c', '-L', out,
+            '-Wl,-rpath,' + str(out), '-lcef', '-o', records_binary])
+        text = run('records-c-api', ['xvfb-run', '-a', records_binary,
+            roots / 'c-records', evidence / 'records-runtime'])
+        if 'PASS profile-records-c-wrapper' not in text:
+            raise RuntimeError('C record callback consumer result missing')
         if (roots / 'invalid-unicode').exists():
             raise RuntimeError('Malformed password created profile files')
         run('ciphertext-markers', ['rg', '-a', '-i', '-l',

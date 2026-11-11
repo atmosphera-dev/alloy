@@ -107,7 +107,17 @@ int main(int argc, char** argv) {
   alloy_profile_t* profile = alloy_create_profile(&path, &password);
   check(profile != NULL, "create-password"); if (!profile) return 1;
   check(profile->get_state(profile) == ALLOY_PROFILE_UNLOCKED, "created-unlocked");
+  int64_t decay_period = -1;
+  int decay_clock = -1;
+  check(profile->get_decay_settings(profile, &decay_period, &decay_clock) && decay_period == 0 &&
+        decay_clock == ALLOY_DECAY_SINCE_LAST_VISIT, "decay-no-default");
+  check(profile->set_decay_settings(profile, 6, ALLOY_DECAY_SINCE_LAST_VISIT), "decay-durable-set");
+  check(!profile->set_decay_settings(profile, -1, ALLOY_DECAY_SINCE_LAST_VISIT), "decay-negative-refused");
+  check(!profile->set_decay_settings(profile, INT64_MAX, ALLOY_DECAY_SINCE_LAST_VISIT), "decay-overflow-refused");
   check(profile->lock(profile), "password-lock");
+  decay_period = 77; decay_clock = 88;
+  check(!profile->get_decay_settings(profile, &decay_period, &decay_clock) && decay_period == 77 && decay_clock == 88,
+        "locked-decay-no-read-or-output-change");
   check(profile->get_state(profile) == ALLOY_PROFILE_LOCKED, "password-locked");
   check(!profile->unlock_with_password(profile, &wrong), "wrong-password-refused");
   check(profile->get_state(profile) == ALLOY_PROFILE_LOCKED, "wrong-password-stays-locked"); drop(profile);
@@ -115,6 +125,9 @@ int main(int argc, char** argv) {
   check(profile->get_state(profile) == ALLOY_PROFILE_LOCKED, "reopen-locked");
   check(profile->unlock_with_password(profile, &password), "password-unlock-after-reopen");
   check(profile->get_state(profile) == ALLOY_PROFILE_UNLOCKED, "password-unlocked");
+  check(profile->get_decay_settings(profile, &decay_period, &decay_clock) && decay_period == 6 &&
+        decay_clock == ALLOY_DECAY_SINCE_LAST_VISIT, "decay-cold-policy");
+  check(profile->set_decay_settings(profile, 0, ALLOY_DECAY_SINCE_LAST_VISIT), "decay-disable");
   check(profile->lock(profile), "password-lock-after-reopen"); drop(profile);
   alloy_profile_t* duplicate = alloy_create_profile(&path, &password);
   check(duplicate == NULL, "existing-path-refused"); drop(duplicate);

@@ -130,6 +130,26 @@ TEST_F(RecordValueStoreTest, LockDeniesCachedNativeReadsAndEveryWrite) {
   EXPECT_FALSE(store_->Clear().status().ok());
 }
 
+TEST_F(RecordValueStoreTest, WholeCatalogueFenceRefusesNativeWritersWithoutIoFailure) {
+  Set("policy", kMarker);
+  base::UnguessableToken fence;
+  ASSERT_EQ(FileStatus::kOk, files_->BeginSiteDeletion(&fence));
+  const auto refused = [](const value_store::ValueStore::Status& status) {
+    EXPECT_EQ(value_store::ValueStore::READ_ONLY, status.code) << status.message;
+  };
+  refused(store_->Set(value_store::ValueStore::DEFAULTS, "late", base::Value(1)).status());
+  refused(store_->Remove("policy").status());
+  refused(store_->Clear().status());
+  EXPECT_TRUE(files_->unlocked());
+  RecordDeletion deleted;
+  ASSERT_EQ(FileStatus::kOk, files_->DeleteRecord(record_.id, [] {}, &deleted));
+  ASSERT_EQ(FileStatus::kOk, files_->EndSiteDeletion(fence));
+  Resolve();
+  std::unique_ptr<value_store::LeveldbValueStore> fresh;
+  ASSERT_EQ(FileStatus::kOk, CreateRecordValueStore(files_, cap_, kPurpose, database_, &fresh));
+  auto empty = fresh->Get(); ASSERT_TRUE(empty.status().ok()); EXPECT_TRUE(empty.settings().empty());
+}
+
 TEST_F(RecordValueStoreTest, RecordDeletionDeniesWarmCacheAndOtherRecordIsIntact) {
   Set("policy", kMarker);
   Expect("policy", std::string(kMarker));

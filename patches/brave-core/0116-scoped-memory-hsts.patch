@@ -1,0 +1,34 @@
+--- a/chromium_src/net/http/transport_security_state.cc
++++ b/chromium_src/net/http/transport_security_state.cc
+@@ -181,7 +181,9 @@
+                                            std::string_view value) {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+   auto auto_reset_partition_hash = enabled_sts_hosts_.SetScopedPartitionHash(
+-      GetPartitionHashForAddingHSTS(isolation_info));
++      alloy_scoped_memory_only_
++          ? GetPartitionHashForHSTS(isolation_info.network_anonymization_key())
++          : GetPartitionHashForAddingHSTS(isolation_info));
+   if (enabled_sts_hosts_.HasPartitionHash() &&
+       !enabled_sts_hosts_.IsPartitionHashValid()) {
+     return false;
+--- a/chromium_src/net/http/transport_security_state.h
++++ b/chromium_src/net/http/transport_security_state.h
+@@ -50,6 +50,8 @@
+   bool AddHSTSHeader(const IsolationInfo& isolation_info,
+                      std::string_view host,
+                      std::string_view value);
++  // Called only while constructing an engine-owned, pathless temporary context.
++  void SetAlloyScopedMemoryOnly() { alloy_scoped_memory_only_ = true; }
+ 
+   // This is used only for manual adding via net-internals page.
+   void AddHSTS(std::string_view host,
+@@ -62,6 +64,9 @@
+                           const NetLogWithSource& net_log = NetLogWithSource());
+   bool GetDynamicSTSState(const std::string& host, STSState* result);
+   bool DeleteDynamicDataForHost(const std::string& host);
++
++ private:
++  bool alloy_scoped_memory_only_ = false;
+ };
+ 
+ }  // namespace net

@@ -1,0 +1,218 @@
+diff --git a/content/browser/renderer_host/navigation_request.cc b/content/browser/renderer_host/navigation_request.cc
+index 406cfdd..b33ca56 100644
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -7188,7 +7188,7 @@ void NavigationRequest::CommitNavigation() {
+   }
+   isolation_info_for_subresources_ =
+       GetRenderFrameHost()->ComputeIsolationInfoForSubresourcesForPendingCommit(
+-          origin_to_commit, is_credentialless(), ComputeFencedFrameNonce());
++          origin_to_commit, is_credentialless(), ComputeFencedFrameNonce(), this);
+   CHECK(!isolation_info_for_subresources_.IsEmpty());
+ 
+   // If this is a srcdoc document, the content comes from the parent frame, so
+@@ -7220,7 +7220,7 @@ void NavigationRequest::CommitNavigation() {
+   }
+ 
+   commit_params_->storage_key = GetRenderFrameHost()->CalculateStorageKey(
+-      origin_to_commit, base::OptionalToPtr(nonce));
++      origin_to_commit, base::OptionalToPtr(nonce), this);
+ 
+   RenderFrameHostImpl* old_frame_host =
+       frame_tree_node_->render_manager()->current_frame_host();
+@@ -10896,7 +10896,7 @@ net::IsolationInfo NavigationRequest::GetIsolationInfo() {
+   // instead of creating one from a URL which lacks opacity information.
+   return frame_tree_node_->current_frame_host()
+       ->ComputeIsolationInfoForNavigation(
+-          common_params_->url, is_credentialless(), ComputeFencedFrameNonce());
++          common_params_->url, is_credentialless(), ComputeFencedFrameNonce(), this);
+ }
+ 
+ bool NavigationRequest::HasSubframeNavigationEntryCommitted() {
+diff --git a/content/browser/renderer_host/render_frame_host_impl.cc b/content/browser/renderer_host/render_frame_host_impl.cc
+index 84ca288..0e0cb9c 100644
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -5435,7 +5435,7 @@ void RenderFrameHostImpl::DidNavigate(
+   isolation_info_ = ComputeIsolationInfoInternal(
+       GetLastCommittedOrigin(), isolation_info_.request_type(),
+       navigation_request->is_credentialless(),
+-      navigation_request->ComputeFencedFrameNonce());
++      navigation_request->ComputeFencedFrameNonce(), navigation_request);
+ 
+   if (lifecycle_state_ == LifecycleStateImpl::kActive) {
+     // The NIK might have changed after the above call, so increment the count
+@@ -5604,23 +5604,26 @@ net::IsolationInfo RenderFrameHostImpl::ComputeIsolationInfoForNavigation(
+ net::IsolationInfo RenderFrameHostImpl::ComputeIsolationInfoForNavigation(
+     const GURL& destination,
+     bool is_credentialless,
+-    std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation) {
++    std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation,
++    NavigationRequest* navigation) {
+   net::IsolationInfo::RequestType request_type =
+       is_main_frame() ? net::IsolationInfo::RequestType::kMainFrame
+                       : net::IsolationInfo::RequestType::kSubFrame;
+   return ComputeIsolationInfoInternal(url::Origin::Create(destination),
+                                       request_type, is_credentialless,
+-                                      fenced_frame_nonce_for_navigation);
++                                      fenced_frame_nonce_for_navigation,
++                                      navigation);
+ }
+ 
+ net::IsolationInfo
+ RenderFrameHostImpl::ComputeIsolationInfoForSubresourcesForPendingCommit(
+     const url::Origin& main_world_origin,
+     bool is_credentialless,
+-    std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation) {
++    std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation,
++    NavigationRequest* navigation) {
+   return ComputeIsolationInfoInternal(
+       main_world_origin, net::IsolationInfo::RequestType::kOther,
+-      is_credentialless, fenced_frame_nonce_for_navigation);
++      is_credentialless, fenced_frame_nonce_for_navigation, navigation);
+ }
+ 
+ net::SiteForCookies RenderFrameHostImpl::ComputeSiteForCookies() {
+@@ -5631,7 +5634,8 @@ net::IsolationInfo RenderFrameHostImpl::ComputeIsolationInfoInternal(
+     const url::Origin& frame_origin,
+     net::IsolationInfo::RequestType request_type,
+     bool is_credentialless,
+-    std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation) {
++    std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation,
++    NavigationRequest* navigation) {
+   url::Origin top_frame_origin = ComputeTopFrameOrigin(frame_origin);
+ 
+   // When this frame is inside a MIME handler extension subtree, the
+@@ -5711,7 +5715,7 @@ net::IsolationInfo RenderFrameHostImpl::ComputeIsolationInfoInternal(
+   std::optional<base::UnguessableToken> nonce =
+       ComputeNonce(is_credentialless, fenced_frame_nonce_for_navigation);
+   if (!nonce) {
+-    nonce = GetAlloyEmbeddedNonceForCandidate(this, frame_origin);
++    nonce = GetAlloyEmbeddedNonceForCandidate(this, frame_origin, navigation);
+   }
+   return net::IsolationInfo::Create(
+       request_type, top_frame_origin, frame_origin, candidate_site_for_cookies,
+@@ -5817,13 +5821,14 @@ RenderFrameHostImpl::GetAncestorChainForStorageKeyCalculation(
+ 
+ blink::StorageKey RenderFrameHostImpl::CalculateStorageKey(
+     const url::Origin& new_rfh_origin,
+-    const base::UnguessableToken* nonce) {
++    const base::UnguessableToken* nonce,
++    NavigationRequest* navigation) {
+   if (nonce) {
+     // If the nonce isn't null, we can use the simpler form of the constructor.
+     return blink::StorageKey::CreateWithNonce(new_rfh_origin, *nonce);
+   }
+ 
+-  if (GetAlloyEmbeddedStateForCandidate(this, new_rfh_origin)
++  if (GetAlloyEmbeddedStateForCandidate(this, new_rfh_origin, navigation)
+           .considered_first_party) {
+     return blink::StorageKey::CreateFirstParty(new_rfh_origin);
+   }
+@@ -16661,11 +16666,8 @@ bool RenderFrameHostImpl::DidCommitNavigationInternal(
+         navigation_request->devtools_navigation_token());
+     document_associated_data_->SetNetworkRestrictionsId(
+         navigation_request->network_restrictions_id());
+-    if (alloy::site_records::RequestContextPolicy::IsStateless(
+-            *GetBrowserContext())) {
+-      document_associated_data_->set_navigation_or_document_handle(
+-          navigation_request->navigation_or_document_handle());
+-    }
++    document_associated_data_->set_navigation_or_document_handle(
++        navigation_request->navigation_or_document_handle());
+     SetAlloyNetworkGenerationForDocument(
+         this, navigation_request->GetAlloyNetworkGeneration());
+     AlloyCommitDocumentNoiseIdentity(this, navigation_request.get());
+@@ -17041,7 +17043,8 @@ void RenderFrameHostImpl::TakeNewDocumentPropertiesFromNavigation(
+ 
+   url::Origin origin = GetLastCommittedOrigin();
+   blink::StorageKey storage_key_to_commit = CalculateStorageKey(
+-      origin, base::OptionalToPtr(provisional_storage_key.nonce()));
++      origin, base::OptionalToPtr(provisional_storage_key.nonce()),
++      navigation_request);
+   SetStorageKey(storage_key_to_commit);
+ 
+   coep_reporter_ = navigation_request->TakeCoepReporter();
+diff --git a/content/browser/renderer_host/render_frame_host_impl.h b/content/browser/renderer_host/render_frame_host_impl.h
+index e81bbcd..e8915b5 100644
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -1046,7 +1046,8 @@ class CONTENT_EXPORT RenderFrameHostImpl
+   net::IsolationInfo ComputeIsolationInfoForNavigation(
+       const GURL& destination,
+       bool is_credentialless,
+-      std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation);
++      std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation,
++      NavigationRequest* navigation = nullptr);
+ 
+   // Computes the IsolationInfo for this frame to |destination|.
+   net::IsolationInfo ComputeIsolationInfoForNavigation(const GURL& destination);
+@@ -1060,7 +1061,8 @@ class CONTENT_EXPORT RenderFrameHostImpl
+   net::IsolationInfo ComputeIsolationInfoForSubresourcesForPendingCommit(
+       const url::Origin& main_world_origin_for_url_loader_factory,
+       bool is_credentialless,
+-      std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation);
++      std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation,
++      NavigationRequest* navigation = nullptr);
+ 
+   // Computes site_for_cookies for this frame. A non-empty result denotes which
+   // domains are considered first-party to the top-level site when resources are
+@@ -2851,7 +2853,8 @@ class CONTENT_EXPORT RenderFrameHostImpl
+   // same as the top-level site for the purposes of calculating the storage key.
+   // See the implementation for more details.
+   blink::StorageKey CalculateStorageKey(const url::Origin& new_rfh_origin,
+-                                        const base::UnguessableToken* nonce);
++                                       const base::UnguessableToken* nonce,
++                                       NavigationRequest* navigation = nullptr);
+ 
+   // Returns the BrowsingContextState associated with this RenderFrameHostImpl.
+   // See class comments in BrowsingContextState for a more detailed description.
+@@ -3470,7 +3473,8 @@ class CONTENT_EXPORT RenderFrameHostImpl
+       const url::Origin& frame_origin,
+       net::IsolationInfo::RequestType request_type,
+       bool is_credentialless,
+-      std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation);
++      std::optional<base::UnguessableToken> fenced_frame_nonce_for_navigation,
++      NavigationRequest* navigation = nullptr);
+ 
+   // mojom::FrameHost:
+   void CreateNewWindow(mojom::CreateNewWindowParamsPtr params,
+diff --git a/content/browser/security/coop/cross_origin_opener_policy_status.cc b/content/browser/security/coop/cross_origin_opener_policy_status.cc
+--- a/content/browser/security/coop/cross_origin_opener_policy_status.cc
++++ b/content/browser/security/coop/cross_origin_opener_policy_status.cc
+@@ -206,7 +206,8 @@ void CrossOriginOpenerPolicyStatus::EnforceCOOP(
+       frame_tree_node_->current_frame_host()
+           ->ComputeIsolationInfoForSubresourcesForPendingCommit(
+               response_origin, navigation_request_->is_credentialless(),
+-              navigation_request_->ComputeFencedFrameNonce());
++              navigation_request_->ComputeFencedFrameNonce(),
++              navigation_request_);
+   CHECK(!isolation_info_for_subresources.IsEmpty(), base::NotFatalUntil::M152);
+ 
+   // Set up endpoint if response contains Reporting-Endpoints header.
+diff --git a/content/browser/storage_partition_impl.cc b/content/browser/storage_partition_impl.cc
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -3879,16 +3879,16 @@ std::optional<blink::StorageKey> StoragePartitionImpl::CalculateStorageKey(
+-  if (!handle) {
++  if (!handle || !handle->GetAlloyStateOwner()) {
+     return std::nullopt;
+   }
+-  FrameTreeNode* node = handle->GetFrameTreeNode();
+-  if (!node) {
+-    return std::nullopt;
++  auto* navigation = handle->GetNavigationRequest();
++  auto* frame_host = static_cast<RenderFrameHostImpl*>(handle->GetDocument());
++  if (!frame_host && navigation) {
++    frame_host = navigation->frame_tree_node()->current_frame_host();
+   }
+-  RenderFrameHostImpl* frame_host = node->current_frame_host();
+   if (!frame_host) {
+     return std::nullopt;
+   }
+ 
+-  return frame_host->CalculateStorageKey(origin, nonce);
++  return frame_host->CalculateStorageKey(origin, nonce, navigation);
+ }
+ 
+ GlobalRenderFrameHostId

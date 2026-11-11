@@ -21,7 +21,8 @@ revokes admission and wipes keys. Releasing the last profile reference locks it.
 Operations are blocking and run on an embedder background thread. They can run
 before `CefInitialize`, so profile bootstrap does not require constructing an
 ordinary Chromium Profile or opening private preferences first. Browser-context
-and native-store binding use this foundation in their own integration layers.
+and native-store binding use the same original profile generation. See the
+[SDK index](experimental-api.md) and [mode selection](profile-modes.md).
 
 The states are LOCKED, UNLOCKED, TRANSITION and ERROR. LOCKED acknowledges that
 engine-owned keys and admitted file access are gone. An in-flight unlock keeps
@@ -141,7 +142,86 @@ plaintext fallback. Record HMAC names cannot be tested by plain domain hashes.
 All engine-owned profile, record and file keys are wiped on lock, including
 retained old handles. Forgotten password data has no recovery mechanism.
 
+## Native contexts and site settings
+
+After `CefInitialize`, call `AlloyCreateEncryptedRequestContext` on browser UI
+with the explicit unlocked profile. Its boolean return means queued; the
+callback supplies a context only with `ALLOY_SETTINGS_OK`. Native preferences
+use that profile's original settings projection before Profile construction,
+without an ordinary Preferences file or parent-profile fallback. CEF sharing
+preserves the same native owner.
+
+Permissions/content settings, host zoom, Shields settings/seeds, preferred link
+handlers and managed-origin configuration use their site's record. Explicit
+non-site configuration, including global search choice and profile attributes,
+uses the encrypted profile-level namespace. Process-wide Local State is always
+memory-only; install-wide startup settings are embedder inputs.
+
+`AlloyProfile::DeleteSiteRecord` queues key-first deletion on UI and acknowledges
+only after native documents, workers, grants and generated references retire.
+Unrelated records and user-selected external files are preserved. `LockAsync`
+revokes the original context's keys, native owners and preference caches before
+completion. Unlocking does not reauthorize an old context.
+
+`ListSiteRecords` returns owned domain/last-visit snapshots; `DeleteAllSiteRecords`
+holds a write/create fence through whole-profile site retirement, not through
+navigation. Profile-wide configuration survives. See [site records](site-records.md)
+for callback ordering and the honest deletion boundary. [Decay](profile-decay.md)
+is persisted policy; [idle/auto-lock](profile-auto-lock.md) is runtime policy.
+
+### Native first-party working state
+
+Record deletion also retires the native working state of every attached request
+context, not just its encrypted files. A captured record lease closes admission
+before teardown. Replacement admission opens only after the native owners and
+the record coordinator finish; a context created during deletion observes the
+same shared admission block. Old documents, pending navigations and retained
+storage endpoints cannot adopt the replacement lease.
+
+| # | Native state | Retirement owner |
+|---|---|---|
+| 1 | Cookies, including partitioned cookies and bound script-cookie endpoints | Native network context and cookie store |
+| 2 | localStorage and sessionStorage, including namespace clones | DOM storage service; old area endpoints are disconnected |
+| 3 | IndexedDB, Cache Storage, OPFS, managed filesystems and quota metadata | Native quota clients, with deletion statuses joined |
+| 4 | Service workers, script resources and dependent background registrations | Existing worker teardown and native storage deletion |
+| 5 | HTTP and No-Vary-Search caches | Native resource and isolation-key ownership |
+| 6 | Generated code, media salts and persistent origin-trial working state | Record-owned native service instances |
+| 7 | HSTS, server properties, Reporting/NEL configuration, auth, DNS and client-certificate decisions | Typed native network owners; unrelated sites and proxy authentication are preserved |
+| 8 | History, visited-link projections, favicon mappings and download metadata | Native history, favicon and download owners; mappings without a history visit are included |
+| 9 | Notifications and CDM working files | Native endpoint and data retirement; this does not enable persistent CDM licenses |
+
+The existing targeted transport barrier drains old network writers before
+native data is removed. It also retires CORS preflight, shared-dictionary and
+connection state. Native failure or a dropped storage reply is not reported as
+successful deletion. Another site's own data remains intact, including shared
+favicon content still referenced by that site's pages. User-selected external
+files are never deleted by this operation.
+
+Generated-code caches currently use a bounded-admission fallback, not a global
+entry LRU. One process-wide pool reserves at most 80 MiB of native cache
+capacities, matching Chromium's default disk code-cache size. Each cache bundle
+reserves 16 MiB: a 4 MiB limit for each of JS, Wasm, the JS memory front-cache
+and the persistent/source-keyed collection. Thus at most five bundles are
+admitted across records, contexts and partitions. Capacity returns only after
+native cache shutdown runs. Additional caches are refused while full; pages
+still execute normally, without those optional cached compilations. Chromium's
+native no-cache host acknowledges lookups as
+misses rather than disconnecting a live renderer. A later binding can acquire
+capacity released by native shutdown; existing no-cache bindings remain valid.
+This is cache-capacity accounting, not a total-process RSS bound. Other record state
+is neither evicted nor recreated to make room. Entry-level size-triggered LRU
+is tracked in [issue 13](https://github.com/atmosphera-dev/alloy/issues/13).
+
+The profile and context embed-list accessors share the same encrypted owner;
+guest context accessors use memory only, and stateless access is refused. See
+[embed-list settings](embed-list-settings.md) for callback, validation and
+publication semantics, and [the system-state boundary](stateless-contexts.md#user-level-system-state)
+for fontconfig indexes outside Alloy profiles.
+
 ## Verification consumers
+
+Persisted, embedder-configured decay and its unlock/periodic enforcement are
+described in [site-record decay](site-record-decay.md).
 
 `alloy_site_records_unittests` covers the hierarchy, production password source,
 official Argon2id known-answer vector, wrong-password/locked behavior, encrypted
@@ -149,11 +229,14 @@ metadata/names, private-state persistence, real key clearing, provider reentry
 and cancellation. The inherited file-layer crash/integrity tests still run.
 
 `tools/profile_probe.py --check core` is the native API proof on the assigned
-build/test machine. It drives the generated C ABI and a C++ wrapper consumer
+build/test guest. It drives the generated C ABI and a C++ wrapper consumer
 before `CefInitialize`, including custom provider transport/refcounts, Unicode
 passwords, reopen, wrong credentials, cancellation, encrypted marker scans and
-a corrupted-root refusal that preserves the on-disk files. Store/browser probes
-are added with the corresponding integrations.
+a corrupted-root refusal that preserves the on-disk files. It also runs the
+generated C record-list callback after CEF initialization, including canonical
+domains, settings-only records, delete-all completion, owned snapshot lifetime,
+decay/idle configuration and locked cancellation.
+The C++ embedded-profile consumer exercises the same copied catalogue.
 
 `tools/profile_probe.py --check keyring` runs generated C ABI/C++ wrapper and
 cold-process native consumers in an explicitly owned throwaway gnome-keyring on
@@ -166,5 +249,7 @@ an absent provider is not activated. The storage unit suite can run through
 `tools/test_keyring.py --root <new-B-evidence-path> -- <suite argv...>` for actual
 provider, per-profile isolation, missing-key and key-wipe tests. Without that
 explicit private-session opt-in, tests requiring a provider skip rather than
-access a real user keyring. Item 6 adds browser store routing: this foundational
-probe does not yet prove cookie/localStorage/IndexedDB/browser-cache persistence.
+access a real user keyring. Browser-store routing is covered separately by
+`--check encrypted`, `--check embedded` and `--check delete`, not by the
+key-source-only test. Run acceptance on the assigned `alloy-do-build` guest,
+with its disk-backed workspace and TMPDIR, never on the source host.

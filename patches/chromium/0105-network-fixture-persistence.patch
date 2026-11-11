@@ -1,0 +1,91 @@
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -1921,6 +1921,11 @@
+   // Check if there is a preloaded shared dictionary info.
+   HasPreloadedSharedDictionaryInfoForTesting() => (bool value);
+ 
++  // Testing-only setup fence: waits native initialization, flushes pending
++  // HTTP properties and commits the context's persistent preference store.
++  // Preserves stored data; reply is native persistence completion.
++  FlushPersistentStateForTesting() => ();
++
+   // Will flush cached client certificate for `host` if `certificate`
+   // doesn't match the corresponding cached certificate.
+   FlushCachedClientCertIfNeeded(
+--- a/services/network/network_context.h
++++ b/services/network/network_context.h
+@@ -622,6 +622,8 @@
+           preload_handle) override;
+   void HasPreloadedSharedDictionaryInfoForTesting(
+       HasPreloadedSharedDictionaryInfoForTestingCallback callback) override;
++  void FlushPersistentStateForTesting(
++      FlushPersistentStateForTestingCallback callback) override;
+   void FlushCachedClientCertIfNeeded(
+       const net::HostPortPair& host,
+       const scoped_refptr<net::X509Certificate>& certificate) override;
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -3883,6 +3883,50 @@
+       shared_dictionary_manager_->HasPreloadedSharedDictionaryInfo());
+ }
+ 
++void NetworkContext::FlushPersistentStateForTesting(
++    FlushPersistentStateForTestingCallback callback) {
++  auto* prefs = url_request_context_owner_.pref_service.get();
++  if (!prefs) {
++    std::move(callback).Run();
++    return;
++  }
++  auto flush = base::BindOnce(
++      [](base::WeakPtr<NetworkContext> self,
++         FlushPersistentStateForTestingCallback callback) {
++        if (!self) {
++          return;
++        }
++        auto* properties = self->url_request_context_->http_server_properties();
++        // Initialization observers were registered during construction, before
++        // this setup request. Dispatch after that native observer batch; never
++        // use the testing flush to invalidate uninitialized startup properties.
++        CHECK(properties && properties->IsInitialized());
++        properties->FlushWritePropertiesForTesting(base::BindOnce(
++            [](base::WeakPtr<NetworkContext> self,
++               FlushPersistentStateForTestingCallback callback) {
++              if (self) {
++                self->url_request_context_owner_.pref_service
++                    ->CommitPendingWrite(std::move(callback));
++              }
++            },
++            self, std::move(callback)));
++      },
++      weak_factory_.GetWeakPtr(), std::move(callback));
++  if (prefs->GetInitializationStatus() ==
++      PrefService::INITIALIZATION_STATUS_WAITING) {
++    prefs->AddPrefInitObserver(base::BindOnce(
++        [](base::OnceClosure flush, bool success) {
++          CHECK(success);
++          base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++              FROM_HERE, std::move(flush));
++        },
++        std::move(flush)));
++  } else {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++                                                             std::move(flush));
++  }
++}
++
+ void NetworkContext::FlushCachedClientCertIfNeeded(
+     const net::HostPortPair& host,
+     const scoped_refptr<net::X509Certificate>& certificate) {
+--- a/services/network/test/test_network_context.h
++++ b/services/network/test/test_network_context.h
+@@ -407,6 +407,10 @@
+           preload_handle) override {}
+   void HasPreloadedSharedDictionaryInfoForTesting(
+       HasPreloadedSharedDictionaryInfoForTestingCallback callback) override {}
++  void FlushPersistentStateForTesting(
++      FlushPersistentStateForTestingCallback callback) override {
++    std::move(callback).Run();
++  }
+   void FlushCachedClientCertIfNeeded(
+       const net::HostPortPair& host,
+       const scoped_refptr<net::X509Certificate>& certificate) override {}

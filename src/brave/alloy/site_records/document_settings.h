@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "base/functional/callback.h"
+#include "base/memory/scoped_refptr.h"
 #include "components/content_settings/core/browser/content_settings_observer.h"
 #include "components/content_settings/core/browser/host_content_settings_map.h"
 #include "components/keyed_service/core/keyed_service.h"
@@ -17,7 +18,8 @@ namespace alloy::site_records {
 
 // A native settings shard whose decisions and notifications have one owner.
 // Configuration stays live through PrefService; user decisions never enter it.
-class DocumentSettings final : public content_settings::Observer {
+class DocumentSettings final : public KeyedService,
+                               public content_settings::Observer {
  public:
   using Changed = base::RepeatingCallback<void(const ContentSettingsPattern&,
                                                const ContentSettingsPattern&,
@@ -27,12 +29,13 @@ class DocumentSettings final : public content_settings::Observer {
 
   DocumentSettings(PrefService* configuration, Changed changed);
   ~DocumentSettings() override;
+  void Shutdown() override;
   DocumentSettings(const DocumentSettings&) = delete;
   DocumentSettings& operator=(const DocumentSettings&) = delete;
 
-  HostContentSettingsMap& settings() { return *settings_; }
+  HostContentSettingsMap& settings();
   // Key is a browser-owned type tag, never renderer data. The native service
-  // stays unique within this document and shuts down before its settings map.
+  // stays unique within this owner and shuts down before its settings map.
   // Closing admission during shutdown also prevents reentrant recreation.
   KeyedService* GetOrCreateService(const void* key, ServiceFactory factory);
 
@@ -41,10 +44,9 @@ class DocumentSettings final : public content_settings::Observer {
                                const ContentSettingsPattern& secondary,
                                ContentSettingsTypeSet types) override;
 
-  const scoped_refptr<HostContentSettingsMap> settings_;
+  struct State;
+  const scoped_refptr<State> state_;
   const Changed changed_;
-  std::map<const void*, std::unique_ptr<KeyedService>> services_;
-  bool shutting_down_ = false;
 };
 
 }  // namespace alloy::site_records

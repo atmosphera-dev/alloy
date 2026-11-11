@@ -26,10 +26,12 @@ class NativeProfileConfiguration final {
   struct Bindings {
     scoped_refptr<PersistentPrefStore> prefs;
     base::RepeatingCallback<bool()> admitted;
+    base::RepeatingCallback<bool(std::string_view)> record_working_state_admitted;
     base::OnceCallback<bool(base::OnceClosure)> begin_construction;
     base::RepeatingClosure construction_finished;
     base::OnceClosure finish_teardown;
     base::OnceCallback<void(base::SupportsUserData&)> attach_consumer;
+    base::RepeatingCallback<void(const GURL&, const url::Origin&)> committed_visit;
   };
   NativeProfileConfiguration(RecordCapability profile_settings,
                              Bindings bindings,
@@ -39,6 +41,9 @@ class NativeProfileConfiguration final {
   NativeProfileConfiguration& operator=(const NativeProfileConfiguration&) = delete;
 
   bool admitted() const;
+  base::RepeatingCallback<bool(std::string_view)> record_working_state_admission() const {
+    return bindings_.record_working_state_admitted;
+  }
   bool BeginConstruction();
   void SetTeardownHandler(base::OnceClosure teardown);
   void ConstructionFinished();
@@ -47,6 +52,7 @@ class NativeProfileConfiguration final {
   scoped_refptr<PersistentPrefStore> prefs() const { return bindings_.prefs; }
   StorageMode mode() const { return profile_settings_.mode(); }
   bool SharesOwnerWith(const NativeProfileConfiguration& other) const;
+  void DidCommitSiteVisit(const GURL& url, const url::Origin& origin) const;
   // Typed consumer adapters retain their own private inputs here. Only the
   // adapter knows its key/type; common lifecycle code never interprets them.
   void SetConsumerData(const void* key,

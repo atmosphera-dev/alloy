@@ -123,7 +123,7 @@
      : local_state_(local_state),
        locale_(locale),
        profile_dir_(profile_dir),
-@@ -212,13 +230,22 @@
+@@ -212,10 +230,17 @@
            component_update_service_);
    default_resource_provider_ = default_resource_provider.get();
  
@@ -143,12 +143,14 @@
        std::make_unique<AdBlockFilterListCatalogProvider>(
            component_update_service_);
  
+@@ -230,4 +257,6 @@
 -  dat_cache_manager_ = std::make_unique<AdBlockDATCacheManager>(profile_dir_);
 +  dat_cache_manager_ = backends
 +      ? std::make_unique<AdBlockDATCacheManager>(std::move(backends->dat))
 +      : std::make_unique<AdBlockDATCacheManager>(profile_dir_);
-   // Start reading cached DAT files from disk as early as possible so the
-   // engine can be populated before components arrive from the network.
+   if (use_dat_cache_) {
+     // Start reading cached DAT files from disk as early as possible so the
+     // engine can be populated before components arrive from the network.
 @@ -233,10 +260,17 @@
        local_state_, filters_provider_manager_.get(), locale_,
        component_update_service_, filter_list_catalog_provider_.get(),

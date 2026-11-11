@@ -1,0 +1,245 @@
+diff --git a/components/content_settings/core/common/cookie_settings_base.cc b/components/content_settings/core/common/cookie_settings_base.cc
+index a28ddc4..350a0be 100644
+--- a/components/content_settings/core/common/cookie_settings_base.cc
++++ b/components/content_settings/core/common/cookie_settings_base.cc
+@@ -335,7 +335,8 @@ CookieSettingsBase::ModifierMode CookieSettingsBase::GetModifierMode(
+     return ModifierMode::kBlock;
+   }
+   if (overrides.Has(
+-          net::CookieSettingOverride::kForceEnableThirdPartyCookies)) {
++          net::CookieSettingOverride::kForceEnableThirdPartyCookies) ||
++      overrides.Has(net::CookieSettingOverride::kAlloyConsideredFirstParty)) {
+     return ModifierMode::kAllow;
+   }
+   return ModifierMode::kUndefined;
+diff --git a/content/browser/loader/navigation_url_loader_impl.cc b/content/browser/loader/navigation_url_loader_impl.cc
+index 1e03719..ee17155 100644
+--- a/content/browser/loader/navigation_url_loader_impl.cc
++++ b/content/browser/loader/navigation_url_loader_impl.cc
+@@ -29,6 +29,7 @@
+ #include "components/download/public/common/download_stats.h"
+ #include "content/browser/about_url_loader_factory.h"
+ #include "content/browser/alloy_network_generation.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
+ #include "content/browser/client_hints/client_hints.h"
+ #include "content/browser/data_url_loader_factory.h"
+@@ -2314,6 +2315,9 @@ NavigationURLLoaderImpl::CreateNetworkLoaderFactory(
+     scoped_refptr<base::SingleThreadTaskRunner> network_response_task_runner) {
+   auto generation =
+       frame_tree_node->navigation_request()->GetAlloyNetworkGeneration();
++  const auto cookie_origin = AlloyConsideredFirstPartyCookieOrigin(
++      AlloyNavigationStateOwner(frame_tree_node->navigation_request()),
++      browser_context);
+   mojo::PendingRemote<network::mojom::TrustedURLLoaderHeaderClient>
+       header_client;
+ 
+@@ -2365,15 +2369,17 @@ NavigationURLLoaderImpl::CreateNetworkLoaderFactory(
+             storage_partition, std::move(devtools_cookie_overrides),
+             std::move(cookie_overrides),
+             network::GetNoOpNetworkRestrictionsId(),
+-            generation ? generation->GetNetworkContext() : nullptr));
++            generation ? generation->GetNetworkContext() : nullptr,
++            cookie_origin));
+   } else {
+-    if (generation || !devtools_cookie_overrides.empty() ||
++    if (generation || cookie_origin || !devtools_cookie_overrides.empty() ||
+         !cookie_overrides.empty() || factory_builder.RequiresFreshFactory()) {
+       network::mojom::URLLoaderFactoryParamsPtr params =
+           storage_partition->CreateURLLoaderFactoryParams();
+       params->devtools_cookie_setting_overrides =
+           std::move(devtools_cookie_overrides);
+       params->cookie_setting_overrides = std::move(cookie_overrides);
++      params->alloy_considered_first_party_cookie_origin = cookie_origin;
+       return std::move(factory_builder)
+           .Finish(generation ? generation->GetNetworkContext()
+                              : storage_partition->GetNetworkContext(),
+@@ -2575,7 +2581,8 @@ NavigationURLLoaderImpl::CreateURLLoaderFactoryWithHeaderClient(
+     std::optional<net::CookieSettingOverrides> devtools_cookie_overrides,
+     std::optional<net::CookieSettingOverrides> cookie_overrides,
+     const base::UnguessableToken& network_restrictions_id,
+-    network::mojom::NetworkContext* generation_context) {
++    network::mojom::NetworkContext* generation_context,
++    std::optional<url::Origin> cookie_origin) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+ 
+   if (url_loader_factory::GetTestingInterceptor()) {
+@@ -2586,6 +2593,7 @@ NavigationURLLoaderImpl::CreateURLLoaderFactoryWithHeaderClient(
+   network::mojom::URLLoaderFactoryParamsPtr params =
+       network::mojom::URLLoaderFactoryParams::New();
+   params->header_client = std::move(header_client);
++  params->alloy_considered_first_party_cookie_origin = std::move(cookie_origin);
+   params->process_id = network::OriginatingProcessId::browser();
+   params->is_trusted = true;
+   params->is_orb_enabled = false;
+diff --git a/content/browser/loader/navigation_url_loader_impl.h b/content/browser/loader/navigation_url_loader_impl.h
+index b87a3e9..01382a4 100644
+--- a/content/browser/loader/navigation_url_loader_impl.h
++++ b/content/browser/loader/navigation_url_loader_impl.h
+@@ -110,7 +110,8 @@ class CONTENT_EXPORT NavigationURLLoaderImpl
+       std::optional<net::CookieSettingOverrides> devtools_cookie_overrides,
+       std::optional<net::CookieSettingOverrides> cookie_overrides,
+       const base::UnguessableToken& network_restrictions_id,
+-      network::mojom::NetworkContext* generation_context);
++      network::mojom::NetworkContext* generation_context,
++      std::optional<url::Origin> cookie_origin = std::nullopt);
+ 
+   // NavigationURLLoader implementation:
+   // Starts the loader by finalizing loader factories initialization and
+diff --git a/content/browser/renderer_host/render_frame_host_impl.cc b/content/browser/renderer_host/render_frame_host_impl.cc
+index d4e135b..9fa43b6 100644
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -14258,7 +14258,7 @@ network::mojom::URLLoaderFactoryParamsPtr
+ RenderFrameHostImpl::CreateURLLoaderFactoryParamsForMainWorld(
+     const SubresourceLoaderFactoriesConfig& config,
+     std::string_view debug_tag) {
+-  return URLLoaderFactoryParamsHelper::CreateForFrame(
++  auto params = URLLoaderFactoryParamsHelper::CreateForFrame(
+       this, config.CreateNetworkObserver(*this), config.origin(),
+       config.isolation_info(), config.GetClientSecurityState(),
+       config.GetCoepReporter(), config.GetDipReporter(), GetProcess(),
+@@ -14266,6 +14266,10 @@ RenderFrameHostImpl::CreateURLLoaderFactoryParamsForMainWorld(
+       config.trust_token_redemption_policy(), config.cookie_setting_overrides(),
+       config.network_restrictions_id(),
+       config.renderer_accessible_http_cache_write_enabled(), debug_tag);
++  params->alloy_considered_first_party_cookie_origin =
++      AlloyConsideredFirstPartyCookieOrigin(config.alloy_state_owner(),
++                                           GetBrowserContext());
++  return params;
+ }
+ 
+ bool RenderFrameHostImpl::CreateNetworkServiceDefaultFactoryAndObserve(
+diff --git a/content/browser/storage_partition_impl.cc b/content/browser/storage_partition_impl.cc
+index 63ade65..5e12eda 100644
+--- a/content/browser/storage_partition_impl.cc
++++ b/content/browser/storage_partition_impl.cc
+@@ -1714,6 +1714,14 @@ void StoragePartitionImpl::CreateRestrictedCookieManager(
+     mojo::PendingRemote<network::mojom::CookieAccessObserver> cookie_observer,
+     std::optional<base::WeakPtr<base::SupportsUserData>> owner_state) {
+   CHECK(initialized_, base::NotFatalUntil::M159);
++  if (owner_state) {
++    const auto captured =
++        AlloyConsideredFirstPartyCookieOrigin(*owner_state, browser_context_);
++    if (captured && captured->IsSameOriginWith(origin)) {
++      cookie_setting_overrides.Put(
++          net::CookieSettingOverride::kAlloyConsideredFirstParty);
++    }
++  }
+   if (!GetContentClient()->browser()->WillCreateRestrictedCookieManager(
+           role, browser_context_, origin, isolation_info, is_service_worker,
+           process_id, routing_id, prefer_bound_cookie_context, &receiver)) {
+diff --git a/content/browser/worker_host/dedicated_worker_host.cc b/content/browser/worker_host/dedicated_worker_host.cc
+index dc59c3a..ed1e649 100644
+--- a/content/browser/worker_host/dedicated_worker_host.cc
++++ b/content/browser/worker_host/dedicated_worker_host.cc
+@@ -731,6 +731,10 @@ DedicatedWorkerHost::CreateNetworkFactoryForSubresources(
+   // Worker subresources are not outermost-main-frame requests even when their
+   // creator frame is outermost.
+   factory_params->is_outermost_main_frame = false;
++  factory_params->alloy_considered_first_party_cookie_origin =
++      AlloyConsideredFirstPartyCookieOrigin(
++          AlloyDocumentStateOwner(ancestor_render_frame_host),
++          worker_process_host_->GetBrowserContext());
+ 
+   RenderFrameHost* frame = nullptr;
+   if (base::FeatureList::IsEnabled(
+diff --git a/content/browser/worker_host/worker_script_fetcher.cc b/content/browser/worker_host/worker_script_fetcher.cc
+index f9a347b..0b1cfce 100644
+--- a/content/browser/worker_host/worker_script_fetcher.cc
++++ b/content/browser/worker_host/worker_script_fetcher.cc
+@@ -11,6 +11,7 @@
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "content/browser/alloy_network_generation.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/browser/connection_allowlist_utils.h"
+ #include "content/browser/data_url_loader_factory.h"
+ #include "content/browser/devtools/devtools_agent_host_impl.h"
+@@ -553,6 +554,10 @@ void WorkerScriptFetcher::CreateScriptLoader(
+     // `WorkerScriptFetcher` in the browser process. We can mark this trusted
+     // safely.
+     factory_params->is_trusted = true;
++    factory_params->alloy_considered_first_party_cookie_origin =
++        AlloyConsideredFirstPartyCookieOrigin(
++            AlloyDocumentStateOwner(&ancestor_render_frame_host),
++            browser_context);
+ 
+     bool bypass_redirect_checks = false;
+     // TODO(crbug.com/40139181): The UKM ID could be computed.
+diff --git a/net/cookies/cookie_setting_override.h b/net/cookies/cookie_setting_override.h
+index f1855c7..8f2d57e 100644
+--- a/net/cookies/cookie_setting_override.h
++++ b/net/cookies/cookie_setting_override.h
+@@ -42,7 +42,11 @@ enum class CookieSettingOverride {
+   // exist.
+   kForceEnableThirdPartyCookies,
+ 
+-  kMaxValue = kForceEnableThirdPartyCookies,
++  // Browser-captured directional embed-list admission, confined to the bound
++  // document origin. Does not override explicit site blocks or SameSite rules.
++  kAlloyConsideredFirstParty,
++
++  kMaxValue = kAlloyConsideredFirstParty,
+ };
+ 
+ using CookieSettingOverrides = base::EnumSet<CookieSettingOverride>;
+diff --git a/services/network/public/mojom/network_context.mojom b/services/network/public/mojom/network_context.mojom
+index ece831e..158f298 100644
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -986,6 +986,10 @@ struct URLLoaderFactoryParams {
+   // each URLRequest.
+   CookieSettingOverrides cookie_setting_overrides;
+ 
++  // Captured by the browser from the original navigation/document owner.
++  // Applies only to same-origin destinations, rechecked on every redirect.
++  url.mojom.Origin? alloy_considered_first_party_cookie_origin;
++
+   // The cookie setting overrides from devtools, only conditionally applied
+   // on requests from devtools enabled context, i.e. when
+   // `ResourceRequest::devtools_request_id` is present.
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+index ab96655..f53edd4 100644
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/url_loader.h"
++#include "net/cookies/alloy_cookie_settings.h"
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -1063,6 +1064,9 @@ void URLLoader::OnReceivedRedirect(net::URLRequest* url_request,
+     return;
+   }
+ 
++  net::ApplyAlloyCookieOrigin(
++      factory_params_->alloy_considered_first_party_cookie_origin,
++      redirect_info.new_url, url_request_->cookie_setting_overrides());
+   url_loader_util::SetRequestCredentials(
+       redirect_info.new_url, factory_params_->client_security_state,
+       request_mode_, request_credentials_mode_, url_request_->initiator(),
+diff --git a/services/network/url_loader_util.cc b/services/network/url_loader_util.cc
+index 370ca04..704412c 100644
+--- a/services/network/url_loader_util.cc
++++ b/services/network/url_loader_util.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/url_loader_util.h"
++#include "net/cookies/alloy_cookie_settings.h"
+ 
+ #include <algorithm>
+ #include <optional>
+@@ -590,6 +591,9 @@ void ConfigureUrlRequest(const ResourceRequest& request,
+   url_request.cookie_setting_overrides() = CalculateCookieSettingOverrides(
+       factory_params.cookie_setting_overrides,
+       factory_params.devtools_cookie_setting_overrides, request);
++  net::ApplyAlloyCookieOrigin(
++      factory_params.alloy_considered_first_party_cookie_origin, request.url,
++      url_request.cookie_setting_overrides());
+   url_request.SetLoadFlags(request.load_flags);
+   SetRequestCredentials(request.url, factory_params.client_security_state,
+                         request.mode, request.credentials_mode,

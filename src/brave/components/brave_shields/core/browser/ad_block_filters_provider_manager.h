@@ -18,6 +18,7 @@ class AdBlockFiltersProviderManager : public AdBlockFiltersProvider,
   using Parse=base::OnceCallback<void(rust::Box<adblock::FilterSet>*)>;
   using Loaded=base::OnceCallback<void(Parse)>;
   AdBlockFiltersProviderManager();
+  explicit AdBlockFiltersProviderManager(bool use_dat_cache);
   ~AdBlockFiltersProviderManager() override;
   AdBlockFiltersProviderManager(const AdBlockFiltersProviderManager&)=delete;
   AdBlockFiltersProviderManager& operator=(const AdBlockFiltersProviderManager&)=delete;

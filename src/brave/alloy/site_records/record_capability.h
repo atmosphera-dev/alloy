@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <string>
+#include <string_view>
 
 #include "base/memory/ref_counted.h"
 #include "base/memory/scoped_refptr.h"
@@ -71,6 +72,11 @@ bool IsProfileStorePurpose(StorePurpose purpose);
 // intact inside a record. SchemefulSite supplies private-registry/IP semantics.
 std::string RecordDomainForPrincipal(const GURL& browser_owned_url,
                                      const url::Origin& browser_owned_origin);
+
+// Reconstruct a browser-owned principal from an exact canonical host without
+// content-setting pattern normalization. Preserve subdomains and trailing dots;
+// record grouping remains owned by RecordDomainForPrincipal.
+GURL RecordPrincipalForHost(std::string_view host);
 
 class RecordCapabilityIssuer;
 

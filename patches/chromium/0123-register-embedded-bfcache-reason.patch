@@ -1,0 +1,60 @@
+diff --git a/content/browser/back_forward_cache/back_forward_cache_disable.h b/content/browser/back_forward_cache/back_forward_cache_disable.h
+--- a/content/browser/back_forward_cache/back_forward_cache_disable.h
++++ b/content/browser/back_forward_cache/back_forward_cache_disable.h
+@@ -46,6 +46,9 @@
+     // Documents that are cleared for discard should not be BFCached.
+     kDiscarded = 14,
+ 
++    // Restoring renderer caches could expose retired embedded-memory state.
++    kAlloyEmbeddedState = 15,
++
+     // New reasons should be accompanied by a comment as to why BackForwardCache
+     // cannot be used in this case and a link to a bug to fix that if it is
+     // fixable.
+diff --git a/content/browser/back_forward_cache/back_forward_cache_disable.cc b/content/browser/back_forward_cache/back_forward_cache_disable.cc
+--- a/content/browser/back_forward_cache/back_forward_cache_disable.cc
++++ b/content/browser/back_forward_cache/back_forward_cache_disable.cc
+@@ -33,6 +33,8 @@
+       return "ScreenReader";
+     case BackForwardCacheDisable::DisabledReasonId::kDiscarded:
+       return "Discarded";
++    case BackForwardCacheDisable::DisabledReasonId::kAlloyEmbeddedState:
++      return "AlloyEmbeddedState";
+   }
+ }
+ 
+diff --git a/content/browser/devtools/protocol/page_handler.cc b/content/browser/devtools/protocol/page_handler.cc
+--- a/content/browser/devtools/protocol/page_handler.cc
++++ b/content/browser/devtools/protocol/page_handler.cc
+@@ -2461,6 +2461,9 @@
+               ContentScreenReader;
+         case BackForwardCacheDisable::DisabledReasonId::kDiscarded:
+           return Page::BackForwardCacheNotRestoredReasonEnum::ContentDiscarded;
++        case BackForwardCacheDisable::DisabledReasonId::kAlloyEmbeddedState:
++          return Page::BackForwardCacheNotRestoredReasonEnum::
++              ContentAlloyEmbeddedState;
+       }
+     case BackForwardCache::DisabledSource::kEmbedder:
+       switch (static_cast<back_forward_cache::DisabledReasonId>(reason.id)) {
+diff --git a/third_party/blink/public/devtools_protocol/domains/Page.pdl b/third_party/blink/public/devtools_protocol/domains/Page.pdl
+--- a/third_party/blink/public/devtools_protocol/domains/Page.pdl
++++ b/third_party/blink/public/devtools_protocol/domains/Page.pdl
+@@ -1662,6 +1662,7 @@
+       ContentMediaSessionService
+       ContentScreenReader
+       ContentDiscarded
++      ContentAlloyEmbeddedState
+ 
+       # See components/back_forward_cache/back_forward_cache_disable.h for explanations.
+       EmbedderPopupBlockerTabHelper
+diff --git a/tools/metrics/histograms/enums.xml b/tools/metrics/histograms/enums.xml
+--- a/tools/metrics/histograms/enums.xml
++++ b/tools/metrics/histograms/enums.xml
+@@ -665,6 +665,7 @@
+   <int value="131084" label="kContent-kMediaPlay"/>
+   <int value="131085" label="kContent-kScreenReader"/>
+   <int value="131086" label="kContent-kDiscarded"/>
++  <int value="131087" label="kContent-kAlloyEmbeddedState"/>
+   <int value="196608" label="kEmbedder-kUnknown"/>
+   <int value="196609" label="kEmbedder-kPopupBlockerTabHelper"/>
+   <int value="196610" label="kEmbedder-kSafeBrowsingTriggeredPopupBlocker"/>

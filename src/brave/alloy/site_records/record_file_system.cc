@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <utility>
 
 #include "brave/alloy/site_records/encrypted_tree.h"
@@ -316,6 +317,8 @@ struct RecordFileSystem::Impl {
   std::map<base::UnguessableToken, std::unique_ptr<Record>> records;
   base::UnguessableToken private_record;
   std::set<ObjectId> deleting;
+  std::map<base::UnguessableToken, ObjectId> pending_deletions;
+  base::UnguessableToken site_deletion_fence;
   FileFault fault;
 
   FileStatus Admission() const {
@@ -428,8 +431,9 @@ struct RecordFileSystem::Impl {
     return live;
   }
 
+  /// Validate original capability and current fences; only retirement may bypass site writes.
   FileStatus Check(const RecordCapability& cap, StorePurpose purpose,
-                    StorageAccess access, Record** out) {
+                    StorageAccess access, Record** out, bool retirement = false) {
     auto status = Admission();
     if (status != FileStatus::kOk) {
       return status;
@@ -442,6 +446,9 @@ struct RecordFileSystem::Impl {
       return FileStatus::kDenied;
     }
     *out = found->second.get();
+    if (!retirement && !site_deletion_fence.is_empty() &&
+        !found->second->profile_private && access == StorageAccess::kWriteRecordFiles)
+      return FileStatus::kBusy;
     return FileStatus::kOk;
   }
 
@@ -553,7 +560,7 @@ struct RecordFileSystem::Impl {
 
   FileStatus PutRecord(Record& record, ObjectRef* into) {
     Encoder value;
-    value.U32(record.profile_private ? 2 : 1);
+    value.U32(record.profile_private ? 2 : 3);
     value.Token(record.info.id);
     value.Token(record.info.generation);
     value.Text(record.info.domain);
@@ -561,6 +568,7 @@ struct RecordFileSystem::Impl {
     value.Blob(record.info.metadata);
     value.Blob(record.wrapped_key);
     value.Ref(record.names);
+    if (!record.profile_private) value.U64(record.info.last_visit_us);
     ObjectRef updated;
     const auto status = CatalogueTree().Put(*into, record.info.directory,
                                              value.bytes, &updated);
@@ -575,7 +583,7 @@ struct RecordFileSystem::Impl {
     auto record = std::make_unique<Record>();
     Decoder in(value);
     const auto kind = in.U32();
-    if (kind != 1 && kind != 2) {
+    if (kind != 1 && kind != 2 && kind != 3) {
       return FileStatus::kIntegrity;
     }
     record->profile_private = kind == 2;
@@ -589,6 +597,7 @@ struct RecordFileSystem::Impl {
     const auto wrapped = in.Blob(80);
     record->wrapped_key.assign(wrapped.begin(), wrapped.end());
     record->names = in.Ref();
+    if (kind == 3) record->info.last_visit_us = static_cast<int64_t>(in.U64());
     const auto expected = record->profile_private ? PrivateDirectory()
         : KeyedName(lookup_key, base::as_byte_span(record->info.domain));
     if (!in.Done() || record->info.domain.empty() != record->profile_private ||
@@ -770,6 +779,86 @@ struct RecordFileSystem::Impl {
       record->gc_needed = false;
       for (auto& [file_id, file] : record->files) {
         file->dirty = false;
+      }
+    }
+    return FileStatus::kOk;
+  }
+
+  // Stage immutable ciphertext and COW namespace roots before publishing any
+  // of them to live state. The enclosing coordinator mutex is the transaction
+  // barrier; no other native adapter can publish an intermediate shard root.
+  /// Stage authenticated settings atomically, allowing reference pruning during retirement.
+  FileStatus StageSettings(base::span<const SettingsReplacement> replacements,
+                           base::UnguessableToken deleting_record = {}) {
+    struct Update {
+      ObjectRef names;
+      std::vector<ObjectId> detached;
+    };
+    std::map<Record*, Update> updates;
+    std::set<std::tuple<base::UnguessableToken, uint32_t, ObjectId, std::string>> selected;
+    for (const auto& replacement : replacements) {
+      if ((replacement.purpose != StorePurpose::kSiteSettings &&
+           replacement.purpose != StorePurpose::kProfileSettings) ||
+          replacement.bytes.size() > 64 * 1024 * 1024 ||
+          replacement.capability.record() == deleting_record) {
+        return FileStatus::kInvalid;
+      }
+      Record* record;
+      auto status = Check(replacement.capability, replacement.purpose,
+                          StorageAccess::kWriteRecordFiles, &record, !deleting_record.is_empty());
+      if (status != FileStatus::kOk) return status;
+      const auto tag = PersistentStoreTag(replacement.purpose);
+      NamespaceEntry entry;
+      status = Parent(*record, tag, replacement.name, &entry.parent, &entry.name);
+      if (status != FileStatus::kOk) return status;
+      if (!selected.emplace(record->info.id, tag, entry.parent, entry.name).second) {
+        return FileStatus::kInvalid;
+      }
+      auto [it, inserted] = updates.try_emplace(record);
+      auto& update = it->second;
+      if (inserted) update.names = record->names;
+      NamespaceEntry old;
+      status = GetEntry(*record, tag, entry.parent, entry.name, &old);
+      if (status == FileStatus::kOk) {
+        if (old.directory) return FileStatus::kIsDirectory;
+        // A replacement cannot turn corrupted existing content into an
+        // apparently successful fresh settings file, even after startup load.
+        std::unique_ptr<EncryptedFileContents> previous;
+        status = EncryptedFileContents::Open(*record->objects, record->key,
+            replacement.capability, replacement.purpose, old.root, &previous);
+        if (status != FileStatus::kOk) return status;
+        if (old.root.length > 64 * 1024 * 1024) return FileStatus::kInvalid;
+        WipedPage page;
+        for (uint64_t offset = 0; offset < old.root.length; offset += page.page.size()) {
+          size_t read = 0;
+          const auto count = static_cast<size_t>(
+              std::min<uint64_t>(page.page.size(), old.root.length - offset));
+          status = previous->Read(offset, base::span(page.page).first(count), &read);
+          if (status != FileStatus::kOk) return status;
+          if (read != count) return FileStatus::kIntegrity;
+        }
+        update.detached.push_back(old.root.file_id);
+      } else if (status != FileStatus::kNotFound) {
+        return status;
+      }
+      std::unique_ptr<EncryptedFileContents> contents;
+      status = EncryptedFileContents::Create(*record->objects, record->key,
+          replacement.capability, replacement.purpose, &contents);
+      if (status == FileStatus::kOk) status = contents->Write(0, replacement.bytes);
+      if (status != FileStatus::kOk) return status;
+      entry.purpose = tag;
+      entry.modified_us = NowMicros();
+      entry.root = contents->root();
+      status = PutEntry(*record, entry, &update.names);
+      if (status != FileStatus::kOk) return status;
+    }
+    for (auto& [record, update] : updates) {
+      record->names = update.names;
+      record->dirty = true;
+      record->gc_needed = true;
+      for (const auto& id : update.detached) {
+        const auto old = record->files.find(id);
+        if (old != record->files.end()) old->second->linked = false;
       }
     }
     return FileStatus::kOk;
@@ -993,6 +1082,7 @@ FileStatus RecordFileSystem::Sync() {
   return impl_->Observe(impl_->Commit());
 }
 
+/// Resolve a canonical site without admitting new records through a whole-set fence.
 FileStatus RecordFileSystem::ResolveRecord(const GURL& url,
                                             const url::Origin& origin,
                                             bool create, RecordInfo* out) {
@@ -1018,6 +1108,7 @@ FileStatus RecordFileSystem::ResolveRecord(const GURL& url,
   if (!create) {
     return FileStatus::kNotFound;
   }
+  if (!impl_->site_deletion_fence.is_empty()) return FileStatus::kBusy;
   auto record = std::make_unique<Impl::Record>();
   record->info.id = base::UnguessableToken::Create();
   record->info.generation = base::UnguessableToken::Create();
@@ -1072,6 +1163,73 @@ FileStatus RecordFileSystem::ListRecords(std::vector<RecordInfo>* out) {
   return FileStatus::kOk;
 }
 
+/// Persist a top-level visit only while the site's generation remains writable.
+FileStatus RecordFileSystem::RecordVisit(base::UnguessableToken id, int64_t now_us) {
+  std::lock_guard lock(impl_->mutex);
+  const auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  const auto found = impl_->records.find(id);
+  if (found == impl_->records.end()) return FileStatus::kNotFound;
+  if (now_us <= 0 || found->second->profile_private) return FileStatus::kInvalid;
+  if (!impl_->site_deletion_fence.is_empty()) return FileStatus::kBusy;
+  found->second->info.last_visit_us = now_us;
+  found->second->dirty = true;
+  return impl_->Observe(impl_->Commit());
+}
+
+/// Clamp future site clocks before decay, refusing mutation during whole-set retirement.
+FileStatus RecordFileSystem::ClampFutureRecordTimes(int64_t now_us) {
+  std::lock_guard lock(impl_->mutex);
+  const auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  if (now_us <= 0) return FileStatus::kInvalid;
+  if (!impl_->site_deletion_fence.is_empty()) return FileStatus::kBusy;
+  bool changed = false;
+  for (auto& [id, record] : impl_->records) {
+    if (record->profile_private) continue;
+    for (auto* time : {&record->info.created_us, &record->info.last_visit_us}) {
+      if (*time > now_us) { *time = now_us; record->dirty = changed = true; }
+    }
+  }
+  return changed ? impl_->Observe(impl_->Commit()) : FileStatus::kOk;
+}
+
+/// Flush accepted writes and acquire exclusive site creation/write retirement ownership.
+FileStatus RecordFileSystem::BeginSiteDeletion(base::UnguessableToken* fence) {
+  if (!fence) return FileStatus::kInvalid;
+  std::lock_guard lock(impl_->mutex);
+  auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  if (!impl_->site_deletion_fence.is_empty() || !impl_->pending_deletions.empty())
+    return FileStatus::kBusy;
+  status = impl_->Observe(impl_->Commit());
+  if (status != FileStatus::kOk) return status;
+  *fence = impl_->site_deletion_fence = base::UnguessableToken::Create();
+  return FileStatus::kOk;
+}
+
+/// Release the matching fence only after catalogue and pending retirement tickets are empty.
+FileStatus RecordFileSystem::EndSiteDeletion(base::UnguessableToken fence) {
+  std::lock_guard lock(impl_->mutex);
+  const auto status = impl_->Admission();
+  if (status != FileStatus::kOk) return status;
+  if (fence.is_empty() || fence != impl_->site_deletion_fence) return FileStatus::kDenied;
+  if (!impl_->pending_deletions.empty()) return FileStatus::kBusy;
+  for (const auto& [id, record] : impl_->records)
+    if (!record->profile_private) return FileStatus::kBusy;
+  impl_->site_deletion_fence = {};
+  return FileStatus::kOk;
+}
+
+/// Query authoritative coordinator admission without mutating or opening a backend.
+FileStatus RecordFileSystem::CheckAccess(const RecordCapability& capability,
+    StorePurpose purpose, StorageAccess access) {
+  std::lock_guard lock(impl_->mutex);
+  Impl::Record* record;
+  return impl_->Check(capability, purpose, access, &record);
+}
+
+/// Replace encrypted metadata only for an admitted writable record generation.
 FileStatus RecordFileSystem::SetRecordMetadata(
     base::UnguessableToken id, base::span<const uint8_t> metadata) {
   std::lock_guard lock(impl_->mutex);
@@ -1083,6 +1241,8 @@ FileStatus RecordFileSystem::SetRecordMetadata(
   if (found == impl_->records.end()) {
     return FileStatus::kNotFound;
   }
+  if (!found->second->profile_private && !impl_->site_deletion_fence.is_empty())
+    return FileStatus::kBusy;
   if (metadata.size() > kMaxRecordMetadata) {
     return FileStatus::kInvalid;
   }
@@ -1133,8 +1293,41 @@ FileStatus RecordFileSystem::RecordKeyEnvelopePathForTesting(
 }
 
 FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
-                                           std::function<void()> teardown,
-                                           RecordDeletion* result) {
+                                            std::function<void()> teardown,
+                                            RecordDeletion* result) {
+  return DeleteRecordWithSettings(id, {}, std::move(teardown), result);
+}
+
+FileStatus RecordFileSystem::ReplaceSettings(
+    base::span<const SettingsReplacement> replacements) {
+  std::lock_guard lock(impl_->mutex);
+  auto status = impl_->Admission();
+  if (status == FileStatus::kOk) status = impl_->StageSettings(replacements);
+  if (status != FileStatus::kOk) return impl_->Observe(status);
+  if (replacements.empty()) return FileStatus::kOk;
+  status = impl_->Commit();
+  // A failed publication must not leave a native client able to publish the
+  // staged transaction later while believing that replacement was refused.
+  return status == FileStatus::kOk ? status
+      : impl_->Observe(FileStatus::kCommitUncertain);
+}
+
+FileStatus RecordFileSystem::DeleteRecordWithSettings(
+    base::UnguessableToken id,
+    base::span<const SettingsReplacement> replacements,
+    std::function<void()> teardown,
+    RecordDeletion* result) {
+  base::UnguessableToken ticket;
+  const auto status = RetireRecordWithSettings(id, replacements, &ticket);
+  if (status != FileStatus::kOk) return status;
+  if (teardown) teardown();
+  return FinishRecordDeletion(ticket, result);
+}
+
+FileStatus RecordFileSystem::RetireRecordWithSettings(
+    base::UnguessableToken id, base::span<const SettingsReplacement> replacements,
+    base::UnguessableToken* ticket, std::optional<int64_t> unchanged_visit) {
+  if (!ticket) return FileStatus::kInvalid;
   std::unique_lock lock(impl_->mutex);
   auto status = impl_->Admission();
   if (status != FileStatus::kOk) {
@@ -1147,6 +1340,12 @@ FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
   if (found->second->profile_private) {
     return FileStatus::kDenied;
   }
+  // Selection and publication can race a qualifying visit. The shared commit
+  // barrier, not a timer's earlier snapshot, decides which operation won.
+  if (unchanged_visit && found->second->info.last_visit_us != *unchanged_visit)
+    return FileStatus::kBusy;
+  status = impl_->StageSettings(replacements, id);
+  if (status != FileStatus::kOk) return impl_->Observe(status);
   auto record = std::move(found->second);
   const auto directory = record->info.directory;
   impl_->records.erase(found);
@@ -1165,12 +1364,20 @@ FileStatus RecordFileSystem::DeleteRecord(base::UnguessableToken id,
     // exist. Fail closed until reopen instead of reintroducing a revoked key.
     return impl_->Observe(FileStatus::kCommitUncertain);
   }
-  lock.unlock();
-  if (teardown) {
-    teardown();
-  }
-  lock.lock();
-  status = impl_->open ? impl_->root->RemoveChild(directory) : FileStatus::kIo;
+  *ticket = base::UnguessableToken::Create();
+  impl_->pending_deletions.emplace(*ticket, directory);
+  return FileStatus::kOk;
+}
+
+FileStatus RecordFileSystem::FinishRecordDeletion(base::UnguessableToken ticket,
+                                                  RecordDeletion* result) {
+  if (!result) return FileStatus::kInvalid;
+  std::lock_guard lock(impl_->mutex);
+  const auto found = impl_->pending_deletions.find(ticket);
+  if (found == impl_->pending_deletions.end()) return FileStatus::kNotFound;
+  const auto directory = found->second;
+  const auto status = impl_->open ? impl_->root->RemoveChild(directory) : FileStatus::kIo;
+  impl_->pending_deletions.erase(found);
   impl_->deleting.erase(directory);
   *result = status == FileStatus::kOk ? RecordDeletion::kDeleted
                                      : RecordDeletion::kDeletedFilesPending;
@@ -1637,6 +1844,7 @@ FileStatus RecordFile::Sync() {
                                     : status;
 }
 
+/// Close clean handles under read admission; dirty linked handles still require writable commit.
 FileStatus RecordFile::Close() {
   const auto owner = owner_.lock();
   if (!owner) {
@@ -1647,13 +1855,14 @@ FileStatus RecordFile::Close() {
     return FileStatus::kOk;
   }
   RecordFileSystem::Impl::Record* record;
-  auto status = owner->impl_->CheckHandle(*this, StorageAccess::kWriteRecordFiles,
+  auto status = owner->impl_->CheckHandle(*this, StorageAccess::kReadRecordFiles,
                                           &record);
   closed_ = true;
   state_->locks.erase(this);
   --state_->handles;
   if (status == FileStatus::kOk && state_->dirty && state_->linked) {
-    status = owner->impl_->Commit();
+    status = owner->impl_->Check(capability_, purpose_, StorageAccess::kWriteRecordFiles, &record);
+    if (status == FileStatus::kOk) status = owner->impl_->Commit();
   }
   if (status == FileStatus::kOk && state_->handles == 0 &&
       (!state_->dirty || !state_->linked)) {

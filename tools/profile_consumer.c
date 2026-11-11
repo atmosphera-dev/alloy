@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "profile_control.h"
 #include "include/cef_api_hash.h"
 #include "include/capi/alloy/alloy_request_context_capi.h"
 #include "include/capi/cef_app_capi.h"
@@ -16,10 +17,13 @@
 #include "include/capi/cef_client_capi.h"
 #include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_dialog_handler_capi.h"
+#include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_preference_capi.h"
 #include "include/capi/cef_permission_handler_capi.h"
 #include "include/capi/cef_request_handler_capi.h"
 #include "include/capi/cef_values_capi.h"
+#define UNIT_TEST 1
+#include "include/capi/test/cef_test_helpers_capi.h"
 
 static cef_app_t app;
 static cef_browser_process_handler_t process_handler;
@@ -27,6 +31,7 @@ static cef_client_t client;
 static cef_render_handler_t render;
 static cef_life_span_handler_t life;
 static cef_display_handler_t display;
+static cef_load_handler_t load_handler;
 static cef_permission_handler_t permissions;
 static cef_dialog_handler_t dialogs;
 static cef_request_handler_t requests;
@@ -35,7 +40,7 @@ static int hold_next_certificate;
 static cef_string_t selected_file, output_file;
 static cef_file_dialog_callback_t* held_file;
 static int hold_next_file;
-static cef_string_t initial_url, blank_url, profile_root;
+static cef_string_t initial_url, blank_url, profile_root, embedded_scope;
 static cef_request_context_t* context;
 static cef_request_context_t* shared_context;
 static cef_request_context_t* peer_context;
@@ -45,10 +50,16 @@ static alloy_network_state_t network_state;
 static int browser_count;
 static int bootstrap_browser;
 static int no_disk_bootstrap;
+static int persistent_only;
 static int memory_only;
+static int control_setup_started, control_setup_complete;
+static int inject_no_disk_write, no_disk_write_injected;
+static cef_completion_callback_t control_persistence_callback;
+static int primary_scope_configured, peer_scope_configured;
 static cef_permission_prompt_callback_t* held_permission;
 static uint64_t held_prompt_id;
 static int hold_next_permission;
+static profile_control_transport control_transport;
 static void make_browser(const cef_string_t* url,cef_request_context_t* request_context);
 static void start_stateless(void);
 
@@ -63,6 +74,30 @@ static void base(cef_base_ref_counted_t* b, size_t size) {
 static void release_ref(void* object) {
   cef_base_ref_counted_t* b=object;
   if (b) b->release(b);
+}
+static void CEF_CALLBACK loading_state_changed(cef_load_handler_t* self,
+    cef_browser_t* browser,int loading,int can_back,int can_forward) {
+  if (!loading) {
+    /* The public load callback follows CEF's navigation-state publication.
+     * A document/control message can arrive before that publication. */
+    if (browser->can_go_back(browser)!=can_back ||
+        browser->can_go_forward(browser)!=can_forward)
+      abort();
+    cef_frame_t* frame=browser->get_main_frame(browser);
+    if (!frame) { release_ref(browser); return; }
+    cef_string_userfree_t url=frame->get_url(frame);
+    cef_string_utf8_t utf8={0};
+    if (url) cef_string_utf16_to_utf8(url->str,url->length,&utf8);
+    printf("PROFILE_EVENT {\"event\":\"history-state\",\"browser\":%d,\"url\":\"%s\",\"can_back\":%d,\"can_forward\":%d}\n",
+        browser->get_identifier(browser),utf8.str?utf8.str:"",can_back,can_forward);
+    cef_string_utf8_clear(&utf8);
+    if (url) cef_string_userfree_free(url);
+    release_ref(frame);
+  }
+  release_ref(browser);
+}
+static cef_load_handler_t* CEF_CALLBACK get_load(cef_client_t* self) {
+  return &load_handler;
 }
 /* CEF's translator consumes a library object's structure reference when it
  * crosses back into the DLL (CppToCRefCounted::Unwrap). Keep owned handles and
@@ -243,6 +278,22 @@ static void CEF_CALLBACK created(cef_life_span_handler_t* self,
     return;
   }
   int peer=peer_context && actual->is_sharing_with(actual,dll_arg(peer_context));
+  int* scope_configured=peer?&peer_scope_configured:&primary_scope_configured;
+  if (embedded_scope.length && !*scope_configured) {
+    cef_string_t invalid_scope={0};text(&invalid_scope,"invalid-embedded-scope");
+    if (alloy_set_embedded_state_scope(NULL,&embedded_scope) ||
+        alloy_set_embedded_state_scope(dll_arg(actual),&invalid_scope))
+      fail("invalid embedded scope input accepted");
+    cef_string_clear(&invalid_scope);
+    if (!alloy_set_embedded_state_scope(dll_arg(actual),&embedded_scope))
+      fail("embedded scope selection before document admission refused");
+    *scope_configured=1;
+    printf("PROFILE_EVENT {\"event\":\"embedded-scope-configured\",\"browser\":%d}\n",
+        browser->get_identifier(browser));
+  } else if (embedded_scope.length) {
+    printf("PROFILE_EVENT {\"event\":\"embedded-scope-reused\",\"browser\":%d}\n",
+        browser->get_identifier(browser));
+  }
   if (peer) {
     if (peer_browser) fail("multiple independent peer browsers");
     peer_browser=browser->get_identifier(browser);
@@ -252,7 +303,7 @@ static void CEF_CALLBACK created(cef_life_span_handler_t* self,
   int shares=actual->is_sharing_with(actual,dll_arg(peer?peer_context:context));
   cef_string_userfree_t cache=actual->get_cache_path(actual);
   int no_cache_path=!cache || cache->length==0;
-  int isolated=parent_preference_isolated(actual);
+  int isolated=persistent_only?0:parent_preference_isolated(actual);
   if (cache) cef_string_userfree_free(cache);
   printf("PROFILE_EVENT {\"event\":\"created\",\"browser\":%d,"
       "\"shares_context\":%d,\"empty_cache_path\":%d,"
@@ -261,7 +312,23 @@ static void CEF_CALLBACK created(cef_life_span_handler_t* self,
       no_cache_path,isolated,browser->can_go_back(browser),browser->can_go_forward(browser),
       peer?"peer":"primary",peer?peer_memory_only:memory_only);
   release_ref(actual); release_ref(host);
-  if (!shares || !no_cache_path || !isolated) fail("browser lost stateless context");
+  if (!shares || (!persistent_only && (!no_cache_path || !isolated)) ||
+      (persistent_only && no_cache_path)) fail("browser lost its native context mode");
+  if (inject_no_disk_write && !no_disk_write_injected && !peer) {
+    if (!memory_only || !control_setup_complete || no_disk_bootstrap)
+      fail("invalid post-barrier no-disk negative control");
+    cef_string_utf8_t root={0};
+    cef_string_utf16_to_utf8(profile_root.str,profile_root.length,&root);
+    char path[4096];
+    if (!root.str || snprintf(path,sizeof(path),"%s/no-disk-negative-control",root.str)>=(int)sizeof(path))
+      fail("negative control path invalid");
+    FILE* file=fopen(path,"wx");
+    if (!file || fputs("intentional no-disk-context fault injection\n",file)<0 || fclose(file))
+      fail("negative control write failed");
+    cef_string_utf8_clear(&root);no_disk_write_injected=1;
+    printf("PROFILE_EVENT {\"event\":\"no-disk-write-injected\",\"browser\":%d,\"after_native_barrier\":1}\n",
+        browser->get_identifier(browser));
+  }
   release_ref(browser);
 }
 static void CEF_CALLBACK closed(cef_life_span_handler_t* self,
@@ -273,20 +340,23 @@ static void CEF_CALLBACK closed(cef_life_span_handler_t* self,
   if (--browser_count==0) cef_quit_message_loop();
   release_ref(browser);
 }
-static void CEF_CALLBACK title_changed(cef_display_handler_t* self,
-    cef_browser_t* browser,const cef_string_t* title) {
-  static const char prefix[]="ALLOY_PROFILE_PROBE:";
-  cef_string_utf8_t utf8={0};
-  cef_string_utf16_to_utf8(title->str,title->length,&utf8);
-  if (utf8.str && !strncmp(utf8.str,prefix,sizeof(prefix)-1)) {
-    const char* token=utf8.str+sizeof(prefix)-1;
+static void dispatch_control(void* opaque,
+    const profile_control_request* command) {
+  cef_browser_t* browser=opaque;
+  const char* token=command->action;
     if (strlen(token) && strspn(token,
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_")==strlen(token)) {
       printf("PROFILE_EVENT {\"event\":\"navigation\",\"token\":\"%s\","
-          "\"browser\":%d,\"can_back\":%d,\"can_forward\":%d}\n",
+          "\"browser\":%d,\"can_back\":%d,\"can_forward\":%d,\"request_id\":\"%s\"}\n",
           token,browser->get_identifier(browser),browser->can_go_back(browser),
-           browser->can_go_forward(browser));
-       if (!strcmp(token,"start-stateless")) {
+           browser->can_go_forward(browser),command->id);
+        if (!strcmp(token,"prepare-control")) {
+          if (context || control_setup_started || browser->get_identifier(browser)!=bootstrap_browser)
+            fail("invalid persistent-control setup request");
+          control_setup_started=1;
+          if (!cef_flush_browser_persistent_state_for_tests(dll_arg(browser),dll_arg(&control_persistence_callback)))
+            fail("native persistent-control fence refused");
+        } else if (!strcmp(token,"start-stateless")) {
          if (context || browser->get_identifier(browser)!=bootstrap_browser)
            fail("invalid stateless start control");
          start_stateless();
@@ -302,7 +372,8 @@ static void CEF_CALLBACK title_changed(cef_display_handler_t* self,
         if (!strcmp(token,"memory-peer") || !strcmp(token,"memory-peer-stateless")) {
           if (!memory_only || !context || peer_context)
             fail("invalid independent context creation");
-          peer_memory_only=!strcmp(token,"memory-peer");
+           peer_memory_only=!strcmp(token,"memory-peer");
+           peer_scope_configured=0;
           peer_context=peer_memory_only?alloy_create_memory_request_context(NULL):
               alloy_create_stateless_request_context(ALLOY_NETWORK_STATE_CUT,NULL);
           if (!peer_context || peer_context->is_sharing_with(peer_context,dll_arg(context)))
@@ -320,13 +391,22 @@ static void CEF_CALLBACK title_changed(cef_display_handler_t* self,
             fail("memory recreation before primary context disposal");
           start_stateless();
         }
-       if (!strcmp(token,"zoom-set")) {
+        if (!strcmp(token,"zoom-set")) {
          cef_browser_host_t* host=browser->get_host(browser);
          host->set_zoom_level(host,1.0);
          printf("PROFILE_EVENT {\"event\":\"zoom\",\"browser\":%d,\"level\":%.8f}\n",
              browser->get_identifier(browser),host->get_zoom_level(host));
-         release_ref(host);
-       }
+          release_ref(host);
+        }
+        if (!strcmp(token,"embedded-scope-late")) {
+          cef_browser_host_t* host=browser->get_host(browser);
+          cef_request_context_t* actual=host->get_request_context(host);
+          if (!embedded_scope.length ||
+              alloy_set_embedded_state_scope(dll_arg(actual),&embedded_scope))
+            fail("late embedded scope change was accepted");
+          printf("PROFILE_EVENT {\"event\":\"embedded-scope-late-refused\"}\n");
+          release_ref(actual);release_ref(host);
+        }
         if (!strcmp(token,"hold-file")) {
          hold_next_file=1;
          printf("PROFILE_EVENT {\"event\":\"file-hold-ready\"}\n");
@@ -359,7 +439,24 @@ static void CEF_CALLBACK title_changed(cef_display_handler_t* self,
              (unsigned long long)held_prompt_id);
        }
     }
-  }
+}
+static void control_reply(void* opaque,
+    const profile_control_request* command,int replayed) {
+  (void)opaque;
+  printf("PROFILE_EVENT {\"event\":\"control-reply\",\"request_id\":\"%s\","
+      "\"token\":\"%s\",\"browser\":%d,\"phase\":\"%s\","
+      "\"replayed\":%d,\"executions\":%u}\n",command->id,command->action,
+      command->browser,command->complete?"dispatched":"pending",replayed,
+      command->executions);
+  fflush(stdout);
+}
+static void CEF_CALLBACK title_changed(cef_display_handler_t* self,
+    cef_browser_t* browser,const cef_string_t* title) {
+  cef_string_utf8_t utf8={0};
+  cef_string_utf16_to_utf8(title->str,title->length,&utf8);
+  int result=profile_control_receive(&control_transport,browser->get_identifier(browser),
+      utf8.str,dispatch_control,control_reply,browser);
+  if (result<0) fail("invalid or conflicting native control request");
   cef_string_utf8_clear(&utf8);
   release_ref(browser);
 }
@@ -372,7 +469,10 @@ static void make_browser(const cef_string_t* url,cef_request_context_t* request_
                                       dll_arg(request_context))) fail("browser creation refused");
 }
 static void start_stateless(void) {
+  if (!no_disk_bootstrap && !control_setup_complete)
+    fail("no-disk context creation before native control persistence completion");
   printf("PROFILE_EVENT {\"event\":\"%s-start\"}\n",memory_only?"memory":"stateless");
+  primary_scope_configured=0;
   if (!memory_only && alloy_create_stateless_request_context((alloy_network_state_t)-1,NULL))
     fail("invalid network option accepted");
   context=memory_only?alloy_create_memory_request_context(NULL):
@@ -386,7 +486,24 @@ static void start_stateless(void) {
   make_browser(&initial_url,context);
   make_browser(&blank_url,shared_context);
 }
+static void CEF_CALLBACK control_persistence_complete(cef_completion_callback_t* self) {
+  if (!control_setup_started || control_setup_complete || context || !bootstrap_browser)
+    fail("invalid native control-persistence completion");
+  control_setup_complete=1;
+  printf("PROFILE_EVENT {\"event\":\"parent-persistence-complete\",\"browser\":%d}\n",bootstrap_browser);
+}
 static void CEF_CALLBACK initialized(cef_browser_process_handler_t* self) {
+  if (persistent_only) {
+    context=cef_request_context_get_global_context();
+    if (!context || !context->is_global(context)) fail("ordinary global context missing");
+    shared_context=cef_request_context_cef_create_context_shared(dll_arg(context),NULL);
+    if (!shared_context || !shared_context->is_sharing_with(shared_context,dll_arg(context)))
+      fail("ordinary sharing alias missing");
+    printf("PROFILE_EVENT {\"event\":\"ordinary-persistent-start\"}\n");
+    make_browser(&initial_url,context);
+    make_browser(&blank_url,shared_context);
+    return;
+  }
   if (no_disk_bootstrap) {
     start_stateless();
     return;
@@ -417,8 +534,12 @@ int main(int argc,char** argv) {
   const char* network=getenv("ALLOY_PROFILE_NETWORK");
   const char* file=getenv("ALLOY_PROFILE_SELECTED_FILE");
   const char* output=getenv("ALLOY_PROFILE_OUTPUT_FILE");
+  const char* scope=getenv("ALLOY_PROFILE_EMBEDDED_SCOPE");
   no_disk_bootstrap=getenv("ALLOY_PROFILE_NO_DISK")!=NULL;
+  persistent_only=getenv("ALLOY_PROFILE_PERSISTENT")!=NULL;
+  if (persistent_only && no_disk_bootstrap) fail("conflicting native context modes");
   memory_only=getenv("ALLOY_PROFILE_MEMORY")!=NULL;
+  inject_no_disk_write=getenv("ALLOY_PROFILE_INJECT_NO_DISK_WRITE")!=NULL;
   if (!url || !root || !network || !file || !output) return 9;
   if (!strcmp(network,"keep")) network_state=ALLOY_NETWORK_STATE_KEEP;
   else if (!strcmp(network,"cut")) network_state=ALLOY_NETWORK_STATE_CUT;
@@ -428,11 +549,15 @@ int main(int argc,char** argv) {
   text(&initial_url,url); text(&blank_url,"about:blank"); text(&profile_root,root);
   text(&selected_file,file);
   text(&output_file,output);
+  if (scope) text(&embedded_scope,scope);
   base(&app.base,sizeof(app)); base(&process_handler.base,sizeof(process_handler));
   base(&client.base,sizeof(client)); base(&render.base,sizeof(render));
   base(&life.base,sizeof(life)); base(&display.base,sizeof(display));
+  base(&load_handler.base,sizeof(load_handler));
   base(&permissions.base,sizeof(permissions));
   base(&requests.base,sizeof(requests));requests.on_certificate_error=certificate_error;
+  base(&control_persistence_callback.base,sizeof(control_persistence_callback));
+  control_persistence_callback.on_complete=control_persistence_complete;
   base(&dialogs.base,sizeof(dialogs));dialogs.on_file_dialog=file_dialog;
   app.get_browser_process_handler=get_process;
   app.on_before_command_line_processing=process_command_line;
@@ -441,6 +566,8 @@ int main(int argc,char** argv) {
   process_handler.on_register_custom_preferences=register_preferences;
   client.get_render_handler=get_render; client.get_life_span_handler=get_life;
   client.get_display_handler=get_display;
+  client.get_load_handler=get_load;
+  load_handler.on_loading_state_change=loading_state_changed;
   client.get_permission_handler=get_permissions;
   client.get_dialog_handler=get_dialogs;
   client.get_request_handler=get_requests;
@@ -462,9 +589,11 @@ int main(int argc,char** argv) {
   if (held_certificate) fail("held certificate decision not exercised");
   release_ref(peer_context); release_ref(shared_context); release_ref(context);
   cef_shutdown();
+  profile_control_destroy(&control_transport);
   cef_string_clear(&settings.cache_path); cef_string_clear(&settings.root_cache_path);
   cef_string_clear(&initial_url); cef_string_clear(&blank_url);
   cef_string_clear(&profile_root);
+  cef_string_clear(&embedded_scope);
   cef_string_clear(&selected_file);
   cef_string_clear(&output_file);
   return 0;

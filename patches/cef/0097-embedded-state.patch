@@ -1,0 +1,59 @@
+--- a/libcef/browser/request_context_impl.h
++++ b/libcef/browser/request_context_impl.h
+@@ -44,3 +44,4 @@
+   static CefRefPtr<CefRequestContext> CreateMemory(
+       CefRefPtr<CefRequestContextHandler> handler);
++  bool SetAlloyEmbeddedStateScope(const CefString& scope);
+ 
+--- a/libcef/browser/request_context_impl.cc
++++ b/libcef/browser/request_context_impl.cc
+@@ -3,6 +3,7 @@
+ // can be found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/request_context_impl.h"
++#include "content/browser/alloy_embedded_state.h"
+ #include "base/alloy/storage_policy.h"
+ 
+ #include "cef/include/alloy/alloy_request_context.h"
+@@ -187,8 +188,18 @@
+ CefRefPtr<CefRequestContext> AlloyCreateMemoryRequestContext(
+     CefRefPtr<CefRequestContextHandler> handler) {
+   CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
+   return CefRequestContextImpl::CreateMemory(handler);
+ }
++
++bool AlloySetEmbeddedStateScope(CefRefPtr<CefRequestContext> context,
++                                const CefString& scope) {
++  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
++  if (!CONTEXT_STATE_VALID() || !context || !CEF_CURRENTLY_ON_UIT()) {
++    return false;
++  }
++  return static_cast<CefRequestContextImpl*>(context.get())
++      ->SetAlloyEmbeddedStateScope(scope);
++}
+ 
+ // CefRequestContextImpl
+ 
+@@ -221,3 +232,22 @@
++bool CefRequestContextImpl::SetAlloyEmbeddedStateScope(const CefString& scope) {
++  if (!CEF_CURRENTLY_ON_UIT() || !browser_context() ||
++      !browser_context()->IsInitialized()) {
++    return false;
++  }
++  const std::string value = scope;
++  using Scope = alloy::site_records::EmbeddedStateScope;
++  Scope selected;
++  if (value == "per-outer-site") {
++    selected = Scope::kPerOuterSite;
++  } else if (value == "per-tab") {
++    selected = Scope::kPerTab;
++  } else {
++    return false;
++  }
++  auto* native = browser_context()->AsBrowserContext();
++  return native && content::ConfigureAlloyEmbeddedStateScope(*native, selected);
++}
++
+ CefRequestContextImpl::~CefRequestContextImpl() {
+   CEF_REQUIRE_UIT();
+ 

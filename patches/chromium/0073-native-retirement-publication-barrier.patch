@@ -1,0 +1,461 @@
+--- a/chrome/browser/custom_handlers/BUILD.gn
++++ b/chrome/browser/custom_handlers/BUILD.gn
+@@ -30,6 +30,7 @@
+   }
+ 
+   deps = [
++    "//chrome/browser/content_settings:content_settings_factory",
+     "//build:chromeos_buildflags",
+     "//chrome/browser/profiles:profile_io_data",
+     "//chrome/common:constants",
+--- a/chrome/browser/custom_handlers/protocol_handler_registry_factory.cc
++++ b/chrome/browser/custom_handlers/protocol_handler_registry_factory.cc
+@@ -11,6 +11,7 @@
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
+ #include "chrome/browser/custom_handlers/chrome_protocol_handler_registry_delegate.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "components/custom_handlers/protocol_handler_registry.h"
+ #include "components/user_prefs/user_prefs.h"
+ #include "content/public/browser/browser_context.h"
+@@ -32,9 +33,11 @@
+   // overlay and are not persisted to disk.
+   PrefService* prefs = user_prefs::UserPrefs::Get(context);
+   CHECK(prefs);
+-  return custom_handlers::ProtocolHandlerRegistry::Create(
++  auto registry = custom_handlers::ProtocolHandlerRegistry::Create(
+       prefs, std::make_unique<ChromeProtocolHandlerRegistryDelegate>(),
+       context->IsOffTheRecord());
++  registry->ObserveSitePermissions(HostContentSettingsMapFactory::GetForProfile(context));
++  return registry;
+ }
+ 
+ // static
+@@ -61,7 +64,9 @@
+               .WithRegular(ProfileSelection::kOwnInstance)
+               .WithGuest(ProfileSelection::kOwnInstance)
+               .WithAshInternals(ProfileSelection::kOwnInstance)
+-              .Build()) {}
++              .Build()) {
++  DependsOn(HostContentSettingsMapFactory::GetInstance());
++}
+ 
+ ProtocolHandlerRegistryFactory::~ProtocolHandlerRegistryFactory() = default;
+ 
+--- a/chrome/browser/webid/federated_identity_account_keyed_permission_context.cc
++++ b/chrome/browser/webid/federated_identity_account_keyed_permission_context.cc
+@@ -8,6 +8,7 @@
+ #include <optional>
+ 
+ #include "base/functional/callback_helpers.h"
++#include "base/containers/flat_set.h"
+ #include "base/json/values_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -488,3 +489,32 @@
+   new_list.Append(std::move(account_dict));
+   dict.Set(kAccountIdsKey, base::Value(std::move(new_list)));
+ }
++
++std::vector<url::Origin> FederatedIdentityAccountKeyedPermissionContext::PermissionParticipants(
++    const Object& object) {
++  auto participants = ObjectPermissionContextBase::PermissionParticipants(object);
++  for (const auto* role : {kRpRequesterKey, kRpEmbedderKey, kSharingIdpKey})
++    if (const auto* origin = object.value.FindString(role))
++      participants.push_back(url::Origin::Create(GURL(*origin)));
++  return participants;
++}
++
++std::vector<url::Origin> FederatedIdentityAccountKeyedPermissionContext::RevokeEphemeralPermissions(
++    const content_settings::SitePermissionMatcher& owns, bool unconditional) {
++  if (unconditional) base::EraseIf(storage_access_eligible_connections_, [&](const auto& pair) {
++    return owns.Run(url::Origin::Create(pair.first.GetURL())) ||
++        owns.Run(url::Origin::Create(pair.second.GetURL()));
++  });
++  return {};
++}
++
++void FederatedIdentityAccountKeyedPermissionContext::DrainSitePermissions(
++    base::OnceCallback<void(bool)> done) {
++  auto callbacks = base::SplitOnceCallback(std::move(done));
++  auto dropped = base::ScopedClosureRunner(base::BindOnce(std::move(callbacks.second), false));
++  SyncSharingPermissionGrantsToNetworkService(base::BindOnce(
++      [](base::OnceCallback<void(bool)> done, base::ScopedClosureRunner dropped) {
++        auto unused = dropped.Release(); unused.Reset();
++        std::move(done).Run(true);
++      }, std::move(callbacks.first), std::move(dropped)));
++}
+--- a/chrome/browser/webid/federated_identity_account_keyed_permission_context.h
++++ b/chrome/browser/webid/federated_identity_account_keyed_permission_context.h
+@@ -128,8 +128,12 @@
+   // settings. The returned value only includes permissions for (site, site)
+   // pairs that were marked "eligible" via `MarkStorageAccessEligible`.
+   ContentSettingsForOneType GetSharingPermissionGrantsAsContentSettings();
++  void DrainSitePermissions(base::OnceCallback<void(bool)> done) override;
+ 
+  private:
++  std::vector<url::Origin> PermissionParticipants(const Object& object) override;
++  std::vector<url::Origin> RevokeEphemeralPermissions(
++      const content_settings::SitePermissionMatcher& owns, bool unconditional) override;
+   // permissions::ObjectPermissionContextBase:
+   bool IsValidObject(const base::DictValue& object) override;
+   std::u16string GetObjectDisplayName(const base::DictValue& object) override;
+--- a/components/content_settings/core/browser/content_settings_observer.h
++++ b/components/content_settings/core/browser/content_settings_observer.h
+@@ -21,6 +21,11 @@
+   // The returned notification runs only after every owner has prepared.
+   virtual base::OnceClosure PrepareSitePermissionRetirement(
+       const SitePermissionMatcher& owns) { return {}; }
++  // Completion represents native revocation, not merely a queued request.
++  virtual void DrainSitePermissions(base::OnceCallback<void(bool)> done) {
++    std::move(done).Run(true);
++  }
++  virtual void OnSitePermissionRetirementPublished() {}
+ 
+   virtual void OnContentSettingChanged(
+       const ContentSettingsPattern& primary_pattern,
+--- a/components/content_settings/core/browser/host_content_settings_map.cc
++++ b/components/content_settings/core/browser/host_content_settings_map.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "base/barrier_callback.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
+ 
+ #include <stddef.h>
+ 
+@@ -994,6 +997,14 @@
+     ContentSettingsTypeSet content_type_set) {
+   DCHECK(primary_pattern.IsValid());
+   DCHECK(secondary_pattern.IsValid());
++  if (retirement_publications_) {
++    retirement_notifications_.push_back(base::BindOnce(
++        [](base::WeakPtr<HostContentSettingsMap> map, ContentSettingsPattern primary,
++           ContentSettingsPattern secondary, ContentSettingsTypeSet types) {
++          if (map && map->prefs_) map->OnContentSettingChanged(primary, secondary, types);
++        }, weak_ptr_factory_.GetWeakPtr(), primary_pattern, secondary_pattern, content_type_set));
++    return;
++  }
+   for (content_settings::Observer& observer : observers_) {
+     auto* registration = &observer;
+     observer.OnContentSettingChanged(primary_pattern, secondary_pattern,
+@@ -1017,6 +1028,7 @@
+   DCHECK(thread_checker_.CalledOnValidThread());
+   DCHECK(prefs_);
+   permission_epochs_.clear();
++  retirement_notifications_.clear();
+   expiration_enforcement_timers_.clear();
+   prefs_ = nullptr;
+   for (const auto& provider_pair : content_settings_providers_) {
+@@ -1482,6 +1494,7 @@
+     const content_settings::SitePermissionMatcher& owns) {
+   DCHECK(thread_checker_.CalledOnValidThread());
+   scoped_refptr<HostContentSettingsMap> alive(this);
++  ++retirement_publications_;
+   std::erase_if(permission_epochs_, [&](const auto& entry) { return owns.Run(entry.first); });
+   std::vector<base::OnceClosure> notifications;
+   for (auto& observer : observers_) {
+@@ -1506,3 +1519,28 @@
+     for (auto& notify : notifications) std::move(notify).Run();
+   }, std::move(alive), owns, std::move(notifications));
+ }
++
++void HostContentSettingsMap::DrainSitePermissions(base::OnceCallback<void(bool)> done) {
++  size_t count = 1;
++  for (auto it = observers_.begin(); it != observers_.end(); ++it) ++count;
++  auto barrier = base::BarrierCallback<bool>(count, base::BindOnce(
++      [](scoped_refptr<HostContentSettingsMap>, base::OnceCallback<void(bool)> done,
++         std::vector<bool> results) {
++        std::move(done).Run(std::ranges::all_of(results, [](bool ok) { return ok; }));
++      }, base::WrapRefCounted(this),
++      base::BindPostTask(base::SequencedTaskRunner::GetCurrentDefault(), std::move(done))));
++  for (auto& observer : observers_) observer.DrainSitePermissions(barrier);
++  barrier.Run(true);  // Completion cannot reenter the observer traversal.
++}
++
++base::OnceClosure HostContentSettingsMap::TakeSitePermissionRetirementPublication() {
++  CHECK_GT(retirement_publications_, 0u);
++  return base::BindOnce([](scoped_refptr<HostContentSettingsMap> map) {
++    CHECK_GT(map->retirement_publications_, 0u);
++    if (--map->retirement_publications_ || !map->prefs_) return;
++    auto pending = std::move(map->retirement_notifications_);
++    map->retirement_notifications_.clear();
++    for (auto& notify : pending) std::move(notify).Run();
++    for (auto& observer : map->observers_) observer.OnSitePermissionRetirementPublished();
++  }, base::WrapRefCounted(this));
++}
+--- a/components/content_settings/core/browser/host_content_settings_map.h
++++ b/components/content_settings/core/browser/host_content_settings_map.h
+@@ -97,6 +97,8 @@
+   base::RepeatingCallback<bool()> CapturePermissionAdmission(const url::Origin& origin);
+   base::OnceClosure PrepareSitePermissionRetirement(
+       const content_settings::SitePermissionMatcher& owns) override;
++  void DrainSitePermissions(base::OnceCallback<void(bool)> done) override;
++  base::OnceClosure TakeSitePermissionRetirementPublication();
+ 
+ 
+   // Adds a new provider for |type|. This should be used instead of
+@@ -624,6 +626,8 @@
+ 
+   class SitePermissionEpoch;
+   std::map<url::Origin, std::unique_ptr<SitePermissionEpoch>> permission_epochs_;
++  size_t retirement_publications_ = 0;
++  std::vector<base::OnceClosure> retirement_notifications_;
+   base::WeakPtrFactory<HostContentSettingsMap> weak_ptr_factory_{this};
+ };
+ 
+--- a/components/custom_handlers/BUILD.gn
++++ b/components/custom_handlers/BUILD.gn
+@@ -14,6 +14,7 @@
+     "protocol_handler_throttle.h",
+   ]
+ 
++  public_deps = [ "//components/content_settings/core/browser" ]
+   deps = [
+     "//components/keyed_service/content",
+     "//components/keyed_service/core",
+--- a/components/custom_handlers/protocol_handler_registry.cc
++++ b/components/custom_handlers/protocol_handler_registry.cc
+@@ -593,6 +593,8 @@
+ 
+ void ProtocolHandlerRegistry::Shutdown() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (permission_map_) permission_map_->RemoveObserver(this);
++  permission_map_ = nullptr;
+   delegate_.reset(NULL);
+ 
+   weak_ptr_factory_.InvalidateWeakPtrs();
+@@ -610,6 +612,7 @@
+ 
+ ProtocolHandlerRegistry::~ProtocolHandlerRegistry() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (permission_map_) permission_map_->RemoveObserver(this);
+ }
+ 
+ void ProtocolHandlerRegistry::AddObserver(Observer* observer) {
+@@ -902,3 +905,50 @@
+ }
+ 
+ }  // namespace custom_handlers
++
++namespace custom_handlers {
++void ProtocolHandlerRegistry::ObserveSitePermissions(HostContentSettingsMap* map) {
++  CHECK(map); CHECK(!permission_map_);
++  permission_map_ = map;
++  map->AddObserver(this);
++}
++
++base::OnceClosure ProtocolHandlerRegistry::PrepareSitePermissionRetirement(
++    const content_settings::SitePermissionMatcher& owns) {
++  auto selected = [&](const ProtocolHandler& handler) {
++    return owns.Run(url::Origin::Create(handler.url())) &&
++        !std::ranges::contains(predefined_protocol_handlers_, handler);
++  };
++  for (auto& [protocol, handlers] : user_protocol_handlers_) {
++    std::vector<ProtocolHandler> removed;
++    for (const auto& handler : handlers) if (selected(handler)) removed.push_back(handler);
++    std::erase_if(handlers, selected);
++    auto& live = protocol_handlers_[protocol];
++    for (const auto& handler : removed) {
++      if (!HandlerExists(handler, &policy_protocol_handlers_))
++        std::erase(live, handler);
++    }
++    retirement_changed_ |= !removed.empty();
++    auto current = default_handlers_.find(protocol);
++    if (current != default_handlers_.end() &&
++        !std::ranges::contains(live, current->second)) {
++      default_handlers_.erase(current);
++      if (!live.empty()) default_handlers_.emplace(protocol, live.front());
++    }
++  }
++  std::erase_if(user_protocol_handlers_, [](const auto& entry) { return entry.second.empty(); });
++  for (const auto& handler : user_ignored_protocol_handlers_) if (selected(handler)) {
++    retirement_changed_ = true;
++    if (!std::ranges::contains(policy_ignored_protocol_handlers_, handler))
++      std::erase(ignored_protocol_handlers_, handler);
++  }
++  std::erase_if(user_ignored_protocol_handlers_, selected);
++  return {};  // Never publish UI/pref notifications while revocation is draining.
++}
++
++void ProtocolHandlerRegistry::OnSitePermissionRetirementPublished() {
++  if (!retirement_changed_) return;
++  retirement_changed_ = false;
++  NotifyChanged();
++}
++}  // namespace custom_handlers
+--- a/components/custom_handlers/protocol_handler_registry.h
++++ b/components/custom_handlers/protocol_handler_registry.h
+@@ -18,6 +18,8 @@
+ #include "base/time/time.h"
+ #include "base/values.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/content_settings/core/browser/content_settings_observer.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "content/public/browser/browser_thread.h"
+ 
+ namespace user_prefs {
+@@ -44,7 +46,7 @@
+ // instance of this class, which is initialized on browser start through
+ // Profile::InitRegisteredProtocolHandlers(), and they should be the only
+ // instances of this class.
+-class ProtocolHandlerRegistry : public KeyedService {
++class ProtocolHandlerRegistry : public KeyedService, public content_settings::Observer {
+  public:
+   enum HandlerSource {
+     USER,    // The handler was installed by user
+@@ -103,6 +105,10 @@
+   void RemoveObserver(Observer* observer);
+ 
+   void SetDelegateForTesting(std::unique_ptr<Delegate> delegate);
++  void ObserveSitePermissions(HostContentSettingsMap* map);
++  base::OnceClosure PrepareSitePermissionRetirement(
++      const content_settings::SitePermissionMatcher& owns) override;
++  void OnSitePermissionRetirementPublished() override;
+ 
+   // Called when a site tries to register as a protocol handler. If the request
+   // can be handled silently by the registry - either to ignore the request
+@@ -420,6 +426,8 @@
+   // The PrefService to store the registered handlers in the user profile (it
+   // may be null for testing)
+   raw_ptr<PrefService> prefs_ = nullptr;
++  scoped_refptr<HostContentSettingsMap> permission_map_;
++  bool retirement_changed_ = false;
+ 
+   // The Delegate that registers / deregisters external handlers on our behalf.
+   std::unique_ptr<Delegate> delegate_;
+--- a/components/permissions/object_permission_context_base.cc
++++ b/components/permissions/object_permission_context_base.cc
+@@ -526,19 +526,46 @@
+     const url::Origin& origin) {
+   return host_content_settings_map_->CapturePermissionAdmission(origin);
+ }
++std::vector<url::Origin> ObjectPermissionContextBase::PermissionParticipants(const Object& object) {
++  return {url::Origin::Create(object.origin)};
++}
+ base::OnceClosure ObjectPermissionContextBase::PrepareSitePermissionRetirement(
+     const content_settings::SitePermissionMatcher& owns) {
+   std::set<url::Origin> retired;
+-  for (const auto& object : GetAllGrantedObjects()) {
+-    auto origin = url::Origin::Create(object->origin);
+-    if (owns.Run(origin)) retired.insert(std::move(origin));
++  std::set<url::Origin> updated;
++  // Typed native owners expose every participant of a relationship. Remove
++  // selected objects individually so unrelated objects at the same RP survive.
++  for (auto it = objects().begin(); it != objects_.end();) {
++    const auto removed = std::erase_if(it->second, [&](const auto& entry) {
++      const auto participants = PermissionParticipants(*entry.second);
++      return std::ranges::any_of(participants, [&](const auto& origin) { return owns.Run(origin); });
++    });
++    if (removed) {
++      retired.insert(it->first);
++      if (!owns.Run(it->first)) updated.insert(it->first);
++    }
++    if (it->second.empty()) {
++      origins_with_scheduled_save_settings_calls_.erase(it->first);
++      it = objects_.erase(it);
++    } else ++it;
+   }
+   for (const auto& origin : origins_with_scheduled_save_settings_calls_)
+     if (owns.Run(origin)) retired.insert(origin);
+   for (const auto& entry : objects_)
+     if (owns.Run(entry.first)) retired.insert(entry.first);
+-  for (const auto& origin : retired) origins_with_scheduled_save_settings_calls_.erase(origin);
++  // A surviving origin can still have unrelated pending saves. They now read
++  // only its staged surviving objects; selected primary origins cannot save.
++  for (const auto& origin : retired)
++    if (owns.Run(origin)) origins_with_scheduled_save_settings_calls_.erase(origin);
+   std::erase_if(objects_, [&](const auto& entry) { return owns.Run(entry.first); });
++  // Keep the provider projection coherent with staged typed-object removal.
++  // HCSMap holds settings notifications, but a newly constructed native owner
++  // can read its provider during the async drain. It must see surviving objects
++  // now, never reload a deleted relationship from the old cached Rule value.
++  for (const auto& origin : updated) {
++    origins_with_scheduled_save_settings_calls_.insert(origin);
++    SaveWebsiteSetting(origin);
++  }
+   auto ephemeral = RevokeEphemeralPermissions(owns, true);
+   retired.insert(ephemeral.begin(), ephemeral.end());
+   return base::BindOnce([](base::WeakPtr<ObjectPermissionContextBase> owner,
+--- a/components/permissions/object_permission_context_base.h
++++ b/components/permissions/object_permission_context_base.h
+@@ -201,6 +201,7 @@
+   // TODO(odejesush): Use this method in all derived classes instead of using a
+   // member variable to store this state.
+   bool IsOffTheRecord();
++  virtual std::vector<url::Origin> PermissionParticipants(const Object& object);
+   void NotifyPermissionChanged();
+   void NotifyPermissionRevoked(const url::Origin& origin);
+   virtual std::vector<url::Origin> RevokeEphemeralPermissions(
+--- a/components/permissions/permission_manager.cc
++++ b/components/permissions/permission_manager.cc
+@@ -851,8 +851,14 @@
+ 
+ namespace permissions {
+ bool PermissionManager::RetireSitePermissions(const content_settings::SitePermissionMatcher& owns) {
++  auto revoke = PrepareSitePermissions(owns);
++  if (!revoke) return false;
++  std::move(revoke).Run();
++  return true;
++}
++base::OnceClosure PermissionManager::PrepareSitePermissions(const content_settings::SitePermissionMatcher& owns) {
+   scoped_refptr<HostContentSettingsMap> map = PermissionsClient::Get()->GetSettingsMap(browser_context_);
+-  if (!map) return false;
++  if (!map) return {};
+   auto notify_objects = map->PrepareSitePermissionRetirement(owns);
+   std::vector<base::OnceClosure> notifications;
+   for (auto& entry : permission_contexts_) {
+@@ -872,8 +878,21 @@
+     }
+   }
+   for (const auto id : removed) pending_requests_.Remove(id);
+-  if (notify_objects) std::move(notify_objects).Run();
+-  for (auto& notify : notifications) std::move(notify).Run();
+-  return true;
++  return base::BindOnce([](base::OnceClosure objects, std::vector<base::OnceClosure> notifications) {
++    if (objects) std::move(objects).Run();
++    for (auto& notify : notifications) std::move(notify).Run();
++  }, std::move(notify_objects), std::move(notifications));
+ }
+ }  // namespace permissions
++
++namespace permissions {
++void PermissionManager::DrainSitePermissions(base::OnceCallback<void(bool)> done) {
++  auto* map = PermissionsClient::Get()->GetSettingsMap(browser_context_);
++  if (map) map->DrainSitePermissions(std::move(done));
++  else std::move(done).Run(false);
++}
++base::OnceClosure PermissionManager::TakeSitePermissionRetirementPublication() {
++  auto* map = PermissionsClient::Get()->GetSettingsMap(browser_context_);
++  return map ? map->TakeSitePermissionRetirementPublication() : base::OnceClosure();
++}
++}  // namespace permissions
+--- a/components/permissions/permission_manager.h
++++ b/components/permissions/permission_manager.h
+@@ -63,6 +63,9 @@
+   ~PermissionManager() override;
+ 
+   bool RetireSitePermissions(const content_settings::SitePermissionMatcher& owns) override;
++  base::OnceClosure PrepareSitePermissions(const content_settings::SitePermissionMatcher& owns) override;
++  void DrainSitePermissions(base::OnceCallback<void(bool)> done) override;
++  base::OnceClosure TakeSitePermissionRetirementPublication() override;
+   // KeyedService implementation.
+   void Shutdown() override;
+ 
+--- a/content/public/browser/permission_controller_delegate.h
++++ b/content/public/browser/permission_controller_delegate.h
+@@ -43,6 +43,12 @@
+   // False means the embedder cannot prove retirement; never acknowledge success.
+   virtual bool RetireSitePermissions(
+       const base::RepeatingCallback<bool(const url::Origin&)>& owns) { return false; }
++  virtual base::OnceClosure PrepareSitePermissions(
++      const base::RepeatingCallback<bool(const url::Origin&)>& owns) { return {}; }
++  virtual void DrainSitePermissions(base::OnceCallback<void(bool)> done) {
++    std::move(done).Run(false);
++  }
++  virtual base::OnceClosure TakeSitePermissionRetirementPublication() { return {}; }
+ 
+ 
+   // Requests permissions from the given RenderFrameHost. This API takes into

@@ -60,7 +60,7 @@ class AlloyRequestContextCallback : public virtual CefBaseRefCounted {
 ///
 /// EXPERIMENTAL: Queue an encrypted context for the explicit unlocked |profile|.
 /// Call on browser UI after CefInitialize. The profile's existing asynchronous
-/// private input preparation supplies native inputs before Profile construction. The
+/// settings projection supplies native inputs before Profile construction. The
 /// native context retains that original owner until teardown; locking retires
 /// its browsers and cancels access. CEF sharing retains the same native owner.
 /// Returns true if accepted; |callback| reports creation asynchronously on UI.
@@ -73,6 +73,33 @@ bool AlloyCreateEncryptedRequestContext(
     CefRefPtr<AlloyProfile> profile,
     CefRefPtr<CefRequestContextHandler> handler,
     CefRefPtr<AlloyRequestContextCallback> callback);
+
+///
+/// EXPERIMENTAL: Read the considered-first-party list for |outer_url| in the
+/// explicit original |context|. Browser UI only, after context initialization.
+/// True means queued; |callback| receives copied canonical domains on UI.
+/// Memory contexts use their own volatile settings; encrypted contexts use the
+/// same record-backed owner as AlloyProfile. Stateless, missing, locked and
+/// retired contexts report CANCELLED with no entries, without parent fallback.
+/// Wrong-thread, invalid initialization or missing-callback calls return false.
+///
+/*--cef(added=experimental,optional_param=context)--*/
+bool AlloyGetFirstPartyEmbeds(CefRefPtr<CefRequestContext> context,
+                             const CefString& outer_url,
+                             CefRefPtr<AlloySiteSettingsCallback> callback);
+
+///
+/// EXPERIMENTAL: Atomically replace the outer site's list in the original
+/// |context| using absolute URLs in |embedded|. Empty clears it; invalid input
+/// preserves the prior list. Thread and callback semantics match the getter.
+/// Callback OK means durable publication for encrypted profiles, or completed
+/// memory-only publication for guest contexts. Setters return no entries.
+///
+/*--cef(added=experimental,optional_param=context)--*/
+bool AlloySetFirstPartyEmbeds(CefRefPtr<CefRequestContext> context,
+                             const CefString& outer_url,
+                             const std::vector<CefString>& embedded,
+                             CefRefPtr<AlloySiteSettingsCallback> callback);
 
 ///
 /// EXPERIMENTAL: Read the original context's native AdBlock custom filters.
@@ -98,6 +125,21 @@ bool AlloyGetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
 /*--cef(added=experimental,optional_param=context,optional_param=filters)--*/
 bool AlloySetAdBlockCustomFilters(CefRefPtr<CefRequestContext> context,
                                 const CefString& filters);
+
+///
+/// EXPERIMENTAL: Selects the embedded-state lifetime for an explicit initialized
+/// request context. Must be called on browser UI before the first network
+/// document is admitted. |scope| is "per-outer-site" (the default, including a
+/// 30-second keepalive after its last tab closes) or "per-tab" (tab + outer site,
+/// immediate retirement on tab close or moving to a different outer site).
+/// Back after a per-tab scope ends starts fresh. Sharing contexts share this
+/// immutable choice. Returns false for a null/uninitialized context, wrong
+/// thread, invalid option, retired context or a choice made after admission.
+/// Stateless contexts still refuse all storage in either scope.
+///
+/*--cef(added=experimental)--*/
+bool AlloySetEmbeddedStateScope(CefRefPtr<CefRequestContext> context,
+                                const CefString& scope);
 #endif
 
 #endif  // ALLOY_INCLUDE_ALLOY_REQUEST_CONTEXT_H_

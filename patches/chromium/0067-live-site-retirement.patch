@@ -1,0 +1,182 @@
+--- a/content/browser/renderer_host/document_associated_data.h
++++ b/content/browser/renderer_host/document_associated_data.h
+@@ -65,6 +65,7 @@
+   // Native weak/safe references remain valid for teardown. New Alloy state
+   // must stop being admitted before any service/user-data destructor runs.
+   bool IsAlloyStateAdmissionOpen() const { return alloy_state_admission_open_; }
++  void RetireAlloyState();
+ 
+   // The Page object associated with the main document. It is nullptr for
+   // subframes.
+--- a/content/browser/renderer_host/document_associated_data.cc
++++ b/content/browser/renderer_host/document_associated_data.cc
+@@ -64,12 +64,15 @@
+   }
+ }
+ 
+-DocumentAssociatedData::~DocumentAssociatedData() {
++void DocumentAssociatedData::RetireAlloyState() {
++  if (!alloy_state_admission_open_) return;
+   alloy_state_admission_open_ = false;
+   RetireAlloyNetworkGenerationForDocument(GetWeakPtr().get());
+-  if (navigation_or_document_handle_) {
+-    navigation_or_document_handle_->RetireAlloyState();
+-  }
++  if (navigation_or_document_handle_) navigation_or_document_handle_->RetireAlloyState();
++}
++
++DocumentAssociatedData::~DocumentAssociatedData() {
++  RetireAlloyState();
+   TRACE_EVENT0("navigation", "DocumentAssociatedData::~DocumentAssociatedData");
+   base::ScopedUmaHistogramTimer histogram_timer(
+       "Navigation.DocumentAssociatedDataDestructor");
+--- a/content/public/browser/shared_worker_service.h
++++ b/content/public/browser/shared_worker_service.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_PUBLIC_BROWSER_SHARED_WORKER_SERVICE_H_
+ 
+ #include <string>
++#include "base/functional/callback.h"
+ 
+ #include "base/observer_list_types.h"
+ #include "content/common/content_export.h"
+@@ -92,6 +93,11 @@
+       const blink::StorageKey& storage_key,
+       const blink::mojom::SharedWorkerSameSiteCookies same_site_cookies) = 0;
+ 
++  // Retires the native host and waits for the renderer worker's connection
++  // to close after termination. No success is inferred from merely scheduling.
++  virtual void TerminateWorkerAndWait(const blink::SharedWorkerToken& token,
++                                      base::OnceClosure done) = 0;
++
+   // Drops all shared workers and references to processes for shared workers
+   // synchronously.
+   virtual void Shutdown() = 0;
+--- a/content/browser/worker_host/shared_worker_service_impl.h
++++ b/content/browser/worker_host/shared_worker_service_impl.h
+@@ -76,6 +76,8 @@
+                        const blink::mojom::SharedWorkerSameSiteCookies
+                            same_site_cookies) override;
+   void Shutdown() override;
++  void TerminateWorkerAndWait(const blink::SharedWorkerToken& token,
++                              base::OnceClosure done) override;
+ 
+   // Uses |url_loader_factory| to load workers' scripts instead of
+   // StoragePartition's ReconnectableURLLoaderFactoryForIOThread.
+--- a/content/browser/worker_host/shared_worker_host.h
++++ b/content/browser/worker_host/shared_worker_host.h
+@@ -154,6 +154,7 @@
+   // Causes this instance to be deleted, which will terminate the worker. May
+   // be done based on a UI action.
+   void Destruct();
++  void TerminateAndNotify(base::OnceClosure done);
+ 
+   void DestructIfNoClients();
+ 
+--- a/content/browser/worker_host/shared_worker_host.cc
++++ b/content/browser/worker_host/shared_worker_host.cc
+@@ -1273,3 +1273,18 @@
+ }
+ 
+ }  // namespace content
++
++namespace content {
++void SharedWorkerHost::TerminateAndNotify(base::OnceClosure done) {
++  auto worker = std::make_unique<mojo::Remote<blink::mojom::SharedWorker>>(std::move(worker_));
++  if (!worker->is_bound() || !worker->is_connected()) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, std::move(done));
++    return;
++  }
++  (*worker)->Terminate();
++  auto* pipe = worker.get();
++  pipe->set_disconnect_handler(base::BindOnce(
++      [](std::unique_ptr<mojo::Remote<blink::mojom::SharedWorker>> worker,
++         base::OnceClosure done) { std::move(done).Run(); }, std::move(worker), std::move(done)));
++}
++}  // namespace content
+--- a/content/browser/worker_host/shared_worker_service_impl.cc
++++ b/content/browser/worker_host/shared_worker_service_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/shared_worker_service_impl.h"
++#include "content/public/browser/alloy_document_state.h"
+ 
+ #include <stddef.h>
+ 
+@@ -135,7 +136,7 @@
+ 
+   RenderFrameHostImpl* render_frame_host =
+       RenderFrameHostImpl::FromID(client_render_frame_host_id);
+-  if (!render_frame_host) {
++  if (!AlloyDocumentStateAdmitted(render_frame_host)) {
+     // TODO(crbug.com/40340498): Support the case where the requester is a
+     // worker (i.e., nested worker).
+     ScriptLoadFailed(std::move(client), /*error_message=*/"");
+@@ -689,3 +690,16 @@
+ }
+ 
+ }  // namespace content
++
++namespace content {
++void SharedWorkerServiceImpl::TerminateWorkerAndWait(const blink::SharedWorkerToken& token,
++                                                    base::OnceClosure done) {
++  auto* host = GetSharedWorkerHostFromToken(token);
++  if (!host) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, std::move(done));
++    return;
++  }
++  host->TerminateAndNotify(std::move(done));
++  host->Destruct();
++}
++}  // namespace content
+--- a/content/browser/worker_host/dedicated_worker_host_factory_impl.cc
++++ b/content/browser/worker_host/dedicated_worker_host_factory_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/worker_host/dedicated_worker_host_factory_impl.h"
++#include "content/public/browser/alloy_document_state.h"
+ 
+ #include <memory>
+ #include <utility>
+@@ -113,6 +114,11 @@
+       "script_url", script_url);
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   base::TimeTicks start_time = base::TimeTicks::Now();
++  if (!AlloyDocumentStateAdmitted(ancestor_document_.AsRenderFrameHostIfValid())) {
++    mojo::Remote<blink::mojom::DedicatedWorkerHostFactoryClient> remote(std::move(client));
++    remote->OnScriptLoadStartFailed();
++    return;
++  }
+ 
+   // This function is known to be heap allocation heavy and performance
+   // critical. Extra memory safety checks can introduce regression
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -132,6 +132,7 @@
+   ldflags = []
+ 
+   deps = [
++    "//components/keyed_service/core",
+     ":child_process_security_policy_impl",
+     "//base",
+     "//base:base_static",
+@@ -403,6 +404,7 @@
+ 
+   sources = [
+     "alloy_document_state.cc",
++    "alloy_site_retirement.cc",
+     "$target_gen_dir/devtools/protocol/audits.cc",
+     "$target_gen_dir/devtools/protocol/audits.h",
+     "$target_gen_dir/devtools/protocol/background_service.cc",
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -33,6 +33,7 @@
+     "allow_service_worker_result.cc",
+     "allow_service_worker_result.h",
+     "alloy_document_state.h",
++    "alloy_site_retirement.h",
+     "alloy_document_identity.h",
+     "anchor_element_preconnect_delegate.h",
+     "attribution_data_model.cc",

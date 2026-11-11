@@ -26,6 +26,68 @@ source_set("document_settings") {
   ]
 }
 
+source_set("embedded_state") {
+  sources = [ "embedded_state.cc", "embedded_state.h" ]
+  public_deps = [
+    ":capabilities",
+    "//base",
+    "//components/keyed_service/core",
+  ]
+}
+
+source_set("native_profile_configuration") {
+  sources = [ "native_profile_configuration.cc", "native_profile_configuration.h" ]
+  public_deps = [ ":capabilities", "//components/prefs", "//components/keyed_service/core" ]
+}
+
+source_set("native_pref_view") {
+  sources = [ "native_pref_view.cc", "native_pref_view.h" ]
+  public_deps = [ "//base", "//components/prefs" ]
+}
+
+source_set("native_profile_preferences") {
+  sources = [ "native_profile_preferences.cc", "native_profile_preferences.h" ]
+  public_deps = [ ":native_pref_view", ":capabilities" ]
+  deps = [ ":pref_cache" ]
+}
+
+source_set("site_profile_configuration") {
+  sources = [ "site_profile_configuration.cc", "site_profile_configuration.h" ]
+  public_deps = [ ":native_profile_configuration", ":pref_files" ]
+}
+
+source_set("profile_filter_storage") {
+  sources = [ "profile_filter_storage.cc", "profile_filter_storage.h" ]
+  public_deps = [ ":record_files", ":value_stores", "//brave/components/brave_shields/core/browser" ]
+}
+
+source_set("profile_filter_preferences") {
+  sources = [ "profile_filter_preferences.cc", "profile_filter_preferences.h", "profile_filter_resources.cc", "profile_filter_resources.h", "profile_filter_subscriptions.cc" ]
+  public_deps = [ ":profile_filter_storage", "//components/prefs", "//brave/components/brave_shields/content/browser" ]
+  deps = [ ":pref_cache", "//crypto" ]
+}
+
+source_set("profile_subscription_fetch") {
+  sources = [ "profile_subscription_fetch.cc", "profile_subscription_fetch.h" ]
+  public_deps = [ ":profile_filter_preferences", "//services/network/public/cpp" ]
+  deps = [ "//net" ]
+}
+
+source_set("profile_subscription_source") {
+  sources = [ "profile_subscription_source.cc", "profile_subscription_source.h" ]
+  public_deps = [ ":profile_filter_preferences", "//content/public/browser" ]
+}
+
+source_set("profile_adblock_service") {
+  sources = [ "profile_adblock_service.cc", "profile_adblock_service.h" ]
+  public_deps = [ ":profile_filter_preferences" ]
+}
+
+source_set("pref_cache") {
+  sources = [ "pref_cache_clear.cc", "pref_cache_clear.h" ]
+  public_deps = [ ":record_files", "//components/prefs" ]
+}
+
 source_set("record_files") {
   sources = [
     "authenticated_objects.cc",
@@ -56,12 +118,42 @@ source_set("profiles") {
     "secret_service_key_source.cc",
     "secret_service_key_source.h",
   ]
-  public_deps = [ ":record_files" ]
+  public_deps = [ ":record_files", ":pref_files" ]
   deps = [
     "//brave/third_party/argon2",
     "//dbus",
     "//third_party/boringssl",
   ]
+}
+
+source_set("auto_lock") {
+  sources = [ "profile_auto_lock.cc", "profile_auto_lock.h",
+              "linux_lock_signals.cc", "linux_lock_signals.h" ]
+  public_deps = [ "//base", "//dbus" ]
+}
+
+source_set("pref_files") {
+  sources = [
+    "embed_list_settings.cc",
+    "embed_list_settings.h",
+    "preferred_app_storage.cc",
+    "preferred_app_storage.h",
+    "record_pref_store.cc",
+    "record_pref_store.h",
+    "site_pref_store.cc",
+    "site_pref_store.h",
+    "site_pref_store_io.cc",
+    "site_pref_store_io.h",
+    "site_record_decay.cc",
+    "site_record_decay.h",
+  ]
+  public_deps = [ ":record_files", ":preferred_app_records", ":origin_value_stores", ":native_pref_view", "//components/prefs" ]
+  deps = [ ":pref_cache", "//components/content_settings/core/browser" ]
+}
+
+source_set("preferred_app_records") {
+  sources = [ "preferred_app_records.cc", "preferred_app_records.h" ]
+  public_deps = [ ":record_files", "//components/services/app_service" ]
 }
 
 source_set("sqlite_files") {
@@ -77,6 +169,35 @@ source_set("sqlite_files") {
   deps = [ "//third_party/boringssl" ]
 }
 
+source_set("value_stores") {
+  sources = [ "record_value_store.cc", "record_value_store.h" ]
+  public_deps = [ ":leveldb_files", "//components/value_store" ]
+}
+
+source_set("origin_value_stores") {
+  sources = [ "origin_value_store_binding.cc", "record_value_store_binding.h" ]
+  public_deps = [ ":value_stores", "//url" ]
+}
+
+source_set("managed_settings_test_support") {
+  testonly = true
+  sources = [
+    "//chrome/browser/device_api/managed_configuration_store.cc",
+    "//chrome/browser/device_api/managed_configuration_api.cc",
+  ]
+  public_deps = [
+    "//base", "//components/keyed_service/core", "//components/prefs",
+    "//components/pref_registry", "//components/value_store", "//url",
+    "//services/network/public/cpp", "//services/network/public/mojom",
+  ]
+}
+
+source_set("zoom_settings_test_support") {
+  testonly = true
+  sources = [ "//chrome/browser/ui/zoom/chrome_zoom_level_prefs.cc" ]
+  deps = [ "//base", "//components/prefs", "//components/zoom", "//content/public/browser" ]
+}
+
 executable("alloy_profile_cpp_consumer") {
   testonly = true
   use_libcxx_modules = false
@@ -85,6 +206,90 @@ executable("alloy_profile_cpp_consumer") {
   deps = [
     "//cef:libcef",
     "//cef:libcef_dll_wrapper",
+  ]
+}
+
+executable("alloy_browser_creation_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "browser_creation_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_site_settings_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "site_settings_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_guest_settings_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "guest_settings_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_local_state_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "local_state_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_encrypted_context_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "encrypted_context_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_embedded_profile_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "embedded_profile_consumer.cc", "profile_control.h" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_profile_auto_lock_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "profile_auto_lock_consumer.cc", "profile_control.h" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_encrypted_adblock_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "adblock_encrypted_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_encrypted_ssl_consumer") {
+  testonly = true
+  use_libcxx_modules = false
+  sources = [ "encrypted_ssl_consumer.cc" ]
+  defines = [ "USING_CEF_SHARED" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+}
+
+executable("alloy_encrypted_record_delete_consumer") {
+  testonly = true
+  sources = [ "encrypted_record_delete_consumer.cc" ]
+  deps = [
+    ":pref_files",
+    ":profiles",
+    "//base:i18n",
+    "//base/test:test_support",
+    "//url",
   ]
 }
 
@@ -122,10 +327,11 @@ source_set("cache_files") {
 
 test("alloy_site_records_unittests") {
   sources = [
-    "record_value_store_unittest.cc",
     "cookie_mode_unittest.cc",
     "document_object_grants_unittest.cc",
     "document_settings_unittest.cc",
+    "embedded_state_unittest.cc",
+    "first_party_retirement_unittest.cc",
     "independent_prefs_unittest.cc",
     "permission_services_unittest.cc",
     "record_capability_unittest.cc",
@@ -135,21 +341,56 @@ test("alloy_site_records_unittests") {
     "authenticated_objects_unittest.cc",
     "encrypted_file_contents_unittest.cc",
     "encrypted_profile_unittest.cc",
+    "profile_auto_lock_unittest.cc",
+    "linux_lock_signals_unittest.cc",
+    "site_record_decay_unittest.cc",
     "secret_service_key_source_unittest.cc",
     "encrypted_tree_unittest.cc",
     "record_file_crash_unittest.cc",
     "record_file_system_unittest.cc",
     "record_leveldb_env_unittest.cc",
+    "record_pref_store_unittest.cc",
+    "site_pref_store_unittest.cc",
+    "record_value_store_unittest.cc",
+    "managed_configuration_unittest.cc",
+    "preferred_app_records_unittest.cc",
+    "preferred_app_model_unittest.cc",
+    "preferred_app_persistence_unittest.cc",
+    "search_settings_unittest.cc",
+    "shields_settings_unittest.cc",
+    "embed_list_unittest.cc",
+    "site_pref_store_async_unittest.cc",
+    "zoom_settings_unittest.cc",
+    "//components/services/app_service/public/cpp/preferred_apps_list_unittest.cc",
     "record_cache_files_unittest.cc",
     "record_sqlite_vfs_unittest.cc",
     "test_main.cc",
   ]
   deps = [
-    ":value_stores",
+    ":network_retirement_test_support",
+    "//components/services/storage",
     ":capabilities",
     ":document_settings",
+    ":embedded_state",
     ":record_files",
     ":profiles",
+    ":pref_files",
+    ":auto_lock",
+    "//dbus:test_support",
+    ":value_stores",
+    ":managed_settings_test_support",
+    ":zoom_settings_test_support",
+    "//content/test:test_support",
+    "//services/network:test_support",
+    "//components/search_engines:test_support",
+    "//brave/components/brave_shields/core/browser",
+    "//brave/components/brave_shields/core/common",
+    "//components/regional_capabilities:test_support",
+    "//components/variations:test_support",
+    "//mojo/core/embedder",
+    "//components/services/app_service/public/cpp:test_support",
+    "//components/content_settings/core/browser",
+    "//components/pref_registry",
     ":sqlite_files",
     ":leveldb_files",
     ":cache_files",
@@ -323,50 +564,67 @@ test("alloy_no_disk_owner_unittests") {
 test("alloy_native_grants_unittests") {
   configs += [ "//cef/libcef/features:config" ]
   sources = [
-    "adblock_consumers_unittest.cc",
-    "adblock_generation_unittest.cc",
+    "bootstrap_factory_unittest.cc",
+    "activity_compatibility_unittest.cc",
     "adblock_profile_owner_unittest.cc",
+    "adblock_generation_unittest.cc",
+    "adblock_consumers_unittest.cc",
     "adblock_regional_unittest.cc",
     "adblock_snapshot_unittest.cc",
-    "native_profile_preferences_unittest.cc",
-    "profile_adblock_broker_unittest.cc",
-    "profile_adblock_service_unittest.cc",
+    "profile_filter_storage_unittest.cc",
     "profile_filter_preferences_unittest.cc",
     "profile_filter_resources_unittest.cc",
-    "profile_filter_storage_unittest.cc",
     "profile_filter_subscriptions_unittest.cc",
     "profile_subscription_fetch_unittest.cc",
     "profile_subscription_source_unittest.cc",
-    "bootstrap_factory_unittest.cc",
+    "profile_adblock_service_unittest.cc",
+    "profile_adblock_broker_unittest.cc",
     "document_native_grants_unittest.cc",
+    "embedded_cookie_policy_unittest.cc",
     "extension_storage_admission_unittest.cc",
     "fixture_gesture_unittest.cc",
+    "local_state_ownership_unittest.cc",
     "native_audit_consumers_unittest.cc",
+    "native_embedded_state_unittest.cc",
+    "native_dom_storage_security_unittest.cc",
     "native_profile_service_fence_unittest.cc",
+    "native_profile_preferences_unittest.cc",
+    "profile_settings_lifecycle_unittest.cc",
+    "producer_composition_unittest.cc",
+    "site_retirement_unittest.cc",
     "stateless_spelling_owner_unittest.cc",
   ]
   deps = [
-    "//components/supervised_user/core/browser",
-    ":native_profile_configuration",
-    ":native_profile_preferences",
+    ":capabilities",
+    "//brave/alloy/api_compatibility:test_main",
+    ":pref_files",
+    ":profiles",
+    "//cef:libcef_test_support",
+    ":site_profile_configuration",
     ":profile_filter_storage",
     ":profile_filter_preferences",
     ":profile_subscription_fetch",
     ":profile_subscription_source",
     ":profile_adblock_service",
+    ":native_profile_preferences",
+    "//components/supervised_user/core/browser",
     "//brave/browser/brave_shields:brave_shields_impl",
-    "//brave/components/brave_shields/content/browser",
-    "//brave/components/brave_shields/core/common",
-    "//services/network:test_support",
-    ":capabilities",
-    "//brave/alloy/api_compatibility:test_main",
-    "//cef:libcef_test_support",
+    ":embedded_state",
     "//base/test:test_support",
     "//chrome/browser/autofill",
+    "//chrome/browser/apps/app_service",
+    "//chrome/browser/device_api",
     "//chrome/browser/background_fetch",
     "//chrome/browser/background_sync",
     "//chrome/browser/content_index",
     "//brave/components/url_sanitizer/core/browser",
+    "//brave/browser/misc_metrics",
+    "//brave/components/misc_metrics",
+    "//brave/components/brave_shields/content/browser",
+    "//brave/components/brave_shields/core/common",
+    "//brave/test:test_support",
+    "//chrome/browser/ui/webui/settings",
+    "//components/prefs:test_support",
     "//brave/components/request_otr/browser",
     "//chrome/browser",
     "//chrome/browser/feature_engagement",
@@ -403,6 +661,9 @@ test("alloy_native_grants_unittests") {
     "//chrome/browser/serial",
     "//chrome/browser/ssl",
     "//chrome/browser/usb",
+    "//chrome/browser/custom_handlers",
+    "//chrome/browser/webid",
+    "//components/custom_handlers",
     "//chrome/browser/ui/page_info",
     "//chrome/browser/ui/autofill",
     "//chrome/test:test_support",
@@ -416,6 +677,12 @@ test("alloy_native_grants_unittests") {
     "//components/language/core/browser",
     "//components/translate/core/browser",
     "//components/favicon/content",
+    "//components/persistent_cache",
+    "//components/persistent_cache/mojom",
+    "//gpu/config",
+    "//third_party/blink/public:test_headers",
+    "//third_party/blink/public:test_support",
+    "//crypto",
     "//components/permissions",
     "//components/sync_preferences",
     "//components/security_interstitials/content:security_interstitial_page",
@@ -427,77 +694,9 @@ test("alloy_native_grants_unittests") {
     "//extensions/common:test_support",
     "//mojo/core/embedder",
     "//services/device/public/cpp:test_support",
+    "//services/network:test_support",
     "//net:test_support",
     "//testing/gtest",
     "//third_party/metrics_proto",
   ]
-}
-
-executable("alloy_browser_creation_consumer") {
-  testonly = true
-  use_libcxx_modules = false
-  sources = [ "browser_creation_consumer.cc" ]
-  defines = [ "USING_CEF_SHARED" ]
-  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
-}
-
-source_set("native_profile_configuration") {
-  sources = [ "native_profile_configuration.cc", "native_profile_configuration.h" ]
-  public_deps = [ ":capabilities", "//components/prefs", "//components/keyed_service/core" ]
-}
-
-source_set("native_pref_view") {
-  sources = [ "native_pref_view.cc", "native_pref_view.h" ]
-  public_deps = [ "//base", "//components/prefs" ]
-}
-
-source_set("native_profile_preferences") {
-  sources = [ "native_profile_preferences.cc", "native_profile_preferences.h" ]
-  public_deps = [ ":native_pref_view", ":capabilities" ]
-  deps = [ ":pref_cache" ]
-}
-
-source_set("pref_cache") {
-  sources = [ "pref_cache_clear.cc", "pref_cache_clear.h" ]
-  public_deps = [ ":record_files", "//components/prefs" ]
-}
-
-source_set("value_stores") {
-  sources = [ "record_value_store.cc", "record_value_store.h" ]
-  public_deps = [ ":leveldb_files", "//components/value_store" ]
-}
-
-source_set("profile_filter_storage") {
-  sources = [ "profile_filter_storage.cc", "profile_filter_storage.h" ]
-  public_deps = [ ":record_files", ":value_stores", "//brave/components/brave_shields/core/browser" ]
-}
-
-source_set("profile_filter_preferences") {
-  sources = [ "profile_filter_preferences.cc", "profile_filter_preferences.h", "profile_filter_resources.cc", "profile_filter_resources.h", "profile_filter_subscriptions.cc" ]
-  public_deps = [ ":profile_filter_storage", "//components/prefs", "//brave/components/brave_shields/content/browser" ]
-  deps = [ ":pref_cache", "//crypto" ]
-}
-
-source_set("profile_subscription_fetch") {
-  sources = [ "profile_subscription_fetch.cc", "profile_subscription_fetch.h" ]
-  public_deps = [ ":profile_filter_preferences", "//services/network/public/cpp" ]
-  deps = [ "//net" ]
-}
-
-source_set("profile_subscription_source") {
-  sources = [ "profile_subscription_source.cc", "profile_subscription_source.h" ]
-  public_deps = [ ":profile_filter_preferences", "//content/public/browser" ]
-}
-
-source_set("profile_adblock_service") {
-  sources = [ "profile_adblock_service.cc", "profile_adblock_service.h" ]
-  public_deps = [ ":profile_filter_preferences" ]
-}
-
-executable("alloy_encrypted_adblock_consumer") {
-  testonly = true
-  use_libcxx_modules = false
-  sources = [ "adblock_encrypted_consumer.cc" ]
-  defines = [ "USING_CEF_SHARED" ]
-  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
 }

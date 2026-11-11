@@ -29,6 +29,23 @@ network option. It does not merge tabs' navigation stacks. Mutable parent
 preferences are not inherited; registered defaults and explicitly supplied
 process-wide policy/command-line inputs remain configuration inputs.
 
+### User-level system state
+
+Fontconfig's font index is user-level system state, outside Alloy profiles in
+all three modes. Browser-owned profile and cache roots retain their zero-new-files
+boundary in stateless and memory-only operation. The probes give the browser a
+separate `XDG_CACHE_HOME` outside those measured roots and assert that it contains
+only `fontconfig/*.cache-*` files and `CACHEDIR.TAG`; any other state fails.
+`HOME` remains separate and measured. This boundary does not authorize site data,
+browser caches or preferences in the system-cache directory.
+
+The probes likewise isolate `XDG_RUNTIME_DIR` as user-level desktop state,
+outside measured browser roots, and permit only `dconf/user` there. Unknown
+files and symlinks fail the boundary. This does not relax the browser-root
+assertions. GPU, Dawn WebGPU and Graphite disk caches are disabled by Alloy's
+storage authority in every context mode, including encrypted profiles; these
+caches are not encrypted or relocated into a system-state directory.
+
 Native permission, chooser, external-file and certificate decisions belong to
 their original document or pending navigation. Their working state is retired
 before teardown callbacks; a held callback or live handle cannot authorize a

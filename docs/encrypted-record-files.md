@@ -53,6 +53,11 @@ lowercase hexadecimal IDs, apart from the nonsemantic fixed authoritative name
 `root`. Native filenames, directory relationships, domains, creation/modification
 times, logical lengths, revisions and all private metadata are encrypted.
 
+Site catalogue kind 3 appends an encrypted Unix-microsecond last-visit value
+to the record entry. The reader also accepts kind 1 (no qualifying visit stored,
+so decay uses creation time). Profile-private kind 2 is unchanged. Updating a
+site entry writes kind 3; older binaries cannot read those new entries.
+
 | # | Structure | Encoding and authentication |
 |---|---|---|
 |1|Immutable object|A 4096-byte plaintext page/chunk plus the 16-byte AES-256-GCM-SIV tag. Its random 256-bit ID is its physical name; its parent stores the expected ID and SHA-256 ciphertext digest|

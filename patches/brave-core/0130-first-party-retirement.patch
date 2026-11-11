@@ -1,0 +1,99 @@
+--- a/chromium_src/net/http/transport_security_state.cc
++++ b/chromium_src/net/http/transport_security_state.cc
+@@ -4,6 +4,7 @@
+  * You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ #include "net/http/transport_security_state.h"
++#include "net/base/alloy_network_record_target.h"
+ 
+ #include <optional>
+ 
+@@ -188,7 +189,9 @@
+       !enabled_sts_hosts_.IsPartitionHashValid()) {
+     return false;
+   }
+-  return TransportSecurityState_ChromiumImpl::AddHSTSHeader(host, value);
++  const bool added = TransportSecurityState_ChromiumImpl::AddHSTSHeader(host, value);
++  if (added) RememberAlloyHost(host);
++  return added;
+ }
+ 
+ // Use NetworkAnonymizationKey to create PartitionHash for accessing/storing
+@@ -201,6 +204,30 @@
+       GetHostBoundPartitionHashForHSTS(host));
+   TransportSecurityState_ChromiumImpl::AddHSTS(host, expiry,
+                                                include_subdomains);
++  RememberAlloyHost(host);
++}
++
++void TransportSecurityState::RememberAlloyHost(std::string_view host) {
++  const GURL url(base::StrCat({"https://", host}));
++  const auto domain = AlloyRecordDomainForPrincipal(url, url::Origin::Create(url));
++  const auto canonical = CanonicalizeHost(host);
++  if (!domain.empty() && !canonical.empty())
++    alloy_record_hosts_[domain].insert(HashHost(canonical));
++}
++
++void TransportSecurityState::RetireAlloyRecord(const std::string& domain) {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  bool changed = false;
++  auto hosts = alloy_record_hosts_.extract(domain);
++  if (!hosts.empty()) for (const auto& hash : hosts.mapped())
++    changed = enabled_sts_hosts_.DeleteDataInAllPartitions(hash) || changed;
++  const auto canonical = CanonicalizeHost(domain);
++  if (!canonical.empty()) {
++    const auto hash = HashHost(canonical);
++    changed = enabled_sts_hosts_.DeleteDataInAllPartitions(hash) || changed;
++    changed = enabled_sts_hosts_.DeletePartition(hash) || changed;
++  }
++  if (changed) DirtyNotify();
+ }
+ 
+ // Use NetworkAnonymizationKey to create PartitionHash for accessing/storing
+--- a/chromium_src/net/http/transport_security_state.h
++++ b/chromium_src/net/http/transport_security_state.h
+@@ -7,6 +7,8 @@
+ #define BRAVE_CHROMIUM_SRC_NET_HTTP_TRANSPORT_SECURITY_STATE_H_
+ 
+ #include "brave/net/http/partitioned_host_state_map.h"
++#include <map>
++#include <set>
+ #include "net/base/isolation_info.h"
+ 
+ namespace net {
+@@ -64,9 +66,13 @@
+                           const NetLogWithSource& net_log = NetLogWithSource());
+   bool GetDynamicSTSState(const std::string& host, STSState* result);
+   bool DeleteDynamicDataForHost(const std::string& host);
++  // Dynamic native memory only; immutable preloads are never touched.
++  void RetireAlloyRecord(const std::string& domain);
+ 
+  private:
+   bool alloy_scoped_memory_only_ = false;
++  void RememberAlloyHost(std::string_view host);
++  std::map<std::string, std::set<HashedHost>> alloy_record_hosts_;
+ };
+ 
+ }  // namespace net
+--- a/net/http/partitioned_host_state_map.h
++++ b/net/http/partitioned_host_state_map.h
+@@ -111,6 +111,19 @@
+     return map_.find(GetKeyWithPartitionHash(k));
+   }
+ 
++  // R13: remove every host in one native top-site partition.
++  bool DeletePartition(const key_type& partition) {
++    bool removed = false;
++    const auto suffix = base::span(partition).template first<crypto::kSHA256Length / 2>();
++    for (auto it = map_.begin(); it != map_.end();) {
++      const auto key_suffix = base::span(it->first).template last<crypto::kSHA256Length / 2>();
++      if (std::equal(suffix.begin(), suffix.end(), key_suffix.begin())) {
++        it = map_.erase(it); removed = true;
++      } else ++it;
++    }
++    return removed;
++  }
++
+   // Removes all items with similar first 16 bytes of |k|, effectively ignoring
+   // partition hash part.
+   bool DeleteDataInAllPartitions(const key_type& k) {

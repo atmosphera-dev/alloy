@@ -1,0 +1,28 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -326,3 +326,11 @@
+   ]
+ 
++  if (is_linux) {
++    deps += [
++      "//brave/alloy/guest:alloy_guest_host",
++      "//brave/alloy/guest:alloy_guest_engine",
++      "//brave/alloy/guest:alloy_guest_session_unittests",
++    ]
++  }
++
+   if (is_win) {
+@@ -1162,2 +1170,13 @@
+   deps += [ "//brave/alloy/site_records:capabilities" ]
++  if (is_linux) {
++    deps += [ "//brave/alloy/guest:session" ]
++    sources += [
++      "//brave/alloy/guest/session/client.cc",
++      "//brave/alloy/guest/session/supervisor.cc",
++      "//brave/alloy/guest/session/host.cc",
++    ]
++    libs = [ "dl" ]
++  } else {
++    sources += [ "//brave/alloy/guest/session/unavailable.cc" ]
++  }
+   sources += [ "libcef/browser/alloy/profile_store.cc" ]

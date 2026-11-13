@@ -1,0 +1,93 @@
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -1815,3 +1815,5 @@
+   if (is_linux || is_chromeos) {
+     sources += [
++      "process/alloy_guest_runtime.c",
++      "process/alloy_guest_runtime.h",
+       "base_paths_posix.cc",
+--- a/base/command_line.cc
++++ b/base/command_line.cc
+@@ -27,3 +27,7 @@
+ #include "build/build_config.h"
+ 
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++#include "base/process/alloy_guest_runtime.h"
++#endif
++
+ #if BUILDFLAG(IS_WIN)
+@@ -266,2 +270,5 @@
+ bool CommandLine::Init(int argc, const char* const* argv) {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  alloy_guest_initialize_runtime();
++#endif
+   if (current_process_commandline_) {
+@@ -288,2 +295,5 @@
+ bool CommandLine::Init(const StringVector& argv) {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  alloy_guest_initialize_runtime();
++#endif
+   if (current_process_commandline_) {
+--- a/base/process/launch_posix.cc
++++ b/base/process/launch_posix.cc
+@@ -23,1 +23,2 @@
++#include <algorithm>
+ #include <array>
+@@ -53,2 +53,3 @@
+ #include <sys/prctl.h>
++#include "base/process/alloy_guest_runtime.h"
+ #endif
+@@ -292,3 +294,30 @@
+ Process LaunchProcess(const std::vector<std::string>& argv,
+-                      const LaunchOptions& options) {
++                      const LaunchOptions& input_options) {
++  LaunchOptions options(input_options);
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  if (alloy_guest_is_runtime()) {
++    const char* bootstrap = getenv("ALLOY_GUEST_BOOTSTRAP");
++    const bool runtime_entry = bootstrap &&
++        std::find(argv.begin(), argv.end(), bootstrap) != argv.end();
++    if (runtime_entry) {
++      std::string manifest;
++      for (const auto& mapping : options.fds_to_remap) {
++        if (mapping.second >= ALLOY_GUEST_REGISTRATION_FD &&
++            mapping.second <= ALLOY_GUEST_RESOURCE_FD) {
++          return Process();
++        }
++        if (!manifest.empty()) manifest += ",";
++        manifest += NumberToString(mapping.second);
++      }
++      for (int fd : options.fds_to_remove_cloexec) {
++        if (!manifest.empty()) manifest += ",";
++        manifest += NumberToString(fd);
++      }
++      options.fds_to_remap.emplace_back(ALLOY_GUEST_REGISTRATION_FD,
++                                        ALLOY_GUEST_REGISTRATION_FD);
++      options.fds_to_remove_cloexec.push_back(ALLOY_GUEST_REGISTRATION_FD);
++      options.environment["ALLOY_GUEST_PRESERVE_FDS"] = manifest;
++    }
++  }
++#endif
+   TRACE_EVENT0("base", "LaunchProcess");
+@@ -803,3 +831,7 @@
+   base::internal::InvalidateTidCache();
++  // Raw clone does not run pthread_atfork. Close inherited browser peer ends
++  // even in short-lived namespace probes, before they can falsely retain it.
++  alloy_guest_close_fork_control();
++
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+ 
+--- a/content/zygote/zygote_main_linux.cc
++++ b/content/zygote/zygote_main_linux.cc
+@@ -25,2 +25,3 @@
+ #include "base/command_line.h"
++#include "base/process/alloy_guest_runtime.h"
+ #include "base/compiler_specific.h"
+@@ -241,3 +242,7 @@
+       base::BindOnce(CloseFds, linux_sandbox->GetFileDescriptorsToClose()));
+ 
++  // The native init-reaper fork changed the runtime identity. Register its
++  // child before the zygote can admit any browsing work, without new threads.
++  alloy_guest_initialize_runtime();
++
+   const int sandbox_flags = linux_sandbox->GetStatus();

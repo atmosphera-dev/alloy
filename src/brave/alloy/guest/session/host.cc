@@ -342,7 +342,7 @@ int RunBrowser(const CefMainArgs& args) {
   while (true) {
     // External pumping is scheduled by downstream progress, never by an
     // unbounded producer queue. Control I/O stays live while native work yields.
-    outgoing.Pump();
+    outgoing.Pump(ALLOY_GUEST_CONTROL_FD, closing);
     if (!closing && *global_ready && !context) {
       CefRefPtr<ContextReady> handler = new ContextReady(context_ready);
       context = settings.mode == "memory"
@@ -461,9 +461,10 @@ int RunBrowser(const CefMainArgs& args) {
       }
       GURL normalized = url_util::MakeGURL(url[0], /*fixup=*/false);
       if (!normalized.is_valid()) {
-        Envelope rejected{Message::kNavigationComplete, {}, 0, *owner,
-                          std::to_string(net::ERR_INVALID_URL)};
-        emit(std::move(rejected));
+        // The SDK validates before admission. An invalid internal command is
+        // a protocol violation, never a completion for the unchanged document.
+        failed = true;
+        close();
         continue;
       }
       found->second->Navigate(request.owner.request, normalized.spec());

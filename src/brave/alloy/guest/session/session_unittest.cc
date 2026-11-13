@@ -325,6 +325,34 @@ TEST(GuestControlQueue, PartiallySentFramesNeverChange) {
   queue.pop_front();
   EXPECT_EQ("newest", queue.front().payload);
 }
+TEST(GuestControlQueue, DrainedOutputReadsCommandsBeforeProducingAgain) {
+  base::test::SingleThreadTaskEnvironment tasks;
+  ControlQueue queue;
+  Channel channel;
+  int batches = 0;
+  auto produce = [&] {
+    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+        FROM_HERE, base::BindOnce([](ControlQueue* queue, int* batches) {
+          ++*batches;
+          queue->Push({Message::kTitle, {}, 0, {1, 1, 1, 1}, "busy"});
+        }, base::Unretained(&queue), base::Unretained(&batches)));
+  };
+  produce();
+  queue.Pump(channel.fds[0]);
+  ASSERT_EQ(1, batches);
+  queue.pop_front();
+  produce();
+  Peer app(Id()), host(Id());
+  ASSERT_TRUE(app.Send(channel.fds[1], {Message::kClose, {}, 0, {}, {}}));
+  queue.Pump(channel.fds[0]);
+  EXPECT_EQ(1, batches);
+  EXPECT_TRUE(queue.empty());
+  Envelope command;
+  ASSERT_TRUE(host.Receive(channel.fds[0], &command));
+  EXPECT_EQ(Message::kClose, command.message);
+  queue.Pump(channel.fds[0]);
+  EXPECT_EQ(2, batches);
+}
 TEST(GuestProviders, UnsupportedNeverInvokesNativeFallback) {
   auto session = Active();
   auto owner = session.CreateView();

@@ -66,10 +66,11 @@ control.sendmsg([b'bound'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i'
 
 
 class Fixtures:
-    def __init__(self, repo: Path, tls_root=None):
+    def __init__(self, repo: Path, tls_root=None, tracker_https=False):
         self.repo = repo
         self.certificate = None
         self.scheme = 'https' if tls_root is not None else 'http'
+        self.tracker_https = tracker_https
         self.requests = []
         self.protocol_errors = []
         self.navigation_waiting = threading.Event()
@@ -117,6 +118,10 @@ onbeforeunload=()=>{fetch('/close-entered',{keepalive:true});while(true){}};
 </script>'''
                 elif path == '/close-entered':
                     body = b'entered'
+                elif path == '/title-flood':
+                    body = b'''<!doctype html><title>FLOOD_READY</title><script>
+let count=0;setInterval(()=>document.title='FLOOD_'+(++count),0);
+</script>'''
                 elif path == '/query':
                     body = b"<!doctype html><script>document.title='QUERY:'+location.search;</script>"
                 elif path == '/neutral.js':
@@ -126,7 +131,7 @@ onbeforeunload=()=>{fetch('/close-entered',{keepalive:true});while(true){}};
                     content_type = 'application/javascript'
                     body = b'window.trackerExecuted=true;'
                 elif path == '/blocking':
-                    urls = list(TRACKERS.values()) if outer.certificate is not None else [
+                    urls = list(TRACKERS.values()) if outer.tracker_https else [
                         f'{outer.scheme}://{urlsplit(url).hostname}:{outer.port}{urlsplit(url).path}'
                         for url in TRACKERS.values()]
                     body = ('''<!doctype html><title>BLOCKING_PENDING</title><script>
@@ -147,7 +152,8 @@ outcomes,trackerExecuted:window.trackerExecuted});})();</script>''').encode()
                 self.end_headers()
                 self.wfile.write(body)
 
-        if tls_root is not None:
+        if tracker_https:
+            assert tls_root is not None
             listener = tracker_https_socket()
             self.server = FixtureServer(('127.0.0.1', 443), Handler,
                                                          bind_and_activate=False)

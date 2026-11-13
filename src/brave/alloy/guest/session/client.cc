@@ -25,6 +25,8 @@
 #include "cef/include/cef_api_hash.h"
 #include "cef/include/cef_version.h"
 #include "cef/libcef/common/api_version_util.h"
+#include "cef/libcef/common/net/url_util.h"
+#include "url/gurl.h"
 
 namespace alloy::guest {
 bool ParseProtection(const std::string& value, Protection* protection) {
@@ -204,9 +206,11 @@ class ViewImpl final : public AlloyGuestView {
   bool Navigate(const CefString& url) override {
     auto client = client_.lock();
     std::string value = url.ToString();
+    if (!client || closed_ || value.empty() || value.find('\0') != std::string::npos)
+      return false;
+    GURL normalized = url_util::MakeGURL(url, /*fixup=*/false);
     std::string packed;
-    if (!client || closed_ || value.empty() || value.find('\0') != std::string::npos ||
-        !PackFields({value}, &packed))
+    if (!normalized.is_valid() || !PackFields({normalized.spec()}, &packed))
       return false;
     Command command;
     command.kind = Message::kNavigate;

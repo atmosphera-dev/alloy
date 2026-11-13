@@ -49,6 +49,10 @@ whose `Navigate` method uses CEF's URL/scheme admission. This is not a remote `C
 facade. Multiple views use one context; different sessions use different
 contexts and browser crash groups.
 
+Invalid URLs return false from Navigate before admission; they do not change
+the live document or emit a load-completion callback for it. Native URL
+normalization is shared with CEF, including bare-hostname scheme insertion.
+
 ## Sequences, ownership and shutdown
 
 | # | Contract | Behavior |

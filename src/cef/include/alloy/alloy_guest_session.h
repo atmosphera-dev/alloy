@@ -119,7 +119,8 @@ class AlloyGuestView : public virtual CefBaseRefCounted {
   virtual uint64_t GetId() = 0;
   ///
   /// Queue a URL while ACTIVE, using CEF's normal scheme validation and native
-  /// admission. Navigation retires the old
+  /// admission. Invalid URLs return false before queuing and do not change the
+  /// current document or produce a load completion. Navigation retires the old
   /// document's pending owners before admitting its replacement.
   ///
   /*--cef()--*/

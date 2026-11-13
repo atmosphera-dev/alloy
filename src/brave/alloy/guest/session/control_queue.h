@@ -4,6 +4,8 @@
 #define BRAVE_ALLOY_GUEST_SESSION_CONTROL_QUEUE_H_
 
 #include <deque>
+#include <cerrno>
+#include <poll.h>
 #include <utility>
 #include "base/run_loop.h"
 #include "brave/alloy/guest/protocol/session.h"
@@ -15,9 +17,18 @@ namespace alloy::guest {
 class ControlQueue {
  public:
   bool CanProduce() const { return pending_.empty(); }
-  void Pump() {
+  void Pump(int control = -1, bool closing = false) {
     if (!CanProduce())
       return;
+    if (control >= 0 && !closing) {
+      // A drained output batch owes control a read turn before native work can
+      // produce again. HUP/errors also belong to the host's control loop.
+      pollfd event = {control, POLLIN, 0};
+      int ready;
+      do { ready = poll(&event, 1, 0); } while (ready < 0 && errno == EINTR);
+      if (ready != 0)
+        return;
+    }
     // CEF's public pump uses RunUntilIdle too, but cannot yield when an event
     // is queued. Own this run level so the first output ends the native batch.
     base::RunLoop loop;

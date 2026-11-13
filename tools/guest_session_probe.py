@@ -200,11 +200,42 @@ def foundation(out, evidence, fixtures):
         assert page['document'] > 0 and page['status'] != -300, page
         after = len(client.events)
         client.send(f'navigate guest {page["view"]} http://[')
-        rejected = client.wait('guest', 'load', lambda v: v['status'] == -300, after=after)
-        client.page(fixtures.base + '/title/VALID_AFTER_INVALID', 'VALID_AFTER_INVALID')
+        rejected = client.wait('guest', 'navigate-queued', after=after)
+        assert rejected['ok'] is False, rejected
+        client.send(f'navigate guest {page["view"]} {fixtures.base}/title/VALID_AFTER_INVALID')
+        resumed = client.wait('guest', 'title', lambda v: v['title'] == 'VALID_AFTER_INVALID', after=after)
+        assert resumed['view'] == page['view'] and resumed['document'] > page['document']
+        assert not any(v['event'] == 'load' and v['document'] == page['document'] and v['status'] == -300
+                       for v in client.events[after:])
+        after = len(client.events)
+        client.send('create guest -')
+        blank = client.wait('guest', 'view-ready', after=after)
+        after = len(client.events)
+        client.send(f'navigate guest {blank["view"]} http://[')
+        assert client.wait('guest', 'navigate-queued', after=after)['ok'] is False
+        client.send(f'navigate guest {blank["view"]} {fixtures.base}/title/VALID_BLANK_OWNER')
+        client.wait('guest', 'title', lambda v: v['view'] == blank['view'] and v['title'] == 'VALID_BLANK_OWNER',
+                    after=after)
+        assert not any(v['event'] == 'load' and v['document'] == 0 for v in client.events[after:])
         close_and_observe(client, out)
         rows.append({'case': 'schemeless-and-invalid-navigation-keeps-session-usable',
                      'page': page, 'invalid_result': rejected})
+    with Client(out, evidence / 'commands-during-output') as client:
+        client.start()
+        client.active()
+        client.send('create guest ' + fixtures.base + '/title-flood')
+        flooded = client.wait('guest', 'title', lambda v:
+                              v['title'].startswith('FLOOD_') and v['title'][6:].isdigit())
+        after = len(client.events)
+        client.send(f'navigate guest {flooded["view"]} {fixtures.base}/title/COMMAND_PROGRESS')
+        client.wait('guest', 'title', lambda v: v['title'] == 'COMMAND_PROGRESS', after=after)
+        after = len(client.events)
+        client.send(f'navigate guest {flooded["view"]} {fixtures.base}/title-flood')
+        client.wait('guest', 'title', lambda v:
+                    v['title'].startswith('FLOOD_') and v['title'][6:].isdigit(), after=after)
+        processes = close_and_observe(client, out)
+        rows.append({'case': 'navigate-and-graceful-close-progress-during-native-output',
+                     'owned_processes_exited': processes})
     with Client(out, evidence / 'spawn-descriptor-collision', reserve_descriptors=193) as client:
         client.wait('driver', 'descriptor-ceiling', lambda v: v['last'] == 193)
         client.start()
@@ -426,7 +457,8 @@ def main(argv=None):
     result = {'check': args.check, 'out': str(out), 'status': 'running'}
     fixtures = None
     try:
-        with Fixtures(REPO, tls_root=evidence / 'tls' if args.check == 'blocking' else None) as fixtures:
+        with Fixtures(REPO, tls_root=evidence / 'tls' if args.check == 'blocking' else None,
+                      tracker_https=args.check == 'blocking') as fixtures:
             if args.check == 'foundation':
                 rows = foundation(out, evidence, fixtures)
             elif args.check == 'smoke':

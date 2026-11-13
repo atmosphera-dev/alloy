@@ -14,7 +14,7 @@ import sys
 import threading
 import tempfile
 import time
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import unittest
 from urllib.request import urlopen
 
@@ -28,7 +28,9 @@ from guest_test_support.session import Client, descendants, process_role
 class GuestProbeTests(unittest.TestCase):
     def test_idle_tls_peer_does_not_block_requests_or_shutdown(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with Fixtures(TOOLS.parent, tls_root=Path(temporary) / 'tls') as fixtures:
+            with patch('guest_test_support.fixtures.tracker_https_socket',
+                       side_effect=AssertionError('Unit tests must not bind a privileged listener')), \
+                 Fixtures(TOOLS.parent, tls_root=Path(temporary) / 'tls') as fixtures:
                 idle = socket.create_connection(('127.0.0.1', fixtures.port), timeout=3)
                 try:
                     context = ssl.create_default_context(cafile=fixtures.certificate)

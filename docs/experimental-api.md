@@ -21,6 +21,7 @@ Alloy output; never substitute a stock CEF SDK.
 | 5 | [Decay](profile-decay.md) | Persistent `SetDecaySettings` / `GetDecaySettings` period/timebase policy |
 | 6 | [Auto-lock](profile-auto-lock.md) | Runtime idle policy, native trigger availability and lock events |
 | 7 | [Embedded exceptions](embed-list-settings.md) | Explicit directional lists, owned by the outer site's record |
+| 8 | [Guest sessions](guest-sessions.md) | Separate developmental browser sessions, explicit report acceptance and asynchronous closure |
 
 ## Threads and completion
 

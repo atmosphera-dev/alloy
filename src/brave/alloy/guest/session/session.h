@@ -12,6 +12,13 @@
 
 namespace alloy::guest {
 
+// Navigation belongs to its original view/document/request. A GPU stream epoch
+// is independent: recovery must not silently retire a still-live navigation.
+inline bool SameNavigation(const Owner& original, const Owner& current) {
+  return original.view == current.view && original.document == current.document &&
+         original.request == current.request;
+}
+
 enum class State { kStarting, kPrepared, kActive, kClosing, kClosed, kFailed };
 enum class Protection { kUnavailable, kNamedWritersOnly, kDataWritesDenied,
                         kReadOnlyView };

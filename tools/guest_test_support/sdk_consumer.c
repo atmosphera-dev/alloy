@@ -26,8 +26,8 @@ static void CEF_CALLBACK add(cef_base_ref_counted_t* base) {
 }
 static int CEF_CALLBACK release(cef_base_ref_counted_t* base) {
   handler_t* handler = (handler_t*)base;
-  int old = atomic_fetch_sub(&handler->references, 1);
   pthread_mutex_lock(&handler->mutex);
+  int old = atomic_fetch_sub(&handler->references, 1);
   pthread_cond_broadcast(&handler->changed);
   pthread_mutex_unlock(&handler->mutex);
   return old == 1;

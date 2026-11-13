@@ -15,6 +15,25 @@ from urllib.parse import urlsplit
 from probe_blocking import TRACKERS
 
 
+class FixtureServer(http.server.ThreadingHTTPServer):
+    tls_context = None
+
+    def finish_request(self, request, client_address):
+        if self.tls_context is None:
+            return super().finish_request(request, client_address)
+        # finish_request runs in the request worker, never in accept(). An idle
+        # TCP client cannot stall other clients or the server's shutdown loop.
+        with self.tls_context.wrap_socket(request, server_side=True,
+                                         do_handshake_on_connect=False) as tls:
+            tls.settimeout(10)
+            try:
+                tls.do_handshake()
+            except (ssl.SSLError, TimeoutError, ConnectionError):
+                # Incomplete/abandoned TLS is local to this request worker.
+                return
+            super().finish_request(tls, client_address)
+
+
 def tracker_https_socket():
     """Bind the original tracker URLs' HTTPS port, without a root browser.
 
@@ -53,6 +72,8 @@ class Fixtures:
         self.scheme = 'https' if tls_root is not None else 'http'
         self.requests = []
         self.protocol_errors = []
+        self.navigation_waiting = threading.Event()
+        self.navigation_release = threading.Event()
         self.lock = threading.Lock()
         outer = self
 
@@ -84,6 +105,18 @@ document.title=document.cookie.includes('alloy_session=one')?'COOKIE_SET':'COOKI
                 elif path == '/cookie':
                     body = b'''<!doctype html><script>document.title=
 document.cookie.includes('alloy_session=one')?'COOKIE_PRESENT':'COOKIE_ABSENT';</script>'''
+                elif path == '/pending-navigation':
+                    outer.navigation_waiting.set()
+                    if not outer.navigation_release.wait(30):
+                        self.send_error(504)
+                        return
+                    body = b'<!doctype html><title>GPU_PENDING_COMPLETED</title>'
+                elif path == '/hang-close':
+                    body = b'''<!doctype html><title>CLOSE_HANDLER_READY</title><script>
+onbeforeunload=()=>{fetch('/close-entered',{keepalive:true});while(true){}};
+</script>'''
+                elif path == '/close-entered':
+                    body = b'entered'
                 elif path == '/query':
                     body = b"<!doctype html><script>document.title='QUERY:'+location.search;</script>"
                 elif path == '/neutral.js':
@@ -116,7 +149,7 @@ outcomes,trackerExecuted:window.trackerExecuted});})();</script>''').encode()
 
         if tls_root is not None:
             listener = tracker_https_socket()
-            self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 443), Handler,
+            self.server = FixtureServer(('127.0.0.1', 443), Handler,
                                                          bind_and_activate=False)
             self.server.socket.close()
             self.server.socket = listener
@@ -124,7 +157,7 @@ outcomes,trackerExecuted:window.trackerExecuted});})();</script>''').encode()
             self.server.server_port = 443
             self.server.server_activate()
         else:
-            self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            self.server = FixtureServer(('127.0.0.1', 0), Handler)
         if tls_root is not None:
             tls_root.mkdir(mode=0o700)
             self.certificate = tls_root / 'certificate.pem'
@@ -139,7 +172,7 @@ outcomes,trackerExecuted:window.trackerExecuted});})();</script>''').encode()
                     stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(self.certificate, key)
-            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+            self.server.tls_context = context
         self.port = self.server.server_port
         self.base = f'{self.scheme}://127.0.0.1:{self.port}'
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -149,6 +182,7 @@ outcomes,trackerExecuted:window.trackerExecuted});})();</script>''').encode()
         return self
 
     def __exit__(self, *args):
+        self.navigation_release.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()

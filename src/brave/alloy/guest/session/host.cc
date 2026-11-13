@@ -3,6 +3,7 @@
 #include "brave/alloy/guest/session/client.h"
 #include "brave/alloy/guest/session/supervisor.h"
 #include "brave/alloy/guest/providers.h"
+#include "brave/alloy/guest/session/control_queue.h"
 
 #include <cerrno>
 #include <deque>
@@ -28,6 +29,7 @@
 #include "cef/include/cef_render_handler.h"
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/libcef/common/api_version_util.h"
+#include "cef/libcef/common/net/url_util.h"
 #include "content/public/browser/alloy_document_identity.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/gpu_data_manager.h"
@@ -36,6 +38,7 @@
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "net/http/http_response_headers.h"
+#include "net/base/net_errors.h"
 #include "url/gurl.h"
 #include "url/url_constants.h"
 
@@ -109,7 +112,7 @@ class NativeView final : public CefClient,
     pending_.clear();
     current_token_ = {};
     if (browser_)
-      browser_->GetHost()->CloseBrowser(true);
+      browser_->GetHost()->CloseBrowser(false);
     else
       closed_ = true;
   }
@@ -160,8 +163,9 @@ class NativeView final : public CefClient,
       return;
     Owner original = found->second;
     pending_.erase(found);
-    if (original != owner_)
+    if (!SameNavigation(original, owner_))
       return;
+    original.generation = owner_.generation;
     if (!navigation->HasCommitted() || navigation->GetNetErrorCode() != net::OK) {
       emit_({Message::kNavigationComplete, {}, 0, original,
               std::to_string(static_cast<int>(navigation->GetNetErrorCode()))});
@@ -300,7 +304,7 @@ int RunBrowser(const CefMainArgs& args) {
   report.bootstrap_before_engine = true;
   report.inherited_handles_closed = true;
   report.runtime_supervision = true;
-  std::deque<Envelope> outgoing;
+  ControlQueue outgoing;
   Envelope prepared;
   prepared.message = Message::kPrepared;
   uint64_t features = 0;
@@ -323,7 +327,9 @@ int RunBrowser(const CefMainArgs& args) {
   });
   bool failed = false;
   bool closing = false;
-  auto emit = [&outgoing](Envelope envelope) { outgoing.push_back(std::move(envelope)); };
+  auto emit = [&outgoing, &peer](Envelope envelope) {
+    outgoing.Push(std::move(envelope), peer.HasPendingSend());
+  };
   auto close = [&] {
     if (closing)
       return;
@@ -334,7 +340,9 @@ int RunBrowser(const CefMainArgs& args) {
       view->Close();
   };
   while (true) {
-    CefDoMessageLoopWork();
+    // External pumping is scheduled by downstream progress, never by an
+    // unbounded producer queue. Control I/O stays live while native work yields.
+    outgoing.Pump();
     if (!closing && *global_ready && !context) {
       CefRefPtr<ContextReady> handler = new ContextReady(context_ready);
       context = settings.mode == "memory"
@@ -352,7 +360,7 @@ int RunBrowser(const CefMainArgs& args) {
         close();
       } else {
         prepared_queued = true;
-        outgoing.push_back(std::move(prepared));
+        outgoing.Push(std::move(prepared));
       }
     }
     for (auto found = views.begin(); found != views.end();) {
@@ -364,7 +372,7 @@ int RunBrowser(const CefMainArgs& args) {
     if (closing && views.empty() && outgoing.empty())
       break;
     pollfd event = {ALLOY_GUEST_CONTROL_FD,
-                    static_cast<short>((closing ? 0 : POLLIN) |
+                    static_cast<short>((closing || !outgoing.CanProduce() ? 0 : POLLIN) |
                                         (outgoing.empty() ? 0 : POLLOUT)), 0};
     int observed = poll(&event, 1, 1);
     if (observed < 0 && errno == EINTR)
@@ -446,13 +454,19 @@ int RunBrowser(const CefMainArgs& args) {
         emit({Message::kCancel, {}, 0, request.owner, {}});
         continue;
       }
-      if (!request.owner.request || !UnpackFields(request.payload, 1, &url) ||
-          !GURL(url[0]).is_valid()) {
+      if (!request.owner.request || !UnpackFields(request.payload, 1, &url)) {
         failed = true;
         close();
         continue;
       }
-      found->second->Navigate(request.owner.request, url[0]);
+      GURL normalized = url_util::MakeGURL(url[0], /*fixup=*/false);
+      if (!normalized.is_valid()) {
+        Envelope rejected{Message::kNavigationComplete, {}, 0, *owner,
+                          std::to_string(net::ERR_INVALID_URL)};
+        emit(std::move(rejected));
+        continue;
+      }
+      found->second->Navigate(request.owner.request, normalized.spec());
     } else if (request.message == Message::kCloseView) {
       auto found = views.find(request.owner.view);
       if (found != views.end()) {

@@ -45,6 +45,22 @@ bool LaunchSupervisor(Supervisor* child) {
     close(pair[1]);
     return false;
   }
+  // dup2 actions execute in order. Neither source may alias either target,
+  // including when the embedding app already has many descriptors open.
+  for (int* source : {&pair[1], &resources[1]}) {
+    if (*source >= ALLOY_GUEST_CONTROL_FD && *source <= ALLOY_GUEST_RESOURCE_FD) {
+      int moved = fcntl(*source, F_DUPFD_CLOEXEC, ALLOY_GUEST_RESOURCE_FD + 1);
+      if (moved < 0) {
+        close(pair[0]);
+        close(pair[1]);
+        close(resources[0]);
+        close(resources[1]);
+        return false;
+      }
+      close(*source);
+      *source = moved;
+    }
+  }
   std::vector<std::string> environment = {
       "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "ALLOY_GUEST_RUNTIME=1",
       "ALLOY_GUEST_BOOTSTRAP=" + bootstrap,

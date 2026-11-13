@@ -58,9 +58,14 @@ contexts and browser crash groups.
 | 3 | Queued methods | True means queued, not completed; callbacks observe actual creation, page title/load or terminal retirement |
 | 4 | Reentrancy | Callbacks may close/release owners; closing synchronously stops new client admission |
 | 5 | Identity | Session, view, native document, request and stream generation remain distinct; IDs are not authority |
-| 6 | Close | Call Close explicitly; it cancels view owners, exchanges native close over private control, and waits for supervisor teardown/reaping before final completion |
+| 6 | Close | Graceful: cancel view owners, run native browser close (page handlers may delay), then wait for supervisor teardown/reaping |
 | 7 | Failure | Browser death ends the session; renderer/GPU recovery uses fresh generations under unchanged protection |
 | 8 | Final callback | View cancellation/retirement precedes session OnClosed; no callback resurrects a retired owner |
+| 9 | Terminate | Forced and idempotent in any state, including pending Close; skip page handlers, reap owned children, and deliver the same single final completion; no-op after CLOSED |
+
+Alloy selects no close timeout. An app that wants timed escalation calls
+`Terminate()` itself. Termination disconnects supervision from the calling thread,
+so a stalled native page or control consumer cannot prevent process teardown.
 
 Retain objects needed beyond a callback. In native C, each refptr callback
 argument transfers one counted reference; release it, including session,
@@ -90,6 +95,10 @@ The control envelope negotiates protocol, build, experimental API hash and
 feature availability. It uses explicit byte order, exact lengths and ordered
 sequence numbers, not native C++ layout. Logical control messages are chunked
 independently of socket packet size and accommodate Chromium's URL limit.
+The host yields its native producer batch when control output is queued and
+admits another batch or command only after that output drains. Title state
+coalesces per original owner; reliable control remains ordered. A stalled
+consumer neither grows an unbounded event queue nor triggers a quota failure.
 Unexpected control handles are closed and rejected. The inherited resource lane
 belongs to the same session; later resource transport does not replace control.
 

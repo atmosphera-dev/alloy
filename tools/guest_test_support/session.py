@@ -101,10 +101,15 @@ class OwnedProcesses:
 
 
 class Client:
-    def __init__(self, out: Path, root: Path, flexible=False, trusted_certificate=None):
+    def __init__(self, out: Path, root: Path, flexible=False, trusted_certificate=None,
+                 reserve_descriptors=None):
         self.out = out
         self.root = root
+        self.finished = False
+        self.aborted = False
         self.env = environment(root, out)
+        if reserve_descriptors is not None:
+            self.env['ALLOY_FIXTURE_FD_CEILING'] = str(reserve_descriptors)
         if trusted_certificate is not None:
             # Existing boundary probes use this same private OS/NSS input.
             # Trust only the generated fixture CA; never disable TLS validation.
@@ -177,8 +182,13 @@ class Client:
         return self.wait(name, 'closed', lambda value: value['reason'] == reason)
 
     def finish(self):
-        self.send('quit')
-        self.process.stdin.close()
+        if self.finished:
+            return
+        # On failure, __exit__ aborts and joins the reader before closing sinks.
+        if self.process.poll() is None:
+            self.send('quit')
+        if not self.process.stdin.closed:
+            self.process.stdin.close()
         code = self.process.wait(timeout=120)
         self.reader.join(timeout=10)
         assert not self.reader.is_alive()
@@ -186,27 +196,45 @@ class Client:
             value = self.incoming.get_nowait()
             if value is not None:
                 self.events.append(value)
+        (self.root / 'events.json').write_text(json.dumps(self.events, indent=2) + '\n')
         assert code == 0, (code, self.root)
         assert any(v['event'] == 'finished' for v in self.events)
-        (self.root / 'events.json').write_text(json.dumps(self.events, indent=2) + '\n')
+        self.finished = True
+        self.process.stdout.close()
         self.log.close()
         self.stderr.close()
 
     def abort(self):
+        self.aborted = True
         if self.process.poll() is None:
             handle = os.pidfd_open(self.process.pid)
             signal.pidfd_send_signal(handle, signal.SIGKILL)
             os.close(handle)
             self.process.wait(timeout=30)
         self.reader.join(timeout=10)
+        assert not self.reader.is_alive(), 'Consumer reader did not stop'
+        self.process.stdin.close()
+        self.process.stdout.close()
         self.log.close()
         self.stderr.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, error, *args):
-        if error:
-            self.abort()
-        elif self.process.poll() is None:
-            self.finish()
+    def __exit__(self, error_type, error, traceback):
+        if error is not None:
+            try:
+                self.abort()
+            except BaseException as cleanup:
+                error.add_note('Consumer cleanup also failed: ' + repr(cleanup))
+            return False
+        if self.aborted:
+            return False  # An intentional app-death test already collected it.
+        try:
+            self.finish()  # Also validate a consumer that has already exited.
+        except BaseException as original:
+            try:
+                self.abort()
+            except BaseException as cleanup:
+                original.add_note('Consumer cleanup also failed: ' + repr(cleanup))
+            raise

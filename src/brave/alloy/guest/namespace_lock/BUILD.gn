@@ -2,5 +2,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 source_set("namespace_lock") {
   sources = [ "provider.cc" ]
-  deps = [ "../protocol" ]
+  deps = [ "..:provider_api" ]
 }

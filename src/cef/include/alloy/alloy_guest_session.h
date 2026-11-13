@@ -200,10 +200,19 @@ class AlloyGuestSession : public virtual CefBaseRefCounted {
                            CefRefPtr<AlloyGuestViewHandler> handler) = 0;
   ///
   /// Stop admitting work immediately; cancel views and close/reap the owned
-  /// browser-host and its remaining children. Safe in any callback, idempotent.
+  /// browser-host and its remaining children gracefully. Page unload handlers
+  /// may delay completion. Safe in any callback, idempotent. The app may call
+  /// Terminate to escalate; Alloy selects no timeout.
   ///
   /*--cef()--*/
   virtual void Close() = 0;
+  ///
+  /// Force owned-process teardown without waiting for page handlers. Valid in
+  /// any state, including a pending Close; idempotent and a no-op after CLOSED.
+  /// Cancels owners and uses the same single final OnClosed after child reaping.
+  ///
+  /*--cef()--*/
+  virtual void Terminate() = 0;
 };
 
 ///

@@ -8,7 +8,10 @@
 #include "include/cef_render_handler.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <condition_variable>
 #include <deque>
+#include <fcntl.h>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -19,6 +22,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace {
 std::mutex output_mutex;
@@ -79,15 +83,18 @@ class Guest final : public AlloyGuestSessionHandler,
                         const CefString& state) override {
     Attach(session);
     Event(name_, "state", ",\"state\":" + Quote(state.ToString()));
+    if (state == "STARTING" && policy_ == "terminate-start")
+      session->Terminate();
     if (state == "ACTIVE" && policy_ == "queue-close") {
       session->CreateView(640, 480, this);
       session->Close();
     }
   }
-  void OnClosed(CefRefPtr<AlloyGuestSession>, const CefString& reason) override {
+  void OnClosed(CefRefPtr<AlloyGuestSession> session, const CefString& reason) override {
     {
       std::lock_guard guard(mutex_);
       session_ = nullptr;
+      completed_session_ = std::move(session);
       closed_ = true;
     }
     Event(name_, "closed", ",\"reason\":" + Quote(reason.ToString()));
@@ -111,6 +118,10 @@ class Guest final : public AlloyGuestSessionHandler,
     Event(name_, "title", ",\"view\":" + std::to_string(view->GetId()) +
           ",\"document\":" + std::to_string(document) +
           ",\"title\":" + Quote(title.ToString()));
+    if (policy_ == "stall-title" && title == "STALL_CONSUMER") {
+      std::unique_lock lock(stall_mutex_);
+      stall_cv_.wait(lock, [this] { return resumed_; });
+    }
   }
   void OnNavigationComplete(CefRefPtr<AlloyGuestView> view,
                               uint64_t document, int status) override {
@@ -161,12 +172,31 @@ class Guest final : public AlloyGuestSessionHandler,
     { std::lock_guard guard(mutex_); session = session_; }
     if (session) session->Close();
   }
+  void Terminate() {
+    CefRefPtr<AlloyGuestSession> session;
+    {
+      std::lock_guard guard(mutex_);
+      session = session_ ? session_ : completed_session_;
+    }
+    if (session) session->Terminate();
+    Event(name_, "terminate-called", ",\"state\":" +
+          Quote(session ? session->GetState().ToString() : "missing"));
+  }
+  void Resume() {
+    std::lock_guard guard(stall_mutex_);
+    resumed_ = true;
+    stall_cv_.notify_all();
+  }
   bool closed() const { return closed_; }
  private:
   const std::string name_;
   const std::string policy_;
   std::mutex mutex_;
+  std::mutex stall_mutex_;
+  std::condition_variable stall_cv_;
+  bool resumed_ = false;
   CefRefPtr<AlloyGuestSession> session_;
+  CefRefPtr<AlloyGuestSession> completed_session_;
   std::deque<std::string> pending_;
   std::map<uint64_t, CefRefPtr<AlloyGuestView>> views_;
   std::atomic<bool> closed_{false};
@@ -222,6 +252,16 @@ int main(int argc, char** argv) {
   int child = CefExecuteProcess(args, app, nullptr);
   if (child >= 0)
     return child;
+  std::vector<int> reserved;
+  if (const char* ceiling = getenv("ALLOY_FIXTURE_FD_CEILING")) {
+    int last = -1;
+    while (last < std::stoi(ceiling)) {
+      last = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (last < 0) return 1;
+      reserved.push_back(last);
+    }
+    Event("driver", "descriptor-ceiling", ",\"last\":" + std::to_string(last));
+  }
   bool flexible = argc == 3 && std::string(argv[1]) == "--flexible";
   CefRefPtr<CefRequestContext> app_context;
   CefRefPtr<CefBrowser> app_browser;
@@ -302,6 +342,8 @@ int main(int argc, char** argv) {
         if (found == guests.end()) return 2;
         if (operation == "accept") found->second->Accept();
         else if (operation == "close") found->second->Close();
+        else if (operation == "terminate") found->second->Terminate();
+        else if (operation == "resume") found->second->Resume();
         else if (operation == "create") {
           std::string url;
           command >> url;
@@ -323,5 +365,6 @@ int main(int argc, char** argv) {
     CefShutdown();
   }
   Event("driver", "finished");
+  for (int descriptor : reserved) close(descriptor);
   return 0;
 }

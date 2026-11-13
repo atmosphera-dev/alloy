@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "brave/alloy/guest/session/session.h"
 #include "brave/alloy/guest/providers.h"
+#include "brave/alloy/guest/session/control_queue.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -13,6 +14,9 @@
 #include <utility>
 
 #include "testing/gtest/include/gtest/gtest.h"
+#include "base/functional/bind.h"
+#include "base/task/single_thread_task_runner.h"
+#include "base/test/task_environment.h"
 
 namespace alloy::guest {
 namespace {
@@ -260,6 +264,66 @@ TEST(GuestSession, FailureRetiresEveryOutstandingOwner) {
   EXPECT_FALSE(session.Owns(*first));
   EXPECT_FALSE(session.Owns(*second));
   EXPECT_FALSE(session.Activate());
+}
+TEST(GuestSession, NavigationOwnershipIsIndependentOfGpuStreamRecovery) {
+  Owner navigation{1, 2, 3, 4};
+  Owner recovered = navigation;
+  ++recovered.generation;
+  EXPECT_TRUE(SameNavigation(navigation, recovered));
+  ++recovered.document;
+  EXPECT_FALSE(SameNavigation(navigation, recovered));
+  recovered = navigation;
+  ++recovered.request;
+  EXPECT_FALSE(SameNavigation(navigation, recovered));
+}
+TEST(GuestControlQueue, SlowConsumerStopsFurtherProducerBatches) {
+  base::test::SingleThreadTaskEnvironment tasks;
+  ControlQueue queue;
+  int batches = 0;
+  for (int task = 0; task < 10000; ++task) {
+    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+        FROM_HERE, base::BindOnce([](ControlQueue* queue, int* batches) {
+          ++*batches;
+          queue->Push({Message::kActive, {}, 0, {}, {}});
+        }, base::Unretained(&queue), base::Unretained(&batches)));
+  }
+  for (int attempt = 0; attempt < 10000; ++attempt) {
+    queue.Pump();
+  }
+  EXPECT_EQ(1, batches);
+  EXPECT_EQ(1u, queue.size());
+  queue.pop_front();
+  EXPECT_TRUE(queue.CanProduce());
+  queue.Pump();
+  EXPECT_EQ(2, batches);
+  // Pending tasks capture local owners. Retire them before those owners die.
+  while (!queue.empty()) queue.pop_front();
+  tasks.RunUntilIdle();
+}
+TEST(GuestControlQueue, InterleavedTitlesCoalesceButReliableControlStaysOrdered) {
+  ControlQueue queue;
+  Owner first{1, 1, 1, 1}, second{2, 2, 2, 1};
+  queue.Push({Message::kTitle, {}, 0, first, "old"});
+  queue.Push({Message::kTitle, {}, 0, second, "other"});
+  queue.Push({Message::kNavigationComplete, {}, 0, first, "200"});
+  queue.Push({Message::kTitle, {}, 0, first, "latest"});
+  EXPECT_EQ(3u, queue.size());
+  EXPECT_EQ("latest", queue.front().payload);
+  queue.pop_front();
+  EXPECT_EQ("other", queue.front().payload);
+  queue.pop_front();
+  EXPECT_EQ(Message::kNavigationComplete, queue.front().message);
+}
+TEST(GuestControlQueue, PartiallySentFramesNeverChange) {
+  ControlQueue queue;
+  Owner owner{1, 1, 1, 1};
+  queue.Push({Message::kTitle, {}, 0, owner, "in-flight"});
+  queue.Push({Message::kTitle, {}, 0, owner, "new"}, true);
+  queue.Push({Message::kTitle, {}, 0, owner, "newest"}, true);
+  EXPECT_EQ(2u, queue.size());
+  EXPECT_EQ("in-flight", queue.front().payload);
+  queue.pop_front();
+  EXPECT_EQ("newest", queue.front().payload);
 }
 TEST(GuestProviders, UnsupportedNeverInvokesNativeFallback) {
   auto session = Active();

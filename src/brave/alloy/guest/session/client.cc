@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -142,6 +143,31 @@ struct ClientCore {
     ssize_t result;
     do { result = write(wake, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
   }
+  void Terminate() {
+    std::lock_guard guard(mutex);
+    if (state == "CLOSED" || terminated)
+      return;
+    terminated = true;
+    closing = true;
+    state = "CLOSING";
+    // Shutdown, not close: the worker retains FD ownership. This also works
+    // while its application callback is running or graceful close is pending.
+    if (channel >= 0)
+      shutdown(channel, SHUT_RDWR);
+    uint64_t one = 1;
+    ssize_t result;
+    do { result = write(wake, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
+  }
+  void SetChannel(int value) {
+    std::lock_guard guard(mutex);
+    channel = value;
+    if (channel >= 0 && terminated)
+      shutdown(channel, SHUT_RDWR);
+  }
+  bool IsTerminated() {
+    std::lock_guard guard(mutex);
+    return terminated;
+  }
   std::string GetState() {
     std::lock_guard guard(mutex);
     return state;
@@ -165,6 +191,8 @@ struct ClientCore {
   std::mutex mutex;
   std::string state = "STARTING";
   bool closing = false;
+  bool terminated = false;
+  int channel = -1;
   std::deque<Command> commands;
 };
 
@@ -249,6 +277,7 @@ class SessionImpl final : public AlloyGuestSession {
     return core_->Enqueue(std::move(command), "ACTIVE");
   }
   void Close() override { core_->Close(); }
+  void Terminate() override { core_->Terminate(); }
 
  private:
   void StateChanged(const std::string& state) {
@@ -357,6 +386,8 @@ class SessionImpl final : public AlloyGuestSession {
     std::string reason = "failed";
     StateChanged("STARTING");
     bool launched = !core_->IsClosing() && LaunchSupervisor(&child);
+    if (launched)
+      core_->SetChannel(child.channel);
     std::deque<Envelope> outgoing;
     if (launched) {
       Envelope hello;
@@ -380,6 +411,8 @@ class SessionImpl final : public AlloyGuestSession {
       }
     };
     while (running) {
+      if (core_->IsTerminated())
+        break;
       if (core_->IsClosing() && !closing_started) {
         closing_started = true;
         if (close_reason.empty()) close_reason = "closed";
@@ -506,6 +539,7 @@ class SessionImpl final : public AlloyGuestSession {
       CancelView(views_.begin()->first, reason == "failed" ? "failed" : "cancelled");
     // EOF is a close request to the supervisor, which serializes it against
     // registration, terminates/reaps members, and only then exits.
+    core_->SetChannel(-1);
     ReapSupervisor(&child);
     session.Closed();
     core_->SetState("CLOSED");

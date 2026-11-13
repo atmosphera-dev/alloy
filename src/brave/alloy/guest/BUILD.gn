@@ -6,6 +6,7 @@ _implementation = [
   "bootstrap/main.c", "bootstrap/supervisor.c", "bootstrap/engine_main.cc",
   "session/session.cc", "session/session.h", "session/client.cc", "session/client.h",
   "session/supervisor.cc", "session/supervisor.h", "session/host.cc",
+  "session/control_queue.h",
   "protocol/session.cc", "protocol/session.h", "protocol/wire.h",
   "providers.cc", "providers.h", "linux_lock/provider.cc", "stream/provider.cc",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
@@ -23,9 +24,14 @@ action("build_identity") {
          rebase_path(inputs, root_build_dir)
 }
 
-source_set("foundation") {
-  sources = [ "session/session.cc", "session/session.h", "providers.cc", "providers.h" ]
+source_set("provider_api") {
+  sources = [ "providers.h" ]
   public_deps = [ "protocol" ]
+}
+
+source_set("foundation") {
+  sources = [ "session/session.cc", "session/session.h", "session/control_queue.h", "providers.cc" ]
+  public_deps = [ "protocol", ":provider_api", "//base" ]
   deps = [ "linux_lock", "stream", "media", "integration", "accessibility",
            "namespace_lock", "capture" ]
 }
@@ -33,7 +39,7 @@ source_set("foundation") {
 group("session") {
   # Library-side sources compile in libcef_static, like CEF's native adapters.
   # Their private native-header ownership does not create a circular GN edge.
-  deps = [ ":foundation", ":build_identity" ]
+  public_deps = [ ":foundation", ":build_identity" ]
 }
 
 action("alloy_guest_host") {
@@ -65,5 +71,5 @@ executable("alloy_guest_sdk_consumer") {
 
 test("alloy_guest_session_unittests") {
   sources = [ "session/session_unittest.cc" ]
-  deps = [ ":foundation", "//base/test:run_all_unittests", "//testing/gtest" ]
+  deps = [ ":foundation", "//base/test:run_all_unittests", "//base/test:test_support", "//testing/gtest" ]
 }

@@ -16,7 +16,7 @@ import time
 from workspace import validate_output, workspace_path
 from guest_test_support.display import environment
 from guest_test_support.fixtures import Fixtures, tracker_loopback_aliases
-from guest_test_support.session import Client, OwnedProcesses
+from guest_test_support.session import Client, OwnedProcesses, descendants
 
 REPO = Path(__file__).resolve().parents[1]
 WORK = workspace_path(REPO)
@@ -107,8 +107,142 @@ def close_and_observe(client, out, name='guest'):
 
 def foundation(out, evidence, fixtures):
     rows = [compile_c(out, evidence)]
+    registration = evidence / 'registration-exit'
+    subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                    '-I', str(REPO / 'src'), '-I', str(WORK / 'src'),
+                    str(REPO / 'tools/guest_test_support/registration_exit.c'),
+                    '-o', str(registration)], check=True)
+    with (evidence / 'registration-exit.log').open('x') as log:
+        subprocess.run([str(registration)], stdout=log, stderr=subprocess.STDOUT,
+                       check=True, timeout=30)
+    rows.append({'case': 'original-child-exits-before-registration-or-ack', 'passed': True})
     for kind in ('version', 'build', 'api'):
         rows.append(incompatible(out, evidence / ('incompatible-' + kind), kind))
+    with Client(out, evidence / 'terminate-start') as client:
+        client.send('start guest terminate-start memory unavailable 1 -')
+        client.closed()
+        client.send('terminate guest')
+        client.wait('guest', 'terminate-called', lambda v: v['state'] == 'CLOSED')
+        client.finish()
+        assert sum(v['event'] == 'closed' for v in client.events) == 1
+        assert not descendants(client.process.pid)
+        rows.append({'case': 'terminate-before-launch-and-after-closed', 'completions': 1})
+    with Client(out, evidence / 'terminate-admission') as client:
+        client.send('start guest manual memory unavailable 1 -')
+        deadline = time.monotonic() + 30
+        while True:
+            processes = OwnedProcesses(client.process.pid, out)
+            if any(v['role'] == 'supervisor' for v in processes.members):
+                break
+            processes.close()
+            assert time.monotonic() < deadline, 'No in-flight launch observed'
+            time.sleep(0.001)
+        try:
+            client.send('terminate guest\nterminate guest')
+            client.closed()
+            processes.exited()
+            client.finish()
+            assert sum(v['event'] == 'closed' for v in client.events) == 1
+            rows.append({'case': 'terminate-in-flight-launch-admission',
+                         'owned_processes_exited': processes.members, 'completions': 1})
+        finally:
+            processes.close()
+    with Client(out, evidence / 'terminate-pending-close') as client:
+        client.start()
+        client.active()
+        client.page(fixtures.base + '/hang-close', 'CLOSE_HANDLER_READY')
+        processes = OwnedProcesses(client.process.pid, out)
+        try:
+            client.send('close guest')
+            client.wait('guest', 'state', lambda v: v['state'] == 'CLOSING')
+            deadline = time.monotonic() + 15
+            while not any(v['path'] == '/close-entered' for v in fixtures.requests):
+                assert time.monotonic() < deadline, 'Graceful beforeunload did not execute'
+                time.sleep(0.01)
+            assert not any(v['event'] == 'closed' for v in client.events)
+            client.send('terminate guest\nterminate guest')
+            client.closed()
+            processes.exited()
+            client.send('terminate guest')
+            client.wait('guest', 'terminate-called', lambda v: v['state'] == 'CLOSED')
+            client.finish()
+            assert sum(v['event'] == 'closed' for v in client.events) == 1
+            rows.append({'case': 'terminate-pending-page-delayed-graceful-close',
+                         'owned_processes_exited': processes.members, 'completions': 1})
+        finally:
+            processes.close()
+    with Client(out, evidence / 'terminate-stalled-consumer') as client:
+        client.start(policy='stall-title')
+        client.active()
+        client.page(fixtures.base + '/title/STALL_CONSUMER', 'STALL_CONSUMER')
+        processes = OwnedProcesses(client.process.pid, out)
+        try:
+            client.send('terminate guest')
+            # Teardown must not need the blocked callback thread to return.
+            processes.exited()
+            client.send('resume guest')
+            client.closed()
+            client.finish()
+            assert sum(v['event'] == 'closed' for v in client.events) == 1
+            rows.append({'case': 'terminate-tears-down-before-stalled-callback-resumes',
+                         'owned_processes_exited': processes.members, 'completions': 1})
+        finally:
+            processes.close()
+    with Client(out, evidence / 'navigation-normalization') as client:
+        client.start()
+        client.active()
+        # A raw host:port is an invalid scheme in pinned CEF. A bare loopback
+        # host exercises its actual scheme insertion without requiring port 80
+        # to be free or coupling this check to a pre-existing HTTP service.
+        client.send('create guest 127.0.0.1/alloy-schemeless-navigation')
+        ready = client.wait('guest', 'view-ready')
+        page = client.wait('guest', 'load', lambda v: v['view'] == ready['view'])
+        assert page['document'] > 0 and page['status'] != -300, page
+        after = len(client.events)
+        client.send(f'navigate guest {page["view"]} http://[')
+        rejected = client.wait('guest', 'load', lambda v: v['status'] == -300, after=after)
+        client.page(fixtures.base + '/title/VALID_AFTER_INVALID', 'VALID_AFTER_INVALID')
+        close_and_observe(client, out)
+        rows.append({'case': 'schemeless-and-invalid-navigation-keeps-session-usable',
+                     'page': page, 'invalid_result': rejected})
+    with Client(out, evidence / 'spawn-descriptor-collision', reserve_descriptors=193) as client:
+        client.wait('driver', 'descriptor-ceiling', lambda v: v['last'] == 193)
+        client.start()
+        client.active()
+        client.page(fixtures.base + '/title/DESCRIPTOR_ALIAS_SAFE', 'DESCRIPTOR_ALIAS_SAFE')
+        processes = OwnedProcesses(client.process.pid, out)
+        try:
+            browser = next(v for v in processes.members if v['role'] == 'browser')
+            supervisor = next(v for v in processes.members if v['role'] == 'supervisor')
+            handles = Path('/proc') / str(browser['pid']) / 'fd'
+            assert (handles / '198').readlink() != (handles / '200').readlink(), 'Resource lane aliases control'
+            supervisor_control = Path('/proc') / str(supervisor['pid']) / 'fd/198'
+            assert supervisor_control.readlink() != (handles / '200').readlink(), 'Spawn source was overwritten'
+        finally:
+            processes.close()
+        close_and_observe(client, out)
+        rows.append({'case': 'spawn-sources-alias-reserved-targets', 'ceiling': 193})
+    with Client(out, evidence / 'gpu-pending-navigation') as client:
+        client.start()
+        client.active()
+        page = client.page(fixtures.base + '/title/GPU_BEFORE_PENDING', 'GPU_BEFORE_PENDING')
+        after = len(client.events)
+        client.send(f'navigate guest {page["view"]} {fixtures.base}/pending-navigation')
+        assert fixtures.navigation_waiting.wait(30), 'Navigation did not reach server'
+        processes = OwnedProcesses(client.process.pid, out)
+        try:
+            processes.kill('gpu-process')
+            time.sleep(1)
+            fixtures.navigation_release.set()
+            resumed = client.wait('guest', 'title', lambda v: v['title'] == 'GPU_PENDING_COMPLETED', after=after)
+            client.wait('guest', 'load', lambda v: v['document'] == resumed['document'] and v['status'] == 200,
+                        after=after)
+            close_and_observe(client, out)
+            processes.exited()
+            rows.append({'case': 'gpu-loss-preserves-pending-navigation', 'page': resumed})
+        finally:
+            fixtures.navigation_release.set()
+            processes.close()
     with Client(out, evidence / 'lifecycle') as client:
         report = client.start(policy='manual')
         assert report['filesystem'] == 'unavailable' and report['extensions_unavailable']

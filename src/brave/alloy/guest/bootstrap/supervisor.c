@@ -128,6 +128,10 @@ static int admit(int registration, struct members* members) {
           !getsockopt(endpoint, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) &&
           peer.pid == credential.pid && peer.uid == credential.uid;
   int pidfd = valid ? (int)syscall(SYS_pidfd_open, credential.pid, 0) : -1;
+  if (valid && pidfd < 0 && errno == ESRCH) {
+    close(endpoint);  // The original child exited before admission.
+    return 1;
+  }
   if (pidfd >= 0) {
     for (size_t i = 0; i < members->count; ++i) {
       if (members->items[i].process == credential.pid) {
@@ -153,7 +157,22 @@ static int admit(int registration, struct members* members) {
   members->items = replacement;
   members->items[members->count++] =
       (struct member){pidfd, endpoint, credential.pid};
-  return send(endpoint, "A", 1, MSG_NOSIGNAL) == 1;
+  ssize_t acknowledged;
+  do {
+    acknowledged = send(endpoint, "A", 1, MSG_NOSIGNAL);
+  } while (acknowledged < 0 && errno == EINTR);
+  if (acknowledged == 1)
+    return 1;
+  struct pollfd exited = {pidfd, POLLIN, 0};
+  if ((errno == EPIPE || errno == ECONNRESET) ||
+      (poll(&exited, 1, 0) == 1 && exited.revents)) {
+    // Keep the exact pidfd until exit even if its endpoint closed early. No
+    // admission ack reached this entry, but it must not become untracked.
+    close(endpoint);
+    members->items[members->count - 1].liveness = -1;
+    return 1;
+  }
+  return 0;
 }
 
 struct forwarding {
@@ -333,7 +352,8 @@ int alloy_guest_supervise(const char* bootstrap) {
       struct pollfd event = {members.items[i].pidfd, POLLIN, 0};
       if (poll(&event, 1, 0) == 1 && event.revents) {
         close(members.items[i].pidfd);
-        close(members.items[i].liveness);
+        if (members.items[i].liveness >= 0)
+          close(members.items[i].liveness);
         members.items[i] = members.items[--members.count];
       } else {
         ++i;

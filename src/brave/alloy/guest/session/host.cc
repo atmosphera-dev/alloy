@@ -4,6 +4,8 @@
 #include "brave/alloy/guest/session/supervisor.h"
 #include "brave/alloy/guest/providers.h"
 #include "brave/alloy/guest/session/control_queue.h"
+#include "brave/alloy/guest/session/extensions.h"
+#include "brave/alloy/guest/stream/view.h"
 
 #include <cerrno>
 #include <deque>
@@ -23,6 +25,7 @@
 #include "base/token.h"
 #include "base/functional/bind.h"
 #include "base/task/single_thread_task_runner.h"
+#include "base/time/time.h"
 #include "cef/include/alloy/alloy_request_context.h"
 #include "cef/include/cef_client.h"
 #include "cef/include/cef_command_line.h"
@@ -68,25 +71,44 @@ class NativeView final : public CefClient,
                          public content::WebContentsObserver {
  public:
   NativeView(Owner owner, int width, int height, Emit emit,
-             BeginDocument begin_document, Restart restart)
-      : owner_(owner), width_(width), height_(height), emit_(std::move(emit)),
-        begin_document_(std::move(begin_document)), restart_(std::move(restart)) {}
+              BeginDocument begin_document, Restart restart,
+              stream::StreamEvent stream_event, stream::SendResource resource,
+              std::function<uint64_t()> clock)
+      : owner_(owner), emit_(std::move(emit)),
+         begin_document_(std::move(begin_document)), restart_(std::move(restart)),
+         stream_(owner, width, height, std::move(stream_event),
+                 std::move(resource), std::move(clock)) {}
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
-    rect = CefRect(0, 0, width_, height_);
+    rect = stream_.rect();
   }
-  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType,
-                const RectList&, const void*, int, int) override {
-    // No resource transport is advertised in M1. M3 owns copies/leases.
+  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type,
+                const RectList&, const void* pixels, int width, int height) override {
+    stream_.Paint(type == PET_POPUP ? 1 : 0, pixels, width, height);
+  }
+  bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
+    return stream_.Screen(info);
+  }
+  bool GetScreenPoint(CefRefPtr<CefBrowser>, int x, int y, int& sx, int& sy) override {
+    return stream_.ScreenPoint(x, y, sx, sy);
+  }
+  void StreamCall(const Owner& owner, const std::string& operation,
+                  const std::string& payload, ProviderReply reply) {
+    stream_.Call(owner, operation, payload, std::move(reply));
+  }
+  void StreamRelease(const Owner& owner, const std::string& payload, ProviderReply reply) {
+    stream_.Release(owner, payload, std::move(reply));
   }
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     browser_ = browser;
+    stream_.Bind(browser);
     Observe(CefBrowserHostBase::FromBrowser(browser)->GetWebContents());
     emit_({Message::kViewCreated, {}, 0, owner_, {}});
   }
   void OnBeforeClose(CefRefPtr<CefBrowser>) override {
     Observe(nullptr);
+    stream_.Retire();
     browser_ = nullptr;
     closed_ = true;
     emit_({Message::kViewClosed, {}, 0, owner_, {}});
@@ -109,6 +131,7 @@ class NativeView final : public CefClient,
     if (closing_)
       return;
     closing_ = true;
+    stream_.Retire();
     pending_.clear();
     current_token_ = {};
     if (browser_)
@@ -131,6 +154,7 @@ class NativeView final : public CefClient,
       pending_.clear();
     }
     emit_({Message::kGenerationChanged, {}, 0, owner_, {}});
+    stream_.SetOwner(owner_);
   }
   void PrimaryMainFrameRenderProcessGone(base::TerminationStatus) override {
     StreamLost(true);
@@ -156,6 +180,7 @@ class NativeView final : public CefClient,
     pending_.clear();
     pending_.emplace(navigation->GetNavigationId(), owner_);
     emit_({Message::kDocumentStarted, {}, 0, owner_, {}});
+    stream_.SetOwner(owner_);
   }
   void DidFinishNavigation(content::NavigationHandle* navigation) override {
     auto found = pending_.find(navigation->GetNavigationId());
@@ -195,8 +220,6 @@ class NativeView final : public CefClient,
            content::AlloyDocumentNoiseIdentity(frame) == current_token_;
   }
   Owner owner_;
-  const int width_;
-  const int height_;
   const Emit emit_;
   const BeginDocument begin_document_;
   const Restart restart_;
@@ -207,6 +230,7 @@ class NativeView final : public CefClient,
   int status_ = 0;
   bool closing_ = false;
   bool closed_ = false;
+  stream::View stream_;
   IMPLEMENT_REFCOUNTING(NativeView);
 };
 
@@ -294,12 +318,32 @@ int RunBrowser(const CefMainArgs& args) {
     return 125;
   }
   Session session;
+  const auto clock_origin = base::TimeTicks::Now();
+  auto clock = [clock_origin] {
+    return static_cast<uint64_t>((base::TimeTicks::Now() - clock_origin).InMicroseconds());
+  };
+  stream::ResourceLane resources(ALLOY_GUEST_RESOURCE_FD, hello.session);
+  std::map<uint64_t, CefRefPtr<NativeView>> views;
   auto runner = base::SingleThreadTaskRunner::GetCurrentDefault();
   Providers providers([&session](const Owner& owner) { return session.Owns(owner); },
       [runner](std::function<void()> task) {
     runner->PostTask(FROM_HERE, base::BindOnce(
         [](std::function<void()> callback) { callback(); }, std::move(task)));
   });
+  auto stream_provider = StreamProvider(
+      [&views](const Owner& owner, const std::string& operation,
+               const std::string& payload, ProviderReply reply) {
+    auto found = views.find(owner.view);
+    if (found == views.end()) { reply(ProviderResult::kCancelled, {}); return; }
+    found->second->StreamCall(owner, operation, payload, std::move(reply));
+  });
+  stream_provider.release = [&views](const Owner& owner, const std::string&,
+                                     const std::string& payload, ProviderReply reply) {
+    auto found = views.find(owner.view);
+    if (found == views.end()) { reply(ProviderResult::kCancelled, {}); return; }
+    found->second->StreamRelease(owner, payload, std::move(reply));
+  };
+  providers.Install(Feature::kStream, std::move(stream_provider));
   ProtectionReport report;
   report.bootstrap_before_engine = true;
   report.inherited_handles_closed = true;
@@ -320,13 +364,13 @@ int RunBrowser(const CefMainArgs& args) {
               "1", "1", "1", std::to_string(features)}, &prepared.payload);
   bool prepared_queued = false;
   bool prepared_delivered = false;
-  std::map<uint64_t, CefRefPtr<NativeView>> views;
   auto gpu_epoch = std::make_unique<GpuEpoch>([&views] {
     for (auto& [id, view] : views)
       view->StreamLost(false);
   });
   bool failed = false;
   bool closing = false;
+  uint64_t last_extension = 0;
   auto emit = [&outgoing, &peer](Envelope envelope) {
     outgoing.Push(std::move(envelope), peer.HasPendingSend());
   };
@@ -435,7 +479,15 @@ int RunBrowser(const CefMainArgs& args) {
         if (auto original = session.Find(id)) providers.Cancel(*original);
         return session.RestartStream(id);
       };
-      CefRefPtr<NativeView> view = new NativeView(*owner, width, height, emit, begin, restart);
+      auto stream_event = [emit](Owner original, std::string operation, std::string payload) {
+        std::string packed;
+        if (PackExtension({Feature::kStream, 0, std::move(operation), std::move(payload)}, &packed))
+          emit({Message::kExtensionEvent, {}, 0, original, std::move(packed)});
+      };
+      CefRefPtr<NativeView> view = new NativeView(*owner, width, height, emit, begin, restart,
+          std::move(stream_event), [&resources](Envelope envelope, const std::vector<int>& handles) {
+            return resources.Send(std::move(envelope), handles);
+          }, clock);
       views.emplace(owner->view, view);
       CefWindowInfo window;
       window.SetAsWindowless(kNullWindowHandle);
@@ -468,6 +520,29 @@ int RunBrowser(const CefMainArgs& args) {
         continue;
       }
       found->second->Navigate(request.owner.request, normalized.spec());
+    } else if (request.message == Message::kExtensionCall) {
+      ExtensionRequest extension;
+      if (!UnpackExtension(request.payload, &extension) ||
+          extension.id <= last_extension) {
+        failed = true;
+        close();
+        continue;
+      }
+      last_extension = extension.id;
+      // The one generic route. Providers validates the original native owner,
+      // cancellation and exactly-once completion for every extension feature.
+      auto reply = [emit, clock, owner = request.owner, feature = extension.feature, id = extension.id]
+          (ProviderResult result, std::string payload) {
+        std::string packed;
+        if (PackExtensionReply({feature, id, result, clock(), std::move(payload)}, &packed))
+          emit({Message::kExtensionReply, {}, 0, owner, std::move(packed)});
+      };
+      if (!(features & (uint64_t{1} << static_cast<size_t>(extension.feature)))) {
+        reply(ProviderResult::kUnavailable, {});
+      } else {
+        providers.Invoke(extension.feature, request.owner, extension.operation, extension.payload,
+                           std::move(reply));
+      }
     } else if (request.message == Message::kCloseView) {
       auto found = views.find(request.owner.view);
       if (found != views.end()) {

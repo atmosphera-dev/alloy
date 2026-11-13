@@ -72,8 +72,9 @@ class Guest final : public AlloyGuestSessionHandler,
     Event(name_, "prepared", ",\"id\":" + Quote(session->GetId().ToString()) +
           ",\"filesystem\":" + Quote(protection->GetFilesystem().ToString()) +
           ",\"coverage\":" + Quote(protection->GetProcessCoverage().ToString()) +
-          ",\"scratch\":" + Quote(protection->GetScratchBacking().ToString()) +
-          ",\"extensions_unavailable\":" + (unavailable ? "true" : "false"));
+           ",\"scratch\":" + Quote(protection->GetScratchBacking().ToString()) +
+          ",\"stream_available\":" + (capabilities->IsAvailable("stream") ? "true" : "false") +
+           ",\"extensions_unavailable\":" + (unavailable ? "true" : "false"));
     if (policy_ == "refuse")
       session->Close();
     else if (policy_ != "manual")

@@ -7,6 +7,11 @@ _implementation = [
   "session/session.cc", "session/session.h", "session/client.cc", "session/client.h",
   "session/supervisor.cc", "session/supervisor.h", "session/host.cc",
   "session/control_queue.h",
+  "session/extensions.h", "session/extensions.cc",
+  "stream/resource_lane.h", "stream/resource_lane.cc",
+  "stream/frame_pool.h", "stream/frame_pool.cc",
+  "stream/lease.h", "stream/lease.cc", "stream/stream_client.h", "stream/stream_client.cc",
+  "stream/view.h", "stream/view.cc",
   "protocol/session.cc", "protocol/session.h", "protocol/wire.h",
   "providers.cc", "providers.h", "linux_lock/provider.cc", "stream/provider.cc",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
@@ -14,6 +19,7 @@ _implementation = [
   "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h",
   "//cef/include/alloy/alloy_guest_session.h",
   "//cef/include/alloy/alloy_guest_protection.h",
+  "//cef/include/alloy/alloy_guest_stream.h",
 ]
 
 action("build_identity") {
@@ -25,8 +31,8 @@ action("build_identity") {
 }
 
 source_set("provider_api") {
-  sources = [ "providers.h" ]
-  public_deps = [ "protocol" ]
+  sources = [ "providers.h", "session/extensions.h", "session/extensions.cc" ]
+  public_deps = [ "protocol", "stream:resources" ]
 }
 
 source_set("foundation") {
@@ -50,7 +56,7 @@ action("alloy_guest_host") {
   outputs = [ "$root_out_dir/alloy_guest_host" ]
   args = [ "--root", rebase_path("//", root_build_dir),
            "--out", rebase_path(outputs[0], root_build_dir) ]
-  deps = [ ":alloy_guest_engine", ":alloy_guest_sdk_consumer" ]
+  deps = [ ":alloy_guest_engine", ":alloy_guest_sdk_consumer", ":alloy_guest_stream_consumer" ]
 }
 
 executable("alloy_guest_engine") {
@@ -67,6 +73,20 @@ executable("alloy_guest_sdk_consumer") {
   deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
   configs += [ "//build/config/gcc:rpath_for_built_shared_libraries" ]
   use_libcxx_modules = false
+}
+
+executable("alloy_guest_stream_consumer") {
+  testonly = true
+  sources = [ "stream/sdk_consumer.cc" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+  configs += [ "//build/config/gcc:rpath_for_built_shared_libraries" ]
+  use_libcxx_modules = false
+}
+
+test("alloy_guest_stream_unittests") {
+  sources = [ "stream/stream_unittest.cc" ]
+  deps = [ ":foundation", "stream", "stream:resources", "//base/test:run_all_unittests",
+           "//base/test:test_support", "//testing/gtest" ]
 }
 
 test("alloy_guest_session_unittests") {

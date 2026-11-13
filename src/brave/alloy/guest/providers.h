@@ -27,6 +27,10 @@ using ProviderCall = std::function<void(const Owner&, const std::string&,
 // cancellation and exactly-once completion independently of resource transport.
 struct Provider {
   ProviderCall call;
+  // Reserved @release only retires resources owned by the exact original
+  // owner/token. It cannot admit content work and does not require a still-live
+  // document: leases may outlive navigation/resize. Every leaf validates tokens.
+  ProviderCall release = {};
   bool available() const { return !!call; }
 };
 Provider LinuxLockProvider(ProviderCall call = {});
@@ -64,6 +68,7 @@ class Providers {
   bool closed_ = false;
   std::map<Feature, Provider> providers_;
   std::map<uint64_t, std::shared_ptr<Pending>> pending_;
+  uint64_t next_pending_ = 1;
   std::shared_ptr<Lifetime> lifetime_;
 };
 }  // namespace alloy::guest

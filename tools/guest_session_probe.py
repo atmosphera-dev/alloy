@@ -276,7 +276,8 @@ def foundation(out, evidence, fixtures):
             processes.close()
     with Client(out, evidence / 'lifecycle') as client:
         report = client.start(policy='manual')
-        assert report['filesystem'] == 'unavailable' and report['extensions_unavailable']
+        assert report['filesystem'] == 'unavailable' and report['stream_available']
+        assert not report['extensions_unavailable']
         client.send('create guest ' + fixtures.base + '/title/NOT_ADMITTED')
         assert not client.wait('guest', 'create-queued')['ok']
         assert not any('/title/NOT_ADMITTED' in v['path'] for v in fixtures.requests)

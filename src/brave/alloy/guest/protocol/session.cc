@@ -25,7 +25,7 @@ uint64_t Get(const std::vector<uint8_t>& bytes, size_t start, size_t width) {
 }
 
 bool Known(Message message) {
-  return message >= Message::kHello && message <= Message::kGenerationChanged;
+  return message >= Message::kHello && message <= Message::kExtensionResource;
 }
 
 bool Valid(const Envelope& envelope) {

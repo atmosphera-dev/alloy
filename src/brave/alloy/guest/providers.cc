@@ -3,6 +3,7 @@
 #include "brave/alloy/guest/providers.h"
 
 #include <utility>
+#include <limits>
 
 namespace alloy::guest {
 struct Providers::Pending {
@@ -44,34 +45,37 @@ void Providers::Invoke(Feature feature, Owner owner, const std::string& operatio
                          const std::string& payload, ProviderReply reply) {
   if (!reply)
     return;
-  if (closed_ || !admitted_ || !owner.request || !owns_(owner)) {
+  const bool release = operation == "@release";
+  if (closed_ || !admitted_ || !owner.request || (!release && !owns_(owner))) {
     reply(ProviderResult::kCancelled, {});
     return;
   }
   auto found = providers_.find(feature);
-  if (found == providers_.end() || !found->second.available()) {
+  if (found == providers_.end() ||
+      !(release ? !!found->second.release : found->second.available())) {
     reply(ProviderResult::kUnavailable, {});
     return;
   }
-  if (pending_.contains(owner.request)) {
+  if (next_pending_ == std::numeric_limits<uint64_t>::max()) {
     reply(ProviderResult::kFailed, {});
     return;
   }
   auto pending = std::make_shared<Pending>(Pending{owner, std::move(reply)});
-  pending_.emplace(owner.request, pending);
+  const uint64_t id = next_pending_++;
+  pending_.emplace(id, pending);
   std::weak_ptr<Lifetime> lifetime = lifetime_;
-  auto call = found->second.call;
+  auto call = release ? found->second.release : found->second.call;
   auto post = post_;
   call(owner, operation, payload,
-        [lifetime, pending, post](ProviderResult result, std::string value) {
-    post([lifetime, pending, result, value = std::move(value)]() mutable {
+        [lifetime, pending, post, id, release](ProviderResult result, std::string value) {
+    post([lifetime, pending, result, id, release, value = std::move(value)]() mutable {
     auto live = lifetime.lock();
     if (!live || !live->owner || !pending->reply)
       return;
     auto* registry = live->owner;
     auto reply = std::exchange(pending->reply, {});
-    registry->pending_.erase(pending->owner.request);
-    if (registry->closed_ || !registry->owns_(pending->owner)) {
+     registry->pending_.erase(id);
+     if (registry->closed_ || (!release && !registry->owns_(pending->owner))) {
       result = ProviderResult::kCancelled;
       value.clear();
     }
@@ -81,13 +85,19 @@ void Providers::Invoke(Feature feature, Owner owner, const std::string& operatio
   });
 }
 void Providers::Cancel(const Owner& owner) {
-  auto found = pending_.find(owner.request);
-  if (found == pending_.end() || found->second->owner != owner)
-    return;
-  auto pending = std::move(found->second);
-  pending_.erase(found);
-  auto reply = std::exchange(pending->reply, {});
-  reply(ProviderResult::kCancelled, {});
+  std::vector<std::shared_ptr<Pending>> cancelled;
+  for (auto found = pending_.begin(); found != pending_.end();) {
+    if (found->second->owner == owner) {
+      cancelled.push_back(std::move(found->second));
+      found = pending_.erase(found);
+    } else {
+      ++found;
+    }
+  }
+  for (auto& pending : cancelled) {
+    auto reply = std::exchange(pending->reply, {});
+    if (reply) reply(ProviderResult::kCancelled, {});
+  }
 }
 void Providers::Close() {
   if (closed_)

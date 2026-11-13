@@ -1057,6 +1057,11 @@
       "patch": "cef/0132-guest-process-foundation.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0140-guest-extension-stream.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

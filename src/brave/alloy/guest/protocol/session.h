@@ -40,6 +40,12 @@ enum class Message : uint16_t {
   kUnavailable,
   kDocumentStarted,
   kGenerationChanged,
+  // All extension providers share these ordered control slots. Resource FDs
+  // travel only on the inherited resource lane, not in control messages.
+  kExtensionCall,
+  kExtensionReply,
+  kExtensionEvent,
+  kExtensionResource,
 };
 static_assert(static_cast<int>(Message::kClose) == ALLOY_GUEST_CLOSE_MESSAGE);
 static_assert(static_cast<int>(Message::kClosed) == ALLOY_GUEST_CLOSED_MESSAGE);

@@ -3,8 +3,9 @@
 # Experimental guest sessions
 
 M1 is the process foundation, not completed guest mode or write containment.
-Its Linux backend reports filesystem enforcement **unavailable**, scratch
-**disk-possible**, and every streaming/native connector unavailable. An app
+Its Linux backend reports filesystem enforcement **unavailable** and scratch
+**disk-possible**. M3 adds the experimental CPU stream capability described in
+`guest-streaming.md`; later media/native connectors remain unavailable. An app
 must explicitly request and accept developmental unavailable enforcement to
 activate this foundation. Required protection that is unavailable refuses
 admission; it never selects an in-process or weaker-session fallback.
@@ -19,6 +20,9 @@ Include `include/alloy/alloy_guest_session.h`. Define
 `CEF_API_VERSION=CEF_EXPERIMENTAL` and use the generated C headers and C++
 wrapper from the same output as `libcef`. New declarations use `Alloy*`;
 CEF's translator generates the C API and counted-reference wrappers.
+Before using a standalone session client, select and verify the native API hash
+with `cef_api_hash(CEF_API_VERSION, 0)` and `CEF_API_HASH_PLATFORM`. Normal CEF
+startup also does this, but is not required by the guest-session client.
 
 Bundle `alloy_guest_host` (static Linux entry), `alloy_guest_engine`, `libcef`
 and CEF resources together. The library resolves only its sibling bootstrap;

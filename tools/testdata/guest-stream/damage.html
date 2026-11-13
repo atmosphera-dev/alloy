@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DAMAGE_STARTING</title>
+<style>html,body { margin:0; width:100%; height:100%; overflow:hidden; } canvas { display:block; width:100%; height:100%; }</style>
+<canvas></canvas>
+<script>
+// Only one half is repainted per tick. A skipped damage sequence cannot be
+// recovered by applying only the next tick's dirty rectangle to old pixels.
+const canvas = document.querySelector('canvas');
+const context = canvas.getContext('2d', { alpha: false });
+let phase = 2;
+const values = [1, 2];
+function half(side) {
+  const n = values[side];
+  context.fillStyle = `rgb(${n * 3 % 256},${n * 5 % 256},${n})`;
+  context.fillRect(side * canvas.width / 2, 0, canvas.width / 2, canvas.height);
+}
+function size() {
+  canvas.width = Math.ceil(innerWidth * devicePixelRatio);
+  canvas.height = Math.ceil(innerHeight * devicePixelRatio);
+  half(0); half(1);
+}
+function title() { document.title = `DAMAGE_${values[0]}_${values[1]}`; }
+addEventListener('resize', size);
+size(); title();
+setInterval(() => {
+  phase = phase % 250 + 1;
+  const side = phase % 2 ? 0 : 1;
+  values[side] = phase;
+  half(side); title();
+}, 100);
+</script>

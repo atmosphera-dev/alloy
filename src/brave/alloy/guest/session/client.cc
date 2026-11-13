@@ -22,6 +22,8 @@
 #include "brave/alloy/guest/build_identity.h"
 #include "brave/alloy/guest/providers.h"
 #include "brave/alloy/guest/session/supervisor.h"
+#include "brave/alloy/guest/session/extensions.h"
+#include "brave/alloy/guest/stream/stream_client.h"
 #include "cef/include/cef_api_hash.h"
 #include "cef/include/cef_version.h"
 #include "cef/libcef/common/api_version_util.h"
@@ -119,9 +121,13 @@ struct Command {
   int height = 0;
   std::string payload;
   CefRefPtr<AlloyGuestViewHandler> handler;
+  Feature feature = Feature::kStream;
+  std::string operation;
+  ExtensionCompletion completion;
+  std::optional<Owner> resource_owner;
 };
 
-struct ClientCore {
+struct ClientCore : public std::enable_shared_from_this<ClientCore> {
   explicit ClientCore(int wake) : wake(wake) {}
   ~ClientCore() { close(wake); }
   bool Enqueue(Command command, const std::string& required_state) {
@@ -189,6 +195,83 @@ struct ClientCore {
     result.swap(commands);
     return result;
   }
+  ExtensionEndpoint Endpoint(uint64_t view) {
+    std::weak_ptr<ClientCore> weak = shared_from_this();
+    return {
+      [weak, view](Feature feature, std::string operation, std::string payload,
+                   ExtensionCompletion completion) {
+        auto core = weak.lock();
+        if (!core) return false;
+        Command command;
+        command.kind = Message::kExtensionCall;
+        command.view = view; command.feature = feature;
+        command.operation = std::move(operation);
+        command.payload = std::move(payload);
+        command.completion = std::move(completion);
+        return core->Enqueue(std::move(command), "ACTIVE");
+      },
+      [weak, view](Feature feature, std::shared_ptr<ExtensionSink> sink) {
+        auto core = weak.lock();
+        if (!core) return false;
+        Owner owner;
+        {
+          std::lock_guard guard(core->mutex);
+          auto found = core->extension_owners.find(view);
+          if (core->closing || found == core->extension_owners.end() ||
+              core->sinks.contains({view, feature})) return false;
+          owner = found->second;
+          core->sinks.emplace(std::make_pair(view, feature), sink);
+        }
+        sink->OwnerChanged(owner);
+        return true;
+      },
+      [weak, view](Feature feature, Owner original, std::string payload) {
+        auto core = weak.lock();
+        if (!core || original.view != view) return false;
+        Command command;
+        command.kind = Message::kExtensionCall;
+        command.view = view; command.feature = feature;
+        command.operation = "@release"; command.resource_owner = original;
+        command.payload = std::move(payload);
+        return core->Enqueue(std::move(command), "ACTIVE");
+      }
+    };
+  }
+  void ExtensionOwner(Owner owner) {
+    std::vector<std::shared_ptr<ExtensionSink>> notify;
+    {
+      std::lock_guard guard(mutex);
+      extension_owners[owner.view] = owner;
+      for (const auto& [key, sink] : sinks)
+        if (key.first == owner.view) notify.push_back(sink);
+    }
+    for (const auto& sink : notify) sink->OwnerChanged(owner);
+  }
+  std::shared_ptr<ExtensionSink> Sink(uint64_t view, Feature feature) {
+    std::lock_guard guard(mutex);
+    auto found = sinks.find({view, feature});
+    return found == sinks.end() ? nullptr : found->second;
+  }
+  void RetireExtensions(uint64_t view) {
+    std::vector<std::shared_ptr<ExtensionSink>> retire;
+    {
+      std::lock_guard guard(mutex);
+      extension_owners.erase(view);
+      for (auto it = sinks.begin(); it != sinks.end();) {
+        if (it->first.first == view) {
+          retire.push_back(it->second);
+          retired_sinks.push_back(it->second);
+          it = sinks.erase(it);
+        } else { ++it; }
+      }
+    }
+    for (const auto& sink : retire) sink->Retire();
+  }
+  void WaitExtensions() {
+    std::vector<std::shared_ptr<ExtensionSink>> retired;
+    { std::lock_guard guard(mutex); retired.swap(retired_sinks); }
+    for (const auto& sink : retired) sink->Wait();
+  }
   const int wake;
   std::mutex mutex;
   std::string state = "STARTING";
@@ -196,6 +279,9 @@ struct ClientCore {
   bool terminated = false;
   int channel = -1;
   std::deque<Command> commands;
+  std::map<uint64_t, Owner> extension_owners;
+  std::map<std::pair<uint64_t, Feature>, std::shared_ptr<ExtensionSink>> sinks;
+  std::vector<std::shared_ptr<ExtensionSink>> retired_sinks;
 };
 
 class ViewImpl final : public AlloyGuestView {
@@ -203,6 +289,15 @@ class ViewImpl final : public AlloyGuestView {
   ViewImpl(uint64_t id, std::weak_ptr<ClientCore> client)
       : id_(id), client_(std::move(client)) {}
   uint64_t GetId() override { return id_; }
+  CefRefPtr<AlloyGuestStream> GetStream() override {
+    std::lock_guard guard(stream_mutex_);
+    if (!stream_) {
+      auto client = client_.lock();
+      if (!client || closed_) return nullptr;
+      stream_ = stream::MakeClient(client->Endpoint(id_));
+    }
+    return stream_;
+  }
   bool Navigate(const CefString& url) override {
     auto client = client_.lock();
     std::string value = url.ToString();
@@ -222,6 +317,7 @@ class ViewImpl final : public AlloyGuestView {
     if (closed_.exchange(true))
       return;
     if (auto client = client_.lock()) {
+      client->RetireExtensions(id_);
       Command command;
       command.kind = Message::kCloseView;
       command.view = id_;
@@ -234,6 +330,8 @@ class ViewImpl final : public AlloyGuestView {
   const uint64_t id_;
   const std::weak_ptr<ClientCore> client_;
   std::atomic<bool> closed_{false};
+  std::mutex stream_mutex_;
+  CefRefPtr<AlloyGuestStream> stream_;
   IMPLEMENT_REFCOUNTING(ViewImpl);
 };
 
@@ -294,10 +392,23 @@ class SessionImpl final : public AlloyGuestSession {
       return;
     ViewEntry entry = std::move(found->second);
     entry.view->Retire();
+    core_->RetireExtensions(id);
     views_.erase(found);
     entry.handler->OnClosed(entry.view, reason);
   }
   bool Dispatch(Envelope envelope, Session* session, std::string* reason) {
+    if (envelope.message == Message::kExtensionReply) {
+      ExtensionResponse reply;
+      if (!UnpackExtensionReply(envelope.payload, &reply)) return false;
+      auto found = pending_extensions_.find(reply.id);
+      if (found == pending_extensions_.end()) return true;
+      auto pending = std::move(found->second);
+      pending_extensions_.erase(found);
+      if (pending.owner != envelope.owner || pending.feature != reply.feature) return false;
+      if (!session->Owns(pending.owner)) reply.result = ProviderResult::kCancelled;
+      if (pending.completion) pending.completion(reply.result, reply.completed_us, std::move(reply.payload));
+      return true;
+    }
     if (envelope.message == Message::kPrepared) {
       std::vector<std::string> fields;
       ProtectionReport report;
@@ -347,16 +458,26 @@ class SessionImpl final : public AlloyGuestSession {
     }
     if (view->closed())
       return true;
-    if (envelope.message == Message::kDocumentStarted)
-      return session->Observe(envelope.owner);
-    if (envelope.message == Message::kGenerationChanged)
-      return session->ObserveGeneration(envelope.owner);
+    if (envelope.message == Message::kDocumentStarted ||
+        envelope.message == Message::kGenerationChanged) {
+      bool observed = envelope.message == Message::kDocumentStarted
+          ? session->Observe(envelope.owner) : session->ObserveGeneration(envelope.owner);
+      if (observed) core_->ExtensionOwner(envelope.owner);
+      return observed;
+    }
     if (envelope.message == Message::kCancel) {
       handler->OnNavigationComplete(view, envelope.owner.document, -3);
       return true;
     }
     if (!session->Owns(envelope.owner))
       return true;
+    if (envelope.message == Message::kExtensionEvent) {
+      ExtensionRequest event;
+      if (!UnpackExtension(envelope.payload, &event) || event.id) return false;
+      if (auto sink = core_->Sink(envelope.owner.view, event.feature))
+        sink->Event(envelope.owner, std::move(event.operation), std::move(event.payload));
+      return true;
+    }
     if (envelope.message == Message::kViewCreated) {
       if (found->second.ready)
         return false;
@@ -387,11 +508,14 @@ class SessionImpl final : public AlloyGuestSession {
     Supervisor child;
     Session session;
     Peer peer(id_);
+    std::unique_ptr<stream::ResourceLane> resources;
     std::string reason = "failed";
     StateChanged("STARTING");
     bool launched = !core_->IsClosing() && LaunchSupervisor(&child);
     if (launched)
       core_->SetChannel(child.channel);
+    if (launched)
+      resources = std::make_unique<stream::ResourceLane>(child.resources, id_);
     std::deque<Envelope> outgoing;
     if (launched) {
       Envelope hello;
@@ -404,10 +528,12 @@ class SessionImpl final : public AlloyGuestSession {
       outgoing.push_back(std::move(hello));
     }
     uint64_t next_request = 1;
+    uint64_t next_extension = 1;
     bool running = launched;
     bool closing_started = false;
     std::string close_reason;
     auto cancel_command = [this](Command& command) {
+      if (command.completion) command.completion(ProviderResult::kCancelled, 0, {});
       if (command.handler) {
         CefRefPtr<ViewImpl> view = new ViewImpl(0, core_);
         view->Retire();
@@ -465,10 +591,13 @@ class SessionImpl final : public AlloyGuestSession {
           envelope.owner = *owner;
           ViewEntry entry{new ViewImpl(owner->view, core_), command.handler, false};
           views_.emplace(owner->view, std::move(entry));
+          core_->ExtensionOwner(*owner);
         } else {
           auto owner = session.Find(command.view);
-          if (!owner)
+          if (!owner) {
+            if (command.completion) command.completion(ProviderResult::kCancelled, 0, {});
             continue;
+          }
           envelope.owner = *owner;
           if (command.kind == Message::kNavigate) {
             auto found = views_.find(command.view);
@@ -478,6 +607,17 @@ class SessionImpl final : public AlloyGuestSession {
             envelope.payload = std::move(command.payload);
           } else if (command.kind == Message::kCloseView) {
             session.RetireView(command.view);
+          } else if (command.kind == Message::kExtensionCall) {
+            if (command.resource_owner) envelope.owner = *command.resource_owner;
+            if (next_extension == std::numeric_limits<uint64_t>::max() ||
+                !PackExtension({command.feature, next_extension, command.operation,
+                                std::move(command.payload)}, &envelope.payload)) {
+              if (command.completion) command.completion(ProviderResult::kFailed, 0, {});
+              running = false;
+              break;
+            }
+            pending_extensions_.emplace(next_extension++, PendingExtension{
+                envelope.owner, command.feature, std::move(command.completion)});
           }
         }
         outgoing.push_back(std::move(envelope));
@@ -491,9 +631,10 @@ class SessionImpl final : public AlloyGuestSession {
         continue;
       }
       pollfd events[] = {{child.channel, static_cast<short>(POLLIN | (outgoing.empty() ? 0 : POLLOUT)), 0},
-                         {core_->wake, POLLIN, 0}, {child.pidfd, POLLIN, 0}};
+                         {core_->wake, POLLIN, 0}, {child.pidfd, POLLIN, 0},
+                         {child.resources, POLLIN, 0}};
       int observed;
-      do { observed = poll(events, 3, -1); } while (observed < 0 && errno == EINTR);
+      do { observed = poll(events, 4, -1); } while (observed < 0 && errno == EINTR);
       if (observed < 0)
         break;
       if (events[1].revents) {
@@ -521,7 +662,19 @@ class SessionImpl final : public AlloyGuestSession {
         else if (errno != EAGAIN && errno != EWOULDBLOCK)
           break;
       }
-      if ((events[0].revents & (POLLERR | POLLHUP | POLLNVAL)) || events[2].revents)
+      if (!closing_started && (events[3].revents & POLLIN)) {
+        stream::Resource resource;
+        if (resources->Receive(&resource)) {
+          ExtensionRequest event;
+          if (!UnpackExtension(resource.envelope.payload, &event)) break;
+          if (auto sink = core_->Sink(resource.envelope.owner.view, event.feature))
+            sink->Resource(std::move(resource));
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          break;
+        }
+      }
+      if ((events[0].revents & (POLLERR | POLLHUP | POLLNVAL)) || events[2].revents ||
+          (events[3].revents & (POLLERR | POLLHUP | POLLNVAL)))
         break;
     }
     if (!close_reason.empty())
@@ -533,6 +686,7 @@ class SessionImpl final : public AlloyGuestSession {
     if (!closing_started)
       StateChanged(reason == "closed" || reason == "refused" ? "CLOSING" : "FAILED");
     for (auto& command : core_->TakeCommands()) {
+      if (command.completion) command.completion(ProviderResult::kCancelled, 0, {});
       if (command.handler) {
         CefRefPtr<ViewImpl> view = new ViewImpl(0, core_);
         view->Retire();
@@ -541,10 +695,14 @@ class SessionImpl final : public AlloyGuestSession {
     }
     while (!views_.empty())
       CancelView(views_.begin()->first, reason == "failed" ? "failed" : "cancelled");
+    for (auto& [id, pending] : pending_extensions_)
+      if (pending.completion) pending.completion(ProviderResult::kCancelled, 0, {});
+    pending_extensions_.clear();
     // EOF is a close request to the supervisor, which serializes it against
     // registration, terminates/reaps members, and only then exits.
     core_->SetChannel(-1);
     ReapSupervisor(&child);
+    core_->WaitExtensions();
     session.Closed();
     core_->SetState("CLOSED");
     handler_->OnClosed(this, reason);
@@ -556,6 +714,12 @@ class SessionImpl final : public AlloyGuestSession {
   const SessionId id_;
   const std::shared_ptr<ClientCore> core_;
   std::map<uint64_t, ViewEntry> views_;
+  struct PendingExtension {
+    Owner owner;
+    Feature feature;
+    ExtensionCompletion completion;
+  };
+  std::map<uint64_t, PendingExtension> pending_extensions_;
   IMPLEMENT_REFCOUNTING(SessionImpl);
 };
 }  // namespace

@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
 source_set("stream") {
-  sources = [ "provider.cc" ]
+  sources = [ "provider.cc", "frame_pool.cc", "frame_pool.h" ]
   deps = [ "..:provider_api" ]
+  public_deps = [ ":resources" ]
+}
+source_set("resources") {
+  sources = [ "resource_lane.h", "resource_lane.cc" ]
+  public_deps = [ "../protocol", "//base" ]
 }

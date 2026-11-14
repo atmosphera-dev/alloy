@@ -1,0 +1,258 @@
+--- a/libcef/browser/frame_host_impl.h
++++ b/libcef/browser/frame_host_impl.h
+@@ -101,7 +101,11 @@
+   // Send a command to the renderer for execution.
+   void SendCommand(const std::string& command);
+   void SendGuestCommand(const std::string& command,
+-      base::RepeatingCallback<bool()> admitted, base::OnceCallback<void(bool)> completion);
++      base::RepeatingCallback<bool()> admitted, base::OnceCallback<void(bool)> completion,
++      std::optional<base::UnguessableToken> edit_context = std::nullopt);
++  void CaptureGuestEditContext(const base::UnguessableToken& token, bool context_menu,
++      base::OnceCallback<void(bool)> completion);
++  void ReleaseGuestEditContext(const base::UnguessableToken& token);
+   void SendCommandWithResponse(
+       const std::string& command,
+       cef::mojom::RenderFrame::SendCommandWithResponseCallback
+--- a/libcef/browser/frame_host_impl.cc
++++ b/libcef/browser/frame_host_impl.cc
+@@ -418,7 +418,8 @@
+ }
+ 
+ void CefFrameHostImpl::SendGuestCommand(const std::string& command,
+-    base::RepeatingCallback<bool()> extra_admission, base::OnceCallback<void(bool)> completion) {
++    base::RepeatingCallback<bool()> extra_admission, base::OnceCallback<void(bool)> completion,
++    std::optional<base::UnguessableToken> edit_context) {
+   CEF_REQUIRE_UIT();
+   auto* frame = GetRenderFrameHost();
+   auto* integration = content::AlloyGuestIntegration::Get(frame);
+@@ -429,7 +430,8 @@
+   SendToRenderFrame(__FUNCTION__, base::BindOnce(
+       [](const std::string& command, content::WeakDocumentPtr document,
+           base::RepeatingCallback<bool()> admission, base::RepeatingCallback<bool()> extra,
+-          base::OnceCallback<void(bool)> done, const RenderFrameType& remote) {
++          base::OnceCallback<void(bool)> done,
++          std::optional<base::UnguessableToken> edit_context, const RenderFrameType& remote) {
+         auto* original = document.AsRenderFrameHostIfValid();
+         if (!original || !admission.Run() || (extra && !extra.Run())) {
+           std::move(done).Run(false); return;
+@@ -437,9 +439,44 @@
+         static_cast<content::WebContentsImpl*>(content::WebContents::FromRenderFrameHost(original))
+             ->RecordAlloyGuestUiInteraction(original);
+         remote->SendCommandForDocument(command,
+-            static_cast<content::RenderFrameHostImpl*>(original)->GetDocumentToken());
++            static_cast<content::RenderFrameHostImpl*>(original)->GetDocumentToken(), edit_context);
+         std::move(done).Run(true);
+-      }, command, document, std::move(admission), std::move(extra_admission), std::move(done)));
++      }, command, document, std::move(admission), std::move(extra_admission),
++         std::move(done), std::move(edit_context)));
++}
++
++void CefFrameHostImpl::CaptureGuestEditContext(const base::UnguessableToken& token,
++    bool context_menu, base::OnceCallback<void(bool)> completion) {
++  CEF_REQUIRE_UIT();
++  auto* frame = GetRenderFrameHost();
++  auto* integration = content::AlloyGuestIntegration::Get(frame);
++  auto admission = integration ? integration->CaptureAdmission(frame) : base::RepeatingCallback<bool()>();
++  auto done = mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(completion), false);
++  if (token.is_empty() || !admission || !admission.Run()) {
++    std::move(done).Run(false); return;
++  }
++  SendToRenderFrame(__FUNCTION__, base::BindOnce(
++      [](content::WeakDocumentPtr document, base::UnguessableToken token,
++          bool context_menu, base::RepeatingCallback<bool()> admission,
++          base::OnceCallback<void(bool)> done, const RenderFrameType& remote) {
++        auto* original = document.AsRenderFrameHostIfValid();
++        if (!original || !admission.Run()) { std::move(done).Run(false); return; }
++        remote->CaptureGuestEditContext(
++            static_cast<content::RenderFrameHostImpl*>(original)->GetDocumentToken(),
++            token, context_menu, std::move(done));
++      }, frame->GetWeakDocumentPtr(), token, context_menu, std::move(admission), std::move(done)));
++}
++
++void CefFrameHostImpl::ReleaseGuestEditContext(const base::UnguessableToken& token) {
++  if (!CEF_CURRENTLY_ON_UIT()) {
++    CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefFrameHostImpl::ReleaseGuestEditContext, this, token));
++    return;
++  }
++  if (!IsValid()) return;
++  SendToRenderFrame(__FUNCTION__, base::BindOnce(
++      [](base::UnguessableToken token, const RenderFrameType& remote) {
++        remote->ReleaseGuestEditContext(token);
++      }, token));
+ }
+ 
+ void CefFrameHostImpl::SendCommandWithResponse(
+--- a/libcef/common/mojom/cef.mojom
++++ b/libcef/common/mojom/cef.mojom
+@@ -7,6 +7,7 @@
+ import "mojo/public/mojom/base/shared_memory.mojom";
+ import "mojo/public/mojom/base/string16.mojom";
+ import "mojo/public/mojom/base/values.mojom";
++import "mojo/public/mojom/base/unguessable_token.mojom";
+ import "services/network/public/mojom/site_for_cookies.mojom";
+ import "services/network/public/mojom/url_request.mojom";
+ import "third_party/blink/public/mojom/loader/referrer.mojom";
+@@ -63,7 +64,11 @@
+   // Send a command.
+   SendCommand(string command);
+   // Native guest editing retains its original document across IPC/renderer queues.
+-  SendCommandForDocument(string command, blink.mojom.DocumentToken document_token);
++  SendCommandForDocument(string command, blink.mojom.DocumentToken document_token,
++                         mojo_base.mojom.UnguessableToken? edit_context);
++  CaptureGuestEditContext(blink.mojom.DocumentToken document_token,
++      mojo_base.mojom.UnguessableToken token, bool context_menu) => (bool captured);
++  ReleaseGuestEditContext(mojo_base.mojom.UnguessableToken token);
+ 
+   // Send a command that returns an async response.
+   // The returned |response| format is command-specific and will be invalid if
+--- a/libcef/renderer/frame_impl.h
++++ b/libcef/renderer/frame_impl.h
+@@ -10,6 +10,9 @@
+ #include <string>
+ 
+ #include "base/memory/weak_ptr.h"
++#include <optional>
++#include "third_party/blink/public/web/web_element.h"
++#include "third_party/blink/public/web/web_range.h"
+ #include "base/timer/timer.h"
+ #include "cef/include/cef_frame.h"
+ #include "cef/include/cef_v8.h"
+@@ -154,7 +157,12 @@
+                               base::WritableSharedMemoryRegion region) override;
+   void SendCommand(const std::string& command) override;
+   void SendCommandForDocument(const std::string& command,
+-      const blink::DocumentToken& document_token) override;
++      const blink::DocumentToken& document_token,
++      const std::optional<base::UnguessableToken>& edit_context) override;
++  void CaptureGuestEditContext(const blink::DocumentToken& document_token,
++      const base::UnguessableToken& token, bool context_menu,
++      CaptureGuestEditContextCallback callback) override;
++  void ReleaseGuestEditContext(const base::UnguessableToken& token) override;
+   void SendCommandWithResponse(
+       const std::string& command,
+       cef::mojom::RenderFrame::SendCommandWithResponseCallback callback)
+@@ -170,6 +178,13 @@
+   void ContextLifecycleStateChanged(
+       blink::mojom::blink::FrameLifecycleState state) override;
+ 
++  struct GuestEditContext {
++    base::UnguessableToken token;
++    blink::DocumentToken document;
++    blink::WebElement element;
++    blink::WebRange selection;
++  };
++  std::optional<GuestEditContext> guest_edit_context_;
+   CefBrowserImpl* browser_;
+   blink::WebLocalFrame* frame_;
+   const std::string frame_debug_str_;
+--- a/libcef/renderer/frame_impl.cc
++++ b/libcef/renderer/frame_impl.cc
+@@ -47,6 +47,7 @@
+ #include "third_party/blink/public/web/web_navigation_control.h"
+ #include "third_party/blink/public/web/web_script_source.h"
+ #include "third_party/blink/public/web/web_view.h"
++#include "third_party/blink/public/mojom/selection_menu/selection_menu_behavior.mojom.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
+ namespace {
+@@ -426,6 +427,7 @@
+   // keep |this| alive until after this method returns.
+   CefRefPtr<CefFrameImpl> self = this;
+ 
++  guest_edit_context_.reset();
+   browser_->FrameDetached(frame_);
+   frame_ = nullptr;
+ 
+@@ -848,13 +850,63 @@
+           command));
+ }
+ 
++void CefFrameImpl::CaptureGuestEditContext(const blink::DocumentToken& document,
++    const base::UnguessableToken& token, bool context_menu,
++    CaptureGuestEditContextCallback callback) {
++  ExecuteOnLocalFrame(__FUNCTION__, base::BindOnce(
++      [](CefRefPtr<CefFrameImpl> self, blink::DocumentToken document,
++          base::UnguessableToken token, bool context_menu,
++          CaptureGuestEditContextCallback callback, blink::WebLocalFrame* frame) {
++        if (token.is_empty() || frame->GetDocument().Token() != document) {
++          std::move(callback).Run(false); return;
++        }
++        auto element = frame->GetDocument().FocusedElement();
++        if (context_menu) {
++          for (auto node = frame->ContextMenuNode(); !node.IsNull(); node = node.ParentOrShadowHostNode()) {
++            if (!node.IsElementNode()) continue;
++            auto candidate = node.To<blink::WebElement>();
++            if (candidate.IsEditable()) { element = candidate; break; }
++          }
++        }
++        self->guest_edit_context_ = GuestEditContext{token, document, element, frame->SelectionRange()};
++        std::move(callback).Run(true);
++      }, CefRefPtr<CefFrameImpl>(this), document, token, context_menu, std::move(callback)));
++}
++
++void CefFrameImpl::ReleaseGuestEditContext(const base::UnguessableToken& token) {
++  if (guest_edit_context_ && guest_edit_context_->token == token) guest_edit_context_.reset();
++}
++
+ void CefFrameImpl::SendCommandForDocument(const std::string& command,
+-    const blink::DocumentToken& document_token) {
++    const blink::DocumentToken& document_token,
++    const std::optional<base::UnguessableToken>& edit_context) {
+   ExecuteOnLocalFrame(__FUNCTION__, base::BindOnce(
+-      [](std::string command, blink::DocumentToken expected, blink::WebLocalFrame* frame) {
+-        if (frame->GetDocument().Token() == expected)
+-          frame->ExecuteCommand(blink::WebString::FromUtf8(command));
+-      }, command, document_token));
++      [](CefRefPtr<CefFrameImpl> self, std::string command, blink::DocumentToken expected,
++          std::optional<base::UnguessableToken> context, blink::WebLocalFrame* frame) {
++        auto valid = [&] { return self->frame_ == frame && self->frame_ &&
++            self->frame_->GetDocument().Token() == expected; };
++        if (!valid()) return;
++        if (context) {
++          if (!self->guest_edit_context_ || self->guest_edit_context_->token != *context ||
++              self->guest_edit_context_->document != expected) return;
++          auto captured = std::move(*self->guest_edit_context_);
++          self->guest_edit_context_.reset();
++          if (!captured.element.IsNull()) {
++            if (!captured.element.IsConnected() || captured.element.GetDocument().Token() != expected) return;
++            captured.element.Focus();
++            // Focus handlers can detach/navigate the original frame.
++            if (!valid() || !captured.element.IsConnected()) return;
++          }
++          frame->View()->SetFocusedFrame(frame);
++          if (!valid()) return;
++          if (!captured.selection.IsNull()) {
++            frame->SelectRange(captured.selection, blink::WebLocalFrame::kPreserveHandleVisibility,
++                blink::mojom::SelectionMenuBehavior::kHide, blink::WebLocalFrame::kSelectionSetFocus);
++            if (!valid()) return;
++          }
++        }
++        frame->ExecuteCommand(blink::WebString::FromUtf8(command));
++      }, CefRefPtr<CefFrameImpl>(this), command, document_token, edit_context));
+ }
+ 
+ void CefFrameImpl::SendCommandWithResponse(
+--- a/libcef/browser/osr/touch_selection_controller_client_osr.cc
++++ b/libcef/browser/osr/touch_selection_controller_client_osr.cc
+@@ -578,6 +578,21 @@
+     return;
+   }
+ 
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    // Hiding handles synchronously dismisses the quick menu. Dispatch while
++    // its captured native editor is still live, then retire the presentation.
++    auto browser = rwhv_->browser_impl();
++    if (auto handler = browser->client()->GetContextMenuHandler()) {
++      handler->OnQuickMenuCommand(browser.get(), QuickMenuFrame(), command_id,
++          static_cast<cef_event_flags_t>(event_flags));
++    }
++    if (command_id != QM_EDITFLAG_CAN_ELLIPSIS)
++      rwhv_->selection_controller()->HideAndDisallowShowingAutomatically();
++    return;
++  }
++#endif
++
+   if (command_id != QM_EDITFLAG_CAN_ELLIPSIS) {
+     rwhv_->selection_controller()->HideAndDisallowShowingAutomatically();
+   }

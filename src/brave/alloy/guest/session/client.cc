@@ -25,6 +25,7 @@
 #include "brave/alloy/guest/session/extensions.h"
 #include "brave/alloy/guest/session/interactions.h"
 #include "brave/alloy/guest/stream/stream_client.h"
+#include "brave/alloy/guest/integration/integration_client.h"
 #include "cef/include/cef_api_hash.h"
 #include "cef/include/cef_version.h"
 #include "cef/libcef/common/api_version_util.h"
@@ -377,6 +378,15 @@ class ViewImpl final : public AlloyGuestView {
     }
     return stream_;
   }
+  CefRefPtr<AlloyGuestIntegration> GetIntegration() override {
+    std::lock_guard guard(integration_mutex_);
+    if (!integration_) {
+      auto client = client_.lock();
+      if (!client || closed_) return nullptr;
+      integration_ = integration::MakeClient(client->Endpoint(id_));
+    }
+    return integration_;
+  }
   bool Navigate(const CefString& url) override {
     auto client = client_.lock();
     std::string value = url.ToString();
@@ -411,6 +421,8 @@ class ViewImpl final : public AlloyGuestView {
   std::atomic<bool> closed_{false};
   std::mutex stream_mutex_;
   CefRefPtr<AlloyGuestStream> stream_;
+  std::mutex integration_mutex_;
+  CefRefPtr<AlloyGuestIntegration> integration_;
   IMPLEMENT_REFCOUNTING(ViewImpl);
 };
 

@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>integration-loading</title>
+<style>
+body { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:16px; font:14px sans-serif; }
+textarea { grid-column:1/-1; box-sizing:border-box; width:100%; height:80px; }
+button { min-height:30px; }
+#drag,#drop { min-height:55px; border:1px solid black; padding:8px; }
+iframe { grid-column:1/-1; box-sizing:border-box; width:100%; height:95px; border:0; }
+</style>
+<textarea id="edit">native-copy</textarea>
+<button id="write">Async write text</button><button id="read">Async read text</button>
+<button id="writeRich">Async write rich</button><button id="readRich">Async read rich</button>
+<button id="full">Fullscreen</button><button id="exit">Exit fullscreen</button>
+<div id="drag" draggable="true">Native drag source</div><div id="drop">Native drop target</div>
+<iframe id="peer" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+<script>
+const state={kind:'ready',copies:0,pastes:0,drops:0,dragEnds:0,full:false};
+try {
+  localStorage.setItem('native-integration-state','memory-state');
+  state.storage=localStorage.getItem('native-integration-state')==='memory-state'?'memory-state':'refused';
+} catch(error) {state.storage='refused';}
+const edit=document.querySelector('#edit');
+function report(kind,extra={}) {
+  state.kind=kind;Object.assign(state,extra);
+  state.receipt=(state.receipt||0)+1;
+  state.full=!!document.fullscreenElement;
+  state.selection={start:edit.selectionStart,end:edit.selectionEnd,length:edit.value.length};
+  state.rectangles={};
+  for(const node of document.querySelectorAll('[id]')) {
+    const r=node.getBoundingClientRect();state.rectangles[node.id]={x:r.x,y:r.y,width:r.width,height:r.height};
+  }
+  document.title=JSON.stringify(state);
+}
+edit.addEventListener('copy',event=>{
+  const value=edit.value.slice(edit.selectionStart,edit.selectionEnd);
+  event.clipboardData.setData('text/plain',value);
+  event.clipboardData.setData('text/html','<b>'+value+'</b>');
+  event.clipboardData.setData('application/x-alloy-note','native-custom');
+  event.preventDefault();++state.copies;report('copy');
+});
+edit.addEventListener('paste',event=>{
+  const paste={types:[...event.clipboardData.types],text:event.clipboardData.getData('text/plain'),
+    html:event.clipboardData.getData('text/html'),custom:event.clipboardData.getData('application/x-alloy-note')};
+  event.preventDefault();++state.pastes;edit.value=paste.text;report('paste',{paste});
+});
+edit.addEventListener('input',()=>report('input',{text:edit.value}));
+edit.addEventListener('select',()=>report('selection'));
+document.querySelector('#write').onclick=async()=>{
+  try {await navigator.clipboard.writeText('async-native-\u4e2d\ud83d\ude42');report('write-resolved');}
+  catch(error){report('write-denied',{error:error.name});}
+};
+document.querySelector('#read').onclick=async()=>{
+  try {report('read-resolved',{read:await navigator.clipboard.readText()});}
+  catch(error){report('read-denied',{error:error.name});}
+};
+document.querySelector('#writeRich').onclick=async()=>{
+  try {
+    const png=await(await fetch('/pixel.png')).blob();
+    await navigator.clipboard.write([new ClipboardItem({'text/plain':new Blob(['rich-native'],{type:'text/plain'}),
+      'text/html':new Blob(['<em>rich-native</em>'],{type:'text/html'}),'image/png':png,
+      'web application/x-alloy-test':new Blob([new Uint8Array([0,1,2,255])],{type:'application/x-alloy-test'})})]);
+    report('rich-write-resolved');
+  } catch(error) {report('rich-write-denied',{error:error.name});}
+};
+document.querySelector('#readRich').onclick=async()=>{
+  try {
+    const values=[];
+    for(const item of await navigator.clipboard.read())for(const type of item.types) {
+      const blob=await item.getType(type),value={type};
+      if(type==='image/png') {
+        const bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas');
+        canvas.width=bitmap.width;canvas.height=bitmap.height;const ctx=canvas.getContext('2d');
+        ctx.drawImage(bitmap,0,0);value.width=bitmap.width;value.height=bitmap.height;
+        // Canvas readback is intentionally perturbed by Brave privacy. Compare
+        // the received Blob bytes with the app sink, not privacy-shaped pixels.
+        value.bytes=[...new Uint8Array(await blob.arrayBuffer())];
+      } else if(type.startsWith('web ')) value.bytes=[...new Uint8Array(await blob.arrayBuffer())];
+      else value.text=await blob.text();
+      values.push(value);
+    }
+    report('rich-read-resolved',{rich:values});
+  } catch(error) {report('rich-read-denied',{error:error.name});}
+};
+document.querySelector('#full').onclick=async()=>{
+  try {await document.documentElement.requestFullscreen();report('fullscreen-resolved');}
+  catch(error){report('fullscreen-denied',{error:error.name});}
+};
+document.querySelector('#exit').onclick=()=>document.exitFullscreen().catch(()=>{});
+document.addEventListener('fullscreenchange',()=>report('fullscreen-change'));
+const source=document.querySelector('#drag'),drop=document.querySelector('#drop');
+source.ondragstart=event=>{
+  event.dataTransfer.setData('text/plain','drag-native');event.dataTransfer.setData('text/html','<i>drag-native</i>');
+  event.dataTransfer.effectAllowed='copyMove';report('drag-start');
+};
+source.ondragend=event=>{++state.dragEnds;report('drag-end',{sourceEffect:event.dataTransfer.dropEffect});};
+drop.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='copy';};
+drop.ondrop=event=>{
+  event.preventDefault();++state.drops;report('drop',{dropText:event.dataTransfer.getData('text/plain'),
+    dropHtml:event.dataTransfer.getData('text/html'),dropTypes:[...event.dataTransfer.types]});
+};
+const peer=document.querySelector('#peer'),peerUrl=new URL('/frame.html',location.href);
+peerUrl.hostname=location.hostname==='localhost'?'127.0.0.1':'localhost';peer.src=peerUrl.href;
+window.addEventListener('message',event=>{
+  if(event.data?.kind==='frame-state')report('frame-message',{frame:event.data});
+});
+let phase=-1;
+setInterval(async()=>{
+  const next=await(await fetch('/phase')).json();if(next===phase)return;phase=next;
+  if(next===1)peer.contentWindow.postMessage('focus','*');
+  if(next===2)peer.src=peerUrl.href+'?replacement=1';
+  if(next===3&&!new URL(location).searchParams.has('replacement'))location='/ui.html?replacement=1';
+},80);
+report('ready');
+</script>

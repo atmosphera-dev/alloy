@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>body{margin:4px}textarea{box-sizing:border-box;width:100%;height:72px}</style>
+<textarea id="edit">frame-copy</textarea>
+<script>
+const edit=document.querySelector('#edit');
+let pastes=0;
+function report(extra={}){
+  const r=edit.getBoundingClientRect();parent.postMessage({kind:'frame-state',origin:location.origin,
+    replacement:new URL(location).searchParams.has('replacement'),focused:document.activeElement===edit,pastes,
+    rectangle:{x:r.x,y:r.y,width:r.width,height:r.height},...extra},'*');
+}
+edit.addEventListener('focus',()=>report());
+edit.addEventListener('copy',event=>{
+  event.clipboardData.setData('text/plain','frame-copy');event.preventDefault();report({copied:true});
+});
+edit.addEventListener('paste',event=>{
+  const text=event.clipboardData.getData('text/plain');event.preventDefault();
+  edit.value=text;++pastes;report({paste:text});
+});
+window.addEventListener('message',event=>{
+  if(event.data==='focus'){edit.focus();edit.select();report();}
+  if(event.data==='replace')location='/frame.html?replacement=1';
+});
+report();
+</script>

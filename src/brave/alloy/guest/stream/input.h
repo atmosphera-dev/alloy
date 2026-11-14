@@ -12,6 +12,9 @@ CefRefPtr<CefDictionaryValue> ParseDetails(const std::string& json);
 std::string WriteDetails(CefRefPtr<CefDictionaryValue> dictionary);
 CefRefPtr<AlloyGuestInteraction> MakeInteraction(Owner owner, InteractionData data);
 bool ValidUtf16(const CefString& text);
+bool MapSurfacePoint(const CefRect& view, bool popup_visible,
+    const CefRect& popup, uint64_t surface, double x, double y,
+    bool allow_outside, double* root_x, double* root_y);
 class Input {
  public:
   using Receipt = std::function<void(Owner, InteractionData)>;

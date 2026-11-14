@@ -19,6 +19,49 @@ _implementation = [
   "providers.cc", "providers.h", "linux_lock/provider.cc", "stream/provider.cc",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
   "namespace_lock/provider.cc", "capture/provider.cc",
+  "integration/request_owner.h", "integration/request_owner.cc",
+  "integration/native_requests.h", "integration/native_requests.cc",
+  "integration/integration_client.h", "integration/integration_client.cc",
+  "integration/clipboard.h", "integration/clipboard.cc",
+  "integration/menus.h", "integration/menus.cc",
+  "integration/drag.h", "integration/drag.cc",
+  "//cef/include/alloy/alloy_guest_integration.h",
+  "//content/public/browser/alloy_guest_integration.h",
+  "//content/browser/renderer_host/alloy_guest_clipboard.h",
+  "//content/browser/renderer_host/alloy_guest_clipboard.cc",
+  "//content/browser/renderer_host/clipboard_host_impl.h",
+  "//content/browser/renderer_host/clipboard_host_impl.cc",
+  "//content/browser/renderer_host/render_frame_host_impl.h",
+  "//content/browser/renderer_host/render_frame_host_impl.cc",
+  "//content/browser/web_contents/web_contents_impl.h",
+  "//content/browser/web_contents/web_contents_impl.cc",
+  "//cef/libcef/browser/frame_host_impl.h",
+  "//cef/libcef/browser/frame_host_impl.cc",
+  "//cef/libcef/common/mojom/cef.mojom",
+  "//cef/libcef/renderer/frame_impl.h",
+  "//cef/libcef/renderer/frame_impl.cc",
+  "//cef/libcef/browser/menu_manager.h", "//cef/libcef/browser/menu_manager.cc",
+  "//cef/libcef/browser/osr/web_contents_view_osr.cc",
+  "//cef/libcef/browser/osr/touch_selection_controller_client_osr.h",
+  "//cef/libcef/browser/osr/touch_selection_controller_client_osr.cc",
+  "//cef/libcef/browser/alloy/alloy_browser_host_impl.h",
+  "//cef/libcef/browser/alloy/alloy_browser_host_impl.cc",
+  "//chrome/browser/content_settings/host_content_settings_map_factory.h",
+  "//chrome/browser/content_settings/host_content_settings_map_factory.cc",
+  "//chrome/browser/permissions/chrome_permissions_client.h",
+  "//chrome/browser/permissions/chrome_permissions_client.cc",
+  "//components/permissions/permissions_client.h", "//components/permissions/permissions_client.cc",
+  "//components/permissions/permission_context_base.cc",
+  "//components/permissions/content_setting_permission_context_base.cc",
+  "//ui/base/clipboard/clipboard_factory_ozone.cc",
+  "//ui/base/clipboard/clipboard_non_backed.h",
+  "//ui/base/clipboard/clipboard_non_backed.cc",
+  "//ui/base/clipboard/scoped_clipboard_writer.h",
+  "//ui/base/clipboard/scoped_clipboard_writer.cc",
+  "//cef/libcef/browser/chrome/chrome_context_menu_handler.h",
+  "//cef/libcef/browser/chrome/chrome_context_menu_handler.cc",
+  "//cef/libcef/browser/chrome/chrome_web_contents_view_delegate_cef.cc",
+  "//cef/libcef/browser/chrome/extensions/chrome_mime_handler_view_guest_delegate_cef.cc",
   "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h",
   "//cef/include/alloy/alloy_guest_session.h",
   "//cef/include/alloy/alloy_guest_protection.h",
@@ -60,7 +103,8 @@ action("alloy_guest_host") {
   outputs = [ "$root_out_dir/alloy_guest_host" ]
   args = [ "--root", rebase_path("//", root_build_dir),
            "--out", rebase_path(outputs[0], root_build_dir) ]
-  deps = [ ":alloy_guest_engine", ":alloy_guest_sdk_consumer", ":alloy_guest_stream_consumer" ]
+  deps = [ ":alloy_guest_engine", ":alloy_guest_sdk_consumer", ":alloy_guest_stream_consumer",
+           ":alloy_guest_integration_consumer" ]
 }
 
 executable("alloy_guest_engine") {
@@ -96,4 +140,18 @@ test("alloy_guest_stream_unittests") {
 test("alloy_guest_session_unittests") {
   sources = [ "session/session_unittest.cc" ]
   deps = [ ":foundation", "//base/test:run_all_unittests", "//base/test:test_support", "//testing/gtest" ]
+}
+
+test("alloy_guest_integration_unittests") {
+  sources = [ "integration/request_owner_unittest.cc" ]
+  deps = [ "integration", "protocol", "//base/test:run_all_unittests",
+           "//base/test:test_support", "//testing/gtest" ]
+}
+
+executable("alloy_guest_integration_consumer") {
+  testonly = true
+  sources = [ "integration/sdk_consumer.cc" ]
+  deps = [ "//cef:libcef", "//cef:libcef_dll_wrapper" ]
+  configs += [ "//build/config/gcc:rpath_for_built_shared_libraries" ]
+  use_libcxx_modules = false
 }

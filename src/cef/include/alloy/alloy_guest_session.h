@@ -124,6 +124,13 @@ class AlloyGuestView : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual CefRefPtr<AlloyGuestStream> GetStream() = 0;
   ///
+  /// Return this view's typed native-integration endpoint under the same
+  /// session. Attach its app handler explicitly; absence never permits native
+  /// clipboard, UI, picker or file-service fallback.
+  ///
+  /*--cef()--*/
+  virtual CefRefPtr<AlloyGuestIntegration> GetIntegration() = 0;
+  ///
   /// Queue a URL while ACTIVE, using CEF's normal scheme validation and native
   /// admission. Invalid URLs return false before queuing and do not change the
   /// current document or produce a load completion. Navigation retires the old

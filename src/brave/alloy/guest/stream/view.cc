@@ -10,6 +10,15 @@
 #include "ui/gfx/geometry/point.h"
 
 namespace alloy::guest::stream {
+bool View::Point(uint64_t document, uint64_t generation, uint64_t surface,
+                     int x, int y, bool outside, CefMouseEvent* result) const {
+  if (!result || !started() || document != owner_.document || generation != generation_) return false;
+  double root_x = 0, root_y = 0;
+  if (!MapSurfacePoint(rect(), popup_visible_, popup_, surface, x, y, outside,
+                           &root_x, &root_y)) return false;
+  result->x = root_x; result->y = root_y;
+  return true;
+}
 namespace {
 // Match the exact float scaling used by pinned CEF's SizeInPixels and
 // GetCompositorViewportPixelSize, not a double approximation of that geometry.

@@ -1,0 +1,221 @@
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.h
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.h
+@@ -26,6 +26,12 @@
+   // This query uses the existing canonical selection, including revoked owners.
+   static bool UsesScopedSettings(content::RenderFrameHost* frame);
+   static HostContentSettingsMap* GetForFrame(content::RenderFrameHost* frame);
++  // Existing document settings owner, explicitly selected for native
++  // integration grants without changing the memory profile settings map.
++  static HostContentSettingsMap* GetForNativeIntegration(content::RenderFrameHost* frame);
++  static KeyedService* GetNativeIntegrationDocumentService(
++      content::RenderFrameHost* frame, const void* key,
++      base::OnceCallback<std::unique_ptr<KeyedService>(HostContentSettingsMap*)> factory);
+   static KeyedService* GetStatelessDocumentService(
+       content::RenderFrameHost* frame,
+       const void* key,
+--- a/chrome/browser/content_settings/host_content_settings_map_factory.cc
++++ b/chrome/browser/content_settings/host_content_settings_map_factory.cc
+@@ -170,6 +170,25 @@
+   CHECK(UsesScopedSettings(frame));
+   auto* owner = WorkingSettingsForFrame(frame);
+   return owner ? owner->GetOrCreateService(key, std::move(factory)) : nullptr;
++}
++
++HostContentSettingsMap* HostContentSettingsMapFactory::GetForNativeIntegration(
++    content::RenderFrameHost* frame) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!content::AlloyDocumentStateAdmitted(frame)) return nullptr;
++  if (UsesScopedSettings(frame)) return GetForFrame(frame);
++  return &AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)->settings->settings();
++}
++
++KeyedService* HostContentSettingsMapFactory::GetNativeIntegrationDocumentService(
++    content::RenderFrameHost* frame, const void* key,
++    base::OnceCallback<std::unique_ptr<KeyedService>(HostContentSettingsMap*)> factory) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!content::AlloyDocumentStateAdmitted(frame)) return nullptr;
++  if (UsesScopedSettings(frame))
++    return GetStatelessDocumentService(frame, key, std::move(factory));
++  return AlloyDocumentSettings::GetOrCreateForCurrentDocument(frame)->settings->GetOrCreateService(
++      key, std::move(factory));
+ }
+ 
+ HostContentSettingsMapFactory::HostContentSettingsMapFactory()
+--- a/components/permissions/permissions_client.h
++++ b/components/permissions/permissions_client.h
+@@ -87,6 +87,9 @@
+   virtual HostContentSettingsMap* GetSettingsMapForDocument(
+       content::BrowserContext* browser_context,
+       content::RenderFrameHost* frame);
++  virtual HostContentSettingsMap* GetSettingsMapForPermission(
++      content::BrowserContext* context, content::RenderFrameHost* frame,
++      ContentSettingsType type);
+   virtual void SetPermissionSettingForDocument(
+       content::BrowserContext* browser_context,
+       const PermissionRequestData& request,
+--- a/components/permissions/permissions_client.cc
++++ b/components/permissions/permissions_client.cc
+@@ -63,6 +63,12 @@
+   return GetSettingsMap(browser_context);
+ }
+ 
++HostContentSettingsMap* PermissionsClient::GetSettingsMapForPermission(
++    content::BrowserContext* context, content::RenderFrameHost* frame,
++    ContentSettingsType) {
++  return GetSettingsMapForDocument(context, frame);
++}
++
+ void PermissionsClient::SetPermissionSettingForDocument(
+     content::BrowserContext* browser_context,
+     const PermissionRequestData& request,
+--- a/chrome/browser/permissions/chrome_permissions_client.h
++++ b/chrome/browser/permissions/chrome_permissions_client.h
+@@ -45,6 +45,9 @@
+   HostContentSettingsMap* GetSettingsMapForDocument(
+       content::BrowserContext* browser_context,
+       content::RenderFrameHost* frame) override;
++  HostContentSettingsMap* GetSettingsMapForPermission(
++      content::BrowserContext* context, content::RenderFrameHost* frame,
++      ContentSettingsType type) override;
+   void SetPermissionSettingForDocument(
+       content::BrowserContext* browser_context,
+       const permissions::PermissionRequestData& request,
+--- a/chrome/browser/permissions/chrome_permissions_client.cc
++++ b/chrome/browser/permissions/chrome_permissions_client.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/permissions/chrome_permissions_client.h"
++#include "base/process/alloy_guest_runtime.h"
+ 
+ #include <algorithm>
+ #include <optional>
+@@ -139,6 +140,15 @@
+ #endif
+ 
+ namespace {
++bool UsesGuestClipboardSettings(content::RenderFrameHost* frame, ContentSettingsType type) {
++#if BUILDFLAG(IS_LINUX)
++  return frame && alloy_guest_is_runtime() &&
++      (type == ContentSettingsType::CLIPBOARD_READ_WRITE ||
++       type == ContentSettingsType::CLIPBOARD_SANITIZED_WRITE);
++#else
++  return false;
++#endif
++}
+ 
+ using permissions::PermissionPromptDisposition;
+ using permissions::PermissionPromptDispositionReason;
+@@ -305,6 +315,16 @@
+                                                     : GetSettingsMap(context);
+ }
+ 
++HostContentSettingsMap* ChromePermissionsClient::GetSettingsMapForPermission(
++    content::BrowserContext* context, content::RenderFrameHost* frame,
++    ContentSettingsType type) {
++  if (context->ShutdownStarted() || (frame && frame->GetBrowserContext() != context))
++    return nullptr;
++  if (UsesGuestClipboardSettings(frame, type))
++    return HostContentSettingsMapFactory::GetForNativeIntegration(frame);
++  return GetSettingsMapForDocument(context, frame);
++}
++
+ bool ChromePermissionsClient::RequiresDocumentPermissionContext(
+     content::BrowserContext* context) {
+   return alloy::site_records::RequestContextPolicy::IsStateless(*context);
+@@ -354,7 +374,8 @@
+   if (!frame || browser_context->ShutdownStarted() ||
+       frame->GetBrowserContext() != browser_context)
+     return;
+-  if (!HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
++  if (!UsesGuestClipboardSettings(frame, type) &&
++      !HostContentSettingsMapFactory::UsesScopedSettings(frame)) {
+     return PermissionsClient::SetPermissionSettingForDocument(
+         browser_context, request, type, setting, constraints);
+   }
+@@ -365,7 +386,7 @@
+       content_settings::mojom::SessionModel::DURABLE);
+   document_constraints.set_track_last_visit_for_autoexpiration(false);
+   if (scoped_refptr<HostContentSettingsMap> map =
+-          GetSettingsMapForDocument(browser_context, frame)) {
++          GetSettingsMapForPermission(browser_context, frame, type)) {
+     map->SetPermissionSettingDefaultScope(request.requesting_origin,
+                                           request.embedding_origin, type,
+                                           setting, document_constraints);
+--- a/components/permissions/content_setting_permission_context_base.cc
++++ b/components/permissions/content_setting_permission_context_base.cc
+@@ -40,8 +40,8 @@
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
+-  auto* map = PermissionsClient::Get()->GetSettingsMapForDocument(
+-      browser_context(), render_frame_host);
++  auto* map = PermissionsClient::Get()->GetSettingsMapForPermission(
++      browser_context(), render_frame_host, content_settings_type());
+   return map ? map->GetContentSetting(requesting_origin, embedding_origin,
+                                       content_settings_type())
+              : CONTENT_SETTING_BLOCK;
+--- a/components/permissions/permission_context_base.cc
++++ b/components/permissions/permission_context_base.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "components/permissions/permission_context_base.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_guest_integration.h"
+ 
+ #include <stddef.h>
+ 
+@@ -160,6 +162,41 @@
+   // or if the origin is under embargo. If so, respect that decision.
+   DCHECK(rfh);
+   content::PermissionResult result = GetPermissionStatus(*request_data, rfh);
++
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime() && result.status != PermissionStatus::DENIED &&
++      (content_settings_type_ == ContentSettingsType::CLIPBOARD_READ_WRITE ||
++       content_settings_type_ == ContentSettingsType::CLIPBOARD_SANITIZED_WRITE)) {
++    auto* original = PermissionsClient::Get()->GetPermissionRequestDocument(browser_context_, *request_data);
++    auto* integration = content::AlloyGuestIntegration::Get(original);
++    if (!integration) {
++      std::move(callback).Run(content::PermissionResult(PermissionStatus::DENIED));
++      return;
++    }
++    content::AlloyGuestIntegrationData data;
++    data.details.Set("read", content_settings_type_ == ContentSettingsType::CLIPBOARD_READ_WRITE);
++    data.details.Set("gesture", request_data->user_gesture);
++    integration->Request(original, content::AlloyGuestIntegration::Operation::kClipboardPermission,
++        std::move(data), base::BindOnce(
++            [](base::WeakPtr<PermissionContextBase_ChromiumImpl> self,
++                std::unique_ptr<PermissionRequestData> request, BrowserPermissionCallback callback,
++                std::optional<content::AlloyGuestIntegrationData> reply) {
++              if (!self) {
++                std::move(callback).Run(content::PermissionResult(PermissionStatus::DENIED));
++                return;
++              }
++              const bool allow = reply && reply->details.FindBool("allow").value_or(false);
++              // Native sanitized writes have no persisted permission setting.
++              const bool persist = self->content_settings_type() ==
++                  ContentSettingsType::CLIPBOARD_READ_WRITE;
++              self->NotifyPermissionSet(*request, std::move(callback), persist, nullptr,
++                  PermissionPromptDecision{.overall_decision = allow ? PermissionDecision::kAllow
++                                                                    : PermissionDecision::kDeny,
++                                           .is_final = true});
++            }, weak_factory_.GetWeakPtr(), std::move(request_data), std::move(callback)));
++    return;
++  }
++#endif
+ 
+   bool status_ignorable = PermissionUtil::CanPermissionRequestIgnoreStatus(
+       request_data, result.source, result.status,
+@@ -630,8 +667,8 @@
+     content::RenderFrameHost* render_frame_host,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) const {
+-  auto* map = PermissionsClient::Get()->GetSettingsMapForDocument(
+-      browser_context(), render_frame_host);
++  auto* map = PermissionsClient::Get()->GetSettingsMapForPermission(
++      browser_context(), render_frame_host, content_settings_type());
+   return map ? map->GetPermissionSetting(requesting_origin, embedding_origin,
+                                          content_settings_type())
+              : content_settings::PermissionSettingsRegistry::GetInstance()

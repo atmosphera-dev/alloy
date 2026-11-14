@@ -7,6 +7,9 @@
 #include "brave/alloy/guest/session/extensions.h"
 #include "brave/alloy/guest/stream/view.h"
 #include "brave/alloy/guest/stream/popup.h"
+#include "brave/alloy/guest/integration/native_requests.h"
+#include "brave/alloy/guest/integration/menus.h"
+#include "brave/alloy/guest/integration/drag.h"
 
 #include <cerrno>
 #include <deque>
@@ -78,19 +81,44 @@ class NativeView final : public CefClient,
  public:
   NativeView(Owner owner, int width, int height, Emit emit,
               BeginDocument begin_document, Restart restart,
-              stream::StreamEvent stream_event, stream::SendResource resource,
+               stream::StreamEvent stream_event, stream::SendResource resource,
+               integration::NativeRequests::Event integration_event,
               std::function<uint64_t()> clock, CreatePopup create_popup,
               Created created, std::function<void(uint64_t)> abort_popup,
               bool pending_popup)
       : owner_(owner), emit_(std::move(emit)),
          begin_document_(std::move(begin_document)), restart_(std::move(restart)),
-         stream_(owner, width, height, std::move(stream_event),
-                 std::move(resource), std::move(clock)),
+           stream_(owner, width, height, std::move(stream_event),
+                   std::move(resource), clock),
+          integration_(owner, std::move(integration_event), [this](Owner original) {
+            return !closing_ && original == owner_ && DocumentReady();
+           }, clock, [this] { return stream_.generation(); },
+           [this](Owner original, const stream::InteractionData& action,
+                       std::function<void(std::string)> completion) {
+             if (actions_) actions_->Dispatch(original, action, std::move(completion));
+             else completion("rejected:invalid");
+           }),
          create_popup_(std::move(create_popup)), created_(std::move(created)),
-         abort_popup_(std::move(abort_popup)), pending_popup_(pending_popup) {}
+         abort_popup_(std::move(abort_popup)), pending_popup_(pending_popup) {
+     auto weak = weak_.GetWeakPtr();
+     menus_ = new integration::Menus([weak] { return weak ? weak->stream_.generation() : 0; });
+     actions_ = std::make_unique<integration::Actions>(owner,
+         [weak](Owner original, uint64_t generation) {
+           return weak && !weak->closing_ && weak->DocumentReady() &&
+               original == weak->owner_ && generation == weak->stream_.generation();
+         },
+         [weak](uint64_t document, uint64_t generation, uint64_t surface,
+                    int x, int y, bool outside, CefMouseEvent* result) {
+           return weak && weak->stream_.Point(document, generation, surface, x, y, outside, result);
+         },
+         [weak](std::string operation, base::DictValue details) {
+           if (weak) weak->integration_.Notify(std::move(operation), std::move(details));
+         });
+   }
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
-  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return menus_; }
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
     rect = stream_.rect();
   }
@@ -105,23 +133,45 @@ class NativeView final : public CefClient,
   bool GetScreenPoint(CefRefPtr<CefBrowser>, int x, int y, int& sx, int& sy) override {
     return stream_.ScreenPoint(x, y, sx, sy);
   }
-  void StreamCall(const Owner& owner, const std::string& operation,
-                  const std::string& payload, ProviderReply reply) {
-    stream_.Call(owner, operation, payload, DocumentReady(), std::move(reply));
+   void StreamCall(const Owner& owner, const std::string& operation,
+                   const std::string& payload, ProviderReply reply) {
+     const auto generation = stream_.generation();
+     stream_.Call(owner, operation, payload, DocumentReady(), std::move(reply));
+     if (stream_.generation() != generation) actions_->Reset();
   }
-  void StreamRelease(const Owner& owner, const std::string& payload, ProviderReply reply) {
-    stream_.Release(owner, payload, std::move(reply));
-  }
+   void StreamRelease(const Owner& owner, const std::string& payload, ProviderReply reply) {
+     stream_.Release(owner, payload, std::move(reply));
+   }
+   void IntegrationCall(const Owner& owner, const std::string& operation,
+                          const std::string& payload, ProviderReply reply) {
+     integration_.Call(owner, operation, payload, std::move(reply));
+   }
+   void SweepIntegration() { integration_.Sweep(); }
   void OnPopupShow(CefRefPtr<CefBrowser>, bool visible) override { stream_.PopupShow(visible); }
   void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rectangle) override { stream_.PopupSize(rectangle); }
   bool OnCursorChange(CefRefPtr<CefBrowser>, CefCursorHandle, cef_cursor_type_t type,
                        const CefCursorInfo& info) override { stream_.Cursor(type, info); return true; }
-  void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>, const CefRange& range,
-                                     const RectList& bounds) override { stream_.Ime(range, bounds); }
+   void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>, const CefRange& range,
+                                      const RectList& bounds) override { stream_.Ime(range, bounds); }
+   bool StartDragging(CefRefPtr<CefBrowser>, CefRefPtr<CefDragData> data,
+                          DragOperationsMask allowed, int x, int y) override {
+     return actions_->StartDragging(data, static_cast<int>(allowed), x, y, stream_.generation());
+   }
+   void UpdateDragCursor(CefRefPtr<CefBrowser>, DragOperation operation) override {
+     actions_->Cursor(static_cast<int>(operation));
+   }
+   void OnFullscreenModeChange(CefRefPtr<CefBrowser>, bool fullscreen) override {
+     if (!closing_ && DocumentReady()) {
+       base::DictValue details; details.Set("fullscreen", fullscreen);
+       integration_.Notify("fullscreen-changed", std::move(details));
+     }
+   }
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     browser_ = browser;
-    stream_.Bind(browser);
-    Observe(CefBrowserHostBase::FromBrowser(browser)->GetWebContents());
+     stream_.Bind(browser);
+     actions_->Bind(browser);
+     Observe(CefBrowserHostBase::FromBrowser(browser)->GetWebContents());
+     integration_.Bind(web_contents());
     if (pending_popup_) browser_->GetHost()->WasHidden(true);
     if (closing_) { browser_->GetHost()->CloseBrowser(true); return; }
     created_(owner_);
@@ -135,10 +185,14 @@ class NativeView final : public CefClient,
       owner_ = *owner;
       current_token_ = content::AlloyDocumentNoiseIdentity(web_contents()->GetPrimaryMainFrame());
       emit_({Message::kDocumentStarted, {}, 0, owner_, {}});
-      stream_.SetOwner(owner_);
+       stream_.SetOwner(owner_);
+       integration_.SetOwner(owner_);
+       actions_->SetOwner(owner_);
     }
   }
-  void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+   void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+     integration_.Close();
+     actions_->Bind(nullptr);
     Observe(nullptr);
     stream_.Retire();
     browser_ = nullptr;
@@ -193,7 +247,9 @@ class NativeView final : public CefClient,
   void Close(bool force = false) {
     if (closing_)
       return;
-    closing_ = true;
+     closing_ = true;
+     integration_.Close();
+     actions_->Reset();
     stream_.Retire();
     pending_.clear();
     current_token_ = {};
@@ -216,7 +272,9 @@ class NativeView final : public CefClient,
       current_token_ = {};
       pending_.clear();
     }
-    emit_({Message::kGenerationChanged, {}, 0, owner_, {}});
+     integration_.SetOwner(owner_);
+     actions_->SetOwner(owner_);
+     emit_({Message::kGenerationChanged, {}, 0, owner_, {}});
     stream_.SetOwner(owner_);
   }
   void PrimaryMainFrameRenderProcessGone(base::TerminationStatus) override {
@@ -242,7 +300,9 @@ class NativeView final : public CefClient,
     for (const auto& [id, original] : pending_)
       emit_({Message::kCancel, {}, 0, original, {}});
     pending_.clear();
-    pending_.emplace(navigation->GetNavigationId(), owner_);
+     pending_.emplace(navigation->GetNavigationId(), owner_);
+     integration_.SetOwner(owner_);
+     actions_->SetOwner(owner_);
     emit_({Message::kDocumentStarted, {}, 0, owner_, {}});
     stream_.SetOwner(owner_);
   }
@@ -315,13 +375,17 @@ class NativeView final : public CefClient,
   bool closing_ = false;
   bool closed_ = false;
   bool completed_navigation_ = false;
-  stream::View stream_;
+   stream::View stream_;
+   integration::NativeRequests integration_;
+   CefRefPtr<integration::Menus> menus_;
+   std::unique_ptr<integration::Actions> actions_;
   const CreatePopup create_popup_;
   const Created created_;
   const std::function<void(uint64_t)> abort_popup_;
   const bool pending_popup_;
   bool attached_ = false;
-  std::map<int, uint64_t> popup_requests_;
+   std::map<int, uint64_t> popup_requests_;
+   base::WeakPtrFactory<NativeView> weak_{this};
   IMPLEMENT_REFCOUNTING(NativeView);
 };
 
@@ -436,7 +500,14 @@ int RunBrowser(const CefMainArgs& args) {
     if (found == views.end()) { reply(ProviderResult::kCancelled, {}); return; }
     found->second->StreamRelease(owner, payload, std::move(reply));
   };
-  providers.Install(Feature::kStream, std::move(stream_provider));
+   providers.Install(Feature::kStream, std::move(stream_provider));
+   providers.Install(Feature::kIntegration, IntegrationProvider(
+       [&views](const Owner& owner, const std::string& operation,
+                   const std::string& payload, ProviderReply reply) {
+     auto found = views.find(owner.view);
+     if (found == views.end()) { reply(ProviderResult::kCancelled, {}); return; }
+     found->second->IntegrationCall(owner, operation, payload, std::move(reply));
+   }));
   ProtectionReport report;
   report.bootstrap_before_engine = true;
   report.inherited_handles_closed = true;
@@ -484,15 +555,23 @@ int RunBrowser(const CefMainArgs& args) {
       if (auto original = session.Find(id)) { providers.Cancel(*original); popups->Cancel(*original); }
       return session.RestartStream(id);
     };
-    auto event = [emit](Owner original, std::string operation, std::string payload) {
+     auto event = [emit](Owner original, std::string operation, std::string payload) {
       std::string packed;
       if (PackExtension({Feature::kStream, 0, std::move(operation), std::move(payload)}, &packed))
-        emit({Message::kExtensionEvent, {}, 0, original, std::move(packed)});
-    };
+         emit({Message::kExtensionEvent, {}, 0, original, std::move(packed)});
+     };
+     auto integration_event = [emit](Owner original, std::string operation,
+                                       std::string payload) {
+       std::string packed;
+       if (PackExtension({Feature::kIntegration, 0, std::move(operation),
+                            std::move(payload)}, &packed))
+         emit({Message::kExtensionEvent, {}, 0, original, std::move(packed)});
+     };
     return CefRefPtr<NativeView>(new NativeView(owner, width, height, emit, begin, restart,
         std::move(event), [&resources](Envelope envelope, const std::vector<int>& handles) {
           return resources.Send(std::move(envelope), handles);
-        }, clock, create_popup, std::move(created), [&popups](uint64_t id) { popups->Abort(id); }, pending));
+         }, std::move(integration_event), clock, create_popup, std::move(created),
+         [&popups](uint64_t id) { popups->Abort(id); }, pending));
   };
   create_popup = [&](Owner opener, std::string url, std::string name, int disposition,
                       bool gesture, CefRect bounds) -> std::optional<PopupClient> {
@@ -558,7 +637,8 @@ int RunBrowser(const CefMainArgs& args) {
         outgoing.Push(std::move(prepared));
       }
     }
-    for (auto found = views.begin(); found != views.end();) {
+     for (auto found = views.begin(); found != views.end();) {
+       found->second->SweepIntegration();
       if (found->second->closed()) {
         if (auto original = session.Find(found->first)) {
           providers.Cancel(*original); popups->Cancel(*original); session.RetireView(found->first);

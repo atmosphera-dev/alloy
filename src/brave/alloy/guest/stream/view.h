@@ -22,6 +22,9 @@ class View {
   void SetOwner(Owner owner);
   void Retire();
   CefRect rect() const { return CefRect(0, 0, width_, height_); }
+  uint64_t generation() const { return generation_; }
+  bool Point(uint64_t document, uint64_t generation, uint64_t surface,
+                int x, int y, bool outside, CefMouseEvent* result) const;
   bool Screen(CefScreenInfo& screen) const;
   bool ScreenPoint(int x, int y, int& screen_x, int& screen_y) const;
   void Paint(uint64_t surface, const void* pixels, int width, int height);

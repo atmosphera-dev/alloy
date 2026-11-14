@@ -584,6 +584,8 @@ test("alloy_native_grants_unittests") {
     "extension_storage_admission_unittest.cc",
     "fixture_gesture_unittest.cc",
     "native_test_lifetime_unittest.cc",
+    "../guest/integration/native_grants_unittest.cc",
+    "../guest/integration/clipboard_native_unittest.cc",
     "local_state_ownership_unittest.cc",
     "native_audit_consumers_unittest.cc",
     "native_embedded_state_unittest.cc",

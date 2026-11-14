@@ -92,6 +92,20 @@ bool Contains(const CefRect& rectangle, double x, double y) {
 CefRefPtr<AlloyGuestInteraction> MakeInteraction(Owner owner, InteractionData data) {
   return new Interaction(owner, std::move(data));
 }
+bool MapSurfacePoint(const CefRect& view, bool visible, const CefRect& popup,
+    uint64_t surface, double x, double y, bool outside, double* root_x, double* root_y) {
+  if (!root_x || !root_y || !std::isfinite(x) || !std::isfinite(y) || surface > 1) return false;
+  if (surface) {
+    if (!visible || (!outside && (x < 0 || y < 0 || x >= popup.width || y >= popup.height))) return false;
+    x += popup.x; y += popup.y;
+  } else if (!outside && (!Contains(view, x, y) || (visible && Contains(popup, x, y)))) {
+    return false;
+  }
+  if (x < std::numeric_limits<int>::min() || x > std::numeric_limits<int>::max() ||
+      y < std::numeric_limits<int>::min() || y > std::numeric_limits<int>::max()) return false;
+  *root_x = x; *root_y = y;
+  return true;
+}
 void Input::Dispatch(Owner owner, uint64_t generation, const CefRect& view,
                       bool visible, const CefRect& popup, CefRefPtr<CefBrowser> browser,
                       InteractionData input, std::function<uint64_t()> clock, Receipt receipt) {
@@ -113,16 +127,9 @@ void Input::Dispatch(Owner owner, uint64_t generation, const CefRect& view,
   uint32_t modifiers = 0;
   double root_x = 0, root_y = 0;
   auto point = [&](double px, double py, bool leave) {
-    if (!std::isfinite(px) || !std::isfinite(py) || input.surface > 1) return false;
-    if (input.surface) {
-      if (!visible || (!leave && (px < 0 || py < 0 || px >= popup.width || py >= popup.height))) return false;
-      px += popup.x; py += popup.y;
-    } else if (!leave && (!Contains(view, px, py) || (visible && Contains(popup, px, py)))) {
-      return false;
-    }
-    if (px < std::numeric_limits<int>::min() || px > std::numeric_limits<int>::max() ||
-        py < std::numeric_limits<int>::min() || py > std::numeric_limits<int>::max()) return false;
-    root_x = px; root_y = py; x = px; y = py; return true;
+    if (!MapSurfacePoint(view, visible, popup, input.surface, px, py, leave,
+                           &root_x, &root_y)) return false;
+    x = root_x; y = root_y; return true;
   };
   if (input.kind == "pointer" || input.kind == "wheel") {
     int px = 0, py = 0;

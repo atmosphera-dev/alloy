@@ -1,0 +1,499 @@
+--- a/libcef/browser/osr/web_contents_view_osr.cc
++++ b/libcef/browser/osr/web_contents_view_osr.cc
+@@ -4,6 +4,8 @@
+ // found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/osr/web_contents_view_osr.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_guest_integration.h"
+ 
+ #include "base/notimplemented.h"
+ #include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
+@@ -136,7 +138,7 @@
+   }
+ 
+   if (auto browser = GetBrowser()) {
+-    browser->ShowContextMenu(params);
++    browser->ShowContextMenu(params, &render_frame_host);
+   }
+ }
+ 
+@@ -151,6 +153,8 @@
+   auto* source_rwh = static_cast<content::RenderWidgetHostImpl*>(
+       source_rfh.GetRenderWidgetHost());
+   CefRefPtr<AlloyBrowserHostImpl> browser = GetBrowser();
++  if (auto* integration = content::AlloyGuestIntegration::Get(&source_rfh))
++    integration->BeginNativeDrag(&source_rfh);
+   if (browser.get()) {
+     browser->StartDragging(drop_data, allowed_ops, image, cursor_offset,
+                            event_info, source_rwh);
+--- a/libcef/browser/osr/touch_selection_controller_client_osr.h
++++ b/libcef/browser/osr/touch_selection_controller_client_osr.h
+@@ -13,6 +13,10 @@
+ #include "base/observer_list.h"
+ #include "base/timer/timer.h"
+ #include "content/common/content_export.h"
++#include "cef/include/cef_frame.h"
++#include "content/public/browser/weak_document_ptr.h"
++#include "ui/base/clipboard/clipboard_format_type.h"
++#include "base/containers/flat_set.h"
+ #include "content/public/browser/touch_selection_controller_client_manager.h"
+ #include "ui/touch_selection/touch_selection_controller.h"
+ #include "ui/touch_selection/touch_selection_menu_runner.h"
+@@ -92,6 +96,9 @@
+   bool IsQuickMenuAvailable(bool can_paste) const;
+   void CloseQuickMenu();
+   void ShowQuickMenu();
++  CefRefPtr<CefFrame> QuickMenuFrame();
++  void ReadQuickMenuFormats(base::OnceCallback<void(
++      base::flat_set<ui::ClipboardFormatType>)> callback);
+   void ShowQuickMenuWithCanPaste(bool can_paste);
+   void UpdateQuickMenu();
+   void UpdateQuickMenuWithCanPaste(bool can_paste);
+@@ -156,6 +163,10 @@
+   bool scroll_in_progress_ = false;
+   bool handle_drag_in_progress_ = false;
+ 
++  content::WeakDocumentPtr guest_quick_document_;
++  base::RepeatingCallback<bool()> guest_quick_admitted_;
++  // A closed/replaced menu must not be revived by an older clipboard query.
++  base::WeakPtrFactory<CefTouchSelectionControllerClientOSR> clipboard_weak_{this};
+   base::WeakPtrFactory<CefTouchSelectionControllerClientOSR> weak_ptr_factory_;
+ };
+ 
+--- a/libcef/browser/osr/touch_selection_controller_client_osr.cc
++++ b/libcef/browser/osr/touch_selection_controller_client_osr.cc
+@@ -4,6 +4,10 @@
+ // found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/osr/touch_selection_controller_client_osr.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
++#include "content/browser/renderer_host/alloy_guest_clipboard.h"
++#include "content/public/browser/alloy_guest_integration.h"
+ 
+ #include <cmath>
+ #include <set>
+@@ -262,6 +266,9 @@
+ }
+ 
+ void CefTouchSelectionControllerClientOSR::CloseQuickMenu() {
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) clipboard_weak_.InvalidateWeakPtrs();
++#endif
+   if (!quick_menu_running_) {
+     return;
+   }
+@@ -270,15 +277,52 @@
+ 
+   auto browser = rwhv_->browser_impl();
+   if (auto handler = browser->client()->GetContextMenuHandler()) {
+-    handler->OnQuickMenuDismissed(browser.get(), browser->GetFocusedFrame());
+-  }
++    handler->OnQuickMenuDismissed(browser.get(), QuickMenuFrame());
++  }
++}
++
++CefRefPtr<CefFrame> CefTouchSelectionControllerClientOSR::QuickMenuFrame() {
++  auto browser = rwhv_->browser_impl();
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    auto* original = guest_quick_document_.AsRenderFrameHostIfValid();
++    return original && guest_quick_admitted_ && guest_quick_admitted_.Run()
++        ? browser->GetFrameForHost(original) : nullptr;
++  }
++#endif
++  return browser->GetFocusedFrame();
++}
++
++void CefTouchSelectionControllerClientOSR::ReadQuickMenuFormats(
++    base::OnceCallback<void(base::flat_set<ui::ClipboardFormatType>)> callback) {
++  ui::DataTransferEndpoint destination(ui::EndpointType::kDefault,
++                                      {.notify_if_restricted = false});
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    auto* original = guest_quick_document_.AsRenderFrameHostIfValid();
++    auto query = clipboard_weak_.GetWeakPtr();
++    auto admitted = base::BindRepeating(
++        [](base::WeakPtr<CefTouchSelectionControllerClientOSR> query,
++            base::RepeatingCallback<bool()> admitted) {
++          return query && admitted && admitted.Run();
++        }, query, guest_quick_admitted_);
++    auto clipboard = std::make_shared<content::AlloyGuestClipboard>(original, admitted);
++    clipboard->GetAllAvailableFormats(ui::ClipboardBuffer::kCopyPaste, destination,
++        base::BindOnce([](std::shared_ptr<content::AlloyGuestClipboard> clipboard,
++                           base::RepeatingCallback<bool()> admitted,
++                           base::OnceCallback<void(base::flat_set<ui::ClipboardFormatType>)> callback,
++                           base::flat_set<ui::ClipboardFormatType> formats) {
++          if (admitted.Run()) std::move(callback).Run(std::move(formats));
++        }, clipboard, std::move(admitted), std::move(callback)));
++    return;
++  }
++#endif
++  ui::Clipboard::GetForCurrentThread()->GetAllAvailableFormats(
++      ui::ClipboardBuffer::kCopyPaste, destination, std::move(callback));
+ }
+ 
+ void CefTouchSelectionControllerClientOSR::ShowQuickMenu() {
+-  ui::DataTransferEndpoint data_dst = ui::DataTransferEndpoint(
+-      ui::EndpointType::kDefault, {.notify_if_restricted = false});
+-  ui::Clipboard::GetForCurrentThread()->GetAllAvailableFormats(
+-      ui::ClipboardBuffer::kCopyPaste, data_dst,
++  ReadQuickMenuFormats(
+       base::BindOnce(
+           [](base::WeakPtr<CefTouchSelectionControllerClientOSR> weak_this,
+              base::flat_set<ui::ClipboardFormatType> formats) {
+@@ -295,6 +339,8 @@
+ void CefTouchSelectionControllerClientOSR::ShowQuickMenuWithCanPaste(
+     bool can_paste) {
+   auto browser = rwhv_->browser_impl();
++  auto frame = QuickMenuFrame();
++  if (!frame) return;
+   if (auto handler = browser->client()->GetContextMenuHandler()) {
+     gfx::RectF rect =
+         rwhv_->selection_controller()->GetVisibleRectBetweenBounds();
+@@ -325,7 +371,7 @@
+ 
+     quick_menu_running_ = true;
+     if (!handler->RunQuickMenu(
+-            browser, browser->GetFocusedFrame(),
++            browser, frame,
+             {static_cast<int>(std::round(origin.x())),
+              static_cast<int>(std::round(origin.y()))},
+             {static_cast<int>(std::round(size.width())),
+@@ -340,6 +386,16 @@
+ }
+ 
+ void CefTouchSelectionControllerClientOSR::UpdateQuickMenu() {
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    clipboard_weak_.InvalidateWeakPtrs();
++    auto* original = rwhv_->browser_impl()->GetWebContents()->GetFocusedFrame();
++    guest_quick_document_ = original ? original->GetWeakDocumentPtr() : content::WeakDocumentPtr();
++    auto* integration = content::AlloyGuestIntegration::Get(original);
++    guest_quick_admitted_ = integration ? integration->CaptureAdmission(original)
++                                       : base::RepeatingCallback<bool()>();
++  }
++#endif
+   // Hide the quick menu if there is any. This should happen even if the menu
+   // should be shown again, in order to update its location or content.
+   if (quick_menu_running_) {
+@@ -348,10 +404,7 @@
+     quick_menu_timer_.Stop();
+   }
+ 
+-  ui::DataTransferEndpoint data_dst = ui::DataTransferEndpoint(
+-      ui::EndpointType::kDefault, {.notify_if_restricted = false});
+-  ui::Clipboard::GetForCurrentThread()->GetAllAvailableFormats(
+-      ui::ClipboardBuffer::kCopyPaste, data_dst,
++  ReadQuickMenuFormats(
+       base::BindOnce(
+           [](base::WeakPtr<CefTouchSelectionControllerClientOSR> weak_this,
+              base::flat_set<ui::ClipboardFormatType> formats) {
+@@ -537,7 +590,7 @@
+   auto browser = rwhv_->browser_impl();
+   if (auto handler = browser->client()->GetContextMenuHandler()) {
+     if (handler->OnQuickMenuCommand(
+-            browser.get(), browser->GetFocusedFrame(), command_id,
++            browser.get(), QuickMenuFrame(), command_id,
+             static_cast<cef_event_flags_t>(event_flags))) {
+       return;
+     }
+--- a/libcef/browser/alloy/alloy_browser_host_impl.h
++++ b/libcef/browser/alloy/alloy_browser_host_impl.h
+@@ -153,7 +153,8 @@
+ 
+   void OnSetFocus(cef_focus_source_t source) override;
+ 
+-  bool ShowContextMenu(const content::ContextMenuParams& params);
++  bool ShowContextMenu(const content::ContextMenuParams& params,
++                       content::RenderFrameHost* guest_owner = nullptr);
+ 
+   enum DestructionState {
+     DESTRUCTION_STATE_NONE = 0,
+--- a/libcef/browser/alloy/alloy_browser_host_impl.cc
++++ b/libcef/browser/alloy/alloy_browser_host_impl.cc
+@@ -4,6 +4,8 @@
+ // found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_guest_integration.h"
+ #include "cef/libcef/browser/alloy/profile_settings.h"
+ 
+ #include <memory>
+@@ -1093,13 +1095,22 @@
+ }
+ 
+ bool AlloyBrowserHostImpl::ShowContextMenu(
+-    const content::ContextMenuParams& params) {
++    const content::ContextMenuParams& params, content::RenderFrameHost* guest_owner) {
+   CEF_REQUIRE_UIT();
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    if (!guest_owner || !content::AlloyGuestIntegration::Get(guest_owner)) return true;
++  } else {
++    guest_owner = nullptr;
++  }
++#else
++  guest_owner = nullptr;
++#endif
+   if (!menu_manager_.get() && platform_delegate_) {
+     menu_manager_ = std::make_unique<CefMenuManager>(
+         this, platform_delegate_->CreateMenuRunner());
+   }
+-  return menu_manager_->CreateContextMenu(params);
++  return menu_manager_->CreateContextMenu(params, true, guest_owner);
+ }
+ 
+ void AlloyBrowserHostImpl::UpdatePreferredSize(content::WebContents* source,
+--- a/libcef/browser/menu_manager.h
++++ b/libcef/browser/menu_manager.h
+@@ -12,6 +12,7 @@
+ #include "cef/libcef/browser/menu_runner.h"
+ #include "content/public/browser/context_menu_params.h"
+ #include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/weak_document_ptr.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include "components/spellcheck/common/spellcheck_common.h"
+@@ -44,7 +45,8 @@
+ 
+   // Create the context menu.
+   bool CreateContextMenu(const content::ContextMenuParams& params,
+-                         bool query_spellcheck = true);
++                         bool query_spellcheck = true,
++                         content::RenderFrameHost* guest_owner = nullptr);
+   void CancelContextMenu();
+ 
+  private:
+@@ -80,6 +82,8 @@
+ 
+   CefRefPtr<CefMenuModelImpl> model_;
+   content::ContextMenuParams params_;
++  content::WeakDocumentPtr guest_document_;
++  bool guest_owned_ = false;
+ 
+   // Not owned by this class.
+   raw_ptr<CefRunContextMenuCallback> custom_menu_callback_ = nullptr;
+--- a/libcef/browser/menu_manager.cc
++++ b/libcef/browser/menu_manager.cc
+@@ -3,6 +3,8 @@
+ // be found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/menu_manager.h"
++#include "cef/libcef/browser/browser_info.h"
++#include "content/public/browser/alloy_document_state.h"
+ 
+ #include <tuple>
+ #include <utility>
+@@ -128,7 +130,8 @@
+ }
+ 
+ bool CefMenuManager::CreateContextMenu(const content::ContextMenuParams& params,
+-                                       bool query_spellcheck) {
++                                       bool query_spellcheck,
++                                       content::RenderFrameHost* guest_owner) {
+   // The renderer may send the "show context menu" message multiple times, one
+   // for each right click mouse event it receives. Normally, this doesn't happen
+   // because mouse events are not forwarded once the context menu is showing.
+@@ -141,6 +144,8 @@
+   }
+ 
+   params_ = params;
++  guest_owned_ = guest_owner != nullptr;
++  guest_document_ = guest_owner ? guest_owner->GetWeakDocumentPtr() : content::WeakDocumentPtr();
+ 
+ #if BUILDFLAG(IS_WIN)
+   // System spellcheck suggestions need to be queried asynchronously.
+@@ -174,7 +179,9 @@
+     if (handler.get()) {
+       CefRefPtr<CefContextMenuParamsImpl> paramsPtr(
+           new CefContextMenuParamsImpl(&params_));
+-      CefRefPtr<CefFrame> frame = browser_->GetFocusedFrame();
++      CefRefPtr<CefFrame> frame = guest_owned_
++          ? browser_->browser_info()->GetFrameForHost(guest_document_.AsRenderFrameHostIfValid(), true)
++          : browser_->GetFocusedFrame();
+ 
+       handler->OnBeforeContextMenu(browser_.get(), frame, paramsPtr.get(),
+                                    model_.get());
+@@ -240,6 +247,8 @@
+ void CefMenuManager::ExecuteCommand(CefRefPtr<CefMenuModelImpl> source,
+                                     int command_id,
+                                     cef_event_flags_t event_flags) {
++  if (guest_owned_ && !content::AlloyDocumentStateAdmitted(
++                          guest_document_.AsRenderFrameHostIfValid())) return;
+   // Give the client a chance to handle the command.
+   CefRefPtr<CefClient> client = browser_->GetClient();
+   if (client.get()) {
+--- a/libcef/browser/chrome/chrome_context_menu_handler.h
++++ b/libcef/browser/chrome/chrome_context_menu_handler.h
+@@ -10,6 +10,7 @@
+ 
+ namespace content {
+ class WebContents;
++class RenderFrameHost;
+ }
+ 
+ namespace context_menu {
+@@ -19,7 +20,8 @@
+ 
+ // Returns true if the menu was handled.
+ bool HandleContextMenu(content::WebContents* opener,
+-                       const content::ContextMenuParams& params);
++                       const content::ContextMenuParams& params,
++                       content::RenderFrameHost* original = nullptr);
+ 
+ void MaybeResetContextMenu(content::WebContents* opener);
+ 
+--- a/libcef/browser/chrome/chrome_context_menu_handler.cc
++++ b/libcef/browser/chrome/chrome_context_menu_handler.cc
+@@ -352,10 +352,11 @@
+ }
+ 
+ bool HandleContextMenu(content::WebContents* opener,
+-                       const content::ContextMenuParams& params) {
++                       const content::ContextMenuParams& params,
++                       content::RenderFrameHost* original) {
+   auto browser = CefBrowserHostBase::GetBrowserForContents(opener);
+   if (browser && browser->IsAlloyStyle()) {
+-    AlloyBrowserHostImpl::FromBaseChecked(browser)->ShowContextMenu(params);
++    AlloyBrowserHostImpl::FromBaseChecked(browser)->ShowContextMenu(params, original);
+     return true;
+   }
+ 
+--- a/libcef/browser/chrome/chrome_web_contents_view_delegate_cef.cc
++++ b/libcef/browser/chrome/chrome_web_contents_view_delegate_cef.cc
+@@ -14,7 +14,7 @@
+ void ChromeWebContentsViewDelegateCef::ShowContextMenu(
+     content::RenderFrameHost& render_frame_host,
+     const content::ContextMenuParams& params) {
+-  if (context_menu::HandleContextMenu(web_contents_, params)) {
++  if (context_menu::HandleContextMenu(web_contents_, params, &render_frame_host)) {
+     return;
+   }
+ 
+--- a/libcef/browser/chrome/extensions/chrome_mime_handler_view_guest_delegate_cef.cc
++++ b/libcef/browser/chrome/extensions/chrome_mime_handler_view_guest_delegate_cef.cc
+@@ -40,7 +40,7 @@
+ bool ChromeMimeHandlerViewGuestDelegateCef::HandleContextMenu(
+     content::RenderFrameHost& render_frame_host,
+     const content::ContextMenuParams& params) {
+-  if (context_menu::HandleContextMenu(owner_web_contents_, params)) {
++  if (context_menu::HandleContextMenu(owner_web_contents_, params, &render_frame_host)) {
+     return true;
+   }
+ 
+--- a/libcef/browser/frame_host_impl.h
++++ b/libcef/browser/frame_host_impl.h
+@@ -100,6 +100,8 @@
+ 
+   // Send a command to the renderer for execution.
+   void SendCommand(const std::string& command);
++  void SendGuestCommand(const std::string& command,
++      base::RepeatingCallback<bool()> admitted, base::OnceCallback<void(bool)> completion);
+   void SendCommandWithResponse(
+       const std::string& command,
+       cef::mojom::RenderFrame::SendCommandWithResponseCallback
+--- a/libcef/browser/frame_host_impl.cc
++++ b/libcef/browser/frame_host_impl.cc
+@@ -3,6 +3,11 @@
+ // be found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/frame_host_impl.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_guest_integration.h"
++#include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "content/browser/web_contents/web_contents_impl.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
+ 
+ #include "cef/include/cef_request.h"
+ #include "cef/include/cef_stream.h"
+@@ -394,12 +399,47 @@
+ 
+ void CefFrameHostImpl::SendCommand(const std::string& command) {
+   DCHECK(!command.empty());
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    if (!CEF_CURRENTLY_ON_UIT()) {
++      CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefFrameHostImpl::SendCommand, this, command));
++      return;
++    }
++    SendGuestCommand(command, {}, base::DoNothing());
++    return;
++  }
++#endif
+   SendToRenderFrame(__FUNCTION__, base::BindOnce(
+                                       [](const std::string& command,
+                                          const RenderFrameType& render_frame) {
+                                         render_frame->SendCommand(command);
+                                       },
+                                       command));
++}
++
++void CefFrameHostImpl::SendGuestCommand(const std::string& command,
++    base::RepeatingCallback<bool()> extra_admission, base::OnceCallback<void(bool)> completion) {
++  CEF_REQUIRE_UIT();
++  auto* frame = GetRenderFrameHost();
++  auto* integration = content::AlloyGuestIntegration::Get(frame);
++  auto admission = integration ? integration->CaptureAdmission(frame) : base::RepeatingCallback<bool()>();
++  auto done = mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(completion), false);
++  if (!admission || !admission.Run()) { std::move(done).Run(false); return; }
++  const auto document = frame->GetWeakDocumentPtr();
++  SendToRenderFrame(__FUNCTION__, base::BindOnce(
++      [](const std::string& command, content::WeakDocumentPtr document,
++          base::RepeatingCallback<bool()> admission, base::RepeatingCallback<bool()> extra,
++          base::OnceCallback<void(bool)> done, const RenderFrameType& remote) {
++        auto* original = document.AsRenderFrameHostIfValid();
++        if (!original || !admission.Run() || (extra && !extra.Run())) {
++          std::move(done).Run(false); return;
++        }
++        static_cast<content::WebContentsImpl*>(content::WebContents::FromRenderFrameHost(original))
++            ->RecordAlloyGuestUiInteraction(original);
++        remote->SendCommandForDocument(command,
++            static_cast<content::RenderFrameHostImpl*>(original)->GetDocumentToken());
++        std::move(done).Run(true);
++      }, command, document, std::move(admission), std::move(extra_admission), std::move(done)));
+ }
+ 
+ void CefFrameHostImpl::SendCommandWithResponse(
+--- a/libcef/common/mojom/cef.mojom
++++ b/libcef/common/mojom/cef.mojom
+@@ -62,6 +62,8 @@
+ 
+   // Send a command.
+   SendCommand(string command);
++  // Native guest editing retains its original document across IPC/renderer queues.
++  SendCommandForDocument(string command, blink.mojom.DocumentToken document_token);
+ 
+   // Send a command that returns an async response.
+   // The returned |response| format is command-specific and will be invalid if
+--- a/libcef/renderer/frame_impl.h
++++ b/libcef/renderer/frame_impl.h
+@@ -153,6 +153,8 @@
+   void SendSharedMemoryRegion(const std::string& name,
+                               base::WritableSharedMemoryRegion region) override;
+   void SendCommand(const std::string& command) override;
++  void SendCommandForDocument(const std::string& command,
++      const blink::DocumentToken& document_token) override;
+   void SendCommandWithResponse(
+       const std::string& command,
+       cef::mojom::RenderFrame::SendCommandWithResponseCallback callback)
+--- a/libcef/renderer/frame_impl.cc
++++ b/libcef/renderer/frame_impl.cc
+@@ -848,6 +848,15 @@
+           command));
+ }
+ 
++void CefFrameImpl::SendCommandForDocument(const std::string& command,
++    const blink::DocumentToken& document_token) {
++  ExecuteOnLocalFrame(__FUNCTION__, base::BindOnce(
++      [](std::string command, blink::DocumentToken expected, blink::WebLocalFrame* frame) {
++        if (frame->GetDocument().Token() == expected)
++          frame->ExecuteCommand(blink::WebString::FromUtf8(command));
++      }, command, document_token));
++}
++
+ void CefFrameImpl::SendCommandWithResponse(
+     const std::string& command,
+     cef::mojom::RenderFrame::SendCommandWithResponseCallback callback) {

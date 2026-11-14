@@ -1079,8 +1079,38 @@
       "stage": "after-prune"
     },
     {
+      "patch": "chromium/0160-guest-clipboard.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0160-guest-integration.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0161-guest-native-grants.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0162-guest-ui.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0162-guest-ui.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
       "patch": "chromium/0163-native-test-lifetime.patch",
       "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0164-guest-edit-context.patch",
+      "root": "cef",
       "stage": "after-prune"
     }
   ],

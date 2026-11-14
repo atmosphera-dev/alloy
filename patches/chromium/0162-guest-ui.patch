@@ -1,0 +1,100 @@
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -2313,6 +2313,8 @@
+   // blink::mojom::LocalFrameHost
+   void EnterFullscreen(blink::mojom::FullscreenOptionsPtr options,
+                        EnterFullscreenCallback callback) override;
++  void FinishAlloyFullscreen(blink::mojom::FullscreenOptionsPtr options,
++      EnterFullscreenCallback callback, bool had_fullscreen_token);
+   void ExitFullscreen() override;
+   void FullscreenStateChanged(
+       bool is_fullscreen,
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_guest_integration.h"
+ #include "content/browser/buckets/alloy_embedded_bucket_storage.h"
+ #include "content/browser/alloy_embedded_state.h"
+ 
+@@ -9573,6 +9575,37 @@
+     return;
+   }
+ 
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime()) {
++    auto* integration = AlloyGuestIntegration::Get(this);
++    if (!integration) { std::move(callback).Run(false); return; }
++    AlloyGuestIntegrationData data;
++    data.details.Set("display-id", base::NumberToString(options->display_id));
++    data.validate_reply = base::BindRepeating([](const base::DictValue& reply,
++                                                const std::vector<std::string>& bytes) {
++      return bytes.empty() && reply.FindBool("allow").has_value();
++    });
++    integration->Request(this, AlloyGuestIntegration::Operation::kFullscreen, std::move(data),
++        base::BindOnce([](WeakDocumentPtr document, blink::mojom::FullscreenOptionsPtr options,
++                           EnterFullscreenCallback callback, bool had_token,
++                           std::optional<AlloyGuestIntegrationData> reply) {
++          auto* frame = static_cast<RenderFrameHostImpl*>(document.AsRenderFrameHostIfValid());
++          if (!reply || !reply->details.FindBool("allow").value_or(false) || !frame ||
++              !frame->IsActive() || !frame->GetPage().IsPrimary() ||
++              !frame->IsFeatureEnabled(network::mojom::PermissionsPolicyFeature::kFullscreen) ||
++              !frame->delegate_->CanEnterFullscreenMode(frame)) {
++            std::move(callback).Run(false); return;
++          }
++          frame->FinishAlloyFullscreen(std::move(options), std::move(callback), had_token);
++        }, GetWeakDocumentPtr(), std::move(options), std::move(callback), had_fullscreen_token));
++    return;
++  }
++#endif
++  FinishAlloyFullscreen(std::move(options), std::move(callback), had_fullscreen_token);
++}
++
++void RenderFrameHostImpl::FinishAlloyFullscreen(blink::mojom::FullscreenOptionsPtr options,
++    EnterFullscreenCallback callback, bool had_fullscreen_token) {
+   base::RecordAction(base::UserMetricsAction("EnterFullscreen_API"));
+ 
+   // Allow sites with the Window Management permission to open a popup window
+--- a/content/browser/web_contents/web_contents_impl.h
++++ b/content/browser/web_contents/web_contents_impl.h
+@@ -537,6 +537,8 @@
+   void SetPageFrozen(bool frozen) override;
+   std::unique_ptr<WebContents> Clone() override;
+   void ReloadFocusedFrame() override;
++  // Trusted app UI command at its captured native frame, not a fake input event.
++  void RecordAlloyGuestUiInteraction(RenderFrameHost* original);
+   void Undo() override;
+   void Redo() override;
+   void Cut() override;
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_document_state.h"
+ #include "content/browser/alloy_embedded_state.h"
+ #include "content/public/browser/alloy_document_state.h"
+ 
+@@ -7116,6 +7118,17 @@
+   focused_frame->Reload();
+ }
+ 
++void WebContentsImpl::RecordAlloyGuestUiInteraction(RenderFrameHost* original) {
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime() && AlloyDocumentStateAdmitted(original) &&
++      WebContents::FromRenderFrameHost(original) == this) {
++    // Same native bookkeeping as Undo/Copy/Paste below. No permission setting,
++    // fabricated pointer/key event, renderer activation or OS clipboard access.
++    last_interaction_time_ = ui::EventTimeForNow();
++  }
++#endif
++}
++
+ void WebContentsImpl::Undo() {
+   OPTIONAL_TRACE_EVENT0("content", "WebContentsImpl::Undo");
+   auto* input_handler = GetFocusedFrameWidgetInputHandler();

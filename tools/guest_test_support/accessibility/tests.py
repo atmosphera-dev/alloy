@@ -37,6 +37,14 @@ class TextTests(unittest.TestCase):
         self.assertEqual(bridge.codepoint_offset('a\U0001f600b', 3), 2)
         self.assertIsNone(bridge.codepoint_offset('a', 2))
 
+    def test_editable_descendants_keep_name_backed_text(self):
+        for role in ('staticText', 'inlineTextBox', 'heading', 'paragraph', 'button', 'link'):
+            with self.subTest(role=role):
+                node = self.node(role, '', 'Rendered text', states=('editable',))
+                self.assertEqual(node.text(), 'Rendered text')
+                self.assertEqual(node.GetText(0, -1), 'Rendered text')
+                self.assertEqual(node.props(bridge.TEXT)['CharacterCount'], len('Rendered text'))
+
 
 class FocusTests(unittest.TestCase):
     def test_gap_emits_focus_loss_before_retiring_focus(self):

@@ -106,7 +106,8 @@ class Accessible(dbus.service.Object):
     def text(self):
         if not self.data:
             return ''
-        if self.data.get('role') in ('textField', 'textFieldWithComboBox', 'searchBox', 'spinButton') or 'editable' in self.data.get('states', []):
+        role = self.data.get('role')
+        if role in ('textField', 'textFieldWithComboBox', 'searchBox', 'spinButton') or (role == 'genericContainer' and 'editable' in self.data.get('states', [])):
             return self.data.get('value', '')
         return self.data.get('value') or self.data.get('name', '')
 

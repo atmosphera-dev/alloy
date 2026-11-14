@@ -30,6 +30,12 @@ View::View(Owner owner, int width, int height, StreamEvent event,
     : owner_(owner), width_(width), height_(height), event_(std::move(event)),
       resource_(std::move(resource)), clock_(std::move(clock)) {}
 void View::Bind(CefRefPtr<CefBrowser> browser) { browser_ = browser; }
+bool View::PixelSize(CefSize& size) const {
+  gfx::Size pixels;
+  if (!Pixels(width_, height_, scale_, &pixels)) return false;
+  size = CefSize(pixels.width(), pixels.height());
+  return true;
+}
 bool View::InitialGeometry(int width, int height, double scale) {
   size_t stride = 0, bytes = 0;
   scale = static_cast<float>(scale);

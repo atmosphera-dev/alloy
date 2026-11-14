@@ -124,6 +124,12 @@ class AlloyGuestView : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual CefRefPtr<AlloyGuestStream> GetStream() = 0;
   ///
+  /// Return the typed app-owned accessibility endpoint for this view. Attach its
+  /// handler explicitly; no native screen-reader object is created in the guest.
+  ///
+  /*--cef()--*/
+  virtual CefRefPtr<AlloyGuestAccessibility> GetAccessibility() = 0;
+  ///
   /// Queue a URL while ACTIVE, using CEF's normal scheme validation and native
   /// admission. Invalid URLs return false before queuing and do not change the
   /// current document or produce a load completion. Navigation retires the old

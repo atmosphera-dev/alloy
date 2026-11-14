@@ -1077,6 +1077,11 @@
       "patch": "cef/0142-guest-native-input.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0170-guest-accessibility.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

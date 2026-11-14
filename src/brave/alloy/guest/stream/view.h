@@ -19,6 +19,9 @@ class View {
   void Bind(CefRefPtr<CefBrowser> browser);
   bool InitialGeometry(int width, int height, double scale);
   bool started() const { return started_ && !retired_; }
+  uint64_t generation() const { return generation_; }
+  double scale() const { return scale_; }
+  bool PixelSize(CefSize& size) const;
   void SetOwner(Owner owner);
   void Retire();
   CefRect rect() const { return CefRect(0, 0, width_, height_); }

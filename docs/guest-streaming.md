@@ -104,7 +104,83 @@ pixels after shutdown and callback-sequence separation. New targets are
 `alloy_guest_stream_unittests` and `alloy_guest_stream_consumer`; run
 `tools/guest_stream_probe.py --check frames` in the assigned build guest.
 
-Input, popup placement/hit testing, cursor and IME are added by the next M3
-commit. GPU, sound, clocks, native clipboard/files/capture and AX remain later
-milestones. Nothing here changes memory/stateless behavior or production
+The full `--check all` driver also exercises native input, popup placement/hit
+testing, cursor and IME through the same translated SDK. It compares receipts
+with actual page text/state and rendered response pixels, not dispatch alone.
+GPU, sound, clock synchronization, native clipboard/files/capture and AX remain
+later milestones. Nothing here changes memory/stateless behavior or production
 request-logging policy; the consumer retains only explicit synthetic fixtures.
+
+## Native input and one live interaction feed
+
+SendPointer, SendWheel, SendKey, SendTouch, SendFocus and SendCaptureLost use
+the existing native browser-host methods. All require the original document
+and geometry generation. Coordinates are DIP local to surface zero (view) or
+one (PET_POPUP); the connector performs popup hit testing and translates its
+local point to view DIP once. Stale generations/owners and invalid native
+values/order are refused, never applied to replacement geometry. While a
+navigation has no committed native document, input cannot reach the old page.
+Capture-loss notification follows pinned CEF's legacy widget/plugin-capture
+semantics; it does not mean JavaScript Element.releasePointerCapture. DOM
+pointer capture still follows the native pointer-event lifecycle.
+
+Methods return an ordered view-local event ID, or zero when unqueued.
+OnInteraction reports actual native accepted/rejected dispatch, original app
+capture time/source and session-clock dispatch/refusal time. App and agent
+actions use identical typed methods and native dispatch. The app chooses its
+own source labels, redaction and retention; Alloy retains only pending work.
+Acceptance is not proof of DOM effect or an exact first responding frame.
+`cancelled-unobserved` makes an interrupted/unobserved dispatch explicit,
+rather than claiming it succeeded or certainly did nothing.
+
+The session's shared Interactions tracker allocates IDs atomically with command
+admission for every feature, validates exact original-owner/feature receipts
+and removes completion state before delivery. Native and generic completion
+paths cannot produce duplicate echoes. Later menu and AX producers use
+ExtensionEndpoint.interact, the same metadata codec and reserved @interaction
+event, not a new injection path, ID allocator or history store. The existing
+logical control-envelope bound is checked with receipt space reserved before
+an action is admitted. Other providers remain unavailable until implemented.
+
+## Popups and cursor
+
+PET_POPUP has separate full CPU pictures, DIP geometry and hit testing.
+Show/hide/geometry changes retire the geometry generation, so an old popup
+point cannot act on a replacement popup. The app owns placement/compositing.
+
+OnWindowOpen offers the actual CEF-created window.open WebContents. Its original
+WindowProxy/opener, initial blank document and document.write state are kept;
+there is no cancellation followed by URL recreation. A pending child remains
+off-screen/unpresented, but may run page script while awaiting placement. This
+is an app attachment decision, not a promise that script waits for approval.
+The admitted session's existing native context and permission owners still
+govern it; there is no second site-state authority.
+
+AlloyGuestPopup.Attach selects DIP size/scale and adopts a view handler. OnReady
+supplies the same child view; the app starts its stream independently. Native
+offered views have a distinct ID namespace under the same Session so concurrent
+app CreateView calls cannot collide. Deny closes that exact pending child.
+Original opener retirement or child closure emits OnWindowRetired for an
+undecided offer; stale attachment returns false. Final stream close retires all
+pending offers. There is no engine-selected decision timeout.
+
+OnCursor supplies a cursor enum or owned BGRA pixels, pixel hotspot and image
+scale. Custom bytes are copied before the native callback returns; no native
+cursor pointer crosses the session. The app owns the system cursor/UI.
+
+## App-owned IME
+
+The app handles its platform IME/dead keys and calls SetComposition, CommitText,
+FinishComposition or CancelComposition. They reach native CefBrowserHost IME
+methods, not JavaScript text injection. UTF-16 text, directed selection and
+underline ranges/styles/colors are copied and validated without scalar/index
+conversion; an unpaired surrogate is rejected before queuing. (-1,-1) denotes
+an absent replacement range. Replacement/relative-cursor fields retain CEF's
+platform semantics (macOS-only uses are not Linux parity claims).
+
+OnImeBounds supplies the native UTF-16 composition range and per-code-unit
+bounds in view DIP. A trailing surrogate or combining unit can have zero-width
+bounds; it is not a missing glyph slot or a reason to discard the range.
+Apply the same view-to-app/screen transform used by presentation and input.
+Composition inputs and their accepted/rejected receipts join the common live
+interaction feed, with no engine-retained typing/password history.

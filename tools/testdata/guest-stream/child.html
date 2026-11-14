@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CHILD_STARTING</title>
+<style>body { margin:0; background:rgb(35,95,175); color:white; font:20px sans-serif; }</style>
+<button id="child">Preserved child</button>
+<script>
+const token = window.opener?.__alloyToken || '';
+document.title = 'CHILD:' + JSON.stringify({ opener:!!window.opener, token, cookie:document.cookie });
+window.opener?.postMessage({kind:'alloy-child', token}, location.origin);
+document.getElementById('child').addEventListener('click', () => { document.body.style.background='rgb(175,95,35)'; document.title='CHILD_CLICKED'; });
+</script>

@@ -62,11 +62,24 @@ void Session::Fail() {
 }
 
 std::optional<Owner> Session::CreateView(uint64_t request) {
-  if (state_ != State::kActive || !Next(next_view_) || !Next(next_request_))
+  if (state_ != State::kActive || !Next(next_view_) || next_view_ >= (uint64_t{1} << 63) || !Next(next_request_))
     return std::nullopt;
   Owner owner{next_view_++, 0, request ? request : next_request_++, 1};
   owners_.emplace(owner.view, owner);
   return owner;
+}
+std::optional<Owner> Session::CreateNativeView() {
+  if (state_ != State::kActive || !Next(next_native_view_) || !Next(next_request_)) return std::nullopt;
+  Owner owner{next_native_view_++, 0, next_request_++, 1};
+  owners_.emplace(owner.view, owner);
+  return owner;
+}
+bool Session::ObserveNativeView(const Owner& owner) {
+  if (state_ != State::kActive || owner.view < (uint64_t{1} << 63) || !Next(owner.view) ||
+      owner.document || owner.generation != 1 || owner.request < (uint64_t{1} << 63) ||
+      !Next(owner.request) || owners_.contains(owner.view)) return false;
+  owners_.emplace(owner.view, owner);
+  return true;
 }
 
 std::optional<Owner> Session::Navigate(uint64_t view, uint64_t request) {

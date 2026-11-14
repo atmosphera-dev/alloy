@@ -23,6 +23,7 @@
 #include "brave/alloy/guest/providers.h"
 #include "brave/alloy/guest/session/supervisor.h"
 #include "brave/alloy/guest/session/extensions.h"
+#include "brave/alloy/guest/session/interactions.h"
 #include "brave/alloy/guest/stream/stream_client.h"
 #include "cef/include/cef_api_hash.h"
 #include "cef/include/cef_version.h"
@@ -124,7 +125,7 @@ struct Command {
   Feature feature = Feature::kStream;
   std::string operation;
   ExtensionCompletion completion;
-  std::optional<Owner> resource_owner;
+  std::optional<Owner> original_owner;
 };
 
 struct ClientCore : public std::enable_shared_from_this<ClientCore> {
@@ -231,17 +232,85 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
         Command command;
         command.kind = Message::kExtensionCall;
         command.view = view; command.feature = feature;
-        command.operation = "@release"; command.resource_owner = original;
+        command.operation = "@release"; command.original_owner = original;
         command.payload = std::move(payload);
         return core->Enqueue(std::move(command), "ACTIVE");
+      },
+      [weak, view](Feature feature, Owner original, std::string operation,
+                   std::string payload, ExtensionCompletion completion) {
+        auto core = weak.lock();
+        if (!core || original.view != view) return false;
+        Command command;
+        command.kind = Message::kExtensionCall;
+        command.view = view; command.feature = feature;
+        command.operation = std::move(operation); command.original_owner = original;
+        command.payload = std::move(payload); command.completion = std::move(completion);
+        return core->Enqueue(std::move(command), "ACTIVE");
+      },
+      [weak, view](Feature feature, Owner original, std::string operation, stream::InteractionData input) {
+        auto core = weak.lock();
+        return core ? core->Interact(view, feature, original, std::move(operation), std::move(input)) : 0;
       }
     };
+  }
+  uint64_t Interact(uint64_t view, Feature feature, Owner original,
+                     std::string operation, stream::InteractionData input) {
+    std::lock_guard guard(mutex);
+    auto next = interactions.Next(view);
+    if (closing || state != "ACTIVE" || original.view != view ||
+        !extension_owners.contains(view) || !next) return 0;
+    input.id = *next;
+    std::string payload, envelope;
+    if (!stream::FitsInteraction(input) || !stream::PackInteraction(input, &payload) ||
+        !PackExtension({feature, std::numeric_limits<uint64_t>::max(), operation, payload}, &envelope)) return 0;
+    Command command; command.kind = Message::kExtensionCall;
+    command.view = view; command.feature = feature; command.operation = std::move(operation);
+    command.payload = std::move(payload); command.original_owner = original;
+    std::weak_ptr<ClientCore> weak = shared_from_this();
+    command.completion = [weak, view, id = input.id](ProviderResult result, uint64_t time, std::string) {
+      if (auto core = weak.lock()) core->FinishInteraction(view, id, result, time);
+    };
+    if (!interactions.Track(feature, original, input)) return 0;
+    commands.push_back(std::move(command));
+    uint64_t one = 1; ssize_t result;
+    do { result = write(wake, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
+    return input.id;
+  }
+  bool ReceiveInteraction(Feature feature, Owner original, const std::string& payload) {
+    stream::InteractionData value;
+    if (!stream::UnpackInteraction(payload, &value) || value.outcome.empty()) return false;
+    std::shared_ptr<ExtensionSink> sink;
+    {
+      std::lock_guard guard(mutex);
+      auto observed = interactions.Receive(feature, original, value);
+      if (observed == Interactions::Receipt::kMissing) return true;
+      if (observed == Interactions::Receipt::kInvalid) return false;
+      if (auto receiver = sinks.find({original.view, Feature::kStream}); receiver != sinks.end()) sink = receiver->second;
+    }
+    if (sink) sink->Event(original, "@interaction", payload);
+    return true;
+  }
+  void FinishInteraction(uint64_t view, uint64_t id, ProviderResult result, uint64_t time) {
+    std::optional<Interactions::Action> action;
+    std::shared_ptr<ExtensionSink> sink;
+    {
+      std::lock_guard guard(mutex);
+      action = interactions.Complete(view, id);
+      if (!action) return;
+      if (auto receiver = sinks.find({view, Feature::kStream}); receiver != sinks.end()) sink = receiver->second;
+    }
+    action->input.dispatch_us = time;
+    action->input.outcome = result == ProviderResult::kUnavailable ? "unavailable" :
+        result == ProviderResult::kFailed ? "rejected:invalid" : "cancelled-unobserved";
+    std::string payload;
+    if (sink && stream::PackInteraction(action->input, &payload)) sink->Event(action->owner, "@interaction", std::move(payload));
   }
   void ExtensionOwner(Owner owner) {
     std::vector<std::shared_ptr<ExtensionSink>> notify;
     {
       std::lock_guard guard(mutex);
       extension_owners[owner.view] = owner;
+      interactions.BeginView(owner.view);
       for (const auto& [key, sink] : sinks)
         if (key.first == owner.view) notify.push_back(sink);
     }
@@ -257,6 +326,7 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     {
       std::lock_guard guard(mutex);
       extension_owners.erase(view);
+      interactions.RetireView(view);
       for (auto it = sinks.begin(); it != sinks.end();) {
         if (it->first.first == view) {
           retire.push_back(it->second);
@@ -282,6 +352,7 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
   std::map<uint64_t, Owner> extension_owners;
   std::map<std::pair<uint64_t, Feature>, std::shared_ptr<ExtensionSink>> sinks;
   std::vector<std::shared_ptr<ExtensionSink>> retired_sinks;
+  Interactions interactions;
 };
 
 class ViewImpl final : public AlloyGuestView {
@@ -294,7 +365,15 @@ class ViewImpl final : public AlloyGuestView {
     if (!stream_) {
       auto client = client_.lock();
       if (!client || closed_) return nullptr;
-      stream_ = stream::MakeClient(client->Endpoint(id_));
+      std::weak_ptr<ClientCore> weak = client;
+      stream_ = stream::MakeClient(client->Endpoint(id_),
+          [weak](uint64_t child, CefRefPtr<AlloyGuestViewHandler> handler) {
+        auto core = weak.lock();
+        if (!core || !handler) return false;
+        Command command; command.kind = Message::kExtensionViewOffer;
+        command.view = child; command.handler = std::move(handler);
+        return core->Enqueue(std::move(command), "ACTIVE");
+      });
     }
     return stream_;
   }
@@ -339,6 +418,7 @@ struct ViewEntry {
   CefRefPtr<ViewImpl> view;
   CefRefPtr<AlloyGuestViewHandler> handler;
   bool ready = false;
+  std::optional<std::pair<uint64_t, Feature>> offer_parent;
 };
 
 class SessionImpl final : public AlloyGuestSession {
@@ -394,9 +474,35 @@ class SessionImpl final : public AlloyGuestSession {
     entry.view->Retire();
     core_->RetireExtensions(id);
     views_.erase(found);
-    entry.handler->OnClosed(entry.view, reason);
+    if (entry.offer_parent)
+      if (auto sink = core_->Sink(entry.offer_parent->first, entry.offer_parent->second)) sink->ViewRetired(id);
+    if (entry.handler) entry.handler->OnClosed(entry.view, reason);
   }
   bool Dispatch(Envelope envelope, Session* session, std::string* reason) {
+    if (envelope.message == Message::kExtensionViewOffer) {
+      ExtensionRequest offer;
+      std::vector<std::string> fields;
+      uint64_t values[4] = {};
+      if (!UnpackExtension(envelope.payload, &offer) || offer.id ||
+          !UnpackFields(offer.payload, 5, &fields)) return false;
+      for (size_t i = 0; i < 4; ++i) if (!ParseUnsigned(fields[i], &values[i])) return false;
+      Owner opener{values[0], values[1], values[2], values[3]};
+      if (!session->ObserveNativeView(envelope.owner)) return false;
+      ViewEntry entry{new ViewImpl(envelope.owner.view, core_), nullptr, false,
+                       std::make_pair(opener.view, offer.feature)};
+      views_.emplace(envelope.owner.view, std::move(entry));
+      core_->ExtensionOwner(envelope.owner);
+      auto sink = session->Owns(opener) ? core_->Sink(opener.view, offer.feature) : nullptr;
+      if (sink) {
+        std::string payload;
+        PackFields({std::to_string(envelope.owner.view), std::move(fields[4])}, &payload);
+        sink->Event(opener, std::move(offer.operation), std::move(payload));
+      } else {
+        Command close; close.kind = Message::kCloseView; close.view = envelope.owner.view;
+        core_->Enqueue(std::move(close), "ACTIVE");
+      }
+      return true;
+    }
     if (envelope.message == Message::kExtensionReply) {
       ExtensionResponse reply;
       if (!UnpackExtensionReply(envelope.payload, &reply)) return false;
@@ -466,7 +572,7 @@ class SessionImpl final : public AlloyGuestSession {
       return observed;
     }
     if (envelope.message == Message::kCancel) {
-      handler->OnNavigationComplete(view, envelope.owner.document, -3);
+      if (handler) handler->OnNavigationComplete(view, envelope.owner.document, -3);
       return true;
     }
     if (!session->Owns(envelope.owner))
@@ -474,19 +580,21 @@ class SessionImpl final : public AlloyGuestSession {
     if (envelope.message == Message::kExtensionEvent) {
       ExtensionRequest event;
       if (!UnpackExtension(envelope.payload, &event) || event.id) return false;
+      if (event.operation == "@interaction")
+        return core_->ReceiveInteraction(event.feature, envelope.owner, event.payload);
       if (auto sink = core_->Sink(envelope.owner.view, event.feature))
         sink->Event(envelope.owner, std::move(event.operation), std::move(event.payload));
       return true;
     }
     if (envelope.message == Message::kViewCreated) {
-      if (found->second.ready)
+      if (found->second.ready || !handler)
         return false;
       found->second.ready = true;
       handler->OnReady(view);
       return true;
     }
     if (envelope.message == Message::kTitle) {
-      handler->OnTitleChanged(view, envelope.owner.document, envelope.payload);
+      if (handler) handler->OnTitleChanged(view, envelope.owner.document, envelope.payload);
       return true;
     }
     if (envelope.message == Message::kNavigationComplete) {
@@ -497,8 +605,8 @@ class SessionImpl final : public AlloyGuestSession {
           status < std::numeric_limits<int>::min() ||
           status > std::numeric_limits<int>::max())
         return false;
-      handler->OnNavigationComplete(view, envelope.owner.document,
-                                    static_cast<int>(status));
+      if (handler) handler->OnNavigationComplete(view, envelope.owner.document,
+                                                 static_cast<int>(status));
       return true;
     }
     return envelope.message == Message::kUnavailable || envelope.message == Message::kCancel;
@@ -535,7 +643,7 @@ class SessionImpl final : public AlloyGuestSession {
     auto cancel_command = [this](Command& command) {
       if (command.completion) command.completion(ProviderResult::kCancelled, 0, {});
       if (command.handler) {
-        CefRefPtr<ViewImpl> view = new ViewImpl(0, core_);
+        CefRefPtr<ViewImpl> view = new ViewImpl(command.kind == Message::kExtensionViewOffer ? command.view : 0, core_);
         view->Retire();
         command.handler->OnClosed(view, "cancelled");
       }
@@ -570,6 +678,16 @@ class SessionImpl final : public AlloyGuestSession {
         commands.pop_front();
         if (core_->IsClosing()) {
           cancel_command(command);
+          continue;
+        }
+        if (command.kind == Message::kExtensionViewOffer) {
+          auto found = views_.find(command.view);
+          if (found == views_.end() || !found->second.offer_parent ||
+              found->second.handler || found->second.ready || found->second.view->closed()) {
+            cancel_command(command);
+          } else {
+            found->second.handler = std::move(command.handler);
+          }
           continue;
         }
         Envelope envelope;
@@ -608,7 +726,7 @@ class SessionImpl final : public AlloyGuestSession {
           } else if (command.kind == Message::kCloseView) {
             session.RetireView(command.view);
           } else if (command.kind == Message::kExtensionCall) {
-            if (command.resource_owner) envelope.owner = *command.resource_owner;
+            if (command.original_owner) envelope.owner = *command.original_owner;
             if (next_extension == std::numeric_limits<uint64_t>::max() ||
                 !PackExtension({command.feature, next_extension, command.operation,
                                 std::move(command.payload)}, &envelope.payload)) {
@@ -686,12 +804,7 @@ class SessionImpl final : public AlloyGuestSession {
     if (!closing_started)
       StateChanged(reason == "closed" || reason == "refused" ? "CLOSING" : "FAILED");
     for (auto& command : core_->TakeCommands()) {
-      if (command.completion) command.completion(ProviderResult::kCancelled, 0, {});
-      if (command.handler) {
-        CefRefPtr<ViewImpl> view = new ViewImpl(0, core_);
-        view->Retire();
-        command.handler->OnClosed(view, "cancelled");
-      }
+      cancel_command(command);
     }
     while (!views_.empty())
       CancelView(views_.begin()->first, reason == "failed" ? "failed" : "cancelled");

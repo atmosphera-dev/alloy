@@ -6,6 +6,7 @@
 #include "brave/alloy/guest/session/control_queue.h"
 #include "brave/alloy/guest/session/extensions.h"
 #include "brave/alloy/guest/stream/view.h"
+#include "brave/alloy/guest/stream/popup.h"
 
 #include <cerrno>
 #include <deque>
@@ -50,6 +51,10 @@ namespace {
 using Emit = std::function<void(Envelope)>;
 using BeginDocument = std::function<std::optional<Owner>(uint64_t)>;
 using Restart = std::function<std::optional<Owner>()>;
+struct PopupClient { uint64_t view; CefRefPtr<CefClient> client; };
+using CreatePopup = std::function<std::optional<PopupClient>(Owner, std::string, std::string,
+                                                            int, bool, CefRect)>;
+using Created = std::function<void(Owner)>;
 
 class GpuEpoch final : public content::GpuDataManagerObserver {
  public:
@@ -66,25 +71,32 @@ class GpuEpoch final : public content::GpuDataManagerObserver {
 // consumer. Native navigation/document owners, not URL matching or CEF title
 // arrival, bind each callback to the original document.
 class NativeView final : public CefClient,
-                         public CefRenderHandler,
+                          public CefRenderHandler,
+                          public CefDisplayHandler,
                          public CefLifeSpanHandler,
                          public content::WebContentsObserver {
  public:
   NativeView(Owner owner, int width, int height, Emit emit,
               BeginDocument begin_document, Restart restart,
               stream::StreamEvent stream_event, stream::SendResource resource,
-              std::function<uint64_t()> clock)
+              std::function<uint64_t()> clock, CreatePopup create_popup,
+              Created created, std::function<void(uint64_t)> abort_popup,
+              bool pending_popup)
       : owner_(owner), emit_(std::move(emit)),
          begin_document_(std::move(begin_document)), restart_(std::move(restart)),
          stream_(owner, width, height, std::move(stream_event),
-                 std::move(resource), std::move(clock)) {}
+                 std::move(resource), std::move(clock)),
+         create_popup_(std::move(create_popup)), created_(std::move(created)),
+         abort_popup_(std::move(abort_popup)), pending_popup_(pending_popup) {}
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
     rect = stream_.rect();
   }
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type,
                 const RectList&, const void* pixels, int width, int height) override {
+    if (!DocumentReady()) return;
     stream_.Paint(type == PET_POPUP ? 1 : 0, pixels, width, height);
   }
   bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
@@ -95,16 +107,36 @@ class NativeView final : public CefClient,
   }
   void StreamCall(const Owner& owner, const std::string& operation,
                   const std::string& payload, ProviderReply reply) {
-    stream_.Call(owner, operation, payload, std::move(reply));
+    stream_.Call(owner, operation, payload, DocumentReady(), std::move(reply));
   }
   void StreamRelease(const Owner& owner, const std::string& payload, ProviderReply reply) {
     stream_.Release(owner, payload, std::move(reply));
   }
+  void OnPopupShow(CefRefPtr<CefBrowser>, bool visible) override { stream_.PopupShow(visible); }
+  void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rectangle) override { stream_.PopupSize(rectangle); }
+  bool OnCursorChange(CefRefPtr<CefBrowser>, CefCursorHandle, cef_cursor_type_t type,
+                       const CefCursorInfo& info) override { stream_.Cursor(type, info); return true; }
+  void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>, const CefRange& range,
+                                     const RectList& bounds) override { stream_.Ime(range, bounds); }
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     browser_ = browser;
     stream_.Bind(browser);
     Observe(CefBrowserHostBase::FromBrowser(browser)->GetWebContents());
-    emit_({Message::kViewCreated, {}, 0, owner_, {}});
+    if (pending_popup_) browser_->GetHost()->WasHidden(true);
+    if (closing_) { browser_->GetHost()->CloseBrowser(true); return; }
+    created_(owner_);
+    // Unlike a newly requested blank view, window.open's initial about:blank
+    // is already a scriptable original document (including document.write).
+    // Offer its view first, then admit that actual native document through the
+    // existing session owner, before a requested popup URL can replace it.
+    if (pending_popup_ && !owner_.document) {
+      auto owner = begin_document_(0);
+      if (!owner) { Close(true); return; }
+      owner_ = *owner;
+      current_token_ = content::AlloyDocumentNoiseIdentity(web_contents()->GetPrimaryMainFrame());
+      emit_({Message::kDocumentStarted, {}, 0, owner_, {}});
+      stream_.SetOwner(owner_);
+    }
   }
   void OnBeforeClose(CefRefPtr<CefBrowser>) override {
     Observe(nullptr);
@@ -113,12 +145,43 @@ class NativeView final : public CefClient,
     closed_ = true;
     emit_({Message::kViewClosed, {}, 0, owner_, {}});
   }
-  bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
-                      const CefString&, const CefString&, WindowOpenDisposition,
-                      bool, const CefPopupFeatures&, CefWindowInfo&,
-                      CefRefPtr<CefClient>&, CefBrowserSettings&,
+  bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int popup_id,
+                      const CefString& url, const CefString& name, WindowOpenDisposition disposition,
+                      bool gesture, const CefPopupFeatures& features, CefWindowInfo& window,
+                      CefRefPtr<CefClient>& client, CefBrowserSettings&,
                       CefRefPtr<CefDictionaryValue>&, bool*) override {
-    // Popups are an unavailable extension until M3 can preserve and attach them.
+    if (closing_ || !stream_.started() || !DocumentReady()) return true;
+    const auto rectangle = stream_.rect();
+    CefRect bounds(features.xSet ? features.x : 0, features.ySet ? features.y : 0,
+                   features.widthSet && features.width > 0 ? features.width : rectangle.width,
+                   features.heightSet && features.height > 0 ? features.height : rectangle.height);
+    auto child = create_popup_(owner_, url.ToString(), name.ToString(), disposition, gesture, bounds);
+    if (!child) return true;
+    popup_requests_[popup_id] = child->view;
+    window.SetAsWindowless(kNullWindowHandle);
+    client = child->client;
+    return false;
+  }
+  void OnBeforePopupAborted(CefRefPtr<CefBrowser>, int popup_id) override {
+    auto found = popup_requests_.find(popup_id);
+    if (found == popup_requests_.end()) return;
+    uint64_t id = found->second; popup_requests_.erase(found); abort_popup_(id);
+  }
+  void ForgetPopup(uint64_t child) {
+    std::erase_if(popup_requests_, [child](const auto& value) { return value.second == child; });
+  }
+  bool AttachWindow(int width, int height, double scale) {
+    if (!pending_popup_ || attached_ || closing_ || !browser_ ||
+        !stream_.InitialGeometry(width, height, scale)) return false;
+    attached_ = true;
+    browser_->GetHost()->NotifyScreenInfoChanged(); browser_->GetHost()->WasResized();
+    browser_->GetHost()->WasHidden(false);
+    emit_({Message::kViewCreated, {}, 0, owner_, {}});
+    if (DocumentReady() && owner_.document && web_contents()) {
+      emit_({Message::kTitle, {}, 0, owner_, CefString(web_contents()->GetTitle()).ToString()});
+      if (!web_contents()->IsLoading())
+        emit_({Message::kNavigationComplete, {}, 0, owner_, std::to_string(status_)});
+    }
     return true;
   }
   void Navigate(uint64_t request, const std::string& url) {
@@ -127,7 +190,7 @@ class NativeView final : public CefClient,
     pending_request_ = request;
     browser_->GetMainFrame()->LoadURL(url);
   }
-  void Close() {
+  void Close(bool force = false) {
     if (closing_)
       return;
     closing_ = true;
@@ -135,7 +198,7 @@ class NativeView final : public CefClient,
     pending_.clear();
     current_token_ = {};
     if (browser_)
-      browser_->GetHost()->CloseBrowser(false);
+      browser_->GetHost()->CloseBrowser(force);
     else
       closed_ = true;
   }
@@ -173,6 +236,7 @@ class NativeView final : public CefClient,
     }
     owner_ = *owner;
     current_token_ = {};
+    completed_navigation_ = false;
     // Explicitly cancel each original pending navigation before admitting the
     // replacement's document event. Do not silently drop old callback owners.
     for (const auto& [id, original] : pending_)
@@ -191,12 +255,15 @@ class NativeView final : public CefClient,
     if (!SameNavigation(original, owner_))
       return;
     original.generation = owner_.generation;
+    if (navigation->HasCommitted())
+      current_token_ = content::AlloyDocumentNoiseIdentity(navigation->GetRenderFrameHost());
     if (!navigation->HasCommitted() || navigation->GetNetErrorCode() != net::OK) {
+      status_ = static_cast<int>(navigation->GetNetErrorCode());
+      completed_navigation_ = true;
       emit_({Message::kNavigationComplete, {}, 0, original,
               std::to_string(static_cast<int>(navigation->GetNetErrorCode()))});
       return;
     }
-    current_token_ = content::AlloyDocumentNoiseIdentity(navigation->GetRenderFrameHost());
     status_ = navigation->GetResponseHeaders()
                   ? navigation->GetResponseHeaders()->response_code() : 0;
   }
@@ -210,10 +277,18 @@ class NativeView final : public CefClient,
       // Read the native page title at completed load as well. A title mutation
       // before DidFinishNavigation must not be lost or attributed to blank.
       emit_({Message::kTitle, {}, 0, owner_, CefString(web_contents()->GetTitle()).ToString()});
-      emit_({Message::kNavigationComplete, {}, 0, owner_, std::to_string(status_)});
+      if (!completed_navigation_) {
+        completed_navigation_ = true;
+        emit_({Message::kNavigationComplete, {}, 0, owner_, std::to_string(status_)});
+      }
     }
   }
  private:
+  bool DocumentReady() const {
+    auto* frame = web_contents() ? web_contents()->GetPrimaryMainFrame() : nullptr;
+    return !owner_.document || (frame && !current_token_.is_zero() &&
+        content::AlloyDocumentNoiseIdentity(frame) == current_token_);
+  }
   bool Current(content::RenderFrameHost* frame) const {
     return !closing_ && web_contents() && frame && frame->IsInPrimaryMainFrame() &&
            owner_.document && !current_token_.is_zero() &&
@@ -230,7 +305,14 @@ class NativeView final : public CefClient,
   int status_ = 0;
   bool closing_ = false;
   bool closed_ = false;
+  bool completed_navigation_ = false;
   stream::View stream_;
+  const CreatePopup create_popup_;
+  const Created created_;
+  const std::function<void(uint64_t)> abort_popup_;
+  const bool pending_popup_;
+  bool attached_ = false;
+  std::map<int, uint64_t> popup_requests_;
   IMPLEMENT_REFCOUNTING(NativeView);
 };
 
@@ -324,6 +406,7 @@ int RunBrowser(const CefMainArgs& args) {
   };
   stream::ResourceLane resources(ALLOY_GUEST_RESOURCE_FD, hello.session);
   std::map<uint64_t, CefRefPtr<NativeView>> views;
+  std::unique_ptr<stream::Popups> popups;
   auto runner = base::SingleThreadTaskRunner::GetCurrentDefault();
   Providers providers([&session](const Owner& owner) { return session.Owns(owner); },
       [runner](std::function<void()> task) {
@@ -331,8 +414,9 @@ int RunBrowser(const CefMainArgs& args) {
         [](std::function<void()> callback) { callback(); }, std::move(task)));
   });
   auto stream_provider = StreamProvider(
-      [&views](const Owner& owner, const std::string& operation,
-               const std::string& payload, ProviderReply reply) {
+      [&views, &popups](const Owner& owner, const std::string& operation,
+                const std::string& payload, ProviderReply reply) {
+    if (popups && popups->Call(owner, operation, payload, reply)) return;
     auto found = views.find(owner.view);
     if (found == views.end()) { reply(ProviderResult::kCancelled, {}); return; }
     found->second->StreamCall(owner, operation, payload, std::move(reply));
@@ -374,11 +458,69 @@ int RunBrowser(const CefMainArgs& args) {
   auto emit = [&outgoing, &peer](Envelope envelope) {
     outgoing.Push(std::move(envelope), peer.HasPendingSend());
   };
+  popups = std::make_unique<stream::Popups>([emit](Owner opener, Owner child, std::string metadata) {
+    std::string body, packed;
+    PackFields({std::to_string(opener.view), std::to_string(opener.document),
+                 std::to_string(opener.request), std::to_string(opener.generation), std::move(metadata)}, &body);
+    if (PackExtension({Feature::kStream, 0, "window-open", std::move(body)}, &packed))
+      emit({Message::kExtensionViewOffer, {}, 0, child, std::move(packed)});
+  });
+  CreatePopup create_popup;
+  auto make_view = [&](Owner owner, int width, int height, bool pending, Created created) {
+    auto begin = [&session, &providers, &popups, id = owner.view](uint64_t original_request) {
+      if (auto original = session.Find(id)) { providers.Cancel(*original); popups->Cancel(*original); }
+      return session.Navigate(id, original_request);
+    };
+    auto restart = [&session, &providers, &popups, id = owner.view] {
+      if (auto original = session.Find(id)) { providers.Cancel(*original); popups->Cancel(*original); }
+      return session.RestartStream(id);
+    };
+    auto event = [emit](Owner original, std::string operation, std::string payload) {
+      std::string packed;
+      if (PackExtension({Feature::kStream, 0, std::move(operation), std::move(payload)}, &packed))
+        emit({Message::kExtensionEvent, {}, 0, original, std::move(packed)});
+    };
+    return CefRefPtr<NativeView>(new NativeView(owner, width, height, emit, begin, restart,
+        std::move(event), [&resources](Envelope envelope, const std::vector<int>& handles) {
+          return resources.Send(std::move(envelope), handles);
+        }, clock, create_popup, std::move(created), [&popups](uint64_t id) { popups->Abort(id); }, pending));
+  };
+  create_popup = [&](Owner opener, std::string url, std::string name, int disposition,
+                      bool gesture, CefRect bounds) -> std::optional<PopupClient> {
+    std::string metadata, body, packed;
+    if (!PackFields({std::move(url), std::move(name), std::to_string(disposition), gesture ? "1" : "0",
+                      std::to_string(bounds.x), std::to_string(bounds.y), std::to_string(bounds.width),
+                      std::to_string(bounds.height)}, &metadata) ||
+        !PackFields({std::to_string(opener.view), std::to_string(opener.document),
+                     std::to_string(opener.request), std::to_string(opener.generation), metadata}, &body) ||
+        !PackExtension({Feature::kStream, 0, "window-open", body}, &packed)) {
+      std::string failure;
+      PackExtension({Feature::kStream, 0, "unavailable", {}}, &failure);
+      emit({Message::kExtensionEvent, {}, 0, opener, std::move(failure)});
+      return std::nullopt;
+    }
+    auto owner = session.CreateNativeView();
+    if (!owner) return std::nullopt;
+    auto child = make_view(*owner, bounds.width, bounds.height, true,
+        [&popups, &views, parent = opener.view](Owner value) {
+      if (auto found = views.find(parent); found != views.end()) found->second->ForgetPopup(value.view);
+      popups->Ready(value.view);
+    });
+    views.emplace(owner->view, child);
+    popups->Add(opener, *owner, std::move(metadata),
+        [child](int width, int height, double scale) { return child->AttachWindow(width, height, scale); },
+        [&session, &providers, child, id = owner->view] {
+          if (auto original = session.Find(id)) providers.Cancel(*original);
+          session.RetireView(id); child->Close(true);
+        });
+    return PopupClient{owner->view, child};
+  };
   auto close = [&] {
     if (closing)
       return;
     closing = true;
     providers.Close();
+    popups->Close();
     session.BeginClose();
     for (auto& [id, view] : views)
       view->Close();
@@ -408,9 +550,13 @@ int RunBrowser(const CefMainArgs& args) {
       }
     }
     for (auto found = views.begin(); found != views.end();) {
-      if (found->second->closed())
+      if (found->second->closed()) {
+        if (auto original = session.Find(found->first)) {
+          providers.Cancel(*original); popups->Cancel(*original); session.RetireView(found->first);
+        }
+        popups->Abort(found->first);
         found = views.erase(found);
-      else
+      } else
         ++found;
     }
     if (closing && views.empty() && outgoing.empty())
@@ -471,23 +617,8 @@ int RunBrowser(const CefMainArgs& args) {
         close();
         continue;
       }
-      auto begin = [&session, &providers, id = owner->view](uint64_t original_request) {
-        if (auto original = session.Find(id)) providers.Cancel(*original);
-        return session.Navigate(id, original_request);
-      };
-      auto restart = [&session, &providers, id = owner->view] {
-        if (auto original = session.Find(id)) providers.Cancel(*original);
-        return session.RestartStream(id);
-      };
-      auto stream_event = [emit](Owner original, std::string operation, std::string payload) {
-        std::string packed;
-        if (PackExtension({Feature::kStream, 0, std::move(operation), std::move(payload)}, &packed))
-          emit({Message::kExtensionEvent, {}, 0, original, std::move(packed)});
-      };
-      CefRefPtr<NativeView> view = new NativeView(*owner, width, height, emit, begin, restart,
-          std::move(stream_event), [&resources](Envelope envelope, const std::vector<int>& handles) {
-            return resources.Send(std::move(envelope), handles);
-          }, clock);
+      CefRefPtr<NativeView> view = make_view(*owner, width, height, false,
+          [emit](Owner value) { emit({Message::kViewCreated, {}, 0, value, {}}); });
       views.emplace(owner->view, view);
       CefWindowInfo window;
       window.SetAsWindowless(kNullWindowHandle);
@@ -546,6 +677,7 @@ int RunBrowser(const CefMainArgs& args) {
     } else if (request.message == Message::kCloseView) {
       auto found = views.find(request.owner.view);
       if (found != views.end()) {
+        if (auto original = session.Find(request.owner.view)) popups->Cancel(*original);
         session.RetireView(request.owner.view);
         found->second->Close();
       }

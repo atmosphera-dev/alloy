@@ -8,10 +8,13 @@ _implementation = [
   "session/supervisor.cc", "session/supervisor.h", "session/host.cc",
   "session/control_queue.h",
   "session/extensions.h", "session/extensions.cc",
+  "session/interactions.h", "session/interactions.cc",
   "stream/resource_lane.h", "stream/resource_lane.cc",
   "stream/frame_pool.h", "stream/frame_pool.cc",
   "stream/lease.h", "stream/lease.cc", "stream/stream_client.h", "stream/stream_client.cc",
   "stream/view.h", "stream/view.cc",
+  "session/view_adoption.h", "stream/input.h", "stream/input.cc",
+  "stream/interaction.h", "stream/interaction.cc", "stream/popup.h", "stream/popup.cc",
   "protocol/session.cc", "protocol/session.h", "protocol/wire.h",
   "providers.cc", "providers.h", "linux_lock/provider.cc", "stream/provider.cc",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
@@ -36,7 +39,8 @@ source_set("provider_api") {
 }
 
 source_set("foundation") {
-  sources = [ "session/session.cc", "session/session.h", "session/control_queue.h", "providers.cc" ]
+  sources = [ "session/session.cc", "session/session.h", "session/control_queue.h", "providers.cc",
+              "session/interactions.h", "session/interactions.cc" ]
   public_deps = [ "protocol", ":provider_api", "//base" ]
   deps = [ "linux_lock", "stream", "media", "integration", "accessibility",
            "namespace_lock", "capture" ]
@@ -45,7 +49,7 @@ source_set("foundation") {
 group("session") {
   # Library-side sources compile in libcef_static, like CEF's native adapters.
   # Their private native-header ownership does not create a circular GN edge.
-  public_deps = [ ":foundation", ":build_identity" ]
+  public_deps = [ ":foundation", ":build_identity", "stream" ]
 }
 
 action("alloy_guest_host") {

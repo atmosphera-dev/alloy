@@ -47,6 +47,10 @@ class Session {
   void Closed();
   void Fail();
   std::optional<Owner> CreateView(uint64_t request = 0);
+  // Host-originated views have their own ID namespace; ordinary app creates
+  // cannot race or reuse an offered popup's session identity.
+  std::optional<Owner> CreateNativeView();
+  bool ObserveNativeView(const Owner& owner);
   // Only the browser/native navigation owner issues document identities. The
   // client observes those identities; enqueueing a URL is not a document commit.
   std::optional<Owner> Navigate(uint64_t view, uint64_t request = 0);
@@ -63,6 +67,7 @@ class Session {
   ProtectionReport report_;
   bool accepted_ = false;
   uint64_t next_view_ = 1;
+  uint64_t next_native_view_ = uint64_t{1} << 63;
   uint64_t next_document_ = 1;
   uint64_t next_request_ = uint64_t{1} << 63;
   std::map<uint64_t, Owner> owners_;

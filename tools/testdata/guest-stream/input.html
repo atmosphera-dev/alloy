@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>INPUT_STARTING</title>
+<style>
+body { margin:0; padding:12px; display:grid; grid-template-columns:2fr 1fr; gap:12px; font:16px sans-serif; }
+button,select,#edit,#cursor,#touch { box-sizing:border-box; min-height:36px; border:1px solid #888; padding:6px; }
+#click { background:rgb(200,40,40); border:0; }
+#edit { background:white; white-space:pre-wrap; }
+#touch { touch-action:none; background:#ccc; }
+#cursor { cursor:url(cursor.png) 3 5, crosshair; }
+#scroll { grid-column:1 / -1; height:1200px; background:linear-gradient(#eee,#bbb); }
+</style>
+<button id="click">Click</button><div id="cursor">Cursor</div>
+<div id="edit" contenteditable="true" tabindex="0"></div><div id="touch">Touch</div>
+<select id="select"><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select>
+<button id="window">Open child</button>
+<button id="deny">Open to deny</button><button id="capture">Capture</button>
+<button id="blank">Write blank child</button><div></div>
+<div id="scroll"></div>
+<script>
+const edit = document.getElementById('edit'), click = document.getElementById('click');
+const touch = document.getElementById('touch'), capture = document.getElementById('capture');
+const select = document.getElementById('select'), deny = document.getElementById('deny');
+const state = { clicks:0, touches:0, captureGot:0, captureLost:0, composed:[], windows:0, originalProxy:false, openerToken:false, blankOpener:false, childClosed:false };
+window.__alloyToken = 'original-opener-token';
+let child = null;
+function report() {
+  const rectangles = {};
+  for (const id of ['click','cursor','edit','touch','select','window','deny','capture','blank']) {
+    const r = document.getElementById(id).getBoundingClientRect();
+    rectangles[id] = { x:r.x, y:r.y, width:r.width, height:r.height };
+  }
+  const value = {...state, text:edit.textContent, selection:window.getSelection()?.toString(),
+                 selected:select.value, scrollY, focused:document.hasFocus(), dpr:devicePixelRatio,
+                 childClosed:!!child && child.closed, rectangles};
+  const title = 'INPUT:' + JSON.stringify(value);
+  if (document.title !== title) document.title = title;
+}
+click.addEventListener('click', () => {
+  state.clicks++;
+  click.style.background = state.clicks % 2 ? 'rgb(32,180,96)' : 'rgb(96,64,192)';
+  click.textContent = 'Click ' + state.clicks;
+  fetch('clicked').catch(() => {});
+  report();
+});
+touch.addEventListener('pointerup', event => { if (event.pointerType === 'touch') { state.touches++; report(); } });
+capture.addEventListener('pointerdown', event => { capture.setPointerCapture(event.pointerId); report(); });
+capture.addEventListener('gotpointercapture', () => { state.captureGot++; report(); });
+capture.addEventListener('lostpointercapture', () => { state.captureLost++; report(); });
+for (const name of ['compositionstart','compositionupdate','compositionend'])
+  edit.addEventListener(name, event => { state.composed.push([name,event.data]); requestAnimationFrame(report); });
+edit.addEventListener('input', report); select.addEventListener('change', report);
+function openChild() { child = window.open('child.html', 'alloy-child-' + state.windows, 'width=240,height=160'); state.windows++; report(); }
+document.getElementById('window').addEventListener('click', openChild);
+deny.addEventListener('click', openChild);
+document.getElementById('blank').addEventListener('click', () => {
+  child = window.open('', 'alloy-blank-' + state.windows, 'width=160,height=100');
+  state.windows++;
+  if (child) {
+    child.document.write('<!doctype html><title>BLANK_WRITTEN</title><body style="margin:0;background:rgb(120,40,200)">Preserved written document</body>');
+    child.document.close();
+    state.blankOpener = child.opener === window;
+  }
+  report();
+});
+addEventListener('message', event => {
+  if (event.origin === location.origin && event.data?.kind === 'alloy-child') {
+    state.originalProxy = event.source === child;
+    state.openerToken = event.data.token === window.__alloyToken;
+    report();
+  }
+});
+addEventListener('scroll', report); addEventListener('resize', report);
+addEventListener('focus', report); addEventListener('blur', report);
+setInterval(report, 100); report();
+</script>

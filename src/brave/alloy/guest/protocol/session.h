@@ -46,6 +46,7 @@ enum class Message : uint16_t {
   kExtensionReply,
   kExtensionEvent,
   kExtensionResource,
+  kExtensionViewOffer,
 };
 static_assert(static_cast<int>(Message::kClose) == ALLOY_GUEST_CLOSE_MESSAGE);
 static_assert(static_cast<int>(Message::kClosed) == ALLOY_GUEST_CLOSED_MESSAGE);

@@ -8,6 +8,7 @@
 #include <string>
 #include "brave/alloy/guest/providers.h"
 #include "brave/alloy/guest/stream/resource_lane.h"
+#include "brave/alloy/guest/stream/interaction.h"
 
 namespace alloy::guest {
 // One internal route for all extension owners. Public typed adapters receive
@@ -24,6 +25,7 @@ class ExtensionSink {
   virtual void Event(Owner owner, std::string operation, std::string payload) = 0;
   virtual void Resource(stream::Resource resource) = 0;
   virtual void OwnerChanged(Owner owner) = 0;
+  virtual void ViewRetired(uint64_t view) = 0;
   virtual void Retire() = 0;
   virtual void Wait() = 0;
 };
@@ -31,6 +33,11 @@ struct ExtensionEndpoint {
   ExtensionCall call;
   std::function<bool(Feature, std::shared_ptr<ExtensionSink>)> attach;
   std::function<bool(Feature, Owner, std::string)> release;
+  std::function<bool(Feature, Owner, std::string, std::string,
+                     ExtensionCompletion)> owned_call;
+  // One per-view allocator/tracker for all action producers, not one private
+  // counter/feed per stream, menu or AX adapter. Uses the same ordered call lane.
+  std::function<uint64_t(Feature, Owner, std::string, stream::InteractionData)> interact;
 };
 
 struct ExtensionRequest {

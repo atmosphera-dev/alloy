@@ -4,6 +4,9 @@
 #include "brave/alloy/guest/stream/resource_lane.h"
 #include "brave/alloy/guest/session/extensions.h"
 #include "brave/alloy/guest/session/session.h"
+#include "brave/alloy/guest/stream/interaction.h"
+#include "brave/alloy/guest/stream/popup.h"
+#include "brave/alloy/guest/session/interactions.h"
 
 #include <array>
 #include <cerrno>
@@ -241,6 +244,114 @@ TEST(GuestExtensions, ResourceReleaseOutlivesDocumentButCannotDispatchContent) {
     EXPECT_EQ(ProviderResult::kCancelled, result);
   });
   EXPECT_EQ(1, releases);
+}
+TEST(GuestInteractions, ExactTimesSourcesAndOriginalTargetsRoundtrip) {
+  InteractionData input{123, 456, 789, 1, 987654321, 123456, "agent", "pointer", "accepted", "{\"x\":12}"};
+  std::string payload;
+  ASSERT_TRUE(FitsInteraction(input));
+  ASSERT_TRUE(PackInteraction(input, &payload));
+  InteractionData result;
+  ASSERT_TRUE(UnpackInteraction(payload, &result));
+  EXPECT_EQ(input.id, result.id); EXPECT_EQ(input.document, result.document);
+  EXPECT_EQ(input.generation, result.generation); EXPECT_EQ(input.surface, result.surface);
+  EXPECT_EQ(input.capture_us, result.capture_us); EXPECT_EQ(input.dispatch_us, result.dispatch_us);
+  EXPECT_EQ(input.details, result.details); EXPECT_EQ(input.source, result.source);
+  input.generation = 0; ASSERT_TRUE(PackInteraction(input, &payload));
+  EXPECT_FALSE(UnpackInteraction(payload, &result));
+}
+TEST(GuestInteractions, ReceiptSpaceIsReservedBeforeDispatchAdmission) {
+  InteractionData input{1, 2, 3, 0, 4, 0, "app", "ime-set", {}, std::string(kMaxControlPayload, 'x')};
+  EXPECT_FALSE(FitsInteraction(input));
+  input.details = std::string(kMaxControlPayload - 256, 'x');
+  EXPECT_TRUE(FitsInteraction(input));
+}
+TEST(GuestInteractions, EveryFeatureSharesIdsAndOneExactlyOnceReceipt) {
+  Interactions tracker;
+  tracker.BeginView(kOwner.view);
+  for (size_t index = 0; index < kFeatureNames.size(); ++index) {
+    auto id = tracker.Next(kOwner.view); ASSERT_TRUE(id); EXPECT_EQ(index + 1, *id);
+    InteractionData input{*id, kOwner.document, 5, 0, 7, 0, "app", "fixture", {}, "{}"};
+    auto feature = static_cast<Feature>(index);
+    ASSERT_TRUE(tracker.Track(feature, kOwner, input));
+    auto wrong = input; wrong.capture_us++; wrong.outcome = "accepted";
+    EXPECT_EQ(Interactions::Receipt::kInvalid, tracker.Receive(feature, kOwner, wrong));
+    input.outcome = "accepted"; input.dispatch_us = 123;
+    EXPECT_EQ(Interactions::Receipt::kReady, tracker.Receive(feature, kOwner, input));
+    EXPECT_EQ(Interactions::Receipt::kMissing, tracker.Receive(feature, kOwner, input));
+    EXPECT_FALSE(tracker.Complete(kOwner.view, input.id));
+  }
+}
+TEST(GuestInteractions, OldOwnersAndRetiredActionsCannotStealOrReviveReceipts) {
+  Interactions tracker;
+  tracker.BeginView(kOwner.view);
+  InteractionData input{1, kOwner.document, 5, 0, 7, 0, "agent", "fixture", {}, "{}"};
+  ASSERT_TRUE(tracker.Track(Feature::kStream, kOwner, input));
+  auto receipt = input; receipt.outcome = "accepted";
+  auto wrong = kOwner; wrong.generation++;
+  EXPECT_EQ(Interactions::Receipt::kInvalid, tracker.Receive(Feature::kStream, wrong, receipt));
+  auto completed = tracker.Complete(kOwner.view, 1); ASSERT_TRUE(completed);
+  EXPECT_EQ(input.source, completed->input.source);
+  EXPECT_EQ(Interactions::Receipt::kMissing, tracker.Receive(Feature::kStream, kOwner, receipt));
+  input.id = 2; ASSERT_TRUE(tracker.Track(Feature::kAccessibility, kOwner, input));
+  tracker.RetireView(kOwner.view);
+  EXPECT_FALSE(tracker.Next(kOwner.view));
+  EXPECT_FALSE(tracker.Complete(kOwner.view, 2));
+  EXPECT_FALSE(tracker.Track(Feature::kStream, kOwner, input));
+}
+TEST(GuestWindows, NativeAndAppViewNamespacesCannotRace) {
+  Session host, client;
+  ProtectionReport report;
+  report.bootstrap_before_engine = report.inherited_handles_closed = report.runtime_supervision = true;
+  for (auto* session : {&host, &client}) {
+    ASSERT_TRUE(session->Prepared(report)); ASSERT_TRUE(session->Accept(Protection::kUnavailable, true));
+    ASSERT_TRUE(session->Activate());
+  }
+  auto child = host.CreateNativeView(); ASSERT_TRUE(child);
+  EXPECT_GE(child->view, uint64_t{1} << 63);
+  ASSERT_TRUE(client.ObserveNativeView(*child));
+  EXPECT_FALSE(client.ObserveNativeView(*child));
+  auto host_view = host.CreateView(1), client_view = client.CreateView(1);
+  ASSERT_TRUE(host_view); ASSERT_TRUE(client_view); EXPECT_EQ(*host_view, *client_view);
+  EXPECT_EQ(1u, host_view->view);
+  auto unoffered = *host_view; EXPECT_FALSE(client.ObserveNativeView(unoffered));
+}
+TEST(GuestWindows, PendingChildIsAttachedOnceWithoutRecreation) {
+  int offered = 0, attached = 0, denied = 0;
+  Owner child{uint64_t{1} << 63, 0, uint64_t{1} << 63, 1};
+  Popups popups([&](Owner opener, Owner value, std::string metadata) {
+    EXPECT_EQ(kOwner, opener); EXPECT_EQ(child, value); EXPECT_EQ("original-window", metadata); ++offered;
+  });
+  popups.Add(kOwner, child, "original-window", [&](int width, int height, double scale) {
+    EXPECT_EQ(192, width); EXPECT_EQ(100, height); EXPECT_EQ(1.5, scale); ++attached; return true;
+  }, [&] { ++denied; });
+  popups.Ready(child.view); popups.Ready(child.view); EXPECT_EQ(1, offered);
+  std::string payload;
+  PackFields({std::to_string(child.view), "1", "192", "100", "1.5"}, &payload);
+  ASSERT_TRUE(popups.Call(kOwner, "window-decision", payload, [](ProviderResult result, std::string) {
+    EXPECT_EQ(ProviderResult::kOk, result);
+  }));
+  EXPECT_EQ(1, attached); EXPECT_EQ(0, denied);
+  popups.Call(kOwner, "window-decision", payload, [](ProviderResult result, std::string) {
+    EXPECT_EQ(ProviderResult::kCancelled, result);
+  });
+  EXPECT_EQ(1, attached);
+}
+TEST(GuestWindows, StaleOpenerCannotAttachAndCancellationIsReentrant) {
+  int attached = 0, denied = 0;
+  Owner child{uint64_t{1} << 63, 0, uint64_t{1} << 63, 1};
+  Popups popups([](Owner, Owner, std::string) {});
+  popups.Add(kOwner, child, {}, [&](int, int, double) { ++attached; return true; }, [&] {
+    ++denied; popups.Close();
+  });
+  popups.Ready(child.view);
+  auto wrong = kOwner; ++wrong.document;
+  std::string payload;
+  PackFields({std::to_string(child.view), "1", "192", "100", "1.5"}, &payload);
+  popups.Call(wrong, "window-decision", payload, [](ProviderResult result, std::string) {
+    EXPECT_EQ(ProviderResult::kCancelled, result);
+  });
+  popups.Cancel(kOwner); popups.Cancel(kOwner);
+  EXPECT_EQ(0, attached); EXPECT_EQ(1, denied);
 }
 }  // namespace
 }  // namespace alloy::guest::stream

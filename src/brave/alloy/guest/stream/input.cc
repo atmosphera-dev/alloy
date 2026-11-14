@@ -192,7 +192,7 @@ void Input::Dispatch(Owner owner, uint64_t generation, const CefRect& view,
     if (!Boolean(data, "focused", &focused)) { reject("invalid"); return; }
     dispatch = [host, focused] { host->SetFocus(focused); };
   } else if (input.kind == "capture-lost") {
-    dispatch = [host] { host->SendCaptureLostEvent(); };
+    dispatch = [this, host] { buttons_.clear(); host->SendCaptureLostEvent(); };
   } else if (input.kind == "ime-set" || input.kind == "ime-commit") {
     if (data->GetType("text") != VTYPE_STRING) { reject("invalid"); return; }
     auto text = data->GetString("text");

@@ -551,6 +551,16 @@ def edge_checks(out, evidence, base, case):
             action('pointer', 'move -20 -20 0 0 0 16')
             action('pointer', 'up -20 -20 0 0 1 0')
             state(lambda v: v['captureLost'] > 0, before)
+            before = len(client.events)
+            action('pointer', f'down {x} {y} 0 0 1 16')
+            action('pointer', f'move {x + 1} {y} 0 0 0 16')
+            state(lambda v: v['captureGot'] > 1, before)
+            action('capture-lost')
+            action('pointer', 'move -20 -20 0 0 0 16', outcomes=('rejected:coordinates',))
+            # Retiring the connector allowance does not promise DOM capture
+            # release from CEF's legacy notification. Normal up still does that.
+            action('pointer', f'up {x} {y} 0 0 1 0')
+            state(lambda v: v['captureLost'] > 1, before)
         elif case == 'non-committing-navigation':
             before = len(client.events)
             client.command('navigate ' + base + '/no-content', 'navigate-queued', lambda v: v['ok'])

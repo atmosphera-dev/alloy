@@ -126,7 +126,8 @@ retired. Captured mouse/touch continuation and termination may leave the view
 bounds, while new presses still require containment and matching owner/geometry.
 Capture-loss notification follows pinned CEF's legacy widget/plugin-capture
 semantics; it does not mean JavaScript Element.releasePointerCapture. DOM
-pointer capture still follows the native pointer-event lifecycle.
+pointer capture still follows the native pointer-event lifecycle. The connector
+retires its pressed-button containment allowance when capture loss is dispatched.
 
 Methods return an ordered view-local event ID, or zero when unqueued.
 OnInteraction reports actual native accepted/rejected dispatch, original app

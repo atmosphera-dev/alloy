@@ -25,6 +25,7 @@
 #include "brave/alloy/guest/session/extensions.h"
 #include "brave/alloy/guest/session/interactions.h"
 #include "brave/alloy/guest/stream/stream_client.h"
+#include "brave/alloy/guest/accessibility/accessibility_client.h"
 #include "cef/include/cef_api_hash.h"
 #include "cef/include/cef_version.h"
 #include "cef/libcef/common/api_version_util.h"
@@ -392,6 +393,15 @@ class ViewImpl final : public AlloyGuestView {
     command.payload = std::move(packed);
     return client->Enqueue(std::move(command), "ACTIVE");
   }
+  CefRefPtr<AlloyGuestAccessibility> GetAccessibility() override {
+    std::lock_guard guard(stream_mutex_);
+    if (!accessibility_) {
+      auto client = client_.lock();
+      if (!client || closed_) return nullptr;
+      accessibility_ = accessibility::MakeClient(client->Endpoint(id_));
+    }
+    return accessibility_;
+  }
   void Close() override {
     if (closed_.exchange(true))
       return;
@@ -411,6 +421,7 @@ class ViewImpl final : public AlloyGuestView {
   std::atomic<bool> closed_{false};
   std::mutex stream_mutex_;
   CefRefPtr<AlloyGuestStream> stream_;
+  CefRefPtr<AlloyGuestAccessibility> accessibility_;
   IMPLEMENT_REFCOUNTING(ViewImpl);
 };
 

@@ -1,0 +1,20 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -334,5 +334,7 @@
+       "//brave/alloy/guest:alloy_guest_stream_consumer",
+       "//brave/alloy/site_records/visited_links:alloy_visited_link_unittests",
++      "//brave/alloy/guest:alloy_guest_accessibility_unittests",
++      "//brave/alloy/guest:alloy_guest_accessibility_consumer",
+     ]
+   }
+ 
+@@ -1187,5 +1189,9 @@
+       "//brave/alloy/guest/stream/stream_client.h",
+       "//brave/alloy/guest/session/view_adoption.h",
++      "//brave/alloy/guest/accessibility/accessibility_client.h",
++      "//brave/alloy/guest/accessibility/accessibility_client.cc",
++      "//brave/alloy/guest/accessibility/ownership.h",
++      "//brave/alloy/guest/accessibility/ownership.cc",
+     ]
+     libs = [ "dl" ]
+   } else {

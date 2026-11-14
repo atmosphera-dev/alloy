@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>AX_READY</title>
+<style>body { margin: 0; } button { position: absolute; left: 40px; top: 80px; width: 180px; height: 40px; } iframe { position: absolute; left: 30px; top: 220px; width: 500px; height: 220px; border: 0; } .space { height: 2000px; }</style>
+<h1>Alloy native accessibility fixture</h1>
+<button id="invoke" onclick="document.title='AX_INVOKED'; this.setAttribute('aria-label','Native action completed'); fetch('/clicked')">Native Action</button>
+<label style="position:absolute;top:140px">Native text <input id="entry" aria-label="Native text" value="CJK 中文 and emoji 😀"></label>
+<iframe title="Embedded fixture" src="/frame.html"></iframe>
+<button aria-label="Retire frame" style="left:240px" onclick="document.querySelector('iframe').src='/replacement.html'">Retire frame</button>
+<button aria-label="Remove frame" style="left:240px;top:140px" onclick="document.querySelector('iframe').remove();fetch('/frame-removed')">Remove frame</button>
+<select aria-label="Native options" style="position:absolute;left:500px;top:80px"><option>Alpha</option><option>Beta</option></select>
+<input aria-label="Native range" type="range" min="0" max="10" step="1" value="3" style="position:absolute;left:500px;top:180px" oninput="fetch('/range?value='+this.value)">
+<div class="space"></div>
+<script>
+document.addEventListener('focusin', e => {
+  fetch('/focused?name=' + encodeURIComponent(e.target.getAttribute('aria-label') || e.target.textContent));
+});
+document.addEventListener('input', e => fetch('/text?value=' + encodeURIComponent(e.target.value)));
+</script>

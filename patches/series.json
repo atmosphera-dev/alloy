@@ -1077,6 +1077,11 @@
       "patch": "cef/0142-guest-native-input.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0163-native-test-lifetime.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

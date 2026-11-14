@@ -583,6 +583,7 @@ test("alloy_native_grants_unittests") {
     "embedded_cookie_policy_unittest.cc",
     "extension_storage_admission_unittest.cc",
     "fixture_gesture_unittest.cc",
+    "native_test_lifetime_unittest.cc",
     "local_state_ownership_unittest.cc",
     "native_audit_consumers_unittest.cc",
     "native_embedded_state_unittest.cc",
@@ -699,4 +700,7 @@ test("alloy_native_grants_unittests") {
     "//testing/gtest",
     "//third_party/metrics_proto",
   ]
+  if (is_linux) {
+    deps += [ "//components/dbus", "//dbus" ]
+  }
 }

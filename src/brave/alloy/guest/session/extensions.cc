@@ -6,6 +6,30 @@
 #include <utility>
 
 namespace alloy::guest {
+bool ExtensionReplies::Add(uint64_t id, Pending pending) {
+  if (!id || pending_.contains(id)) {
+    if (pending.completion) pending.completion(ProviderResult::kFailed, 0, {});
+    return false;
+  }
+  pending_.emplace(id, std::move(pending));
+  return true;
+}
+ExtensionReplies::Match ExtensionReplies::Take(uint64_t id, Owner owner,
+                                               Feature feature, Pending* pending) {
+  auto found = pending_.find(id);
+  if (found == pending_.end()) return Match::kUnknown;
+  if (found->second.owner != owner || found->second.feature != feature)
+    return Match::kInvalid;
+  *pending = std::move(found->second);
+  pending_.erase(found);
+  return Match::kReady;
+}
+void ExtensionReplies::Cancel() {
+  auto pending = std::move(pending_);
+  pending_.clear();
+  for (auto& [id, value] : pending)
+    if (value.completion) value.completion(ProviderResult::kCancelled, 0, {});
+}
 bool ParseUnsigned(const std::string& text, uint64_t* value) {
   if (text.empty()) return false;
   auto parsed = std::from_chars(text.data(), text.data() + text.size(), *value);

@@ -21,7 +21,7 @@ button,select,#edit,#cursor,#touch { box-sizing:border-box; min-height:36px; bor
 const edit = document.getElementById('edit'), click = document.getElementById('click');
 const touch = document.getElementById('touch'), capture = document.getElementById('capture');
 const select = document.getElementById('select'), deny = document.getElementById('deny');
-const state = { clicks:0, touches:0, captureGot:0, captureLost:0, composed:[], windows:0, originalProxy:false, openerToken:false, blankOpener:false, childClosed:false };
+const state = { clicks:0, touches:0, touchCancels:0, captureGot:0, captureLost:0, composed:[], windows:0, originalProxy:false, openerToken:false, blankOpener:false, childClosed:false };
 window.__alloyToken = 'original-opener-token';
 let child = null;
 function report() {
@@ -44,6 +44,7 @@ click.addEventListener('click', () => {
   report();
 });
 touch.addEventListener('pointerup', event => { if (event.pointerType === 'touch') { state.touches++; report(); } });
+touch.addEventListener('pointercancel', event => { if (event.pointerType === 'touch') { state.touchCancels++; report(); } });
 capture.addEventListener('pointerdown', event => { capture.setPointerCapture(event.pointerId); report(); });
 capture.addEventListener('gotpointercapture', () => { state.captureGot++; report(); });
 capture.addEventListener('lostpointercapture', () => { state.captureLost++; report(); });

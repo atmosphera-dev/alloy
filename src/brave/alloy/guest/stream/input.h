@@ -15,7 +15,7 @@ bool ValidUtf16(const CefString& text);
 class Input {
  public:
   using Receipt = std::function<void(Owner, InteractionData)>;
-  void Reset() { touches_.clear(); }
+  void Reset() { touches_.clear(); buttons_.clear(); }
   void Dispatch(Owner owner, uint64_t generation, const CefRect& view,
                 bool popup_visible, const CefRect& popup,
                 CefRefPtr<CefBrowser> browser, InteractionData input,
@@ -23,6 +23,7 @@ class Input {
  private:
   uint64_t last_id_ = 0;
   std::set<int> touches_;
+  std::set<int> buttons_;
 };
 }  // namespace alloy::guest::stream
 #endif

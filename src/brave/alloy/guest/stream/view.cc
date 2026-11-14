@@ -180,7 +180,7 @@ void View::Call(const Owner& owner, const std::string& operation,
     }
     auto receipt = [this](Owner original, InteractionData value) {
       std::string packed;
-      if (PackInteraction(value, &packed)) event_(original, "@interaction", std::move(packed));
+      if (PackInteraction(value, &packed)) event_(original, kInteractionOperation, std::move(packed));
     };
     if (!document_ready) {
       input.dispatch_us = clock_(); input.outcome = "rejected:document-not-ready";

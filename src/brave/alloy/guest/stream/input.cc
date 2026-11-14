@@ -18,6 +18,7 @@ std::string WriteDetails(CefRefPtr<CefDictionaryValue> dictionary) {
 }
 bool ValidUtf16(const CefString& text) {
   const auto* value = text.GetStruct();
+  if (!value) return true;
   for (size_t i = 0; i < value->length; ++i) {
     uint16_t unit = value->str[i];
     if (unit >= 0xd800 && unit <= 0xdbff) {
@@ -127,7 +128,9 @@ void Input::Dispatch(Owner owner, uint64_t generation, const CefRect& view,
     int px = 0, py = 0;
     auto action = data->GetString("action").ToString();
     if (!Integer(data, "x", &px) || !Integer(data, "y", &py) ||
-        !Unsigned(data, "modifiers", &modifiers) || !point(px, py, action == "leave")) {
+        !Unsigned(data, "modifiers", &modifiers) ||
+        !point(px, py, action == "leave" || (input.kind == "pointer" &&
+            (action == "move" || action == "up") && !buttons_.empty()))) {
       reject("coordinates"); return;
     }
     CefMouseEvent event; event.x = x; event.y = y; event.modifiers = static_cast<uint32_t>(modifiers);
@@ -141,6 +144,8 @@ void Input::Dispatch(Owner owner, uint64_t generation, const CefRect& view,
       int button = 0, clicks = 0;
       if (!Integer(data, "button", &button) || button < MBT_LEFT || button > MBT_RIGHT ||
           !Integer(data, "clicks", &clicks) || clicks < 1) { reject("invalid"); return; }
+      if (action == "down") buttons_.insert(button);
+      else buttons_.erase(button);
       dispatch = [host, event, button, clicks, up = action == "up"] {
         host->SendMouseClickEvent(event, static_cast<cef_mouse_button_type_t>(button), up, clicks);
       };
@@ -172,7 +177,7 @@ void Input::Dispatch(Owner owner, uint64_t generation, const CefRect& view,
         !Unsigned(data, "modifiers", &modifiers) || !Number(data, "x", &px) || !Number(data, "y", &py) ||
         !Number(data, "radius_x", &rx) || rx < 0 || !Number(data, "radius_y", &ry) || ry < 0 ||
         !Number(data, "rotation", &rotation) || !Number(data, "pressure", &pressure) || pressure < 0 || pressure > 1 ||
-        !point(px, py, false)) { reject("invalid"); return; }
+        !point(px, py, type != CEF_TET_PRESSED && touches_.contains(event.id))) { reject("invalid"); return; }
     if ((type == CEF_TET_PRESSED && (touches_.contains(event.id) || touches_.size() >= 16)) ||
         (type != CEF_TET_PRESSED && !touches_.contains(event.id))) { reject("touch-order"); return; }
     if (type == CEF_TET_PRESSED) touches_.insert(event.id);

@@ -120,6 +120,10 @@ one (PET_POPUP); the connector performs popup hit testing and translates its
 local point to view DIP once. Stale generations/owners and invalid native
 values/order are refused, never applied to replacement geometry. While a
 navigation has no committed native document, input cannot reach the old page.
+When a navigation ends without committing, its surviving native document is
+admitted under the fresh session owner and streaming resumes; old owners stay
+retired. Captured mouse/touch continuation and termination may leave the view
+bounds, while new presses still require containment and matching owner/geometry.
 Capture-loss notification follows pinned CEF's legacy widget/plugin-capture
 semantics; it does not mean JavaScript Element.releasePointerCapture. DOM
 pointer capture still follows the native pointer-event lifecycle.

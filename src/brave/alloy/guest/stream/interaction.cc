@@ -30,6 +30,6 @@ bool FitsInteraction(const InteractionData& input) {
   receipt.dispatch_us = std::numeric_limits<uint64_t>::max();
   receipt.outcome = "rejected:document-not-ready";
   return PackInteraction(receipt, &payload) &&
-      PackExtension({Feature::kStream, 0, "interaction", payload}, &envelope);
+      PackExtension({Feature::kStream, 0, kInteractionOperation, payload}, &envelope);
 }
 }  // namespace alloy::guest::stream

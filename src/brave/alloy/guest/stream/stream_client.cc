@@ -140,7 +140,7 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
         handler_->OnWindowOpen(popup, url, name, disposition, gesture, rectangle);
       });
       cv_.notify_one();
-    } else if (operation == "@interaction") {
+    } else if (operation == kInteractionOperation) {
       InteractionData input;
       if (!UnpackInteraction(payload, &input) || input.outcome.empty()) { Unavailable(); return; }
       std::lock_guard lock(mutex_);

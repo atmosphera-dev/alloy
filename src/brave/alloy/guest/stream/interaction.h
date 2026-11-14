@@ -4,6 +4,7 @@
 #define BRAVE_ALLOY_GUEST_STREAM_INTERACTION_H_
 #include "brave/alloy/guest/protocol/session.h"
 namespace alloy::guest::stream {
+inline constexpr char kInteractionOperation[] = "@interaction";
 struct InteractionData {
   uint64_t id = 0, document = 0, generation = 0, surface = 0;
   uint64_t capture_us = 0, dispatch_us = 0;

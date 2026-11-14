@@ -257,6 +257,15 @@ class NativeView final : public CefClient,
     original.generation = owner_.generation;
     if (navigation->HasCommitted())
       current_token_ = content::AlloyDocumentNoiseIdentity(navigation->GetRenderFrameHost());
+    else {
+      // A 204, download or cancelled navigation leaves the previous native
+      // document alive. Old session owners stay retired; admit that surviving
+      // document only under this latest navigation's fresh owner.
+      auto* frame = web_contents() ? web_contents()->GetPrimaryMainFrame() : nullptr;
+      if (frame && frame->IsRenderFrameLive())
+        current_token_ = content::AlloyDocumentNoiseIdentity(frame);
+      if (DocumentReady()) browser_->GetHost()->Invalidate(PET_VIEW);
+    }
     if (!navigation->HasCommitted() || navigation->GetNetErrorCode() != net::OK) {
       status_ = static_cast<int>(navigation->GetNetErrorCode());
       completed_navigation_ = true;

@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <climits>
 #include <fcntl.h>
+#include <limits>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -215,6 +216,40 @@ TEST(GuestExtensions, ConcurrentCallsShareOwnerAndCompleteOnce) {
   for (auto& reply : delayed) { reply(ProviderResult::kOk, {}); reply(ProviderResult::kOk, {}); }
   EXPECT_EQ(2, replies);
 }
+TEST(GuestExtensions, InvalidRepliesKeepCompletionsForProtocolFailureCancellation) {
+  for (bool wrong_feature : {false, true}) {
+    ExtensionReplies replies;
+    int cancelled = 0;
+    ASSERT_TRUE(replies.Add(1, {kOwner, Feature::kStream,
+        [&](ProviderResult result, uint64_t time, std::string) {
+          EXPECT_EQ(ProviderResult::kCancelled, result); EXPECT_EQ(0u, time); ++cancelled;
+        }}));
+    auto owner = kOwner;
+    if (!wrong_feature) ++owner.document;
+    ExtensionReplies::Pending pending;
+    EXPECT_EQ(ExtensionReplies::Match::kInvalid,
+        replies.Take(1, owner, wrong_feature ? Feature::kMedia : Feature::kStream, &pending));
+    EXPECT_FALSE(pending.completion);
+    replies.Cancel(); replies.Cancel();
+    EXPECT_EQ(1, cancelled);
+    EXPECT_EQ(ExtensionReplies::Match::kUnknown, replies.Take(1, kOwner, Feature::kStream, &pending));
+  }
+}
+TEST(GuestExtensions, MatchingRepliesTransferTheirCompletionExactlyOnce) {
+  ExtensionReplies replies;
+  int completed = 0;
+  ASSERT_TRUE(replies.Add(1, {kOwner, Feature::kStream,
+      [&](ProviderResult result, uint64_t time, std::string payload) {
+        EXPECT_EQ(ProviderResult::kOk, result); EXPECT_EQ(123u, time);
+        EXPECT_EQ("result", payload); ++completed;
+      }}));
+  ExtensionReplies::Pending pending;
+  ASSERT_EQ(ExtensionReplies::Match::kReady, replies.Take(1, kOwner, Feature::kStream, &pending));
+  pending.completion(ProviderResult::kOk, 123, "result");
+  replies.Cancel();
+  EXPECT_EQ(ExtensionReplies::Match::kUnknown, replies.Take(1, kOwner, Feature::kStream, &pending));
+  EXPECT_EQ(1, completed);
+}
 TEST(GuestExtensions, ResourceReleaseOutlivesDocumentButCannotDispatchContent) {
   Owner current = kOwner;
   int releases = 0, calls = 0;
@@ -264,6 +299,19 @@ TEST(GuestInteractions, ReceiptSpaceIsReservedBeforeDispatchAdmission) {
   EXPECT_FALSE(FitsInteraction(input));
   input.details = std::string(kMaxControlPayload - 256, 'x');
   EXPECT_TRUE(FitsInteraction(input));
+}
+TEST(GuestInteractions, ActualReceiptOperationFitsAtExactControlBoundary) {
+  InteractionData input{1, 2, 3, 0, 4, 0, "app", "ime-set", {}, {}};
+  auto receipt = input;
+  receipt.dispatch_us = std::numeric_limits<uint64_t>::max();
+  receipt.outcome = "rejected:document-not-ready";
+  std::string payload, envelope;
+  ASSERT_TRUE(PackInteraction(receipt, &payload));
+  ASSERT_TRUE(PackExtension({Feature::kStream, 0, "@interaction", payload}, &envelope));
+  input.details.assign(kMaxControlPayload - envelope.size(), 'x');
+  EXPECT_TRUE(FitsInteraction(input));
+  input.details.push_back('x');
+  EXPECT_FALSE(FitsInteraction(input));
 }
 TEST(GuestInteractions, EveryFeatureSharesIdsAndOneExactlyOnceReceipt) {
   Interactions tracker;

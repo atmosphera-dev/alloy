@@ -47,6 +47,10 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+        if path == '/no-content':
+            self.send_response(204)
+            self.end_headers()
+            return
         if path == '/pending-input.html':
             self.server.navigation_waiting.set()
             assert self.server.navigation_release.wait(60), 'pending navigation fixture was not released'
@@ -114,6 +118,25 @@ class Client:
         assert all(v['expected'] and v['actual'] == v['expected'] for v in rows), rows
         return rows
 
+    def retained(self, references):
+        deadline = time.monotonic() + 30
+        while True:
+            rows = self.held()
+            if len(rows) == references:
+                return rows
+            assert len(rows) < references and time.monotonic() < deadline, rows
+            self.pump(0.05)
+
+    def numbered_frames(self, count):
+        deadline = time.monotonic() + 30
+        while True:
+            unique = {v['source_frame'] for v in self.events
+                      if v['event'] == 'frame' and v['document'] and v['pattern']}
+            if len(unique) >= count:
+                return unique
+            assert time.monotonic() < deadline, unique
+            self.pump(0.05)
+
     def finish(self):
         self.send('quit')
         self.wait('finished')
@@ -141,19 +164,16 @@ def frames(out, evidence, base):
         first = client.wait('frame', lambda v: v['document'] and v['pattern'] and v['source_frame'])
         after = len(client.events)
         client.titles(8, after)
-        unique = {v['source_frame'] for v in client.events
-                  if v['event'] == 'frame' and v['document'] and v['pattern']}
-        assert len(unique) >= 5, unique
+        unique = client.numbered_frames(5)
         after = len(client.events)
         client.command('navigate ' + base + '/damage.html', 'navigate-queued', lambda v: v['ok'])
         client.wait('load', lambda v: v['status'] == 200 and v['document'] > first['document'], after=after)
         client.wait('frame', lambda v: v['document'] > first['document'] and v['split_pattern'] and
                     v['left_frame'] != v['right_frame'], after=after)
         client.command('retain on', 'retaining', lambda v: v['on'])
+        held = client.retained(6)
         after = len(client.events)
         client.titles(15, after)
-        held = client.held()
-        assert len(held) == 6, held
         latest = max(v['sequence'] for v in held)
         client.command('release presentation', 'released')
         after = len(client.events)
@@ -169,9 +189,8 @@ def frames(out, evidence, base):
         assert (recovered['left_frame'] - recovered['right_frame']) % 250 in (1, 249), recovered
         assert recovered['bytes'] == recovered['stride'] * recovered['height']
         client.command('retain on', 'retaining', lambda v: v['on'])
+        old = client.retained(6)
         client.titles(10, len(client.events))
-        old = client.held()
-        assert len(old) == 6
         generation = max(v['generation'] for v in old)
         after = len(client.events)
         client.command('configure 192 100 1.5', 'configure-queued', lambda v: v['ok'])
@@ -192,6 +211,7 @@ def frames(out, evidence, base):
         fractional = client.wait('frame', lambda v: v['generation'] == fractional_geometry['generation'] and v['split_pattern'], after=after)
         assert (fractional['width'], fractional['height'], fractional['stride']) == (288, 144, 1152), fractional
         client.command('retain on', 'retaining', lambda v: v['on'])
+        client.retained(6)
         client.titles(8, len(client.events))
         assert client.held()
         processes = OwnedProcesses(client.process.pid, out)
@@ -337,9 +357,12 @@ def input_checks(out, evidence, base, server):
         assert send('ime-commit', '"é" 0 -1 -1')['outcome'] == 'accepted'
         _, snapshot = state(lambda v: v['text'] == 'A' + cjk + 'é')
         assert any(v[0] == 'compositionend' and v[1] == cjk for v in snapshot['composed']), snapshot
+        before = len(client.events)
         assert send('ime-set', '"X" 1 1 -1 -1')['outcome'] == 'accepted'
+        state(lambda v: v['text'] == 'A' + cjk + 'éX', after=before)
+        before = len(client.events)
         assert send('ime-cancel')['outcome'] == 'accepted'
-        state(lambda v: v['text'] == 'A' + cjk + 'é')
+        state(lambda v: v['text'] == 'A' + cjk + 'é', after=before)
         assert send('ime-set', '"Z" 1 1 -1 -1')['outcome'] == 'accepted'
         assert send('ime-finish', '0')['outcome'] == 'accepted'
         _, snapshot = state(lambda v: v['text'] == 'A' + cjk + 'éZ')
@@ -469,6 +492,118 @@ def input_checks(out, evidence, base, server):
         (evidence / 'events.json').write_text(json.dumps(client.events, indent=2) + '\n')
 
 
+def edge_checks(out, evidence, base, case):
+    evidence.mkdir()
+    client = Client(out, evidence)
+    try:
+        client.wait('prepared')
+        geometry = client.wait('configured')
+        before = len(client.events)
+        client.command('configure 520 360 1', 'configure-queued', lambda v: v['ok'])
+        geometry = client.wait('configured', lambda v: v['width'] == 520, after=before)
+        after = len(client.events)
+        client.command('navigate ' + base + '/input.html', 'navigate-queued', lambda v: v['ok'])
+        page = client.wait('title', lambda v: v['title'].startswith('INPUT:'), after=after)
+        snapshot = json.loads(page['title'][6:])
+        frame = client.wait('frame', lambda v: v['document'] == page['document'], after=after)
+        geometry = next(v for v in reversed(client.events) if v['event'] == 'configured')
+
+        def action(kind, arguments='', document=None, outcomes=('accepted',)):
+            queued = client.command(
+                f'input 1 app {page["document"] if document is None else document} '
+                f'{geometry["generation"]} 123456 {kind} {arguments}', 'queued-input')
+            assert queued['id'] > 0, queued
+            receipt = client.wait('interaction', lambda v: v['id'] == queued['id'])
+            assert receipt['outcome'] in outcomes, receipt
+            return receipt
+
+        def state(predicate, after):
+            return client.wait('title', lambda v: v['title'].startswith('INPUT:') and
+                               predicate(json.loads(v['title'][6:])), after=after)
+
+        action('focus', '1')
+        if case == 'empty-text':
+            action('ime-empty')
+        elif case == 'touch-capture':
+            rectangle = snapshot['rectangles']['touch']
+            x, y = round(rectangle['x'] + rectangle['width'] / 2), round(rectangle['y'] + 10)
+            action('touch', '7 1 -20 -20 0 0.5 1 1 0 0 0', outcomes=('rejected:invalid',))
+            for terminal in (0, 3):
+                before = len(client.events)
+                action('touch', f'7 1 {x} {y} 0 0.5 1 1 0 0 0')
+                action('touch', f'7 {terminal} -20 -20 0 0 1 1 0 0 0')
+                if terminal == 0:
+                    state(lambda v: v['touches'] == 1, before)
+                else:
+                    state(lambda v: v['touchCancels'] == 1, before)
+            before = len(client.events)
+            action('touch', f'7 1 {x} {y} 0 0.5 1 1 0 0 0')
+            action('touch', f'7 0 {x} {y} 0 0 1 1 0 0 0')
+            state(lambda v: v['touches'] == 2, before)
+        elif case == 'pointer-capture':
+            before = len(client.events)
+            rectangle = snapshot['rectangles']['capture']
+            x, y = round(rectangle['x'] + 10), round(rectangle['y'] + 10)
+            action('pointer', 'down -20 -20 0 0 1 16', outcomes=('rejected:coordinates',))
+            action('pointer', f'down {x} {y} 0 0 1 16')
+            action('pointer', f'move {x + 1} {y} 0 0 0 16')
+            state(lambda v: v['captureGot'] > 0, before)
+            action('pointer', 'move -20 -20 0 0 0 16')
+            action('pointer', 'up -20 -20 0 0 1 0')
+            state(lambda v: v['captureLost'] > 0, before)
+        elif case == 'non-committing-navigation':
+            before = len(client.events)
+            client.command('navigate ' + base + '/no-content', 'navigate-queued', lambda v: v['ok'])
+            load = client.wait('load', lambda v: v['document'] != page['document'], after=before)
+            assert load['status'] in (-3, 0), load
+            geometry = next(v for v in reversed(client.events) if v['event'] == 'configured')
+            client.wait('frame', lambda v: v['document'] == load['document'] and
+                        v['generation'] == geometry['generation'], after=before, timeout=10)
+            old_document = page['document']
+            page = load
+            for event, modifiers in (('down', 16), ('up', 0)):
+                action('pointer', f'{event} 20 20 0 0 1 {modifiers}', document=old_document,
+                       outcomes=('cancelled-unobserved', 'rejected:stale-generation'))
+            action('pointer', 'down 20 20 0 0 1 16')
+            action('pointer', 'up 20 20 0 0 1 0')
+            state(lambda v: v['clicks'] == 1, before)
+        elif case == 'full-budget-resize':
+            before = len(client.events)
+            client.command('configure 2048 1024 1', 'configure-queued', lambda v: v['ok'])
+            geometry = client.wait('configured', lambda v: v['width'] == 2048, after=before)
+            frame = client.wait('frame', lambda v: v['generation'] == geometry['generation'] and
+                                v['bytes'] == 8 * 1024 * 1024, after=before, timeout=10)
+            pixel = client.command('pixel 1 0 0', 'pixel')
+            assert pixel['ok'] and pixel['generation'] == frame['generation'] and pixel['sequence'] >= frame['sequence'], (pixel, frame)
+        else:
+            raise AssertionError(case)
+        client.send('close')
+        client.wait('closed')
+        client.finish()
+        return {'case': case, 'status': 'passed'}
+    finally:
+        client.dispose()
+        (evidence / 'events.json').write_text(json.dumps(client.events, indent=2) + '\n')
+
+
+def startup_failure(out, evidence):
+    evidence.mkdir()
+    library = evidence / 'refuse-eventfd.so'
+    subprocess.run(['cc', '-shared', '-fPIC', str(REPO / 'tools/testdata/guest-stream/refuse-eventfd.c'),
+                    '-o', str(library)], check=True)
+    env = environment(evidence / 'runtime', out)
+    env['LD_PRELOAD'] = str(library)
+    try:
+        result = subprocess.run([str(out / 'alloy_guest_stream_consumer')], input=b'quit\n',
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=out, timeout=5)
+    except subprocess.TimeoutExpired as error:
+        (evidence / 'consumer.log').write_bytes(error.stdout or b'')
+        raise AssertionError('consumer hung after session startup failure') from error
+    (evidence / 'consumer.log').write_bytes(result.stdout)
+    assert b'M3_EVENTFD_REFUSED' in result.stdout and result.returncode == 1, result
+    return {'case': 'session-startup-failure-exits', 'status': 'passed'}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
@@ -496,6 +631,9 @@ def main(argv=None):
         rows = frames(out, evidence, f'http://127.0.0.1:{server.server_port}')
         if args.check == 'all':
             rows.extend(input_checks(out, evidence / 'input', f'http://127.0.0.1:{server.server_port}', server))
+            for case in ('empty-text', 'touch-capture', 'pointer-capture', 'non-committing-navigation', 'full-budget-resize'):
+                rows.append(edge_checks(out, evidence / case, f'http://127.0.0.1:{server.server_port}', case))
+            rows.append(startup_failure(out, evidence / 'startup-failure'))
         result.update(status='passed', cases=rows, seconds=time.monotonic() - start)
         print('GUEST_STREAM_PASS', flush=True)
     except BaseException as error:

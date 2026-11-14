@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <memory>
+#include <map>
 #include <string>
 #include "brave/alloy/guest/providers.h"
 #include "brave/alloy/guest/stream/resource_lane.h"
@@ -59,5 +60,23 @@ bool PackExtensionReply(const ExtensionResponse& response, std::string* payload)
 bool UnpackExtensionReply(const std::string& payload, ExtensionResponse* response);
 bool ParseUnsigned(const std::string& text, uint64_t* value);
 bool ParseSigned(const std::string& text, int64_t* value);
+
+// The reply registry owns completions until an authenticated matching reply
+// takes them, or shutdown explicitly cancels them. Invalid replies cannot erase
+// the callback that protocol-failure teardown still owes its caller.
+class ExtensionReplies {
+ public:
+  struct Pending {
+    Owner owner;
+    Feature feature = Feature::kStream;
+    ExtensionCompletion completion;
+  };
+  enum class Match { kUnknown, kInvalid, kReady };
+  bool Add(uint64_t id, Pending pending);
+  Match Take(uint64_t id, Owner owner, Feature feature, Pending* pending);
+  void Cancel();
+ private:
+  std::map<uint64_t, Pending> pending_;
+};
 }  // namespace alloy::guest
 #endif

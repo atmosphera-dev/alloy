@@ -13,6 +13,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -39,12 +40,15 @@ void Event(const std::string& event, const std::string& fields = {}) {
             << ",\"thread\":" << std::hash<std::thread::id>{}(std::this_thread::get_id())
             << fields << "}" << std::endl;
 }
-uint64_t Checksum(CefRefPtr<AlloyGuestFrame> frame) {
-  std::vector<uint8_t> pixels(frame->GetByteSize());
-  if (frame->ReadPixels(pixels.data(), pixels.size(), 0) != pixels.size()) return 0;
+uint64_t Checksum(const std::vector<uint8_t>& pixels) {
   uint64_t hash = 1469598103934665603ULL;
   for (auto byte : pixels) hash = (hash ^ byte) * 1099511628211ULL;
   return hash;
+}
+uint64_t Checksum(CefRefPtr<AlloyGuestFrame> frame) {
+  std::vector<uint8_t> pixels(frame->GetByteSize());
+  if (frame->ReadPixels(pixels.data(), pixels.size(), 0) != pixels.size()) return 0;
+  return Checksum(pixels);
 }
 struct Held {
   CefRefPtr<AlloyGuestFrame> frame;
@@ -127,11 +131,13 @@ class Observer final : public AlloyGuestStreamHandler {
 class Consumer final : public AlloyGuestSessionHandler,
                        public AlloyGuestViewHandler {
  public:
-  void Start() {
+  bool Start() {
     auto settings = AlloyCreateGuestSettings("memory", "keep", "unavailable", true, "");
     auto session = AlloyStartGuestSession(settings, this);
+    if (!session) return false;
     std::lock_guard guard(mutex_);
     if (!session_) session_ = std::move(session);
+    return true;
   }
   void OnPrepared(CefRefPtr<AlloyGuestSession> session,
                     CefRefPtr<AlloyGuestProtection>,
@@ -184,7 +190,15 @@ class Consumer final : public AlloyGuestSessionHandler,
     Event("view-closed", ",\"view\":" + std::to_string(view->GetId()) + ",\"reason\":" + Quote(reason.ToString()));
   }
   void Frame(CefRefPtr<AlloyGuestFrame> frame) {
-    const auto checksum = Checksum(frame);
+    auto snapshot = std::make_shared<Snapshot>();
+    snapshot->generation = frame->GetGeneration(); snapshot->sequence = frame->GetSequence();
+    snapshot->capture_us = frame->GetCaptureTimeUs(); snapshot->stride = frame->GetStride();
+    snapshot->width = frame->GetWidth(); snapshot->height = frame->GetHeight();
+    snapshot->pixels.resize(frame->GetByteSize());
+    if (frame->ReadPixels(snapshot->pixels.data(), snapshot->pixels.size(), 0) != snapshot->pixels.size()) {
+      Event("unavailable"); return;
+    }
+    const auto checksum = Checksum(snapshot->pixels);
     uint8_t first[4] = {}, middle[4] = {}, last[4] = {}, left[4] = {}, right[4] = {};
     frame->ReadPixels(first, 4, 0);
     frame->ReadPixels(middle, 4, frame->GetStride() * (frame->GetHeight() / 2) + 4 * (frame->GetWidth() / 2));
@@ -198,6 +212,12 @@ class Consumer final : public AlloyGuestSessionHandler,
         left[2] == left[0] * 3 % 256 && left[1] == left[0] * 5 % 256 &&
         right[2] == right[0] * 3 % 256 && right[1] == right[0] * 5 % 256;
     for (int i = 0; i < 4; ++i) split = split && first[i] == left[i] && last[i] == right[i];
+    {
+      std::lock_guard guard(mutex_);
+      // Readiness publishes copied consumer pixels, not an extra pool lease
+      // that could prevent a replacement from using the full frame budget.
+      if (!frame->GetSurface()) latest_[frame->GetViewId()] = std::move(snapshot);
+    }
     Event("frame", ",\"view\":" + std::to_string(frame->GetViewId()) +
           ",\"document\":" + std::to_string(frame->GetDocumentId()) +
           ",\"generation\":" + std::to_string(frame->GetGeneration()) +
@@ -216,7 +236,6 @@ class Consumer final : public AlloyGuestSessionHandler,
           ",\"split_pattern\":" + std::string(split ? "true" : "false") +
           ",\"pattern\":" + std::string(pattern ? "true" : "false"));
     std::unique_lock lock(mutex_);
-    if (!frame->GetSurface()) latest_[frame->GetViewId()] = frame;
     if (retain_ && frame->GetDocumentId() && (pattern || split)) {
       presentation_.push_back({frame, checksum});
       recorder_.push_back({frame, checksum});
@@ -276,6 +295,11 @@ class Consumer final : public AlloyGuestSessionHandler,
         std::string text; int relative = 0, from = -1, to = -1;
         input >> std::quoted(text) >> relative >> from >> to;
         id = stream->CommitText(source, document, generation, text, CefRange(from, to), relative, capture);
+      } else if (stream && kind == "ime-empty") {
+        // Exercise the SDK's default-constructed empty CefString, not a parsed
+        // non-null backing allocation that happens to have length zero.
+        CefString empty;
+        id = stream->CommitText(source, document, generation, empty, CefRange(-1, -1), 0, capture);
       } else if (stream && kind == "ime-finish") {
         int keep = 0; input >> keep; id = stream->FinishComposition(source, document, generation, keep != 0, capture);
       } else if (stream && kind == "ime-cancel") {
@@ -301,19 +325,19 @@ class Consumer final : public AlloyGuestSessionHandler,
       }
     } else if (operation == "pixel") {
       uint64_t target = 0; int x = 0, y = 0; input >> target >> x >> y;
-      CefRefPtr<AlloyGuestFrame> frame;
+      std::shared_ptr<const Snapshot> frame;
       {
         std::lock_guard guard(mutex_);
         if (!target && view_) target = view_->GetId();
         if (auto found = latest_.find(target); found != latest_.end()) frame = found->second;
       }
       uint8_t bytes[4] = {};
-      bool read = frame && x >= 0 && y >= 0 && x < frame->GetWidth() && y < frame->GetHeight() &&
-          frame->ReadPixels(bytes, 4, frame->GetStride() * y + 4 * x) == 4;
+      bool read = frame && x >= 0 && y >= 0 && x < frame->width && y < frame->height;
+      if (read) memcpy(bytes, frame->pixels.data() + frame->stride * y + 4 * x, 4);
       Event("pixel", ",\"view\":" + std::to_string(target) + ",\"ok\":" + (read ? "true" : "false") +
-            ",\"generation\":" + std::to_string(frame ? frame->GetGeneration() : 0) +
-            ",\"sequence\":" + std::to_string(frame ? frame->GetSequence() : 0) +
-            ",\"capture_us\":" + std::to_string(frame ? frame->GetCaptureTimeUs() : 0) +
+            ",\"generation\":" + std::to_string(frame ? frame->generation : 0) +
+            ",\"sequence\":" + std::to_string(frame ? frame->sequence : 0) +
+            ",\"capture_us\":" + std::to_string(frame ? frame->capture_us : 0) +
             ",\"b\":" + std::to_string(bytes[0]) + ",\"g\":" + std::to_string(bytes[1]) +
             ",\"r\":" + std::to_string(bytes[2]) + ",\"a\":" + std::to_string(bytes[3]));
     } else if (operation == "close-view") {
@@ -379,6 +403,12 @@ class Consumer final : public AlloyGuestSessionHandler,
   }
  private:
   struct Geometry { int width; int height; double scale; };
+  struct Snapshot {
+    uint64_t generation, sequence, capture_us;
+    size_t stride;
+    int width, height;
+    std::vector<uint8_t> pixels;
+  };
   std::mutex mutex_;
   std::condition_variable closed_cv_, stall_cv_;
   bool closed_ = false, retain_ = false, stall_ = false;
@@ -389,7 +419,7 @@ class Consumer final : public AlloyGuestSessionHandler,
   std::map<uint64_t, CefRefPtr<AlloyGuestView>> views_;
   std::map<uint64_t, CefRefPtr<AlloyGuestStream>> streams_;
   std::map<uint64_t, CefRefPtr<AlloyGuestPopup>> windows_;
-  std::map<uint64_t, CefRefPtr<AlloyGuestFrame>> latest_;
+  std::map<uint64_t, std::shared_ptr<const Snapshot>> latest_;
   std::map<uint64_t, Geometry> geometry_;
   IMPLEMENT_REFCOUNTING(Consumer);
 };
@@ -399,7 +429,7 @@ int main() {
   const char* hash = cef_api_hash(CEF_API_VERSION, 0);
   if (!hash || strcmp(hash, CEF_API_HASH_PLATFORM)) return 1;
   CefRefPtr<Consumer> consumer = new Consumer;
-  consumer->Start();
+  if (!consumer->Start()) return 1;
   std::string line;
   while (std::getline(std::cin, line)) if (!consumer->Command(line)) return 0;
   consumer->Command("quit");

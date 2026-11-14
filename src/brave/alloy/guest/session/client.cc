@@ -287,7 +287,7 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
       if (observed == Interactions::Receipt::kInvalid) return false;
       if (auto receiver = sinks.find({original.view, Feature::kStream}); receiver != sinks.end()) sink = receiver->second;
     }
-    if (sink) sink->Event(original, "@interaction", payload);
+    if (sink) sink->Event(original, stream::kInteractionOperation, payload);
     return true;
   }
   void FinishInteraction(uint64_t view, uint64_t id, ProviderResult result, uint64_t time) {
@@ -303,7 +303,7 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     action->input.outcome = result == ProviderResult::kUnavailable ? "unavailable" :
         result == ProviderResult::kFailed ? "rejected:invalid" : "cancelled-unobserved";
     std::string payload;
-    if (sink && stream::PackInteraction(action->input, &payload)) sink->Event(action->owner, "@interaction", std::move(payload));
+    if (sink && stream::PackInteraction(action->input, &payload)) sink->Event(action->owner, stream::kInteractionOperation, std::move(payload));
   }
   void ExtensionOwner(Owner owner) {
     std::vector<std::shared_ptr<ExtensionSink>> notify;
@@ -506,11 +506,10 @@ class SessionImpl final : public AlloyGuestSession {
     if (envelope.message == Message::kExtensionReply) {
       ExtensionResponse reply;
       if (!UnpackExtensionReply(envelope.payload, &reply)) return false;
-      auto found = pending_extensions_.find(reply.id);
-      if (found == pending_extensions_.end()) return true;
-      auto pending = std::move(found->second);
-      pending_extensions_.erase(found);
-      if (pending.owner != envelope.owner || pending.feature != reply.feature) return false;
+      ExtensionReplies::Pending pending;
+      auto match = pending_extensions_.Take(reply.id, envelope.owner, reply.feature, &pending);
+      if (match == ExtensionReplies::Match::kUnknown) return true;
+      if (match == ExtensionReplies::Match::kInvalid) return false;
       if (!session->Owns(pending.owner)) reply.result = ProviderResult::kCancelled;
       if (pending.completion) pending.completion(reply.result, reply.completed_us, std::move(reply.payload));
       return true;
@@ -580,7 +579,7 @@ class SessionImpl final : public AlloyGuestSession {
     if (envelope.message == Message::kExtensionEvent) {
       ExtensionRequest event;
       if (!UnpackExtension(envelope.payload, &event) || event.id) return false;
-      if (event.operation == "@interaction")
+      if (event.operation == stream::kInteractionOperation)
         return core_->ReceiveInteraction(event.feature, envelope.owner, event.payload);
       if (auto sink = core_->Sink(envelope.owner.view, event.feature))
         sink->Event(envelope.owner, std::move(event.operation), std::move(event.payload));
@@ -734,8 +733,11 @@ class SessionImpl final : public AlloyGuestSession {
               running = false;
               break;
             }
-            pending_extensions_.emplace(next_extension++, PendingExtension{
-                envelope.owner, command.feature, std::move(command.completion)});
+            if (!pending_extensions_.Add(next_extension++, {
+                envelope.owner, command.feature, std::move(command.completion)})) {
+              running = false;
+              break;
+            }
           }
         }
         outgoing.push_back(std::move(envelope));
@@ -808,9 +810,7 @@ class SessionImpl final : public AlloyGuestSession {
     }
     while (!views_.empty())
       CancelView(views_.begin()->first, reason == "failed" ? "failed" : "cancelled");
-    for (auto& [id, pending] : pending_extensions_)
-      if (pending.completion) pending.completion(ProviderResult::kCancelled, 0, {});
-    pending_extensions_.clear();
+    pending_extensions_.Cancel();
     // EOF is a close request to the supervisor, which serializes it against
     // registration, terminates/reaps members, and only then exits.
     core_->SetChannel(-1);
@@ -827,12 +827,7 @@ class SessionImpl final : public AlloyGuestSession {
   const SessionId id_;
   const std::shared_ptr<ClientCore> core_;
   std::map<uint64_t, ViewEntry> views_;
-  struct PendingExtension {
-    Owner owner;
-    Feature feature;
-    ExtensionCompletion completion;
-  };
-  std::map<uint64_t, PendingExtension> pending_extensions_;
+  ExtensionReplies pending_extensions_;
   IMPLEMENT_REFCOUNTING(SessionImpl);
 };
 }  // namespace

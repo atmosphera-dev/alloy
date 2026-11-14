@@ -101,6 +101,11 @@ def main():
             assert state['current'] is not None
             emit({'event': 'state', 'name': AXObject.get_name(state['current']),
                   'focused': AXObject.has_state(state['current'], Atspi.StateType.FOCUSED)})
+        elif data['op'] == 'text':
+            assert state['current'] is not None
+            emit({'event': 'text', 'name': AXObject.get_name(state['current']),
+                  'text': Atspi.Text.get_text(state['current'], 0, -1),
+                  'characters': Atspi.Text.get_character_count(state['current'])})
         else:
             raise AssertionError('unknown Orca command: ' + data['op'])
 

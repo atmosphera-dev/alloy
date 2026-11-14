@@ -17,6 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 from guest_test_support.display import environment
 from guest_test_support.accessibility.display import PrivateDisplay
+from guest_test_support.accessibility.cleanup import cleanup_steps, stop_process
 from workspace import validate_output, workspace_path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -81,7 +82,9 @@ class Process:
             for value in self.events[after:]:
                 if value['event'] == event and predicate(value):
                     return value
-            assert time.monotonic() < deadline, (event, self.events[-8:])
+            assert time.monotonic() < deadline, (event, [
+                {key: value.get(key) for key in ('event', 'sequence', 'geometry', 'op', 'outcome') if key in value}
+                for value in self.events[-8:]])
             for peer in self.peers:
                 peer.pump(0)
             self.pump(min(1, deadline - time.monotonic()))
@@ -135,14 +138,18 @@ class Process:
         assert self.child.wait(timeout=60) == 0
 
     def dispose(self):
-        if self.child.poll() is None:
-            try:
-                self.send({'op': 'quit'})
-                self.child.wait(timeout=60)
-            except (OSError, subprocess.TimeoutExpired):
-                self.child.kill()
-                self.child.wait(timeout=60)
-        self.log.close()
+        def process():
+            if self.child.poll() is None:
+                try:
+                    self.send({'op': 'quit'})
+                    self.child.wait(timeout=60)
+                except (OSError, subprocess.TimeoutExpired) as graceful:
+                    try:
+                        stop_process(self.child)
+                    except BaseException as forced:
+                        raise BaseExceptionGroup('Consumer graceful and forced cleanup failed', [graceful, forced]) from None
+                    raise
+        cleanup_steps(process, self.log.close)
 
 
 def receipt(server, path, query=None):
@@ -221,7 +228,7 @@ def native(out, evidence, base, server):
         options, _ = client.node('Native options')
         before = len(client.events)
         assert client.action(options)['outcome'] == 'accepted'
-        popup = client.wait('popup', lambda v: v['visible'], after=before)
+        popup = client.wait('popup', lambda v: v['visible'] and v['width'] > 0 and v['height'] > 0, after=before)
         client.wait('update', lambda v: v['geometry'] == popup['geometry'] and
                     client.named('Native options') is not None and
                     client.named('Native options')[1]['bounds_available'], after=before)
@@ -313,11 +320,7 @@ class PrivateBus:
             connection.close()
 
     def close(self):
-        for child in (self.registry, self.daemon):
-            if child.poll() is None:
-                child.terminate()
-                child.wait(timeout=30)
-        self.log.close()
+        cleanup_steps(lambda: stop_process(self.registry), lambda: stop_process(self.daemon), self.log.close)
 
 
 def orca(out, evidence, base, server):
@@ -406,6 +409,12 @@ def orca(out, evidence, base, server):
         client.wait('atspi-focus', lambda v: v['name'] == 'Native text', after=after)
         focus_state = reader.command({'op': 'state'}, 'state')
         assert focus_state['focused'], focus_state
+        assert client.action(current, 'set-value', value='')['outcome'] == 'accepted'
+        empty_update = client.wait('update', lambda v: any(node['name'] == 'Native text' and node['value'] == ''
+            for tree in v['trees'] for node in tree['nodes']))
+        client.wait('bridge-applied', lambda v: int(v['sequence']) >= int(empty_update['sequence']))
+        empty_text = reader.command({'op': 'text'}, 'text')
+        assert empty_text['text'] == '' and empty_text['characters'] == 0, empty_text
         reader.send({'op': 'quit'})
         assert reader.child.wait(timeout=60) == 0
         spoken = [json.loads(line) for line in sink.read_text().splitlines()]
@@ -416,16 +425,13 @@ def orca(out, evidence, base, server):
         return {'native_action': interaction, 'cross_frame': cross_frame, 'spoken': spoken,
                 'dropped_delta': dropped, 'resync': requested, 'recovered': recovered, 'app_value': app_value,
                 'bounds': bounds, 'frame_bounds': frame_bounds, 'blur_state': blur_state, 'focus_state': focus_state,
+                'empty_text': empty_text,
                 'consumer': 'installed unmodified Orca core, real AT-SPI, app speech-server plugin',
                 'keyboard_device_path': 'not part of windowless connector proof'}
     finally:
-        if reader:
-            reader.dispose()
-        if client:
-            client.dispose()
-        if bus:
-            bus.close()
-        display.close()
+        cleanup_steps(*([reader.dispose] if reader else []),
+                      *([client.dispose] if client else []),
+                      *([bus.close] if bus else []), display.close)
 
 
 def main():

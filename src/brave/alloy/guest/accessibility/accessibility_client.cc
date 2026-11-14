@@ -95,34 +95,63 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
       std::lock_guard lock(mutex_);
       if (retired_ || owner != owner_) return;
       result = projection_.Receive(*data);
+      if (result == Projection::Result::kUnavailable) recovery_.reset();
       cv_.notify_one();
     }
-    if (result == Projection::Result::kResync && !Call("resync")) Unavailable();
+    if (result == Projection::Result::kResync) SendResync(owner);
   }
   void Resource(stream::Resource) override { Unavailable(); }
   void OwnerChanged(Owner owner) override {
     std::lock_guard lock(mutex_);
-    owner_ = owner; projection_.Clear(); parts_.Clear();
+    if (retired_ || !projection_.SetOwner(owner)) return;
+    owner_ = owner; parts_.Clear(); recovery_.reset();
   }
   void ViewRetired(uint64_t) override {}
   void Retire() override {
     std::lock_guard lock(mutex_);
-    retired_ = true; projection_.Clear(); parts_.Clear(); cv_.notify_all();
+    retired_ = true; projection_.Clear(); parts_.Clear(); recovery_.reset(); cv_.notify_all();
   }
   void Wait() override {
     std::unique_lock lock(mutex_); cv_.wait(lock, [this] { return done_; });
   }
  private:
   void RequestResync() {
+    Owner owner;
     {
       std::lock_guard lock(mutex_);
       if (retired_ || !projection_.RequestResync()) return;
+      owner = owner_;
     }
-    if (!Call("resync")) Unavailable();
+    SendResync(owner);
+  }
+  struct Recovery {};
+  void SendResync(Owner owner) {
+    auto recovery = std::make_shared<Recovery>();
+    {
+      std::lock_guard lock(mutex_);
+      if (retired_ || owner != owner_) return;
+      recovery_ = recovery;
+    }
+    std::weak_ptr<State> weak = shared_from_this();
+    auto complete = [weak, recovery, owner](ProviderResult result, uint64_t, std::string) {
+      auto state = weak.lock();
+      if (!state) return;
+      std::lock_guard lock(state->mutex_);
+      if (state->retired_ || owner != state->owner_ || state->recovery_ != recovery) return;
+      state->recovery_.reset();
+      // The native host orders its complete snapshot before this owned reply.
+      // An unready model here means assembly/JSON/sequence validation rejected
+      // that response, not a reason to wait forever on a latched request.
+      if (result != ProviderResult::kOk || !state->projection_.CompleteResync()) {
+        state->projection_.Fail(); state->parts_.Clear(); state->cv_.notify_one();
+      }
+    };
+    if (!endpoint_.owned_call || !endpoint_.owned_call(Feature::kAccessibility, owner,
+        "resync", {}, complete)) complete(ProviderResult::kUnavailable, 0, {});
   }
   void Unavailable() {
     std::lock_guard lock(mutex_);
-    if (!retired_) { projection_.Fail(); parts_.Clear(); cv_.notify_one(); }
+    if (!retired_) { projection_.Fail(); parts_.Clear(); recovery_.reset(); cv_.notify_one(); }
   }
   void Run() {
     for (;;) {
@@ -154,6 +183,7 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
   std::condition_variable cv_;
   Projection projection_;
   UpdateParts parts_;
+  std::shared_ptr<Recovery> recovery_;
   Owner owner_;
   bool started_ = false, retired_ = false, done_ = false;
   CefRefPtr<AlloyGuestAccessibilityHandler> handler_;

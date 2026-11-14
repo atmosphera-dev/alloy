@@ -66,5 +66,30 @@ TEST(GuestAccessibilityProjection, OwnerRetirementClearsPendingStateAndResync) {
   EXPECT_TRUE(projection.RequestResync()); EXPECT_FALSE(projection.RequestResync());
   projection.Clear(); EXPECT_TRUE(projection.RequestResync());
 }
+TEST(GuestAccessibilityProjection, RejectedResyncPayloadCompletesAsUnavailableAndCanRecover) {
+  Projection projection;
+  ASSERT_EQ(projection.Receive(Update(1, true, "one")), Projection::Result::kQueued);
+  ASSERT_TRUE(projection.Take());
+  ASSERT_TRUE(projection.RequestResync());
+  // Both an incomplete multipart response and rejected JSON/sequence payload
+  // leave no validated snapshot. Further fragments do not launch new requests.
+  EXPECT_FALSE(projection.RequestResync());
+  EXPECT_FALSE(projection.CompleteResync());
+  EXPECT_TRUE(projection.TakeUnavailable()); EXPECT_FALSE(projection.ready());
+  ASSERT_TRUE(projection.RequestResync());
+  ASSERT_EQ(projection.Receive(Update(5, true, "recovered")), Projection::Result::kQueued);
+  EXPECT_TRUE(projection.CompleteResync()); EXPECT_TRUE(projection.ready());
+  projection.Fail(); EXPECT_TRUE(projection.RequestResync());
+}
+TEST(GuestAccessibilityProjection, StaleAndDuplicateOwnerNotificationsCannotEraseCurrentState) {
+  Projection projection;
+  const Owner original{1, 1, 1, 1}, current{1, 2, 2, 2};
+  ASSERT_TRUE(projection.SetOwner(original)); ASSERT_TRUE(projection.SetOwner(current));
+  auto update = Update(1, true, "current"); update.Set("document", "2");
+  ASSERT_EQ(projection.Receive(update), Projection::Result::kQueued);
+  EXPECT_FALSE(projection.SetOwner(original)); EXPECT_FALSE(projection.SetOwner(current));
+  EXPECT_TRUE(projection.ready()); auto pending = projection.Take(); ASSERT_TRUE(pending);
+  EXPECT_EQ(*pending->FindString("document"), "2");
+}
 }
 }

@@ -30,7 +30,18 @@ bool Projection::RequestResync() {
   if (resync_pending_) return false;
   resync_pending_ = true; return true;
 }
-void Projection::Fail() { model_.Clear(); pending_.reset(); coalesced_ = 0; unavailable_ = true; }
+bool Projection::CompleteResync() {
+  resync_pending_ = false;
+  if (model_.ready()) return true;
+  Fail(); return false;
+}
+bool Projection::SetOwner(Owner owner) {
+  if (owner_ && (owner == *owner_ || owner.view != owner_->view ||
+      owner.document < owner_->document ||
+      (owner.document == owner_->document && owner.generation < owner_->generation))) return false;
+  owner_ = owner; Clear(); return true;
+}
+void Projection::Fail() { model_.Clear(); pending_.reset(); coalesced_ = 0; resync_pending_ = false; unavailable_ = true; }
 void Projection::Clear() { model_.Clear(); pending_.reset(); coalesced_ = 0; resync_pending_ = unavailable_ = false; }
 bool Projection::TakeUnavailable() { return std::exchange(unavailable_, false); }
 std::optional<base::DictValue> Projection::Take() {

@@ -13,6 +13,7 @@ import secrets
 import select
 import socket
 import subprocess
+from .cleanup import cleanup_steps, stop_process
 
 
 class PrivateDisplay:
@@ -68,8 +69,11 @@ class PrivateDisplay:
                            stdout=self.log, stderr=subprocess.STDOUT)
             subprocess.run(['sudo', '-n', 'nft', 'list', 'table', 'inet', self.table],
                            env=self.env, check=True, stdout=self.log, stderr=subprocess.STDOUT)
-        except BaseException:
-            self.close()
+        except BaseException as startup:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup('Private display startup and cleanup failed', [startup, cleanup]) from None
             raise
         finally:
             os.close(read_fd)
@@ -77,16 +81,16 @@ class PrivateDisplay:
                 os.close(write_fd)
 
     def close(self):
-        if self.child and self.child.poll() is None:
-            self.child.terminate()
-            self.child.wait(timeout=30)
-        if self.policy:
-            subprocess.run(['sudo', '-n', 'nft', 'delete', 'table', 'inet', self.table],
-                           env=self.env, check=True, stdout=self.log, stderr=subprocess.STDOUT)
-            self.policy = False
-        if self.cache_mounted:
-            assert self.cache.samefile('/var/lib/xkb'), 'refusing to unmount an unowned cache'
-            subprocess.run(['sudo', '-n', 'umount', '/var/lib/xkb'], env=self.env, check=True,
-                           stdout=self.log, stderr=subprocess.STDOUT)
-            self.cache_mounted = False
-        self.log.close()
+        def firewall():
+            if self.policy:
+                subprocess.run(['sudo', '-n', 'nft', 'delete', 'table', 'inet', self.table],
+                               env=self.env, check=True, stdout=self.log, stderr=subprocess.STDOUT)
+                self.policy = False
+        def cache():
+            if self.cache_mounted:
+                if not self.cache.samefile('/var/lib/xkb'):
+                    raise RuntimeError('refusing to unmount an unowned cache')
+                subprocess.run(['sudo', '-n', 'umount', '/var/lib/xkb'], env=self.env, check=True,
+                               stdout=self.log, stderr=subprocess.STDOUT)
+                self.cache_mounted = False
+        cleanup_steps(lambda: stop_process(self.child), firewall, cache, self.log.close)

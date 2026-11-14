@@ -4,6 +4,7 @@
 #define BRAVE_ALLOY_GUEST_ACCESSIBILITY_PROJECTION_H_
 #include <optional>
 #include "brave/alloy/guest/accessibility/model.h"
+#include "brave/alloy/guest/protocol/session.h"
 namespace alloy::guest::accessibility {
 // Serialized by the client adapter. Owns current validated state and at most
 // one pending projection, not callback/toolkit objects or completed history.
@@ -12,6 +13,8 @@ class Projection {
   enum class Result { kQueued, kIgnored, kResync, kUnavailable };
   Result Receive(const base::DictValue& update);
   bool RequestResync();
+  bool CompleteResync();
+  bool SetOwner(Owner owner);
   void Fail();
   void Clear();
   bool ready() const { return model_.ready(); }
@@ -24,6 +27,7 @@ class Projection {
   std::optional<base::DictValue> pending_;
   uint64_t coalesced_ = 0;
   bool resync_pending_ = false, unavailable_ = false;
+  std::optional<Owner> owner_;
 };
 }
 #endif

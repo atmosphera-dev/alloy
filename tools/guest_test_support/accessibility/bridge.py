@@ -104,7 +104,11 @@ class Accessible(dbus.service.Object):
                 or 'doDefault' in self.data.get('actions', []))
 
     def text(self):
-        return '' if not self.data else self.data.get('value') or self.data.get('name', '')
+        if not self.data:
+            return ''
+        if self.data.get('role') in ('textField', 'textFieldWithComboBox', 'searchBox', 'spinButton') or 'editable' in self.data.get('states', []):
+            return self.data.get('value', '')
+        return self.data.get('value') or self.data.get('name', '')
 
     def props(self, interface):
         data = self.data or {}
@@ -418,6 +422,8 @@ class Bridge:
             self.trees.clear()
             self.update = None
             self.awaiting_snapshot = True
+            if self.focus:
+                self.focus.StateChanged('focused', 0, 0, dbus.Int32(0), {})
             self.focus = None
             self.frame.children = []
             for obj in self.objects.values():

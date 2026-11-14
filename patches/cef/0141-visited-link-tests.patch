@@ -1,0 +1,10 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -332,6 +332,7 @@
+       "//brave/alloy/guest:alloy_guest_session_unittests",
+       "//brave/alloy/guest:alloy_guest_stream_unittests",
+       "//brave/alloy/guest:alloy_guest_stream_consumer",
++      "//brave/alloy/site_records/visited_links:alloy_visited_link_unittests",
+     ]
+   }
+ 

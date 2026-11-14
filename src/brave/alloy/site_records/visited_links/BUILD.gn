@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import("//testing/test.gni")
+
+source_set("policy") {
+  sources = [ "../visited_link_policy.h" ]
+  public_deps = [ "..:capabilities" ]
+}
+
+test("alloy_visited_link_unittests") {
+  sources = [ "../visited_link_policy_unittest.cc", "../test_main.cc" ]
+  deps = [ ":policy", "//base/test:test_support", "//net:test_support", "//mojo/core/embedder",
+           "//components/visitedlink/browser", "//components/visitedlink/common",
+           "//content/test:test_support", "//testing/gtest" ]
+  use_libcxx_modules = false
+  defines = [ "UNIT_TEST" ]
+}

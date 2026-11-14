@@ -1,0 +1,222 @@
+--- a/components/visitedlink/browser/BUILD.gn
++++ b/components/visitedlink/browser/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ static_library("browser") {
++  public_deps = [ "//brave/alloy/site_records/visited_links:policy" ]
+   sources = [
+     "partitioned_visitedlink_writer.cc",
+     "partitioned_visitedlink_writer.h",
+--- a/components/visitedlink/browser/visitedlink_writer.h
++++ b/components/visitedlink/browser/visitedlink_writer.h
+@@ -26,6 +26,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
++#include "brave/alloy/site_records/visited_link_policy.h"
+ #include "build/build_config.h"
+ #include "components/visitedlink/common/visitedlink_common.h"
+ 
+@@ -370,6 +371,7 @@
+   // Reference to the browser context that this object belongs to
+   // (it knows the path to where the data is stored)
+   raw_ptr<content::BrowserContext> browser_context_ = nullptr;
++  const alloy::site_records::VisitedLinkPolicy alloy_policy_{nullptr, false};
+ 
+   // Client owns the delegate and is responsible for it being valid through
+   // the lifetime this VisitedLinkWriter.
+--- a/components/visitedlink/browser/visitedlink_writer.cc
++++ b/components/visitedlink/browser/visitedlink_writer.cc
+@@ -231,9 +231,10 @@
+                                      VisitedLinkDelegate* delegate,
+                                      bool persist_to_disk)
+     : browser_context_(browser_context),
++      alloy_policy_(browser_context, browser_context->IsOffTheRecord()),
+       delegate_(delegate),
+       listener_(std::make_unique<VisitedLinkEventListener>(browser_context)),
+-      persist_to_disk_(persist_to_disk) {}
++      persist_to_disk_(alloy_policy_.CanPersist(persist_to_disk)) {}
+ 
+ VisitedLinkWriter::VisitedLinkWriter(Listener* listener,
+                                      VisitedLinkDelegate* delegate,
+@@ -243,7 +244,7 @@
+                                      int32_t default_table_size)
+     : delegate_(delegate),
+       listener_(listener),
+-      persist_to_disk_(persist_to_disk),
++      persist_to_disk_(alloy_policy_.CanPersist(persist_to_disk)),
+       database_name_override_(filename),
+       table_size_override_(default_table_size),
+       suppress_rebuild_(suppress_rebuild) {
+@@ -277,6 +278,7 @@
+ }
+ 
+ bool VisitedLinkWriter::Init() {
++  if (!alloy_policy_.CanWriteMemory()) return false;
+   TRACE_EVENT0("browser", "VisitedLinkWriter::Init");
+   // Create the temporary table. If the table is rebuilt that temporary table
+   // will be became the main table.
+@@ -316,12 +318,9 @@
+ }
+ 
+ VisitedLinkWriter::Hash VisitedLinkWriter::TryToAddURL(const GURL& url) {
+-  // Extra check that we are not incognito. This should not happen.
+-  // TODO(boliu): Move this check to HistoryService when IsOffTheRecord is
+-  // removed from BrowserContext.
+-  if (browser_context_ && browser_context_->IsOffTheRecord()) {
+-    NOTREACHED();
+-  }
++  // Native OTR identity is not Alloy storage admission. The captured original
++  // purpose capability admits memory projections and refuses stale generations.
++  if (!alloy_policy_.CanWriteMemory()) return kNullHash;
+ 
+   if (!url.is_valid())
+     return kNullHash;  // Don't add invalid URLs.
+@@ -851,6 +850,7 @@
+ // Initializes the shared memory structure. The salt should already be filled
+ // in so that it can be written to the shared memory
+ bool VisitedLinkWriter::CreateURLTable(int32_t num_entries) {
++  if (!alloy_policy_.CanWriteMemory()) return false;
+   base::MappedReadOnlyRegion table_memory;
+   if (!VisitedLinkWriter::fail_table_creation_for_testing_ &&
+       CreateApartURLTable(num_entries, salt_, &table_memory)) {
+@@ -1018,6 +1018,7 @@
+ 
+ // See the TableBuilder definition in the header file for how this works.
+ bool VisitedLinkWriter::RebuildTableFromDelegate() {
++  if (!alloy_policy_.CanWriteMemory()) return false;
+   DCHECK(!table_builder_);
+ 
+   // TODO(brettw) make sure we have reasonable salt!
+@@ -1030,7 +1031,11 @@
+ void VisitedLinkWriter::OnTableRebuildComplete(
+     bool success,
+     const std::vector<Fingerprint>& fingerprints) {
+-  if (success) {
++  if (!alloy_policy_.CanWriteMemory()) {
++    added_since_rebuild_.clear();
++    deleted_since_rebuild_.clear();
++  }
++  if (success && alloy_policy_.CanWriteMemory()) {
+     // Replace the old table with a new blank one.
+ 
+     int32_t new_table_size = NewTableSizeForCount(static_cast<int32_t>(
+--- a/components/visitedlink/browser/partitioned_visitedlink_writer.h
++++ b/components/visitedlink/browser/partitioned_visitedlink_writer.h
+@@ -12,6 +12,7 @@
+ #include "base/functional/callback.h"
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/read_only_shared_memory_region.h"
++#include "brave/alloy/site_records/visited_link_policy.h"
+ #include "components/visitedlink/common/visitedlink_common.h"
+ #include "components/visitedlink/core/visited_link.h"
+ #include "content/public/browser/browser_context.h"
+@@ -271,6 +272,7 @@
+   // Reference to the browser context that this object belongs to
+   // (it knows the path to where the data is stored).
+   raw_ptr<content::BrowserContext> browser_context_ = nullptr;
++  const alloy::site_records::VisitedLinkPolicy alloy_policy_{nullptr, false};
+ 
+   // Client owns the delegate and is responsible for it being valid through
+   // the lifetime this PartitionedVisitedLinkWriter.
+--- a/components/visitedlink/browser/partitioned_visitedlink_writer.cc
++++ b/components/visitedlink/browser/partitioned_visitedlink_writer.cc
+@@ -212,6 +212,7 @@
+     VisitedLinkDelegate* delegate,
+     bool use_constant_salt)
+     : browser_context_(browser_context),
++      alloy_policy_(browser_context, browser_context->IsOffTheRecord()),
+       delegate_(delegate),
+       listener_(std::make_unique<VisitedLinkEventListener>(browser_context,
+                                                            this,
+@@ -242,6 +243,7 @@
+ PartitionedVisitedLinkWriter::~PartitionedVisitedLinkWriter() = default;
+ 
+ bool PartitionedVisitedLinkWriter::Init() {
++  if (!alloy_policy_.CanWriteMemory()) return false;
+   TRACE_EVENT0("browser", "PartitionedVisitedLinkWriter::Init");
+   // Create a temporary table in mapped_table_memory_ full of null hashes. While
+   // we build the table from history on the DB thread, this temporary
+@@ -270,6 +272,7 @@
+ 
+ // Initializes the shared memory structure.
+ bool PartitionedVisitedLinkWriter::CreateVisitedLinkTable(int32_t num_entries) {
++  if (!alloy_policy_.CanWriteMemory()) return false;
+   base::MappedReadOnlyRegion table_memory;
+   if (!PartitionedVisitedLinkWriter::fail_table_creation_for_testing_ &&
+       CreateVisitedLinkTableHelper(num_entries, &table_memory)) {
+@@ -379,6 +382,7 @@
+ 
+ // See the TableBuilder definition in the header file for how this works.
+ bool PartitionedVisitedLinkWriter::BuildTableFromDelegate() {
++  if (!alloy_policy_.CanWriteMemory()) return false;
+   DCHECK(!table_builder_);
+ 
+   table_builder_ = base::MakeRefCounted<TableBuilder>(
+@@ -507,7 +511,12 @@
+     std::map<url::Origin, uint64_t> salts) {
+   table_builder_ = nullptr;  // Will release our reference to the builder.
+ 
+-  if (success) {
++  if (!alloy_policy_.CanWriteMemory()) {
++    added_during_build_.clear();
++    deleted_during_build_.clear();
++    salts_.clear();
++  }
++  if (success && alloy_policy_.CanWriteMemory()) {
+     // Replace salts_ with the map created when we built the hashtable on the DB
+     // thread.
+     salts_ = std::move(salts);
+@@ -554,7 +563,7 @@
+ 
+   // Now that we have completed our build on the DB thread, we can recover the
+   // per-origin salts of navigations that took place during the build.
+-  listener_->UpdateOriginSalts();
++  if (alloy_policy_.CanWriteMemory()) listener_->UpdateOriginSalts();
+ 
+   // Notify the unit test that the build is complete (will be NULL in prod.)
+   if (!build_complete_task_.is_null()) {
+@@ -638,12 +647,7 @@
+ 
+ VisitedLinkWriter::Hash PartitionedVisitedLinkWriter::TryToAddVisitedLink(
+     const VisitedLink& link) {
+-  // Extra check that we are not incognito. This should not happen.
+-  // TODO(boliu): Move this check to HistoryService when IsOffTheRecord is
+-  // removed from BrowserContext.
+-  if (browser_context_ && browser_context_->IsOffTheRecord()) {
+-    NOTREACHED();
+-  }
++  if (!alloy_policy_.CanWriteMemory()) return kNullHash;
+ 
+   // We don't want to add any invalid VisitedLinks to the hashtable.
+   if (!link.IsValid()) {
+@@ -775,6 +779,7 @@
+ 
+ std::optional<uint64_t> PartitionedVisitedLinkWriter::GetOrAddOriginSalt(
+     const url::Origin& origin) {
++  if (!alloy_policy_.CanWriteMemory()) return std::nullopt;
+   if (use_constant_salt_) {
+     // Pseudo-partitioning uses a constant salt rather than per-origin salts.
+     return kPseudoPartitionedConstantSalt;
+--- a/components/history/content/browser/content_visit_delegate.cc
++++ b/components/history/content/browser/content_visit_delegate.cc
+@@ -5,6 +5,7 @@
+ #include "components/history/content/browser/content_visit_delegate.h"
+ 
+ #include "content/public/browser/browser_context.h"
++#include "brave/alloy/site_records/visited_link_policy.h"
+ 
+ #include <utility>
+ 
+@@ -142,7 +143,9 @@
+             browser_context, this);
+   } else {
+     visitedlink_writer_ = std::make_unique<visitedlink::VisitedLinkWriter>(
+-        browser_context, this, !browser_context->IsOffTheRecord());
++        browser_context, this,
++        alloy::site_records::VisitedLinkPolicy(browser_context,
++            browser_context->IsOffTheRecord()).CanPersist(true));
+   }
+ }
+ 

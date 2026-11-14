@@ -1062,6 +1062,16 @@
       "patch": "cef/0140-guest-extension-stream.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0141-visited-link-policy.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0141-visited-link-tests.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

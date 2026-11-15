@@ -11,6 +11,7 @@
 <button id="locks">Native file/directory locks</button><div id="fileDrop">File drop target</div>
 <div id="filePaste" contenteditable>File paste target</div>
 <button id="largeWrite">Large native write</button>
+<button id="recursive">Remove retained child's parent</button>
 <iframe id="peer"></iframe>
 <script>
 const state={kind:'ready',serial:0};let fileHandle;let sharedReady=false;
@@ -28,6 +29,11 @@ action('write',writeSelected);
 action('largeWrite',async()=>{const bytes=new Uint8Array(2*1024*1024+13);for(let i=0;i<bytes.length;++i)bytes[i]=(i*37+11)%256;
  const writer=await fileHandle.createWritable();await writer.write(bytes);report('write-accepted');await writer.close();report('save-complete',await contents(await fileHandle.getFile()));});
 action('read',async()=>report('file-read',await contents(await fileHandle.getFile())));
+action('recursive',async()=>{const root=await showDirectoryPicker({mode:'readwrite'});
+ const nested=await root.getDirectoryHandle('nested'),child=await nested.getFileHandle('child.txt');
+ const before=await contents(await child.getFile());await root.removeEntry('nested',{recursive:true});
+ let failure='';try{await child.getFile();}catch(e){failure=e.name;}
+ report('recursive-complete',{before,failure,remaining:await contents(await(await root.getFileHandle('selected.txt')).getFile())});});
 action('directory',async()=>{const root=await showDirectoryPicker({mode:'readwrite'});const names=[];
  for await(const [name] of root.entries())names.push(name);
  const nested=await root.getDirectoryHandle('nested');const child=await nested.getFileHandle('child.txt');

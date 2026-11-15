@@ -22,6 +22,14 @@
 #include "base/unguessable_token.h"
 #include "chrome/test/base/chrome_render_view_host_test_harness.h"
 #include "content/public/browser/storage_partition.h"
+#include "content/public/browser/render_process_host.h"
+#include "content/browser/blob_storage/file_backed_blob_factory_frame_impl.h"
+#include "content/browser/security/cpsp/child_process_security_policy_impl.h"
+#include "content/public/test/test_utils.h"
+#include "mojo/public/cpp/bindings/associated_remote.h"
+#include "third_party/blink/public/mojom/blob/blob.mojom.h"
+#include "third_party/blink/public/mojom/blob/data_element.mojom.h"
+#include "third_party/blink/public/mojom/file_system_access/file_system_access_data_transfer_token.mojom.h"
 #include "content/public/test/web_contents_tester.h"
 #include "storage/browser/file_system/file_system_context.h"
 #include "testing/gtest/include/gtest/gtest.h"
@@ -140,6 +148,64 @@ TEST_F(GuestNativeFilesTest, PathOnlyUploadsAreSealedRamAndOriginalDocumentOwned
   app->Revoke(); task_environment()->RunUntilIdle();
   EXPECT_FALSE(proof->admitted.Run()); EXPECT_FALSE(verify());
   EXPECT_FALSE(base::PathExists(path));
+}
+
+TEST_F(GuestNativeFilesTest, ReviewUploadBackingEndsAtLastNativeBlobConsumerNotDocumentEnd) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get();
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame();
+  auto cap = Cap::Create(frame, Entry()); ASSERT_TRUE(cap);
+  base::test::TestFuture<std::optional<content::AlloyGuestUploadFiles>> result;
+  content::SnapshotAlloyGuestFiles(frame, {cap}, false, result.GetCallback());
+  ASSERT_TRUE(result.Get()); const auto path = result.Get()->files[0].path;
+  auto* manager = static_cast<content::FileSystemAccessManagerImpl*>(
+      frame->GetStoragePartition()->GetFileSystemAccessEntryFactory());
+  const auto url = manager->context()->CreateCrackedFileSystemURL(
+      blink::StorageKey(), storage::kFileSystemTypeLocal, path);
+  mojo::Remote<blink::mojom::FileSystemAccessDataTransferToken> token, token_clone;
+  manager->CreateFileSystemAccessDataTransferToken(content::PathInfo(path),
+      frame->GetProcess()->GetID().GetUnsafeValue(), token.BindNewPipeAndPassReceiver());
+  token->Clone(token_clone.BindNewPipeAndPassReceiver()); token.FlushForTesting();
+  token.reset(); cap.reset();
+  content::ChildProcessSecurityPolicyImpl::GetInstance()->GrantReadFile(frame->GetProcess()->GetID(), path);
+  mojo::AssociatedRemote<blink::mojom::FileBackedBlobFactory> factory;
+  content::FileBackedBlobFactoryFrameImpl::CreateForCurrentDocument(frame, factory.BindNewEndpointAndPassDedicatedReceiver());
+  mojo::Remote<blink::mojom::Blob> blob, clone;
+  base::test::TestFuture<void> registered;
+  factory->RegisterBlobSync(blob.BindNewPipeAndPassReceiver(), base::UnguessableToken::Create().ToString(),
+      "text/plain", blink::mojom::DataElementFile::New(path, 0, 6, std::nullopt), registered.GetCallback());
+  ASSERT_TRUE(registered.Wait());
+  blob->Clone(clone.BindNewPipeAndPassReceiver()); blob.FlushForTesting();
+  blob.reset(); content::RunAllTasksUntilIdle();
+  EXPECT_TRUE(base::PathExists(path)); EXPECT_TRUE(app->live);
+  clone.reset(); content::RunAllTasksUntilIdle(); task_environment()->RunUntilIdle();
+  EXPECT_FALSE(base::PathExists(path));
+  EXPECT_FALSE(content::GetAlloyGuestUploadProof(frame, path));
+  {
+    auto retained = Cap::FromURL(profile(), url);
+    EXPECT_TRUE(retained);
+    if (retained) EXPECT_TRUE(retained->Admitted());
+  }
+  token_clone.reset(); content::RunAllTasksUntilIdle();
+  EXPECT_FALSE(Cap::FromURL(profile(), url));
+  EXPECT_TRUE(app->live);
+  app->Revoke(); task_environment()->RunUntilIdle();
+}
+
+TEST_F(GuestNativeFilesTest, ReviewSequenceOwnedFactoriesAdoptTheirInitialReference) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get();
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame();
+  auto cap = Cap::Create(frame, Entry()); ASSERT_TRUE(cap);
+  EXPECT_TRUE(cap->HasOneRef());
+  auto binding = content::AlloyGuestFileBinding::Create(frame, cap); ASSERT_TRUE(binding);
+  EXPECT_TRUE(binding->HasOneRef());
+  EXPECT_FALSE(cap->HasOneRef());
+  binding.reset(); content::RunAllTasksUntilIdle();
+  EXPECT_TRUE(cap->HasOneRef());
+  app->Revoke();
 }
 
 TEST(GuestFileMetadata, RejectsPathAuthorityAndNativeExtentOverflow) {

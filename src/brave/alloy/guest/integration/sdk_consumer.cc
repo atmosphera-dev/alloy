@@ -242,6 +242,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     }
     if (request->IsWrite()) {
       auto write = std::make_shared<Write>(); write->request = request;
+      { std::lock_guard lock(mutex_); writes_[request->GetId()] = write; }
       auto self = CefRefPtr<Consumer>(this);
       write->done = [self](std::shared_ptr<Write> value, bool success) { self->WriteReady(value, success); };
       write->Next(); return;
@@ -268,8 +269,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
   void WriteReady(std::shared_ptr<Write> write, bool success) {
     if (!success) { Event("write-aborted"); return; }
     bool hold = false, fail = false;
-    { std::lock_guard lock(mutex_); hold = hold_writes_; fail = fail_writes_;
-      if (hold) writes_[write->request->GetId()] = write; }
+    { std::lock_guard lock(mutex_); hold = hold_writes_; fail = fail_writes_; }
     auto event = CefDictionaryValue::Create(); event->SetString("request", std::to_string(write->request->GetId()));
     Event("write-ready", event);
     if (hold) return;
@@ -277,7 +277,10 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     StoreWrite(std::move(write));
   }
   void StoreWrite(std::shared_ptr<Write> write) {
-    { std::lock_guard lock(mutex_); clipboard_ = write->formats; ++sequence_; }
+    { std::lock_guard lock(mutex_);
+      const auto found = writes_.find(write->request->GetId());
+      if (found == writes_.end() || found->second != write) return;
+      clipboard_ = write->formats; ++sequence_; writes_.erase(found); }
     const bool queued = write->request->CompleteWrite("app-clipboard", 54321);
     auto event = CefDictionaryValue::Create(); event->SetBool("ok", queued);
     event->SetString("request", std::to_string(write->request->GetId())); Event("clipboard-stored", event);
@@ -364,8 +367,8 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
       Event("clipboard-content", event); queued = true;
     } else if (op == "accept-write") {
       std::shared_ptr<Write> write;
-      { std::lock_guard lock(mutex_); auto found = writes_.find(U(data, "request"));
-        if (found != writes_.end()) { write = found->second; writes_.erase(found); } }
+       { std::lock_guard lock(mutex_); auto found = writes_.find(U(data, "request"));
+         if (found != writes_.end()) write = found->second; }
       if (write) { StoreWrite(std::move(write)); queued = true; }
     } else if (op == "menu-select") {
       CefRefPtr<AlloyGuestMenuRequest> request;

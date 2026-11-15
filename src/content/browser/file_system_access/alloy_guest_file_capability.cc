@@ -40,9 +40,13 @@ bool ValidEntriesReply(const base::DictValue& details, const std::vector<std::st
 
 class AlloyGuestFileRegistry final : public base::SupportsUserData::Data {
  public:
+  static AlloyGuestFileRegistry* Existing(BrowserContext* context) {
+    return context && !context->ShutdownStarted()
+        ? static_cast<AlloyGuestFileRegistry*>(context->GetUserData(&kRegistry)) : nullptr;
+  }
   static AlloyGuestFileRegistry* Get(BrowserContext* context) {
     if (!context || context->ShutdownStarted()) return nullptr;
-    auto* registry = static_cast<AlloyGuestFileRegistry*>(context->GetUserData(&kRegistry));
+    auto* registry = Existing(context);
     if (!registry) {
       auto created = std::make_unique<AlloyGuestFileRegistry>(); registry = created.get();
       context->SetUserData(&kRegistry, std::move(created));
@@ -145,7 +149,7 @@ scoped_refptr<AlloyGuestFileCapability> AlloyGuestFileCapability::Create(
     RenderFrameHost* original, AlloyGuestFileMetadata metadata, base::RepeatingCallback<bool()> extra) {
   auto* bridge = AlloyGuestIntegration::Get(original);
   if (!original || !bridge) return nullptr;
-  auto cap = base::WrapRefCounted(new AlloyGuestFileCapability(original, std::move(metadata)));
+  auto cap = base::AdoptRef(new AlloyGuestFileCapability(original, std::move(metadata)));
   auto* registry = AlloyGuestFileRegistry::Get(original->GetBrowserContext());
   if (!registry || !registry->RegisterIdentity(cap->metadata_)) { cap->Retire(); return nullptr; }
   cap->registry_ = registry->GetWeakPtr();
@@ -342,7 +346,7 @@ std::string AlloyGuestFileCapability::UniqueId() const {
 }
 scoped_refptr<AlloyGuestFileCapability> AlloyGuestFileCapability::FromURL(
     BrowserContext* context, const storage::FileSystemURL& url) {
-  auto* registry = AlloyGuestFileRegistry::Get(context);
+  auto* registry = AlloyGuestFileRegistry::Existing(context);
   return registry ? registry->Find(url.path()) : nullptr;
 }
 

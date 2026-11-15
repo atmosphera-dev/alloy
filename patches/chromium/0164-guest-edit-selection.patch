@@ -1,0 +1,40 @@
+--- a/third_party/blink/public/web/web_local_frame.h
++++ b/third_party/blink/public/web/web_local_frame.h
+@@ -569,6 +569,8 @@
+   virtual bool HasSelection() const = 0;
+ 
+   virtual WebRange SelectionRange() const = 0;
++  // Plain-text offsets in exactly SelectRange's restoration scope.
++  virtual WebRange SelectionRangeForRestoration() const = 0;
+ 
+   virtual WebString SelectionAsText() const = 0;
+   virtual WebString SelectionAsMarkup() const = 0;
+--- a/third_party/blink/renderer/core/frame/web_local_frame_impl.h
++++ b/third_party/blink/renderer/core/frame/web_local_frame_impl.h
+@@ -227,6 +227,7 @@
+   void SetIsCaretBrowsingOverridden(bool overridden) override;
+   bool HasSelection() const override;
+   WebRange SelectionRange() const override;
++  WebRange SelectionRangeForRestoration() const override;
+   WebString SelectionAsText() const override;
+   WebString SelectionAsMarkup() const override;
+   void TextSelectionChanged(const WebString& selection_text,
+--- a/third_party/blink/renderer/core/frame/web_local_frame_impl.cc
++++ b/third_party/blink/renderer/core/frame/web_local_frame_impl.cc
+@@ -1544,6 +1544,16 @@
+       .ToNormalizedEphemeralRange();
+ }
+ 
++WebRange WebLocalFrameImpl::SelectionRangeForRestoration() const {
++  GetFrame()->GetDocument()->UpdateStyleAndLayout(DocumentUpdateReason::kSelection);
++  const auto selection = GetFrame()->Selection().ComputeVisibleSelectionInDomTree();
++  const auto range = selection.ToNormalizedEphemeralRange();
++  if (range.IsNull()) return WebRange();
++  ContainerNode* scope = selection.RootEditableElement();
++  if (!scope) scope = GetFrame()->GetDocument()->documentElement();
++  return scope ? WebRange(PlainTextRange::Create(*scope, range)) : WebRange();
++}
++
+ WebString WebLocalFrameImpl::SelectionAsText() const {
+   DCHECK(GetFrame());
+   WebPluginContainerImpl* plugin_container =

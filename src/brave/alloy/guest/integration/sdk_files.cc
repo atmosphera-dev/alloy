@@ -73,7 +73,10 @@ class SyntheticGuestFiles::Impl : public std::enable_shared_from_this<Impl> {
         : owner_(std::move(owner)), node_(std::move(node)), op_(std::move(op)) {}
     void OnRead(bool success, uint64_t offset, CefRefPtr<CefBinaryValue> data) override {
       std::lock_guard lock(owner_->mutex_);
+      const auto active = owner_->active_.find(op_->GetId());
+      if (active == owner_->active_.end() || active->second.get() != op_.get()) return;
       if (!success || offset || !data || data->GetSize() != op_->GetLength() || node_->ended) { op_->Fail("failed"); return; }
+      if (node_->removed || (node_->target && node_->target->removed)) { op_->Fail("not-found"); return; }
       std::string bytes(data->GetSize(), '\0'); data->GetData(bytes.data(), bytes.size(), 0);
       auto start = op_->GetOffset();
       if (start > node_->bytes.max_size() || bytes.size() > node_->bytes.max_size() - start) { op_->Fail("failed"); return; }
@@ -98,6 +101,9 @@ class SyntheticGuestFiles::Impl : public std::enable_shared_from_this<Impl> {
     auto event = CefDictionaryValue::Create(); event->SetString("mode", mode);
     event->SetString("download", request->GetDownloadId());
     event->SetString("request", std::to_string(request->GetId())); event_("file-selection", event);
+    if (mode == "download" && Option("deny-first-download") && !denied_download_) {
+      denied_download_ = true; request->Deny(); return;
+    }
     if (Option("deny-selection")) { request->Deny(); return; }
     if (Option("hold-selection")) { held_selections_[request->GetId()] = request; return; }
     auto node = source_;
@@ -131,7 +137,13 @@ class SyntheticGuestFiles::Impl : public std::enable_shared_from_this<Impl> {
   }
   void Operation(const std::shared_ptr<Node>& node, CefRefPtr<AlloyGuestFileOperation> op, bool released = false) {
     std::lock_guard lock(mutex_); std::string kind = op->GetKind();
-    if (!released) callback_thread_ = std::this_thread::get_id();
+    if (!released) {
+      callback_thread_ = std::this_thread::get_id();
+      active_[op->GetId()] = op;
+    } else {
+      const auto active = active_.find(op->GetId());
+      if (active == active_.end() || active->second.get() != op.get()) return;
+    }
     auto event = CefDictionaryValue::Create(); event->SetString("request", std::to_string(op->GetId()));
     event->SetString("kind", kind); event->SetString("name", node->name);
     event->SetString("offset", std::to_string(op->GetOffset())); event->SetString("length", std::to_string(op->GetLength()));
@@ -200,7 +212,12 @@ class SyntheticGuestFiles::Impl : public std::enable_shared_from_this<Impl> {
       std::string name = op->GetName(); auto removed = node;
       if (!name.empty()) { auto found = node->children.find(name); if (found == node->children.end()) { op->Fail("not-found"); return; } removed = found->second; }
       if (!op->GetRecursive() && !removed->children.empty()) { op->Fail("not-empty"); return; }
-      removed->removed = true;
+      std::vector<std::shared_ptr<Node>> subtree{removed};
+      while (!subtree.empty()) {
+        auto current = std::move(subtree.back()); subtree.pop_back();
+        current->removed = true;
+        for (const auto& [child_name, child] : current->children) subtree.push_back(child);
+      }
       if (!name.empty()) node->children.erase(name);
       else for (auto& [id, weak] : nodes_) if (auto parent = weak.lock()) {
         for (auto it = parent->children.begin(); it != parent->children.end();) {
@@ -217,7 +234,10 @@ class SyntheticGuestFiles::Impl : public std::enable_shared_from_this<Impl> {
     for (const auto& [name, child] : node->children) { path->push_back(name); if (FindPath(child, id, path, seen)) return true; path->pop_back(); }
     return false;
   }
-  void Ended(uint64_t id) { std::lock_guard lock(mutex_); held_.erase(id); held_selections_.erase(id); }
+  void Ended(uint64_t id) {
+    std::lock_guard lock(mutex_);
+    active_.erase(id); held_.erase(id); held_selections_.erase(id);
+  }
   void Release() {
     decltype(held_) held; { std::lock_guard lock(mutex_); held.swap(held_); }
     for (auto& [id, item] : held) Operation(item.first, item.second, true);
@@ -238,10 +258,14 @@ class SyntheticGuestFiles::Impl : public std::enable_shared_from_this<Impl> {
   std::recursive_mutex mutex_;
   std::shared_ptr<Node> root_, source_, saved_, downloaded_, nested_child_;
   std::map<std::string, std::weak_ptr<Node>> nodes_;
+  // Retirement and replay/async byte acceptance linearize on this same map
+  // under mutex_. Extracting a held operation never detaches its cancellation.
+  std::map<uint64_t, CefRefPtr<AlloyGuestFileOperation>> active_;
   std::map<uint64_t, std::pair<std::shared_ptr<Node>, CefRefPtr<AlloyGuestFileOperation>>> held_;
   std::map<uint64_t, CefRefPtr<AlloyGuestFileSelection>> held_selections_;
   CefRefPtr<CefDictionaryValue> options_;
   std::thread::id callback_thread_;
+  bool denied_download_ = false;
 };
 SyntheticGuestFiles::SyntheticGuestFiles(Event event) : impl_(std::make_shared<Impl>(std::move(event))) {}
 SyntheticGuestFiles::~SyntheticGuestFiles() = default;

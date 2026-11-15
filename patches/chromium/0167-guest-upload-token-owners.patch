@@ -1,0 +1,78 @@
+--- a/content/browser/file_system_access/file_system_access_data_transfer_token_impl.h
++++ b/content/browser/file_system_access/file_system_access_data_transfer_token_impl.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_BROWSER_FILE_SYSTEM_ACCESS_FILE_SYSTEM_ACCESS_DATA_TRANSFER_TOKEN_IMPL_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/sequence_checker.h"
+ #include "base/thread_annotations.h"
+ #include "base/unguessable_token.h"
+@@ -17,6 +18,7 @@
+ #include "third_party/blink/public/mojom/file_system_access/file_system_access_data_transfer_token.mojom.h"
+ 
+ namespace content {
++class AlloyGuestFileCapability;
+ 
+ // This is the browser side implementation of the
+ // FileSystemAccessDataTransferToken interface. This class stores the file path
+@@ -33,7 +35,7 @@
+       const content::PathInfo& file_path_info,
+       int renderer_process_id,
+       mojo::PendingReceiver<blink::mojom::FileSystemAccessDataTransferToken>
+-          receiver);
++          receiver, scoped_refptr<AlloyGuestFileCapability> guest_file = nullptr);
+ 
+   ~FileSystemAccessDataTransferTokenImpl() override;
+ 
+@@ -66,6 +68,8 @@
+   const content::PathInfo file_path_info_;
+   const int renderer_process_id_;
+   const base::UnguessableToken token_;
++  // Lifetime only: redemption still applies native renderer/document/grant checks.
++  const scoped_refptr<AlloyGuestFileCapability> guest_file_;
+ 
+   // This token may contain multiple receivers, which includes a receiver for
+   // the originally constructed instance and then additional receivers for
+--- a/content/browser/file_system_access/file_system_access_data_transfer_token_impl.cc
++++ b/content/browser/file_system_access/file_system_access_data_transfer_token_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/file_system_access/file_system_access_data_transfer_token_impl.h"
++#include "content/browser/file_system_access/alloy_guest_file_capability.h"
+ 
+ #include <utility>
+ 
+@@ -17,11 +18,11 @@
+     const content::PathInfo& file_path_info,
+     int renderer_process_id,
+     mojo::PendingReceiver<blink::mojom::FileSystemAccessDataTransferToken>
+-        receiver)
++        receiver, scoped_refptr<AlloyGuestFileCapability> guest_file)
+     : manager_(manager),
+       file_path_info_(file_path_info),
+       renderer_process_id_(renderer_process_id),
+-      token_(base::UnguessableToken::Create()) {
++      token_(base::UnguessableToken::Create()), guest_file_(std::move(guest_file)) {
+   CHECK(manager_, base::NotFatalUntil::M159);
+ 
+   receivers_.set_disconnect_handler(base::BindRepeating(
+--- a/content/browser/file_system_access/file_system_access_manager_impl.cc
++++ b/content/browser/file_system_access/file_system_access_manager_impl.cc
+@@ -1011,9 +1011,14 @@
+         receiver) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  scoped_refptr<AlloyGuestFileCapability> guest_file;
++  if (auto* process = RenderProcessHost::FromID(ChildProcessId::FromUnsafeValue(renderer_id))) {
++    guest_file = AlloyGuestFileCapability::FromURL(process->GetBrowserContext(),
++        CreateFileSystemURLFromPath(file_path_info));
++  }
+   auto data_transfer_token_impl =
+       std::make_unique<FileSystemAccessDataTransferTokenImpl>(
+-          this, file_path_info, renderer_id, std::move(receiver));
++          this, file_path_info, renderer_id, std::move(receiver), std::move(guest_file));
+   auto token = data_transfer_token_impl->token();
+   data_transfer_tokens_.emplace(token, std::move(data_transfer_token_impl));
+ }

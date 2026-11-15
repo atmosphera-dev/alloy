@@ -14,7 +14,7 @@ scoped_refptr<AlloyGuestFileBinding> AlloyGuestFileBinding::Create(RenderFrameHo
   if (issuer && issuer->Admitted() && issuer->original() == frame) return issuer;
   auto* bridge = AlloyGuestIntegration::Get(frame);
   if (!bridge) return nullptr;
-  auto binding = base::WrapRefCounted(new AlloyGuestFileBinding(frame));
+  auto binding = base::AdoptRef(new AlloyGuestFileBinding(frame));
   binding->source_ = source; binding->issuer_ = issuer;
   auto retire = base::BindRepeating([](base::WeakPtr<AlloyGuestFileBinding> weak) {
     if (weak) { auto retained = base::WrapRefCounted(weak.get()); retained->Retire(); }

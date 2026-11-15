@@ -1,0 +1,130 @@
+--- a/content/browser/blob_storage/file_backed_blob_factory_base.h
++++ b/content/browser/blob_storage/file_backed_blob_factory_base.h
+@@ -18,6 +18,7 @@
+ namespace content {
+ 
+ class ChromeBlobStorageContext;
++class RenderFrameHost;
+ 
+ // `FileBackedBlobFactoryBase` is an abstract class to allow the registration of
+ // file backed blobs. The URL used for the registration should be the URL of the
+@@ -67,6 +68,7 @@
+ 
+  private:
+   virtual GURL GetCurrentUrl() = 0;
++  virtual RenderFrameHost* GetFileSelectionFrame() { return nullptr; }
+   virtual mojo::ReportBadMessageCallback GetBadMessageCallback() = 0;
+ 
+   const ChildProcessId process_id_;
+--- a/content/browser/blob_storage/file_backed_blob_factory_frame_impl.h
++++ b/content/browser/blob_storage/file_backed_blob_factory_frame_impl.h
+@@ -35,6 +35,7 @@
+ 
+   // FileBackedBlobFactoryBase:
+   GURL GetCurrentUrl() override;
++  RenderFrameHost* GetFileSelectionFrame() override { return &render_frame_host(); }
+   mojo::ReportBadMessageCallback GetBadMessageCallback() override;
+ 
+   mojo::AssociatedReceiver<blink::mojom::FileBackedBlobFactory> receiver_;
+--- a/content/browser/blob_storage/file_backed_blob_factory_base.cc
++++ b/content/browser/blob_storage/file_backed_blob_factory_base.cc
+@@ -10,6 +10,11 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "components/file_access/scoped_file_access.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_LINUX)
++#include "content/browser/file_system_access/alloy_guest_uploads.h"
++#endif
++#include "storage/browser/blob/shareable_file_reference.h"
+ #include "content/browser/security/cpsp/child_process_security_policy_impl.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "storage/browser/blob/blob_data_builder.h"
+@@ -53,6 +58,7 @@
+     std::string uuid,
+     std::string content_type,
+     blink::mojom::DataElementFilePtr file,
++    base::OnceClosure guest_consumer,
+     file_access::ScopedFileAccessDelegate::RequestFilesAccessIOCallback
+         file_access,
+     bool security_check_success,
+@@ -62,6 +68,15 @@
+         finish_callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M159);
+   base::ScopedClosureRunner scoped_finish_callback(std::move(finish_callback));
++
++  scoped_refptr<storage::ShareableFileReference> guest_file;
++  if (guest_consumer) {
++    guest_file = storage::ShareableFileReference::GetOrCreate(file->path,
++        storage::ShareableFileReference::DONT_DELETE_ON_FINAL_RELEASE, GetIOThreadTaskRunner({}).get());
++    guest_file->AddFinalReleaseCallback(base::BindOnce(
++        [](base::OnceClosure release, const base::FilePath&) { std::move(release).Run(); },
++        std::move(guest_consumer)));
++  }
+ 
+   if (blob_storage_context->context()->registry().HasEntry(uuid) ||
+       uuid.empty()) {
+@@ -137,10 +152,14 @@
+                            std::move(finish_callback));
+   }
+ 
++  base::OnceClosure guest_consumer;
++#if BUILDFLAG(IS_LINUX)
++  guest_consumer = AcquireAlloyGuestUploadConsumer(GetFileSelectionFrame(), file->path);
++#endif
+   content::GetIOThreadTaskRunner({})->PostTask(
+       FROM_HERE,
+       base::BindOnce(&ContinueRegisterBlob, std::move(blob), uuid, content_type,
+-                     std::move(file),
++                     std::move(file), std::move(guest_consumer),
+                      GetAccessCallback(url_for_file_access_checks),
+                      security_check_success,
+                      base::BindPostTask(GetUIThreadTaskRunner({}),
+--- a/third_party/blink/renderer/core/html/forms/form_data.cc
++++ b/third_party/blink/renderer/core/html/forms/form_data.cc
+@@ -29,6 +29,12 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/html/forms/form_data.h"
++#include <memory>
++#include "build/build_config.h"
++#if BUILDFLAG(IS_LINUX)
++#include "base/process/alloy_guest_runtime.h"
++#include "third_party/blink/renderer/platform/blob/blob_data.h"
++#endif
+ 
+ #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_file_usvstring.h"
+@@ -339,12 +345,30 @@
+     // Append body
+     form_data->AppendData(header);
+     if (file) {
+-      if (file->HasBackingFile()) {
++      bool use_backing_path = file->HasBackingFile();
++#if BUILDFLAG(IS_LINUX)
++      // A native Blob lease, not a copied filename, owns guest RAM snapshots
++      // for the complete multipart request and any in-flight readers.
++      use_backing_path = use_backing_path && !alloy_guest_is_runtime();
++#endif
++      if (use_backing_path) {
+         // Do not add the file if the path is empty.
+         if (!file->GetPath().empty())
+           form_data->AppendFile(file->GetPath(), file->LastModifiedTime());
+       } else {
+-        form_data->AppendBlob(file->GetBlobDataHandle());
++        auto handle = file->GetBlobDataHandle();
++#if BUILDFLAG(IS_LINUX)
++        if (file->HasBackingFile() && alloy_guest_is_runtime()) {
++          // File handles can have unknown native length. Multipart aggregation
++          // needs an explicit extent, just like Blob::slice; retain its items.
++          const auto size = file->size();
++          auto data = std::make_unique<BlobData>();
++          data->SetContentType(file->type());
++          data->AppendBlob(handle, 0, size);
++          handle = BlobDataHandle::Create(std::move(data), size);
++        }
++#endif
++        form_data->AppendBlob(std::move(handle));
+       }
+     } else {
+       std::string encoded_value =

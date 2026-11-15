@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include "base/memory/weak_ptr.h"
+#include "base/functional/callback_helpers.h"
 #include "base/values.h"
 #include "brave/alloy/guest/stream/interaction.h"
 #include "cef/include/cef_browser.h"
@@ -34,6 +35,7 @@ class Actions {
   const Notify notify_;
   CefRefPtr<CefBrowser> browser_;
   bool target_ = false;
+  base::ScopedClosureRunner target_files_;
   std::shared_ptr<Source> source_;
   base::WeakPtrFactory<Actions> weak_{this};
 };

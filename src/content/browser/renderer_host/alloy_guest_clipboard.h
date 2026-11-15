@@ -20,7 +20,11 @@ class AlloyGuestClipboard final
                        base::RepeatingCallback<bool()> receiver_admitted);
   ~AlloyGuestClipboard() override;
   void RefreshSequence(ui::ClipboardBuffer buffer,
-                         base::OnceCallback<void(bool)> done);
+                          base::OnceCallback<void(bool)> done);
+  // The policy owner supplies its original token, not this backend's mutable
+  // cache: concurrent clipboard reads may refresh that cache independently.
+  void ConfirmReadSequence(ui::ClipboardBuffer buffer, ui::ClipboardSequenceNumberToken expected,
+      base::OnceCallback<void(bool)> done) const;
   void OnPreShutdown() override;
   void GetSource(ui::ClipboardBuffer, GetSourceCallback callback) const override;
   const ui::ClipboardSequenceNumberToken& GetSequenceNumber(
@@ -71,7 +75,15 @@ class AlloyGuestClipboard final
   using Data = AlloyGuestIntegrationData;
   using Result = std::optional<Data>;
   void Read(ui::ClipboardBuffer buffer, std::string format,
-             AlloyGuestIntegration::Reply reply) const;
+      AlloyGuestIntegration::Reply reply, base::TimeTicks deadline = {},
+      std::optional<ui::ClipboardSequenceNumberToken> expected = std::nullopt) const;
+  void ReadTextBytes(ui::ClipboardBuffer buffer, AlloyGuestIntegration::Reply reply) const;
+  void CaptureSequence(ui::ClipboardBuffer buffer, base::RepeatingCallback<bool()> admitted,
+      base::OnceCallback<void(std::optional<ui::ClipboardSequenceNumberToken>)> reply) const;
+  void ConfirmSequence(ui::ClipboardBuffer buffer, ui::ClipboardSequenceNumberToken expected,
+      base::RepeatingCallback<bool()> admitted, base::OnceCallback<void(bool)> reply) const;
+  void ReadFilenamesAtSequence(ui::ClipboardBuffer buffer, ui::ClipboardSequenceNumberToken expected,
+      base::RepeatingCallback<bool()> admitted, ReadFilenamesCallback callback) const;
   void Send(AlloyGuestIntegration::Operation operation, Data data,
              AlloyGuestIntegration::Reply reply) const;
   void Add(std::string format, std::string bytes);

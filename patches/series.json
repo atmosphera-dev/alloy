@@ -1084,6 +1084,11 @@
       "stage": "after-prune"
     },
     {
+      "patch": "chromium/0160-guest-clipboard-policy.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
       "patch": "cef/0160-guest-integration.patch",
       "root": "cef",
       "stage": "after-prune"
@@ -1109,6 +1114,11 @@
       "stage": "after-prune"
     },
     {
+      "patch": "chromium/0164-guest-edit-selection.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
       "patch": "cef/0164-guest-edit-context.patch",
       "root": "cef",
       "stage": "after-prune"
@@ -1125,6 +1135,16 @@
     },
     {
       "patch": "chromium/0167-guest-upload-snapshots.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0167-guest-upload-consumers.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0167-guest-upload-token-owners.patch",
       "root": ".",
       "stage": "after-prune"
     },

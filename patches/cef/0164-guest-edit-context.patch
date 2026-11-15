@@ -185,7 +185,7 @@
 +            if (candidate.IsEditable()) { element = candidate; break; }
 +          }
 +        }
-+        self->guest_edit_context_ = GuestEditContext{token, document, element, frame->SelectionRange()};
++        self->guest_edit_context_ = GuestEditContext{token, document, element, frame->SelectionRangeForRestoration()};
 +        std::move(callback).Run(true);
 +      }, CefRefPtr<CefFrameImpl>(this), document, token, context_menu, std::move(callback)));
 +}

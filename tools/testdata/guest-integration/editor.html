@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>editor-loading</title>
+<style>body{margin:20px;font:20px monospace}#editor{padding:16px;border:1px solid;width:400px}button{margin-top:20px}</style>
+<div id="editor" contenteditable><span>abc</span><span>def</span></div><button id="select">Select native editor range</button>
+<script>
+const editor=document.querySelector('#editor'),select=document.querySelector('#select');
+function rect(node){const r=node.getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height};}
+function report(kind,extra={}){document.title=JSON.stringify({kind,rectangles:{editor:rect(editor),select:rect(select)},text:editor.textContent,focused:document.activeElement.id,...extra});}
+select.onclick=()=>{editor.focus();const range=document.createRange(),cross=new URLSearchParams(location.search).has('cross');
+ range.setStart(editor.children[cross?0:1].firstChild,cross?2:1);range.setEnd(editor.children[1].firstChild,2);
+ const selection=getSelection();selection.removeAllRanges();selection.addRange(range);report('editor-selected',{selection:rect(range)});};
+editor.oninput=()=>report('editor-input');report('ready');
+</script>

@@ -22,6 +22,7 @@
 #include "base/posix/eintr_wrapper.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/thread_pool.h"
+#include "base/task/bind_post_task.h"
 #include "base/unguessable_token.h"
 #include "content/public/browser/storage_partition.h"
 #include "net/base/mime_util.h"
@@ -33,8 +34,11 @@ class Snapshot;
 const int kSnapshots = 0;
 class SnapshotRegistry final : public base::SupportsUserData::Data {
  public:
+  static SnapshotRegistry* Existing(WebContents* contents) {
+    return static_cast<SnapshotRegistry*>(contents->GetUserData(&kSnapshots));
+  }
   static SnapshotRegistry* Get(WebContents* contents) {
-    auto* registry = static_cast<SnapshotRegistry*>(contents->GetUserData(&kSnapshots));
+    auto* registry = Existing(contents);
     if (!registry) {
       auto value = std::make_unique<SnapshotRegistry>(); registry = value.get();
       contents->SetUserData(&kSnapshots, std::move(value));
@@ -195,15 +199,34 @@ class Snapshot final : public base::RefCounted<Snapshot> {
     }, backing_, found->second, path, live_flag_);
     return proof;
   }
+  base::OnceClosure AcquireConsumer(RenderFrameHost* original, const base::FilePath& path) {
+    if (!finished_ || !Proof(original, path)) return {};
+    ++consumers_; pending_consumers_.erase(path);
+    return base::BindPostTask(base::SequencedTaskRunner::GetCurrentDefault(),
+        base::BindOnce(&Snapshot::ReleaseConsumer, weak_.GetWeakPtr()));
+  }
  private:
   friend class base::RefCounted<Snapshot>;
   ~Snapshot() = default;
   struct Pending { scoped_refptr<Cap> cap; base::FilePath relative; std::set<std::string> ancestors; };
   bool Admitted() const { return live_ && admitted_ && admitted_.Run() && (!extra_ || extra_.Run()); }
+  void ReleaseConsumer() {
+    CHECK_GT(consumers_, 0u);
+    --consumers_;
+    if (!consumers_ && pending_consumers_.empty()) Retire();
+  }
+  void AbandonHandoff() {
+    pending_consumers_.clear();
+    if (!consumers_) Retire();
+  }
   void Finish(bool success) {
     auto retained = base::WrapRefCounted(this);
     success = success && Admitted();
-    if (success) extra_.Reset();  // Completed snapshots retain document life, not a read deadline/receiver.
+    if (success) {
+      extra_.Reset();  // Consumer leases retain document life, not a read deadline/receiver.
+      finished_ = true;
+      result_.abandon = base::ScopedClosureRunner(base::BindOnce(&Snapshot::AbandonHandoff, weak_.GetWeakPtr()));
+    }
     if (reply_) {
       auto reply = std::move(reply_);
       if (success) {
@@ -291,7 +314,8 @@ class Snapshot final : public base::RefCounted<Snapshot> {
               for (const auto& name : self->current_->relative.DirName().GetComponents())
                 directories.push_back(base::FilePath(name).AsUTF16Unsafe());
             }
-            self->aliases_.emplace(*path, self->index_);
+             self->aliases_.emplace(*path, self->index_);
+             self->pending_consumers_.insert(*path);
             if (self->registry_) self->registry_->Add(*path, self->weak_.GetWeakPtr());
             self->Next();
           }, weak_.GetWeakPtr()));
@@ -331,7 +355,9 @@ class Snapshot final : public base::RefCounted<Snapshot> {
   uint64_t offset_ = 0, size_ = 0;
   size_t index_ = 0;
   int64_t modified_ = 0;
-  bool live_ = true;
+  bool live_ = true, finished_ = false;
+  size_t consumers_ = 0;
+  std::set<base::FilePath> pending_consumers_;
   base::FilePath alias_;
   std::map<base::FilePath, size_t> aliases_;
   base::WeakPtr<SnapshotRegistry> registry_;
@@ -345,6 +371,14 @@ std::optional<AlloyGuestUploadProof> GetAlloyGuestUploadProof(RenderFrameHost* o
   auto* contents = WebContents::FromRenderFrameHost(original)->GetOutermostWebContents();
   auto snapshot = SnapshotRegistry::Get(contents)->Find(path);
   return snapshot ? snapshot->Proof(original, path) : std::nullopt;
+}
+
+base::OnceClosure AcquireAlloyGuestUploadConsumer(RenderFrameHost* original, const base::FilePath& path) {
+  if (!original) return {};
+  auto* contents = WebContents::FromRenderFrameHost(original)->GetOutermostWebContents();
+  auto* registry = SnapshotRegistry::Existing(contents);
+  auto snapshot = registry ? registry->Find(path) : nullptr;
+  return snapshot ? snapshot->AcquireConsumer(original, path) : base::OnceClosure();
 }
 
 void SnapshotAlloyGuestFiles(RenderFrameHost* original, Cap::Entries entries, bool directory,
@@ -384,6 +418,7 @@ void SelectAlloyGuestUploadFiles(RenderFrameHost* original, const blink::mojom::
                 files.push_back(blink::mojom::FileChooserFileInfo::NewNativeFile(
                     blink::mojom::NativeFileInfo::New(file.path, file.display_name.AsUTF16Unsafe(), std::move(directories))));
               }
+              snapshot->Delivered();
               listener->FileSelected(std::move(files), snapshot->directory, mode);
             }, mode, std::move(listener)));
       }, original->GetWeakDocumentPtr(), params.mode, directory, std::move(listener)));

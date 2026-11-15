@@ -587,7 +587,8 @@ class AlloyGuestFileOperation : public virtual CefBaseRefCounted {
   virtual uint64_t GetDocumentId() = 0;
   ///
   /// stat, read, open-write, write, truncate, close, abort, entries, child-file,
-  /// child-directory, child-entry, remove, rename, move, permission, compare or resolve.
+  /// child-directory, child-entry, remove, permission, compare or resolve.
+  /// External move/rename retain Chromium's native unsupported-operation refusal.
   ///
   /*--cef()--*/
   virtual CefString GetKind() = 0;
@@ -640,7 +641,7 @@ class AlloyGuestFileOperation : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual bool GetWritePermission() = 0;
   ///
-  /// Selected destination for move/compare/resolve, or empty otherwise.
+  /// Selected destination for compare/resolve, or empty otherwise.
   ///
   /*--cef()--*/
   virtual CefRefPtr<AlloyGuestFile> GetDestination() = 0;

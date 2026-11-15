@@ -53,6 +53,9 @@ and native permission queries. Buffers distinguish copy/paste from primary
 selection. Sequence replies are nonzero 128-bit tokens encoded as 32 hexadecimal
 digits; change the token when replacing that buffer. ClipboardChanged notifies
 native listeners, which refresh through the same provider.
+Read completion rechecks the app sequence before supplying data to native paste
+policy. A mismatch returns no content, never new bytes labeled with the earlier
+policy identity. Offered text aliases use the same mapping for listing and reads.
 
 Standard text/HTML/SVG/RTF/PNG and opaque platform/custom formats preserve their
 native encodings. Text and HTML bytes are UTF-8; HTML fragment offsets are UTF-16
@@ -89,6 +92,8 @@ not fabricate pointer/key input or install permission grants.
 Pending menus also retain a renderer-owned editor/selection context behind an
 internal opaque token. Native command execution consumes it in the original
 document, rechecking after focus handlers; dismissal and retirement release it.
+Captured selection offsets use exactly the native restoration scope, including
+selections across inline nodes.
 
 Drag target entry carries copied text, link and HTML, not native file paths.
 Over/drop/leave use the same original document and view-DIP geometry. Native
@@ -155,6 +160,14 @@ clipboard read bound; ordinary file operations have no clipboard deadline.
 `DragEnterFiles` requests typed drop files; wait for its normal interaction receipt
 before over/drop. Clipboard writes and source drags expose selected app objects
 through `GetFileCount`/`GetFile`, never OS path authority.
+After handoff, native Blob file references retain snapshot backing through File
+clones, slices, reads and multipart requests. The last consumer releases RAM
+without waiting for navigation; original-document retirement still revokes it
+immediately. Guest multipart bodies use the existing Blob-backed path rather
+than detaching ownership into raw filename elements.
+Unredeemed paste/drop tokens retain the selected app capability, not snapshot
+backing. Their last clone releases it; redemption still uses native process,
+document and permission checks.
 
 Downloads consume the normal guarded native network stream. App chunk
 acknowledgements precede native progress, and actual sink commit precedes native

@@ -139,10 +139,7 @@ class NativeView final : public CefClient,
                   const std::string& payload, ProviderReply reply) {
     const auto generation = stream_.generation();
     stream_.Call(owner, operation, payload, DocumentReady(), std::move(reply));
-    if (stream_.generation() != generation) {
-      actions_->Reset();
-      if (accessibility_) accessibility_->GeometryChanged();
-    }
+    GeometryChanged(generation);
   }
    void StreamRelease(const Owner& owner, const std::string& payload, ProviderReply reply) {
      stream_.Release(owner, payload, std::move(reply));
@@ -158,12 +155,14 @@ class NativeView final : public CefClient,
     accessibility_->Call(owner, operation, payload, std::move(reply));
   }
   void OnPopupShow(CefRefPtr<CefBrowser>, bool visible) override {
+    const auto generation = stream_.generation();
     stream_.PopupShow(visible);
-    if (accessibility_) accessibility_->GeometryChanged();
+    GeometryChanged(generation);
   }
   void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rectangle) override {
+    const auto generation = stream_.generation();
     stream_.PopupSize(rectangle);
-    if (accessibility_) accessibility_->GeometryChanged();
+    GeometryChanged(generation);
   }
   bool OnCursorChange(CefRefPtr<CefBrowser>, CefCursorHandle, cef_cursor_type_t type,
                        const CefCursorInfo& info) override { stream_.Cursor(type, info); return true; }
@@ -387,6 +386,11 @@ class NativeView final : public CefClient,
     }
   }
  private:
+  void GeometryChanged(uint64_t previous) {
+    if (stream_.generation() == previous) return;
+    actions_->Reset();
+    if (accessibility_) accessibility_->GeometryChanged();
+  }
   bool DocumentReady() const {
     auto* frame = web_contents() ? web_contents()->GetPrimaryMainFrame() : nullptr;
     return !owner_.document || (frame && !current_token_.is_zero() &&

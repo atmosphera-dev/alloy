@@ -250,19 +250,27 @@ class Client:
             self.members.exited()
 
     def dispose(self):
-        if self.process.poll() is None:
+        try:
+            if self.process.poll() is None:
+                try:
+                    self.send(op='terminate')
+                    self.process.stdin.close()
+                    self.process.wait(timeout=30)
+                except (OSError, subprocess.TimeoutExpired):
+                    self.process.kill()
+                    self.process.wait(timeout=30)
+        finally:
             try:
-                self.send(op='terminate')
-                self.process.stdin.close()
-                self.process.wait(timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
-                self.process.kill()
-                self.process.wait(timeout=30)
-        if self.members:
-            self.members.exited()
-            self.members.close()
-        self.log.close()
-        (self.root / 'events.json').write_text(json.dumps(self.events, indent=2) + '\n')
+                if self.members:
+                    try:
+                        self.members.exited()
+                    finally:
+                        self.members.close()
+            finally:
+                try:
+                    self.log.close()
+                finally:
+                    (self.root / 'events.json').write_text(json.dumps(self.events, indent=2) + '\n')
 
 
 def case(out, evidence, name, check, **options):
@@ -411,6 +419,22 @@ def quick_menu(client, base):
     return {'app_formats_enable_native_paste': True, 'page_consumed_paste': True}
 
 
+def inline_selection(client, base, cross=False):
+    page = client.page(base, 'editor.html' + ('?cross=1' if cross else ''))
+    client.action(op='focus', focused=True)
+    after = len(client.events); client.click(page['rectangles']['select'])
+    selected = client.title('editor-selected', after)
+    client.click(selected['selection'], button=2)
+    menu = client.wait('menu', after=after)
+    assert client.command(op='menu-select', request=menu['request'], command='cut')['ok']
+    client.wait('clipboard-stored', after=after)
+    actual = client.title('editor-input', after)
+    assert actual['text'] == ('abf' if cross else 'abcdf'), actual
+    assert actual['focused'] == selected['focused'] == 'editor', (selected, actual)
+    assert client.content()['text/plain'] == (b'cde' if cross else b'e')
+    return dict(inline_nodes=True, cross_node=cross, native_cut=True, original_range=True)
+
+
 def denied_permission(client, base):
     page = client.page(base)
     client.action(op='focus', focused=True)
@@ -426,6 +450,31 @@ def denied_permission(client, base):
                    for value in requests), requests
     assert client.content()['text/plain'] == b'permission-protected-data'
     return {'native_app_permission_denial_observed': True, 'protected_data_not_read': True}
+
+
+def popup_drag_retirement(client, base):
+    page = client.page(base); client.action(op='focus', focused=True)
+    drop = page['rectangles']['drop']; x, y = round(drop['x'] + 20), round(drop['y'] + 20)
+    after = len(client.events)
+    client.action(op='drag-enter', x=x, y=y, allowed=1, modifiers=0, text='old-popup-drag', html='')
+    client.action(op='drag-over', x=x, y=y, allowed=1, modifiers=0); client.drag_effect(1, after)
+    after = len(client.events); client.click(page['rectangles']['popup'])
+    client.wait('configured', after=after)
+    after = len(client.events)
+    client.action(op='key', type='rawdown', key=27, native=9, modifiers=0, character=0)
+    # Closing the native popup changes the geometry lease. Observe that native
+    # barrier before releasing the key against the replacement generation.
+    client.wait('configured', after=after)
+    client.action(op='key', type='up', key=27, native=9, modifiers=0, character=0)
+    stale = client.action(outcome='rejected:invalid', op='drag-drop', x=x, y=y, modifiers=0)
+    assert stale['outcome'] != 'accepted', stale
+    after = len(client.events)
+    entered = client.action(op='drag-enter', x=x, y=y, allowed=1, modifiers=0, text='new-popup-drag', html='')
+    assert entered['outcome'] == 'accepted', entered
+    client.action(op='drag-over', x=x, y=y, allowed=1, modifiers=0); client.drag_effect(1, after)
+    client.action(op='drag-drop', x=x, y=y, modifiers=0)
+    assert client.title('drop', after)['dropText'] == 'new-popup-drag'
+    return dict(popup_geometry_retires_drag=True, stale_drop_refused=True, fresh_drag_delivered=True)
 
 
 def drags(client, base):
@@ -814,6 +863,23 @@ def file_download(client, base, server, failure=False):
     return dict(bytes=len(expected), native_state=finished['state'], actual_app_sink=not failure)
 
 
+def file_download_selection_retry(client, base, server):
+    server.download_bytes = b'native-destination-retry-bytes'
+    page = client.page(base, 'files.html'); client.action(op='focus', focused=True)
+    client.command(op='files-configure', **{'deny-first-download': True})
+    after = len(client.events); client.click(page['rectangles']['download'])
+    first = client.wait('file-selection', lambda value: value['mode'] == 'download', after)
+    client.wait('download-state', lambda value: value['state'] == 'interrupted', after)
+    resumed = len(client.events)
+    receipt = client.action(op='download-control', download=first['download'], command='resume')
+    assert receipt['outcome'] == 'accepted', receipt
+    second = client.wait('file-selection', lambda value: value['mode'] == 'download', resumed)
+    assert second['download'] == first['download'] and second['request'] != first['request'], (first, second)
+    assert bytes.fromhex(client.wait('file-committed', after=resumed)['hex']) == server.download_bytes
+    client.wait('download-state', lambda value: value['state'] == 'complete', resumed)
+    return dict(native_restart=True, retained_download_metadata=True, final_app_bytes=True)
+
+
 def file_download_retirement(client, base, server):
     server.download_bytes = b'pending-app-download' * 65536
     page = client.page(base, 'files.html'); client.action(op='focus', focused=True)
@@ -941,6 +1007,16 @@ def file_outcomes(out, evidence, base, server, results):
         results.append(case(out, evidence, name, check))
     results.append(case(out, evidence, 'native-file-stateless-external',
                         lambda client: file_handles(client, base), mode='stateless'))
+    def removed_child(client):
+        page = client.page(base, 'files.html'); client.action(op='focus', focused=True)
+        after = len(client.events); client.click(page['rectangles']['recursive'])
+        result = client.title('recursive-complete', after)
+        assert result['failure'] == 'NotFoundError', result
+        assert result['remaining']['sha256'] == hashlib.sha256(b'app-selected-bytes').hexdigest(), result
+        return dict(retained_descendant_refused=True, sibling_preserved=True)
+    results.append(case(out, evidence, 'native-file-recursive-retained-handle', removed_child))
+    results.append(case(out, evidence, 'native-download-selection-retry',
+                        lambda client: file_download_selection_retry(client, base, server)))
 
 
 def main(argv=None):
@@ -982,10 +1058,13 @@ def main(argv=None):
                 return
             for name, check in [('clipboard-edit-keyboard', lambda client: clipboard_ui(client, base)),
                                 ('async-clipboard-formats-sinks', lambda client: async_clipboard(client, base)),
-                                ('menus-original-owner', lambda client: menus(client, base, server)),
+                                 ('menus-original-owner', lambda client: menus(client, base, server)),
+                                 ('menu-inline-selection', lambda client: inline_selection(client, base)),
+                                 ('menu-cross-node-selection', lambda client: inline_selection(client, base, True)),
                                 ('quick-menu-native-clipboard', lambda client: quick_menu(client, base)),
                                 ('clipboard-permission-denied', lambda client: denied_permission(client, base)),
-                                ('native-drag-data-effects', lambda client: drags(client, base)),
+                                 ('native-drag-data-effects', lambda client: drags(client, base)),
+                                 ('popup-retires-native-drag', lambda client: popup_drag_retirement(client, base)),
                                 ('fullscreen-admission-transition', lambda client: fullscreen(client, base))]:
                 server.phase = 0
                 result['cases'].append(case(out, evidence, name, check))

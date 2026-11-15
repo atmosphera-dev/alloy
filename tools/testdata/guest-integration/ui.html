@@ -14,6 +14,7 @@ iframe { grid-column:1/-1; box-sizing:border-box; width:100%; height:95px; borde
 <button id="full">Fullscreen</button><button id="exit">Exit fullscreen</button>
 <div id="drag" draggable="true">Native drag source</div><div id="drop">Native drop target</div>
 <iframe id="peer" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+<select id="popup"><option>Native popup one</option><option>Native popup two</option></select>
 <script>
 const state={kind:'ready',copies:0,pastes:0,drops:0,dragEnds:0,full:false};
 try {

@@ -1,0 +1,44 @@
+--- a/content/browser/renderer_host/clipboard_host_impl.h
++++ b/content/browser/renderer_host/clipboard_host_impl.h
+@@ -189,6 +189,9 @@
+                             IsClipboardPasteAllowedCallback callback);
+ 
+  private:
++  void PasteIfPolicyAllowedImpl(ui::ClipboardBuffer clipboard_buffer,
++      const ui::ClipboardFormatType& data_type, ui::ClipboardSequenceNumberToken seqno,
++      ClipboardPasteData data, IsClipboardPasteAllowedCallback callback);
+   friend class ClipboardHostImplTest;
+   friend class ClipboardHostImplWriteTest;
+   friend class ClipboardHostImplAsyncWriteTest;
+--- a/content/browser/renderer_host/clipboard_host_impl.cc
++++ b/content/browser/renderer_host/clipboard_host_impl.cc
+@@ -1279,6 +1279,29 @@
+     ui::ClipboardBuffer clipboard_buffer,
+     const ui::ClipboardFormatType& data_type,
+     ui::ClipboardSequenceNumberToken seqno,
++    ClipboardPasteData data,
++    IsClipboardPasteAllowedCallback callback) {
++  if (!guest_clipboard_) {
++    PasteIfPolicyAllowedImpl(clipboard_buffer, data_type, seqno, std::move(data), std::move(callback));
++    return;
++  }
++  guest_clipboard_->ConfirmReadSequence(clipboard_buffer, seqno, base::BindOnce(
++      [](base::WeakPtr<ClipboardHostImpl> host, ui::ClipboardBuffer buffer,
++          ui::ClipboardFormatType type, ui::ClipboardSequenceNumberToken original,
++          ClipboardPasteData data, IsClipboardPasteAllowedCallback callback, bool valid) {
++        const bool active = host && valid && host->context_->IsActive();
++        if (!active || !host) {
++          std::move(callback).Run(std::nullopt); return;
++        }
++        host->PasteIfPolicyAllowedImpl(buffer, type, original, std::move(data), std::move(callback));
++      }, weak_ptr_factory_.GetWeakPtr(), clipboard_buffer, data_type, seqno,
++         std::move(data), std::move(callback)));
++}
++
++void ClipboardHostImpl::PasteIfPolicyAllowedImpl(
++    ui::ClipboardBuffer clipboard_buffer,
++    const ui::ClipboardFormatType& data_type,
++    ui::ClipboardSequenceNumberToken seqno,
+     ClipboardPasteData clipboard_paste_data,
+     IsClipboardPasteAllowedCallback callback) {
+   std::optional<size_t> data_size;

@@ -28,6 +28,12 @@ using Data = AlloyGuestIntegrationData;
 using Result = std::optional<Data>;
 using Operation = AlloyGuestIntegration::Operation;
 
+std::optional<ui::ClipboardSequenceNumberToken> Sequence(const Result& result, const char* field) {
+  const auto* text = result ? result->details.FindString(field) : nullptr;
+  const auto token = text ? base::UnguessableToken::DeserializeFromString(*text) : std::nullopt;
+  return token ? std::make_optional<ui::ClipboardSequenceNumberToken>(*token) : std::nullopt;
+}
+
 std::string Buffer(ui::ClipboardBuffer buffer) {
   return buffer == ui::ClipboardBuffer::kCopyPaste ? "copy-paste" : "selection";
 }
@@ -47,14 +53,17 @@ std::vector<std::u16string> Types(Result result) {
   }
   return types;
 }
+std::u16string StandardType(const std::u16string& type) {
+  if (type == u"text/plain" || type == u"TEXT" || type == u"STRING" ||
+      type == u"UTF8_STRING" || type == u"text/plain;charset=utf-8") return u"text/plain";
+  if (type == u"text/html" || type == u"image/svg+xml" || type == u"text/rtf" ||
+      type == u"image/png" || type == u"text/uri-list") return type;
+  return {};
+}
 std::vector<std::u16string> StandardTypes(const std::vector<std::u16string>& native) {
   std::vector<std::u16string> result;
   for (const auto& type : native) {
-    std::u16string mime;
-    if (type == u"text/plain" || type == u"TEXT" || type == u"STRING" ||
-        type == u"UTF8_STRING" || type == u"text/plain;charset=utf-8") mime = u"text/plain";
-    else if (type == u"text/html" || type == u"image/svg+xml" || type == u"text/rtf" ||
-             type == u"image/png" || type == u"text/uri-list") mime = type;
+    auto mime = StandardType(type);
     if (!mime.empty() && std::find(result.begin(), result.end(), mime) == result.end())
       result.push_back(std::move(mime));
   }
@@ -77,7 +86,9 @@ void AlloyGuestClipboard::Send(Operation operation, Data data,
     std::move(reply).Run(std::nullopt);
     return;
   }
-  data.admitted = receiver_admitted_;
+  data.admitted = base::BindRepeating([](base::RepeatingCallback<bool()> receiver,
+      base::RepeatingCallback<bool()> extra) { return receiver.Run() && (!extra || extra.Run());
+    }, receiver_admitted_, std::move(data.admitted));
   // ui::Clipboard helpers may retain a raw backend pointer across their async
   // read chain, because ordinary backends are browser-lifetime objects. Retain
   // this scoped backend through each continuation, without retaining the
@@ -90,35 +101,95 @@ void AlloyGuestClipboard::Send(Operation operation, Data data,
 }
 
 void AlloyGuestClipboard::Read(ui::ClipboardBuffer buffer, std::string format,
-                                AlloyGuestIntegration::Reply reply) const {
+    AlloyGuestIntegration::Reply reply, base::TimeTicks deadline,
+    std::optional<ui::ClipboardSequenceNumberToken> expected_sequence) const {
+  if (deadline.is_null()) deadline = base::TimeTicks::Now() + AlloyGuestIntegration::kClipboardReadTimeout;
+  auto admitted = base::BindRepeating([](base::TimeTicks deadline) {
+    return base::TimeTicks::Now() < deadline;
+  }, deadline);
+  if (!expected_sequence) {
+    CaptureSequence(buffer, admitted, base::BindOnce(
+        [](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
+            std::string format, AlloyGuestIntegration::Reply reply, base::TimeTicks deadline,
+            std::optional<ui::ClipboardSequenceNumberToken> sequence) {
+          if (!sequence) { std::move(reply).Run(std::nullopt); return; }
+          self->Read(buffer, std::move(format), std::move(reply), deadline, sequence);
+        }, shared_from_this(), buffer, std::move(format), std::move(reply), deadline));
+    return;
+  }
+  const auto expected = *expected_sequence;
   Data data;
   data.details.Set("buffer", Buffer(buffer));
   data.details.Set("format", std::move(format));
-  Send(Operation::kClipboardRead, std::move(data), std::move(reply));
+  data.admitted = admitted;
+  Send(Operation::kClipboardRead, std::move(data), base::BindOnce(
+      [](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
+          ui::ClipboardSequenceNumberToken expected, base::RepeatingCallback<bool()> admitted,
+          AlloyGuestIntegration::Reply reply, Result result) {
+        if (!result) { std::move(reply).Run(std::nullopt); return; }
+        self->ConfirmSequence(buffer, expected, admitted, base::BindOnce(
+            [](ui::ClipboardSequenceNumberToken expected, AlloyGuestIntegration::Reply reply, Result result, bool valid) {
+              if (valid && result) result->details.Set("native-read-sequence", expected.value().ToString());
+              std::move(reply).Run(valid ? std::move(result) : std::nullopt);
+            }, expected, std::move(reply), std::move(result)));
+      }, shared_from_this(), buffer, expected, admitted, std::move(reply)));
+}
+
+void AlloyGuestClipboard::CaptureSequence(ui::ClipboardBuffer buffer,
+    base::RepeatingCallback<bool()> admitted,
+    base::OnceCallback<void(std::optional<ui::ClipboardSequenceNumberToken>)> reply) const {
+  Data data; data.details.Set("buffer", Buffer(buffer)); data.admitted = admitted;
+  Send(Operation::kClipboardSequence, std::move(data), base::BindOnce(
+      [](base::RepeatingCallback<bool()> admitted,
+          base::OnceCallback<void(std::optional<ui::ClipboardSequenceNumberToken>)> reply, Result result) {
+        std::move(reply).Run(admitted.Run() ? Sequence(result, "sequence") : std::nullopt);
+      }, std::move(admitted), std::move(reply)));
+}
+
+void AlloyGuestClipboard::ConfirmSequence(ui::ClipboardBuffer buffer,
+    ui::ClipboardSequenceNumberToken expected, base::RepeatingCallback<bool()> admitted,
+    base::OnceCallback<void(bool)> reply) const {
+  CaptureSequence(buffer, std::move(admitted), base::BindOnce(
+      [](ui::ClipboardSequenceNumberToken expected, base::OnceCallback<void(bool)> reply,
+          std::optional<ui::ClipboardSequenceNumberToken> sequence) {
+        std::move(reply).Run(sequence && *sequence == expected);
+      }, expected, std::move(reply)));
+}
+
+void AlloyGuestClipboard::ReadTextBytes(ui::ClipboardBuffer buffer,
+    AlloyGuestIntegration::Reply reply) const {
+  const auto deadline = base::TimeTicks::Now() + AlloyGuestIntegration::kClipboardReadTimeout;
+  Read(buffer, "@types", base::BindOnce(
+      [](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
+          base::TimeTicks deadline, AlloyGuestIntegration::Reply reply, Result result) {
+        const auto expected = Sequence(result, "native-read-sequence");
+        if (!expected) { std::move(reply).Run(std::nullopt); return; }
+        const auto types = Types(std::move(result));
+        auto found = std::find(types.begin(), types.end(), u"text/plain");
+        if (found == types.end()) found = std::find_if(types.begin(), types.end(),
+            [](const auto& type) { return StandardType(type) == u"text/plain"; });
+        if (found == types.end()) { std::move(reply).Run(std::nullopt); return; }
+        self->Read(buffer, base::UTF16ToUTF8(*found), std::move(reply), deadline, expected);
+      }, shared_from_this(), buffer, deadline, std::move(reply)), deadline);
 }
 
 void AlloyGuestClipboard::RefreshSequence(ui::ClipboardBuffer buffer,
                                            base::OnceCallback<void(bool)> done) {
-  Data data;
-  data.details.Set("buffer", Buffer(buffer));
   // document_ may expire while the app decides. The request owner completes
   // denied on retirement; the ClipboardHost weak callback owns continuation.
-  Send(Operation::kClipboardSequence, std::move(data), base::BindOnce(
+  CaptureSequence(buffer, base::BindRepeating([] { return true; }), base::BindOnce(
       [](base::WeakPtr<AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
-          base::OnceCallback<void(bool)> done, Result result) {
-        bool valid = false;
-        if (self && result) {
-          const auto* text = result->details.FindString("sequence");
-          auto token = text ? base::UnguessableToken::DeserializeFromString(*text)
-                            : std::nullopt;
-          if (token) {
-            self->sequence_[buffer == ui::ClipboardBuffer::kCopyPaste ? 0 : 1] =
-                ui::ClipboardSequenceNumberToken(*token);
-            valid = true;
-          }
-        }
-        std::move(done).Run(valid);
+          base::OnceCallback<void(bool)> done, std::optional<ui::ClipboardSequenceNumberToken> sequence) {
+        if (self && sequence) self->sequence_[buffer == ui::ClipboardBuffer::kCopyPaste ? 0 : 1] = *sequence;
+        std::move(done).Run(self && sequence.has_value());
       }, weak_.GetWeakPtr(), buffer, std::move(done)));
+}
+
+void AlloyGuestClipboard::ConfirmReadSequence(ui::ClipboardBuffer buffer,
+    ui::ClipboardSequenceNumberToken expected, base::OnceCallback<void(bool)> done) const {
+  ConfirmSequence(buffer, expected, base::BindRepeating([](base::TimeTicks deadline) {
+    return base::TimeTicks::Now() < deadline;
+  }, base::TimeTicks::Now() + AlloyGuestIntegration::kClipboardReadTimeout), std::move(done));
 }
 
 void AlloyGuestClipboard::OnPreShutdown() {}
@@ -147,8 +218,10 @@ void AlloyGuestClipboard::GetAllAvailableFormats(ui::ClipboardBuffer buffer,
       [](base::OnceCallback<void(base::flat_set<ui::ClipboardFormatType>)> callback,
           Result result) {
         base::flat_set<ui::ClipboardFormatType> formats;
-        for (const auto& type : Types(std::move(result)))
+        for (const auto& type : Types(std::move(result))) {
           formats.insert(ui::ClipboardFormatType::CustomPlatformType(base::UTF16ToUTF8(type)));
+          if (StandardType(type) == u"text/plain") formats.insert(ui::ClipboardFormatType::PlainTextType());
+        }
         std::move(callback).Run(std::move(formats));
       }, std::move(callback)));
 }
@@ -161,9 +234,12 @@ void AlloyGuestClipboard::Clear(ui::ClipboardBuffer buffer) {
 void AlloyGuestClipboard::ReadAvailableTypes(ui::ClipboardBuffer buffer,
     const std::optional<ui::DataTransferEndpoint>&,
     ReadAvailableTypesCallback callback) const {
+  const auto deadline = base::TimeTicks::Now() + AlloyGuestIntegration::kClipboardReadTimeout;
   Read(buffer, "@types", base::BindOnce(
       [](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
-          ReadAvailableTypesCallback callback, Result result) {
+          base::TimeTicks deadline, ReadAvailableTypesCallback callback, Result result) {
+        const auto expected = Sequence(result, "native-read-sequence");
+        if (!expected) { std::move(callback).Run({}); return; }
         const auto native = Types(std::move(result));
         auto standard = StandardTypes(native);
         const auto custom = base::UTF8ToUTF16(ui::ClipboardFormatType::DataTransferCustomType().GetName());
@@ -176,13 +252,13 @@ void AlloyGuestClipboard::ReadAvailableTypes(ui::ClipboardBuffer buffer,
               auto bytes = Bytes(std::move(result));
               ui::ReadCustomDataTypes(base::as_byte_span(bytes), &types);
               std::move(callback).Run(std::move(types));
-            }, std::move(callback), std::move(standard)));
-      }, shared_from_this(), buffer, std::move(callback)));
+            }, std::move(callback), std::move(standard)), deadline, expected);
+      }, shared_from_this(), buffer, deadline, std::move(callback)), deadline);
 }
 void AlloyGuestClipboard::ReadText(ui::ClipboardBuffer buffer,
     const std::optional<ui::DataTransferEndpoint>&,
     ReadTextCallback callback) const {
-  Read(buffer, "text/plain", base::BindOnce(
+  ReadTextBytes(buffer, base::BindOnce(
       [](ReadTextCallback callback, Result result) {
         std::move(callback).Run(base::UTF8ToUTF16(Bytes(std::move(result))));
       }, std::move(callback)));
@@ -190,7 +266,7 @@ void AlloyGuestClipboard::ReadText(ui::ClipboardBuffer buffer,
 void AlloyGuestClipboard::ReadAsciiText(ui::ClipboardBuffer buffer,
     const std::optional<ui::DataTransferEndpoint>&,
     ReadAsciiTextCallback callback) const {
-  Read(buffer, "text/plain", base::BindOnce(
+  ReadTextBytes(buffer, base::BindOnce(
       [](ReadAsciiTextCallback callback, Result result) {
         std::move(callback).Run(Bytes(std::move(result)));
       }, std::move(callback)));
@@ -263,17 +339,38 @@ void AlloyGuestClipboard::ReadFilenames(ui::ClipboardBuffer buffer,
       base::TimeTicks deadline) {
     return self->receiver_admitted_.Run() && base::TimeTicks::Now() < deadline;
   }, shared_from_this(), base::TimeTicks::Now() + AlloyGuestIntegration::kClipboardReadTimeout);
+  CaptureSequence(buffer, admitted, base::BindOnce(
+      [](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
+          base::RepeatingCallback<bool()> admitted, ReadFilenamesCallback callback,
+          std::optional<ui::ClipboardSequenceNumberToken> expected) {
+        if (!expected) { std::move(callback).Run({}); return; }
+        self->ReadFilenamesAtSequence(buffer, *expected, admitted, std::move(callback));
+      }, shared_from_this(), buffer, admitted, std::move(callback)));
+}
+
+void AlloyGuestClipboard::ReadFilenamesAtSequence(ui::ClipboardBuffer buffer,
+    ui::ClipboardSequenceNumberToken expected, base::RepeatingCallback<bool()> admitted,
+    ReadFilenamesCallback callback) const {
+  auto* original = document_.AsRenderFrameHostIfValid();
+  if (!original || !admitted.Run()) { std::move(callback).Run({}); return; }
   base::DictValue details; details.Set("mode", "clipboard-files"); details.Set("buffer", Buffer(buffer));
   AlloyGuestFileCapability::Select(original, std::move(details), base::BindOnce(
-      [](std::shared_ptr<const AlloyGuestClipboard> self, base::RepeatingCallback<bool()> admitted, ReadFilenamesCallback callback,
+      [](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
+          ui::ClipboardSequenceNumberToken expected, base::RepeatingCallback<bool()> admitted, ReadFilenamesCallback callback,
           std::optional<AlloyGuestFileCapability::Entries> entries) {
         if (!entries || !admitted.Run() || entries->empty()) { std::move(callback).Run({}); return; }
         SnapshotAlloyGuestFiles(self->document_.AsRenderFrameHostIfValid(), std::move(*entries), false,
-            base::BindOnce([](std::shared_ptr<const AlloyGuestClipboard> self, ReadFilenamesCallback callback,
+            base::BindOnce([](std::shared_ptr<const AlloyGuestClipboard> self, ui::ClipboardBuffer buffer,
+                ui::ClipboardSequenceNumberToken expected, base::RepeatingCallback<bool()> admitted, ReadFilenamesCallback callback,
                 std::optional<AlloyGuestUploadFiles> snapshot) {
-              std::move(callback).Run(snapshot && self->receiver_admitted_.Run() ? snapshot->files : std::vector<ui::FileInfo>());
-            }, self, std::move(callback)), admitted);
-      }, shared_from_this(), admitted, std::move(callback)), admitted);
+              if (!snapshot) { std::move(callback).Run({}); return; }
+              self->ConfirmSequence(buffer, expected, admitted, base::BindOnce(
+                  [](ReadFilenamesCallback callback, std::optional<AlloyGuestUploadFiles> snapshot, bool valid) {
+                    if (!valid) { std::move(callback).Run({}); return; }
+                    snapshot->Delivered(); std::move(callback).Run(std::move(snapshot->files));
+                  }, std::move(callback), std::move(snapshot)));
+            }, self, buffer, expected, admitted, std::move(callback)), admitted);
+      }, shared_from_this(), buffer, expected, admitted, std::move(callback)), admitted);
 }
 void AlloyGuestClipboard::ReadURL(const std::optional<ui::DataTransferEndpoint>&,
     ReadUrlCallback callback) const {

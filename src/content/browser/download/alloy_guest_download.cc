@@ -59,7 +59,7 @@ class AppDestination final : public base::RefCountedDeleteOnSequence<AppDestinat
     hash_ = sparse ? std::nullopt : std::make_optional<crypto::hash::Hasher>(crypto::hash::kSha256);
     hash_offset_ = 0;
     if (transaction_) { PrepareStage(); return; }
-    Cap::Select(document_.AsRenderFrameHostIfValid(), std::move(details_), base::BindOnce(
+    Cap::Select(document_.AsRenderFrameHostIfValid(), details_.Clone(), base::BindOnce(
         [](scoped_refptr<AppDestination> self, std::optional<Cap::Entries> selected) {
           if (self->ended_ || !selected || selected->size() != 1 || (*selected)[0]->metadata().directory ||
               !(*selected)[0]->metadata().writable) { self->ReadyDone(false); return; }

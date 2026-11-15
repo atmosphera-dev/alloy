@@ -38,6 +38,8 @@ class ClipboardProvider final : public content::AlloyGuestIntegration {
   std::string source;
   int calls = 0;
   bool invalid_html = false;
+  bool change_on_read = false;
+  std::string sequence = "00000000000000010000000000000002";
   void Request(content::RenderFrameHost* original, Operation operation,
       IntegrationData data, Reply reply) override {
     ++calls;
@@ -53,7 +55,7 @@ class ClipboardProvider final : public content::AlloyGuestIntegration {
         formats.emplace((*types)[index].GetString(), std::move(data.bytes[index]));
       source = data.details.FindString("source-url") ? *data.details.FindString("source-url") : "";
     } else if (operation == Operation::kClipboardSequence) {
-      result.details.Set("sequence", "00000000000000010000000000000002");
+      result.details.Set("sequence", sequence);
     } else {
       EXPECT_EQ(operation, Operation::kClipboardRead);
       const auto* type = data.details.FindString("format");
@@ -63,6 +65,7 @@ class ClipboardProvider final : public content::AlloyGuestIntegration {
         for (const auto& [name, bytes] : formats) types.Append(name);
         result.details.Set("formats", std::move(types));
       } else {
+        if (change_on_read) sequence = "00000000000000010000000000000003";
         result.bytes.push_back(formats[*type]);
         result.details.Set("source-url", source);
         result.details.Set("fragment-start", "0");
@@ -97,6 +100,9 @@ class GuestClipboardNativeTest : public ChromeRenderViewHostTestHarness {
     content::AlloyGuestIntegration::Install(contents_.get(), std::move(provider));
     clipboard_ = std::make_shared<content::AlloyGuestClipboard>(contents_->GetPrimaryMainFrame(),
         base::BindRepeating([](bool* live) { return *live; }, &receiver_live_));
+    base::test::TestFuture<bool> sequence;
+    clipboard_->RefreshSequence(kBuffer, sequence.GetCallback()); ASSERT_TRUE(sequence.Get());
+    provider_->calls = 0;
   }
   void TearDown() override {
     clipboard_.reset();
@@ -188,10 +194,67 @@ TEST_F(GuestClipboardNativeTest, NativeBookmarkEncodingAndSequenceArePreserved) 
   EXPECT_EQ(read.Get().url, bookmark.url);
   EXPECT_EQ(read.Get().title, bookmark.title);
   const auto before = clipboard_->GetSequenceNumber(kBuffer);
+  provider_->sequence = "00000000000000010000000000000003";
   base::test::TestFuture<bool> sequence;
   clipboard_->RefreshSequence(kBuffer, sequence.GetCallback());
   ASSERT_TRUE(sequence.Get());
   EXPECT_NE(clipboard_->GetSequenceNumber(kBuffer), before);
+}
+
+TEST_F(GuestClipboardNativeTest, ReviewSequenceChangeCannotLabelNewBytesWithOldPolicyIdentity) {
+  base::test::TestFuture<bool> sequence;
+  clipboard_->RefreshSequence(kBuffer, sequence.GetCallback()); ASSERT_TRUE(sequence.Get());
+  const auto expected = clipboard_->GetSequenceNumber(kBuffer);
+  provider_->formats["text/plain"] = "unrelated-new-clipboard-bytes";
+  provider_->change_on_read = true;
+  base::test::TestFuture<std::u16string> read;
+  clipboard_->ReadText(kBuffer, std::nullopt, read.GetCallback());
+  EXPECT_TRUE(read.Get().empty());
+  EXPECT_EQ(clipboard_->GetSequenceNumber(kBuffer), expected);
+}
+
+TEST_F(GuestClipboardNativeTest, ReviewAdvertisedNativeTextAliasesReturnTheirActualBytes) {
+  for (const auto* alias : {"UTF8_STRING", "TEXT", "STRING", "text/plain;charset=utf-8"}) {
+    SCOPED_TRACE(alias);
+    base::test::TestFuture<bool> sequence;
+    clipboard_->RefreshSequence(kBuffer, sequence.GetCallback()); ASSERT_TRUE(sequence.Get());
+    provider_->formats = {{alias, "alias-native-text"}};
+    base::test::TestFuture<std::vector<std::u16string>> types;
+    clipboard_->ReadAvailableTypes(kBuffer, std::nullopt, types.GetCallback());
+    ASSERT_NE(std::find(types.Get().begin(), types.Get().end(), u"text/plain"), types.Get().end());
+    base::test::TestFuture<base::flat_set<ui::ClipboardFormatType>> formats;
+    clipboard_->GetAllAvailableFormats(kBuffer, std::nullopt, formats.GetCallback());
+    EXPECT_TRUE(formats.Get().contains(ui::ClipboardFormatType::PlainTextType()));
+    base::test::TestFuture<std::u16string> text;
+    clipboard_->ReadText(kBuffer, std::nullopt, text.GetCallback());
+    EXPECT_EQ(text.Get(), u"alias-native-text");
+    base::test::TestFuture<std::string> ascii;
+    clipboard_->ReadAsciiText(kBuffer, std::nullopt, ascii.GetCallback());
+    EXPECT_EQ(ascii.Get(), "alias-native-text");
+  }
+}
+
+TEST_F(GuestClipboardNativeTest, ReviewPolicyIdentityDoesNotFollowAConcurrentReadersCacheRefresh) {
+  const auto original = clipboard_->GetSequenceNumber(kBuffer);
+  provider_->sequence = "00000000000000010000000000000003";
+  base::test::TestFuture<bool> refreshed;
+  clipboard_->RefreshSequence(kBuffer, refreshed.GetCallback()); ASSERT_TRUE(refreshed.Get());
+  EXPECT_NE(clipboard_->GetSequenceNumber(kBuffer), original);
+  base::test::TestFuture<bool> matched;
+  clipboard_->ConfirmReadSequence(kBuffer, original, matched.GetCallback());
+  EXPECT_FALSE(matched.Get());
+}
+
+TEST_F(GuestClipboardNativeTest, ReviewFreshBackendReadsDoNotRequireHostPreparation) {
+  provider_->formats = {{"UTF8_STRING", "unprepared-native-text"}};
+  auto fresh = std::make_shared<content::AlloyGuestClipboard>(contents_->GetPrimaryMainFrame(),
+      base::BindRepeating([] { return true; }));
+  base::test::TestFuture<std::vector<std::u16string>> types;
+  fresh->GetStandardFormats(kBuffer, std::nullopt, types.GetCallback());
+  EXPECT_NE(std::find(types.Get().begin(), types.Get().end(), u"text/plain"), types.Get().end());
+  base::test::TestFuture<std::u16string> read;
+  fresh->ReadText(kBuffer, std::nullopt, read.GetCallback());
+  EXPECT_EQ(read.Get(), u"unprepared-native-text");
 }
 
 TEST_F(GuestClipboardNativeTest, InvalidHtmlAndRetiredReceiverCannotExposeProviderData) {
@@ -203,18 +266,19 @@ TEST_F(GuestClipboardNativeTest, InvalidHtmlAndRetiredReceiverCannotExposeProvid
   EXPECT_TRUE(html.Get<1>().is_empty());
   EXPECT_EQ(html.Get<2>(), 0u);
   EXPECT_EQ(html.Get<3>(), 0u);
+  const auto calls = provider_->calls;
   provider_->formats["text/plain"] = "original-data";
   receiver_live_ = false;
   base::test::TestFuture<std::u16string> text;
   clipboard_->ReadText(kBuffer, std::nullopt, text.GetCallback());
   EXPECT_TRUE(text.Get().empty());
-  EXPECT_EQ(provider_->calls, 1);
+  EXPECT_EQ(provider_->calls, calls);
   receiver_live_ = true;
   content::RetireAlloyDocumentState(contents_->GetPrimaryMainFrame());
   base::test::TestFuture<std::u16string> retired;
   clipboard_->ReadText(kBuffer, std::nullopt, retired.GetCallback());
   EXPECT_TRUE(retired.Get().empty());
-  EXPECT_EQ(provider_->calls, 1);
+  EXPECT_EQ(provider_->calls, calls);
 }
 }  // namespace
 }  // namespace alloy::guest::integration

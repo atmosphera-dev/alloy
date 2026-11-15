@@ -110,6 +110,63 @@ view-local IDs, source/capture time and session-clock dispatch/outcome receipts.
 An accepted dispatch is not proof of a DOM effect. No interaction history or
 clipboard content is written to product logs.
 
+## Files, uploads and transactional sinks
+
+`OnFileSelection` supplies a typed request for native open/save/directory,
+upload, clipboard/drop files or a download destination. Reply with app-owned
+`AlloyGuestFile` objects, never paths or native destination descriptors. File
+getters and `OnOperation` run on the registering integration callback sequence.
+Completion methods may be called from app I/O threads; metadata getters are
+queued back to that sequence before sending the reply. A true return means queue
+admission, not consumer completion. Invalid results retire the request.
+
+Each app entry has an opaque `GetIdentifier()` identity (use
+`AlloyCreateGuestFileIdentity()`) and canonical opaque ancestor identities, root
+first. Preserve these when returning the same entry from a different picker or
+directory. Logical names are basenames, not paths. Native validation rejects
+cycles and contradictory ancestry. Repeated selections and directory-derived
+handles share Chromium's ordinary file/directory lock hierarchy; app identities
+do not create filesystem paths that the guest may open.
+
+Native permission and grant objects still decide access. Selected capabilities
+and issuing/receiving binding leases only add lifetime: navigation, provider loss,
+close and revocation cancel pending work and cannot grant a replacement page.
+Transfer tokens retain those native grants and leases. Serialized external
+handles refer to the exact live native token, not persisted paths from which
+new grants could be reconstructed. Retirement invalidates restored handles too.
+Experimental platform filesystem observation is unsupported for these entries;
+native external-file move/rename and OPFS-only sync handles keep their existing
+native refusals. OPFS stays on its ordinary storage path.
+
+File operations use bounded acknowledged byte chunks. `open-write` returns an
+app transaction, with keep-existing/exclusive information. Reads use checked
+offset/length and expected modification time. Writes and truncate affect staging;
+`close` acknowledges actual app commit, and `abort` discards it. Release discarded
+transaction resources when their app object is released, including after provider
+loss. Failed saves/writes must preserve the app's prior committed data.
+
+Path-only upload, paste and drop consumers receive native-created aliases to
+sealed RAM snapshots. Native proof checks the exact immutable inode, private
+RAM ancestry and original document before file grant delivery. App display names
+and directory components stay separate from backing aliases, including repeated
+or long basenames. Arbitrary chooser paths and native clipboard/portal services
+are not fallbacks. Clipboard file materialization shares the pinned ten-second
+clipboard read bound; ordinary file operations have no clipboard deadline.
+`DragEnterFiles` requests typed drop files; wait for its normal interaction receipt
+before over/drop. Clipboard writes and source drags expose selected app objects
+through `GetFileCount`/`GetFile`, never OS path authority.
+
+Downloads consume the normal guarded native network stream. App chunk
+acknowledgements precede native progress, and actual sink commit precedes native
+completion. The native item retains uncommitted staging across interruption and
+resume, verifies partial bytes/hash and overlapping ranges, and aborts on cancel,
+destruction or original-document retirement. The app owns destination presentation
+and OS open/reveal actions; guest mode does not initialize Chrome's download UI.
+`GetDownloadId()` identifies the native item independently of its naming metadata.
+`DownloadControl` pauses/resumes/cancels through the existing ordered interaction
+route. `OnDownloadProgress` reports native preparing/active/paused/complete/
+cancelled/interrupted state; sink queue admission alone never means complete.
+
 ## Verification surface
 
 The synthetic `alloy_guest_integration_consumer` uses the translated SDK without
@@ -120,8 +177,9 @@ pending-read retirement. `--check native-grants-unit` invokes the existing
 native-grants binary. Run these only in the assigned build guest; evidence is
 explicit synthetic fixture output, not production logging.
 
-The file/upload/save/download adapter slice is not implemented in this draft.
-Clipboard file capabilities are not yet materialized. `--check all` deliberately
-fails until that slice and its byte/sink/revocation proofs are present; UI-only
-results cannot stand in for complete M5 acceptance. Protected acceptance also
+`--check files` exercises native file reads/writes/directories/locks, upload bytes
+at page and HTTP receiver, clipboard/drop handles, shared/serialized retirement,
+large streams, asynchronous metadata replies and app download sinks/controls.
+`--check all` combines these with the original integration checks. UI-only or
+startup results cannot stand in for file acceptance. Protected acceptance also
 requires the merged Linux protection milestone.

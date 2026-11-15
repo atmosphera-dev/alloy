@@ -1,0 +1,338 @@
+--- a/content/browser/file_system_access/file_system_access_manager_impl.h
++++ b/content/browser/file_system_access/file_system_access_manager_impl.h
+@@ -10,6 +10,7 @@
+ #include "base/containers/flat_set.h"
+ #include "base/containers/unique_ptr_adapters.h"
+ #include "base/files/file_path.h"
++#include "content/browser/file_system_access/alloy_guest_file_binding.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -100,6 +101,9 @@
+ 
+     // Should never be null. These are the read and write permissions for this
+     // handle.
++    // Exact selected app capability follows native handles and transfer tokens.
++    scoped_refptr<AlloyGuestFileCapability> guest_file;
++    scoped_refptr<AlloyGuestFileBinding> guest_binding;
+     const scoped_refptr<FileSystemAccessPermissionGrant> read_grant;
+     const scoped_refptr<FileSystemAccessPermissionGrant> write_grant;
+   };
+--- a/content/browser/file_system_access/file_system_access_manager_impl.cc
++++ b/content/browser/file_system_access/file_system_access_manager_impl.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/file_system_access/file_system_access_manager_impl.h"
++#include "base/process/alloy_guest_runtime.h"
++#include <string_view>
++#include "content/browser/file_system_access/alloy_guest_files.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/browser_context.h"
+ #include "brave/alloy/site_records/request_context_policy.h"
+@@ -96,6 +99,7 @@
+ #endif
+ 
+ namespace content {
++namespace { constexpr char kGuestHandlePrefix[] = "alloy-guest-file:"; }
+ 
+ using blink::mojom::FileSystemAccessStatus;
+ using PermissionStatus = FileSystemAccessPermissionGrant::PermissionStatus;
+@@ -1069,6 +1073,32 @@
+   // directory and call ResolveDataTransferTokenWithFileType with the result.
+   auto fs_url = CreateFileSystemURLFromPath(
+       data_transfer_token_impl->second->file_path_info());
++  if (UsesAlloyGuestExternalFiles(fs_url)) {
++    auto* frame = binding_context.document.AsRenderFrameHostIfValid();
++    auto selected = frame ? AlloyGuestFileCapability::FromURL(frame->GetBrowserContext(), fs_url) : nullptr;
++    auto* bridge = AlloyGuestIntegration::Get(frame);
++    if (!IsBindingContextValid(binding_context) || !selected || !selected->Admitted() || !bridge) {
++      std::move(token_resolved_callback).Run(file_system_access_error::FromStatus(
++          FileSystemAccessStatus::kOperationAborted), nullptr);
++      return;
++    }
++    const auto& original = data_transfer_token_impl->second->file_path_info();
++    PathInfo logical(original.type, original.path, selected->metadata().name);
++    selected->Stat(base::BindOnce([](base::WeakPtr<FileSystemAccessManagerImpl> self,
++        BindingContext context, PathInfo path, storage::FileSystemURL url,
++        scoped_refptr<AlloyGuestFileCapability> selected, GetEntryFromDataTransferTokenCallback callback,
++        AlloyGuestFileCapability::Result result) {
++      if (!self || !AlloyGuestFileCapability::Body(result)) {
++        std::move(callback).Run(file_system_access_error::FromStatus(
++            FileSystemAccessStatus::kOperationAborted), nullptr);
++        return;
++      }
++      self->ResolveDataTransferTokenWithFileType(context, path, url, std::move(callback),
++          selected->metadata().directory ? HandleType::kDirectory : HandleType::kFile);
++    }, weak_factory_.GetWeakPtr(), binding_context, logical, fs_url, selected,
++        std::move(token_resolved_callback)), bridge->CaptureAdmission(frame, true));
++    return;
++  }
+   DoFileSystemOperation(
+       FROM_HERE, &storage::FileSystemOperationRunner::GetMetadata,
+       base::BindOnce(&HandleTypeFromFileInfo)
+@@ -1395,6 +1399,12 @@
+     return;
+   }
+ 
++  if (UsesAlloyGuestExternalFiles(resolved_token->url())) {
++    if (!resolved_token->PinForGuestSerialization()) { std::move(callback).Run({}); return; }
++    const auto value = std::string(kGuestHandlePrefix) + resolved_token->token().ToString();
++    std::move(callback).Run(std::vector<uint8_t>(value.begin(), value.end()));
++    return;
++  }
+   auto value = SerializeURLWithPermissionRoot(
+       resolved_token->url(), resolved_token->type(),
+       resolved_token->GetWriteGrant()->GetPath(),
+@@ -1427,6 +1437,19 @@
+   if (document_context_required_) {
+     return;
+   }
++  const auto guest_bits = base::as_string_view(bits);
++  if (alloy_guest_is_runtime() && guest_bits.starts_with(kGuestHandlePrefix)) {
++    auto identity = base::UnguessableToken::DeserializeFromString(
++        guest_bits.substr(sizeof(kGuestHandlePrefix) - 1));
++    auto found = identity ? transfer_tokens_.find(*identity) : transfer_tokens_.end();
++    if (found != transfer_tokens_.end()) {
++      auto* original = found->second.get();
++      if (original->origin() == storage_key.origin() && original->guest_file() &&
++          original->guest_file()->Admitted() && original->guest_binding() && original->guest_binding()->Admitted())
++        original->Clone(std::move(token));
++    }
++    return;
++  }
+   CHECK(!bits.empty(), base::NotFatalUntil::M159);
+ 
+   FileSystemAccessHandleData data;
+@@ -1435,6 +1458,9 @@
+     return;
+   }
+ 
++  // App external handles restore their exact original native token/state,
++  // never fresh grants reconstructed from a persisted pathname.
++  if (alloy_guest_is_runtime() && data.data_case() != FileSystemAccessHandleData::kSandboxed) return;
+   switch (data.data_case()) {
+     case FileSystemAccessHandleData::kSandboxed: {
+       base::FilePath virtual_path =
+@@ -1615,8 +1641,10 @@
+   mojo::PendingRemote<blink::mojom::FileSystemAccessFileHandle> result;
+   if (!IsBindingContextValid(binding_context)) { return result; }
+   file_receivers_.Add(
+-      std::make_unique<FileSystemAccessFileHandleImpl>(
+-          this, binding_context, url, display_name, handle_state),
++      UsesAlloyGuestExternalFiles(url)
++          ? CreateAlloyGuestFileHandle(this, binding_context, url, display_name, handle_state)
++          : std::make_unique<FileSystemAccessFileHandleImpl>(
++                this, binding_context, url, display_name, handle_state),
+       result.InitWithNewPipeAndPassReceiver());
+   return result;
+ }
+@@ -1634,8 +1662,10 @@
+   mojo::PendingRemote<blink::mojom::FileSystemAccessDirectoryHandle> result;
+   if (!IsBindingContextValid(binding_context)) { return result; }
+   directory_receivers_.Add(
+-      std::make_unique<FileSystemAccessDirectoryHandleImpl>(
+-          this, binding_context, url, handle_state),
++      UsesAlloyGuestExternalFiles(url)
++          ? CreateAlloyGuestDirectoryHandle(this, binding_context, url, handle_state)
++          : std::make_unique<FileSystemAccessDirectoryHandleImpl>(
++                this, binding_context, url, handle_state),
+       result.InitWithNewPipeAndPassReceiver());
+   return result;
+ }
+@@ -1946,6 +1976,14 @@
+     blink::mojom::FileSystemAccessErrorPtr result,
+     std::vector<PathInfo> entries) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto selected = HoldAlloyGuestFileSelection(
++      binding_context.document.AsRenderFrameHostIfValid(), context(), entries);
++  callback = base::BindOnce([](base::ScopedClosureRunner selected,
++      ChooseEntriesCallback callback, blink::mojom::FileSystemAccessErrorPtr error,
++      std::vector<blink::mojom::FileSystemAccessEntryPtr> entries) {
++    std::move(callback).Run(std::move(error), std::move(entries));
++  }, std::move(selected), std::move(callback));
++
+   if (!IsBindingContextValid(binding_context)) {
+     std::move(callback).Run(
+         file_system_access_error::FromStatus(
+@@ -2201,6 +2239,10 @@
+         weak_factory_.GetWeakPtr(), binding_context, entries.front(), fs_url,
+         std::move(callback));
+ 
++    if (UsesAlloyGuestExternalFiles(fs_url)) {
++      TruncateAlloyGuestSaveFile(this, binding_context, fs_url, std::move(did_create_and_truncate));
++      return;
++    }
+ #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
+     if (entries.front().type == PathType::kLocal) {
+       context()->default_file_task_runner()->PostTaskAndReplyWithResult(
+--- a/content/browser/file_system_access/file_system_access_handle_base.cc
++++ b/content/browser/file_system_access/file_system_access_handle_base.cc
+@@ -92,7 +92,9 @@
+ FileSystemAccessHandleBase::PermissionStatus
+ FileSystemAccessHandleBase::GetReadPermissionStatus() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (!manager()->IsBindingContextValid(context())) {
++  if (!manager()->IsBindingContextValid(context()) ||
++      (handle_state_.guest_file && !handle_state_.guest_file->Admitted()) ||
++      (handle_state_.guest_binding && !handle_state_.guest_binding->Admitted())) {
+     return PermissionStatus::DENIED;
+   }
+   // In 3P contexts, user permission prompts are blocked and ambient origin
+@@ -133,7 +135,9 @@
+ FileSystemAccessHandleBase::PermissionStatus
+ FileSystemAccessHandleBase::GetWritePermissionStatus() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (!manager()->IsBindingContextValid(context())) {
++  if (!manager()->IsBindingContextValid(context()) ||
++      (handle_state_.guest_file && !handle_state_.guest_file->Admitted()) ||
++      (handle_state_.guest_binding && !handle_state_.guest_binding->Admitted())) {
+     return PermissionStatus::DENIED;
+   }
+   if (!base::FeatureList::IsEnabled(
+--- a/content/browser/file_system_access/file_system_access_transfer_token_impl.h
++++ b/content/browser/file_system_access/file_system_access_transfer_token_impl.h
+@@ -49,6 +49,9 @@
+   }
+   const storage::FileSystemURL& url() const { return url_; }
+   const url::Origin& origin() const { return origin_; }
++  scoped_refptr<AlloyGuestFileCapability> guest_file() const { return handle_state_.guest_file; }
++  scoped_refptr<AlloyGuestFileBinding> guest_binding() const { return handle_state_.guest_binding; }
++  bool PinForGuestSerialization();
+ 
+   // Returns permission grants associated with this token. These can
+   // return nullptr if this token does not have associated permission grants.
+@@ -84,6 +87,9 @@
+   const FileSystemAccessManagerImpl::SharedHandleState handle_state_;
+   mojo::ReceiverSet<blink::mojom::FileSystemAccessTransferToken> receivers_
+       GUARDED_BY_CONTEXT(sequence_checker_);
++  bool guest_serialized_pin_ = false;
++  base::CallbackListSubscription guest_serialized_scope_;
++  base::WeakPtrFactory<FileSystemAccessTransferTokenImpl> guest_weak_{this};
+ };
+ 
+ }  // namespace content
+--- a/content/browser/file_system_access/file_system_access_transfer_token_impl.cc
++++ b/content/browser/file_system_access/file_system_access_transfer_token_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/file_system_access/file_system_access_transfer_token_impl.h"
++#include "content/browser/file_system_access/alloy_guest_files.h"
+ 
+ #include "content/browser/file_system_access/file_system_access_directory_handle_impl.h"
+ #include "content/browser/file_system_access/file_system_access_file_handle_impl.h"
+@@ -29,7 +30,10 @@
+     auto denied_grant =
+         base::MakeRefCounted<FixedFileSystemAccessPermissionGrant>(
+             blink::mojom::PermissionStatus::DENIED, PathInfo(url.path()));
+-    return SharedHandleState(denied_grant, denied_grant);
++    SharedHandleState denied(denied_grant, denied_grant);
++    denied.guest_file = handle_state.guest_file;
++    denied.guest_binding = handle_state.guest_binding;
++    return denied;
+   }
+   return handle_state;
+ }
+@@ -70,6 +74,9 @@
+     const FileSystemAccessManagerImpl::BindingContext& binding_context) const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   CHECK_EQ(handle_type_, HandleType::kFile, base::NotFatalUntil::M159);
++  if (UsesAlloyGuestExternalFiles(url_))
++    return CreateAlloyGuestFileHandle(manager_, binding_context, url_, display_name_,
++        GetEffectiveHandleStateForContext(url_, binding_context, handle_state_));
+   return std::make_unique<FileSystemAccessFileHandleImpl>(
+       manager_, binding_context, url_, display_name_,
+       GetEffectiveHandleStateForContext(url_, binding_context, handle_state_));
+@@ -80,6 +87,9 @@
+     const FileSystemAccessManagerImpl::BindingContext& binding_context) const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   CHECK_EQ(handle_type_, HandleType::kDirectory, base::NotFatalUntil::M159);
++  if (UsesAlloyGuestExternalFiles(url_))
++    return CreateAlloyGuestDirectoryHandle(manager_, binding_context, url_,
++        GetEffectiveHandleStateForContext(url_, binding_context, handle_state_));
+   return std::make_unique<FileSystemAccessDirectoryHandleImpl>(
+       manager_, binding_context, url_,
+       GetEffectiveHandleStateForContext(url_, binding_context, handle_state_));
+@@ -97,6 +107,20 @@
+   return handle_state_.write_grant.get();
+ }
+ 
++bool FileSystemAccessTransferTokenImpl::PinForGuestSerialization() {
++  if (!handle_state_.guest_file || !handle_state_.guest_file->Admitted() ||
++      !handle_state_.guest_binding || !handle_state_.guest_binding->Admitted()) return false;
++  if (guest_serialized_pin_) return true;
++  guest_serialized_pin_ = true;
++  guest_serialized_scope_ = handle_state_.guest_binding->OnRetired(base::BindOnce(
++      [](base::WeakPtr<FileSystemAccessTransferTokenImpl> token) {
++        if (!token) return;
++        token->guest_serialized_pin_ = false; token->guest_serialized_scope_ = {};
++        if (token->receivers_.empty()) token->manager_->RemoveToken(token->token_);
++      }, guest_weak_.GetWeakPtr()));
++  return true;
++}
++
+ void FileSystemAccessTransferTokenImpl::GetInternalID(
+     GetInternalIDCallback callback) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+@@ -105,7 +129,7 @@
+ 
+ void FileSystemAccessTransferTokenImpl::OnMojoDisconnect() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (receivers_.empty()) {
++  if (receivers_.empty() && !guest_serialized_pin_) {
+     manager_->RemoveToken(token_);
+   }
+ }
+--- a/content/browser/file_system_access/file_system_chooser.cc
++++ b/content/browser/file_system_access/file_system_chooser.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/file_system_access/file_system_chooser.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/browser/file_system_access/alloy_guest_files.h"
+ 
+ #include <memory>
+ #include <utility>
+@@ -339,6 +341,11 @@
+     AbortedCallback(std::move(callback));
+     return;
+   }
++  if (alloy_guest_is_runtime()) {
++    ShowAlloyGuestFilePicker(render_frame_host, options, std::move(callback),
++        std::move(scoped_objects), std::move(canceller));
++    return;
++  }
+   // `listener` deletes itself.
+   auto* listener =
+       new FileSystemChooser(options.type(), std::move(callback),
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/file_system_access/chrome_file_system_access_permission_context.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/public/browser/alloy_guest_integration.h"
+ 
+ #include <algorithm>
+ #include <iterator>
+@@ -1176,6 +1178,17 @@
+     }
+     request_manager = *request_manager_or_error;
+ 
++    if (alloy_guest_is_runtime()) {
++      content::AlloyGuestIntegration::RequestFilePermission(rfh, path_info_.path,
++          path_info_.type == content::PathType::kExternal, type_ == GrantType::kWrite,
++          base::BindOnce([](scoped_refptr<PermissionGrantImpl> self,
++              base::ScopedClosureRunner fullscreen,
++              base::OnceCallback<void(PermissionRequestOutcome)> callback, bool allowed) {
++            self->OnPermissionRequestResult(std::move(callback),
++                allowed ? PermissionAction::GRANTED : PermissionAction::DENIED);
++          }, self, std::move(*blocker), std::move(callback)));
++      return;
++    }
+     if (context_->IsEligibleToUpgradePermissionRequestToRestorePrompt(
+             origin_, path_info_.path, handle_type_, access_trigger_, type_)) {
+       std::vector<FileRequestData> request_data_list =

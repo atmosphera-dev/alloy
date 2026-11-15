@@ -24,7 +24,7 @@ using Operation = content::AlloyGuestIntegration::Operation;
 // The pin's async X11 requester/Wayland read path has no read deadline. Reuse
 // its Linux clipboard transfer bound, not an invented app setting:
 // ui/base/x/selection_owner.cc, kIncrementalTransferTimeout = 10 seconds.
-constexpr auto kClipboardReadTimeout = base::Seconds(10);
+constexpr auto kClipboardReadTimeout = content::AlloyGuestIntegration::kClipboardReadTimeout;
 constexpr std::array<const char*, 14> kOperations = {
     "clipboard-read", "clipboard-write", "clipboard-sequence", "menu",
     "drag-source", "fullscreen", "select-files", "file-read", "file-write",
@@ -36,20 +36,38 @@ class Bridge final : public content::AlloyGuestIntegration {
       content::RenderFrameHost*, Operation,
       content::AlloyGuestIntegrationData, Reply)>;
   using Capture = base::RepeatingCallback<base::RepeatingCallback<bool()>(
-      content::RenderFrameHost*, bool)>;
-  Bridge(RequestCallback request, Capture capture)
-      : request_(std::move(request)), capture_(std::move(capture)) {}
+      content::RenderFrameHost*, bool, base::OnceClosure, int64_t)>;
+  using Release = base::RepeatingCallback<void(const std::string&)>;
+  using Progress = base::RepeatingCallback<void(const std::string&, const std::string&, int64_t, int64_t)>;
+  Bridge(RequestCallback request, Capture capture, Release release, Progress progress)
+      : request_(std::move(request)), capture_(std::move(capture)), release_(std::move(release)),
+        progress_(std::move(progress)) {}
   void Request(content::RenderFrameHost* original, Operation operation,
                 content::AlloyGuestIntegrationData data, Reply reply) override {
     request_.Run(original, operation, std::move(data), std::move(reply));
   }
   base::RepeatingCallback<bool()> CaptureAdmission(content::RenderFrameHost* original,
                                                     bool document_only) override {
-    return capture_.Run(original, document_only);
+    return capture_.Run(original, document_only, {}, 0);
+  }
+  base::RepeatingCallback<bool()> CaptureLifetime(content::RenderFrameHost* original,
+      base::OnceClosure retired) override {
+    return capture_.Run(original, true, std::move(retired), 0);
+  }
+  base::RepeatingCallback<bool()> CaptureDownloadAdmission(content::RenderFrameHost* original,
+      int64_t navigation_id) override {
+    return capture_.Run(original, true, {}, navigation_id);
+  }
+  void RetireFile(const std::string& capability) override { release_.Run(capability); }
+  void DownloadProgress(const std::string& identity, const std::string& state,
+      int64_t received, int64_t total) override {
+    if (progress_) progress_.Run(identity, state, received, total);
   }
  private:
   const RequestCallback request_;
   const Capture capture_;
+  const Release release_;
+  const Progress progress_;
 };
 }  // namespace
 
@@ -58,6 +76,7 @@ struct NativeRequests::PendingInfo {
   base::RepeatingCallback<bool(const base::DictValue&,
                                 const std::vector<std::string>&)> validate;
   bool accepted = false;
+  bool ui_reply = false;
 };
 
 // An integration operation's lifetime, not a permission/site-state owner.
@@ -66,6 +85,8 @@ struct NativeRequests::PendingInfo {
 struct NativeRequests::DocumentCapture {
   bool live = true;
   std::vector<content::FrameTreeNodeId> ancestors;
+  base::RepeatingCallback<bool()> admitted;
+  base::OnceClosure retired;
 };
 
 NativeRequests::NativeRequests(Owner owner, Event event, Owns owns,
@@ -86,31 +107,46 @@ void NativeRequests::Bind(content::WebContents* contents) {
         if (self) self->Request(frame, operation, std::move(data), std::move(reply));
         else std::move(reply).Run(std::nullopt);
       }, weak_.GetWeakPtr()), base::BindRepeating(
-      [](base::WeakPtr<NativeRequests> self, content::RenderFrameHost* frame, bool document_only) {
-        return self ? self->Capture(frame, document_only) : base::RepeatingCallback<bool()>();
+      [](base::WeakPtr<NativeRequests> self, content::RenderFrameHost* frame,
+          bool document_only, base::OnceClosure retired, int64_t download_navigation) {
+        return self ? self->Capture(frame, document_only, std::move(retired), download_navigation)
+                    : base::RepeatingCallback<bool()>();
+      }, weak_.GetWeakPtr()), base::BindRepeating(
+      [](base::WeakPtr<NativeRequests> self, const std::string& capability) {
+        if (!self) return;
+        base::DictValue details; details.Set("capability", capability);
+        self->Notify("file-retired", std::move(details));
+      }, weak_.GetWeakPtr()), base::BindRepeating(
+      [](base::WeakPtr<NativeRequests> self, const std::string& identity, const std::string& state,
+          int64_t received, int64_t total) {
+        if (!self) return;
+        base::DictValue data; data.Set("download-id", identity); data.Set("state", state);
+        data.Set("received", std::to_string(received)); data.Set("total", std::to_string(total));
+        self->Notify("download-state", std::move(data));
       }, weak_.GetWeakPtr())));
 }
 
 base::RepeatingCallback<bool()> NativeRequests::Capture(
-    content::RenderFrameHost* original, bool document_only) {
+    content::RenderFrameHost* original, bool document_only, base::OnceClosure retired, int64_t download_navigation) {
   if (!original || !contents_ ||
       original->GetBrowserContext() != contents_->GetBrowserContext() ||
       content::WebContents::FromRenderFrameHost(original)->GetOutermostWebContents() != contents_.get())
     return {};
   const Owner owner = owner_;
   auto capture = std::make_shared<DocumentCapture>();
+  capture->retired = std::move(retired);
   for (auto* frame = original; frame; frame = frame->GetParentOrOuterDocument())
     capture->ancestors.push_back(frame->GetFrameTreeNodeId());
   for (const auto& [navigation, frame] : navigating_frames_)
-    if (std::find(capture->ancestors.begin(), capture->ancestors.end(), frame) !=
+    if (navigation != download_navigation && std::find(capture->ancestors.begin(), capture->ancestors.end(), frame) !=
         capture->ancestors.end()) capture->live = false;
   std::erase_if(document_captures_, [](const auto& capture) { return capture.expired(); });
   document_captures_.push_back(capture);
-  return base::BindRepeating([](base::WeakPtr<NativeRequests> self, Owner owner,
+  capture->admitted = base::BindRepeating([](base::WeakPtr<NativeRequests> self, Owner owner,
       content::WeakDocumentPtr document, base::WeakPtr<base::SupportsUserData> state,
-      bool document_only, std::shared_ptr<DocumentCapture> capture) {
+      bool document_only) {
     auto* frame = document.AsRenderFrameHostIfValid();
-    return capture->live && self && self->contents_ && !self->closed_ && self->attached_ && owner.document &&
+    return self && self->contents_ && !self->closed_ && self->attached_ && owner.document &&
         self->owner_.view == owner.view && self->owner_.document == owner.document &&
         (document_only || self->owner_ == owner) && self->owns_(self->owner_) &&
         frame && frame->IsActive() &&
@@ -118,7 +154,10 @@ base::RepeatingCallback<bool()> NativeRequests::Capture(
         content::AlloyStateOwnerForContext(state, frame->GetBrowserContext()) &&
         content::AlloyDocumentStateAdmitted(frame);
   }, weak_.GetWeakPtr(), owner, original->GetWeakDocumentPtr(),
-      content::AlloyDocumentStateOwner(original), document_only, std::move(capture));
+      content::AlloyDocumentStateOwner(original), document_only);
+  return base::BindRepeating([](std::shared_ptr<DocumentCapture> capture) {
+    return capture->live && capture->admitted.Run();
+  }, std::move(capture));
 }
 
 void NativeRequests::DidStartNavigation(content::NavigationHandle* navigation) {
@@ -132,7 +171,7 @@ void NativeRequests::DidStartNavigation(content::NavigationHandle* navigation) {
   }
   // Retire pending native operations now, rather than waiting for document
   // commit, which can itself be waiting for one of their synchronous replies.
-  requests_.Sweep();
+  Sweep();
 }
 
 void NativeRequests::DidFinishNavigation(content::NavigationHandle* navigation) {
@@ -143,9 +182,8 @@ void NativeRequests::WebContentsDestroyed() { Close(); }
 
 void NativeRequests::SetOwner(Owner owner) {
   if (owner == owner_) return;
-  const auto previous = owner_;
   owner_ = owner;
-  requests_.Cancel(previous);
+  Sweep();
 }
 
 void NativeRequests::Request(content::RenderFrameHost* original,
@@ -184,6 +222,10 @@ void NativeRequests::Request(content::RenderFrameHost* original,
   auto request_id = std::make_shared<uint64_t>(0);
   auto info = std::make_shared<PendingInfo>();
   info->operation = operation;
+  info->ui_reply = operation == Operation::kMenu || operation == Operation::kDragSource ||
+      operation == Operation::kFullscreen || operation == Operation::kClipboardWrite ||
+      operation == Operation::kSelectFiles || operation == Operation::kDownload ||
+      data.details.FindBool("interaction").value_or(false);
   info->validate = std::move(data.validate_reply);
   auto native_reply = std::make_shared<content::AlloyGuestIntegration::Reply>(
       std::move(reply));
@@ -197,7 +239,8 @@ void NativeRequests::Request(content::RenderFrameHost* original,
         std::optional<content::AlloyGuestIntegrationData> result;
         if (parsed && (!info->validate || info->validate.Run(*parsed, bytes)))
           result.emplace(std::move(*parsed), std::move(bytes));
-        info->accepted = !!result;
+        const auto* response_status = result ? result->details.FindString("status") : nullptr;
+        info->accepted = result && (!response_status || *response_status == "ok");
         if (weak) weak->pending_.erase(*request_id);
         std::string status;
         PackFields({std::to_string(*request_id), result ? "completed" : "retired"}, &status);
@@ -282,10 +325,7 @@ void NativeRequests::Call(Owner owner, const std::string& operation,
         details->GetType("reply") == VTYPE_STRING;
     auto found = valid ? pending_.find(request_id) : pending_.end();
     auto info = found == pending_.end() ? nullptr : found->second;
-    valid = valid && info && (info->operation == Operation::kMenu ||
-        info->operation == Operation::kDragSource ||
-        info->operation == Operation::kFullscreen ||
-        info->operation == Operation::kClipboardWrite);
+    valid = valid && info && info->ui_reply;
     const auto event = event_;
     action.dispatch_us = clock_();
     const bool finished = valid && requests_.Finish(owner, request_id,
@@ -339,7 +379,26 @@ void NativeRequests::Call(Owner owner, const std::string& operation,
   reply(accepted ? ProviderResult::kOk : ProviderResult::kFailed, {});
 }
 
-void NativeRequests::Sweep() { requests_.Sweep(); }
+std::vector<base::OnceClosure> NativeRequests::TakeRetiredCaptures() {
+  std::vector<base::OnceClosure> callbacks;
+  for (auto it = document_captures_.begin(); it != document_captures_.end();) {
+    auto capture = it->lock();
+    if (!capture) { it = document_captures_.erase(it); continue; }
+    if (!capture->live || !capture->admitted.Run()) {
+      capture->live = false;
+      if (capture->retired) callbacks.push_back(std::move(capture->retired));
+    }
+    ++it;
+  }
+  return callbacks;
+}
+
+void NativeRequests::Sweep() {
+  auto callbacks = TakeRetiredCaptures();
+  requests_.Sweep();
+  // Native completion can destroy this owner. No member access after it starts.
+  for (auto& callback : callbacks) std::move(callback).Run();
+}
 void NativeRequests::Notify(std::string operation, base::DictValue details) {
   if (closed_ || !attached_ || !owns_(owner_)) return;
   details.Set("generation", std::to_string(generation_()));
@@ -350,7 +409,9 @@ void NativeRequests::Close() {
   if (closed_) return;
   closed_ = true;
   attached_ = false;
+  auto callbacks = TakeRetiredCaptures();
   requests_.Close();
+  for (auto& callback : callbacks) std::move(callback).Run();
 }
 
 }  // namespace alloy::guest::integration

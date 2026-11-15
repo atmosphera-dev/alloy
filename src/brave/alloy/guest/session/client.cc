@@ -251,6 +251,14 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
       [weak, view](Feature feature, Owner original, std::string operation, stream::InteractionData input) {
         auto core = weak.lock();
         return core ? core->Interact(view, feature, original, std::move(operation), std::move(input)) : 0;
+      },
+      [weak](Feature feature, std::function<std::shared_ptr<ExtensionClientState>()> create) {
+        auto core = weak.lock();
+        if (!core) return std::shared_ptr<ExtensionClientState>();
+        std::lock_guard guard(core->mutex);
+        auto& state = core->client_states[feature];
+        if (!state && !core->closing) state = create();
+        return state;
       }
     };
   }
@@ -353,6 +361,7 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
   std::map<uint64_t, Owner> extension_owners;
   std::map<std::pair<uint64_t, Feature>, std::shared_ptr<ExtensionSink>> sinks;
   std::vector<std::shared_ptr<ExtensionSink>> retired_sinks;
+  std::map<Feature, std::shared_ptr<ExtensionClientState>> client_states;
   Interactions interactions;
 };
 

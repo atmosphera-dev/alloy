@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><style>body{display:flex;gap:8px;margin:4px;font:12px sans-serif}button,div{flex:1;min-height:44px}</style>
+<body><button id="pick">Pick and share native file</button><div id="paste" contenteditable>File paste</div><div id="drop">File drop</div></body><script>
+let handle;
+const parameters=new URLSearchParams(location.search);
+async function database(){return new Promise((resolve,reject)=>{const request=indexedDB.open('alloy-m5-file-transfer',1);
+ request.onupgradeneeded=()=>request.result.createObjectStore('handles');request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});}
+async function stored(value){const db=await database();try{return await new Promise((resolve,reject)=>{
+ const tx=db.transaction('handles',value?'readwrite':'readonly');const store=tx.objectStore('handles');
+ const request=value?store.put(value,'selected'):store.get('selected');let result;
+ request.onsuccess=()=>result=request.result;tx.oncomplete=()=>resolve(result);tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);
+ });}finally{db.close();}}
+async function acquired(value,route){if(!value)throw new Error('missing native file handle');handle=value;
+ await stored(handle);const restored=await stored();const file=await restored.getFile();const text=await file.text();
+ parent.postMessage({kind:'child-picked',route,handle,serializedRead:text},location.origin);}
+async function restore(){try{const value=await stored();const file=await value.getFile();
+ parent.postMessage({kind:'serialized-read',text:await file.text()},location.origin);}
+ catch(e){parent.postMessage({kind:'serialized-refused',error:e.name},location.origin);}}
+window.addEventListener('message',async event=>{if(event.origin!==location.origin)return;if(event.data.restore){await restore();return;}
+ if(!event.data.handle)return;handle=event.data.handle;
+ try{const file=await handle.getFile();parent.postMessage({kind:'shared-read',text:await file.text()},location.origin);}
+ catch(e){parent.postMessage({kind:'shared-error',error:e.name},location.origin);}});
+pick.onclick=async()=>{try{const [selected]=await showOpenFilePicker();await acquired(selected,'picker');}
+ catch(e){parent.postMessage({kind:'shared-error',error:e.name},location.origin);}};
+function files(event,route){event.preventDefault();const promises=[...event[route==='paste'?'clipboardData':'dataTransfer'].items]
+ .filter(item=>item.kind==='file').map(item=>item.getAsFileSystemHandle());
+ Promise.all(promises).then(values=>acquired(values[0],route)).catch(e=>parent.postMessage({kind:'shared-error',error:e.name},location.origin));}
+paste.onpaste=event=>files(event,'paste');drop.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='copy';};drop.ondrop=event=>files(event,'drop');
+function rectangle(element){const r=element.getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height};}
+parent.postMessage({kind:'child-ready',pick:rectangle(pick),paste:rectangle(paste),drop:rectangle(drop)},location.origin);
+if(parameters.has('replacement'))restore();
+</script>

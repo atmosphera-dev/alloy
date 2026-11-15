@@ -5,6 +5,7 @@
 #include "include/alloy/alloy_guest_session.h"
 #include "include/cef_api_hash.h"
 #include "include/cef_parser.h"
+#include "brave/alloy/guest/integration/sdk_files.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -205,7 +206,14 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     Event("integration-closed");
   }
   void OnUnavailable() override { Event("integration-unavailable"); }
+  void OnFileSelection(CefRefPtr<AlloyGuestFileSelection> request) override { files_.Select(request); }
+  void OnDownloadProgress(const CefString& id, const CefString& state, int64_t received, int64_t total) override {
+    auto event = CefDictionaryValue::Create(); event->SetString("download", id); event->SetString("state", state);
+    event->SetString("received", std::to_string(received)); event->SetString("total", std::to_string(total));
+    Event("download-state", event);
+  }
   void OnRequestEnded(uint64_t id, const CefString& reason) override {
+    files_.Ended(id);
     { std::lock_guard lock(mutex_);
       if (auto found = reads_.find(id); found != reads_.end()) retired_reads_[id] = found->second;
       if (auto found = menus_.find(id); found != menus_.end()) retired_menus_[id] = found->second;
@@ -328,6 +336,12 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
       permissions_ = data->GetBool("permissions"); hold_reads_ = data->GetBool("hold_reads");
       deny_reads_ = data->GetBool("deny_reads"); hold_writes_ = data->GetBool("hold_writes");
       fail_writes_ = data->GetBool("fail_writes"); queued = true;
+    } else if (op == "files-configure") {
+      files_.Configure(data); queued = true;
+    } else if (op == "files-get") {
+      Event("files", files_.Snapshot()); queued = true;
+    } else if (op == "files-release") {
+      files_.Release(); queued = true;
     } else if (op == "clipboard-set") {
       auto formats = data->GetDictionary("formats"); std::vector<CefString> keys;
       if (!formats || !formats->GetKeys(keys)) return false;
@@ -408,6 +422,12 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
       touch.pressure = touch.type == CEF_TET_RELEASED || touch.type == CEF_TET_CANCELLED ? 0 : 1;
       touch.pointer_type = CEF_POINTER_TYPE_TOUCH;
       id = stream ? stream->SendTouch(source, document, generation, U(data, "surface"), touch, capture) : 0;
+    } else if (op == "download-control") {
+      id = integration ? integration->DownloadControl(document, generation, Text(data, "download"),
+          Text(data, "command"), source, capture) : 0;
+    } else if (op == "drag-file-enter") {
+      id = integration ? integration->DragEnterFiles(document, generation, data->GetInt("x"), data->GetInt("y"),
+          data->GetInt("allowed"), data->GetInt("modifiers"), source, capture) : 0;
     } else if (op == "drag-enter") {
       auto drag = CefDragData::Create(); drag->SetFragmentText(Text(data, "text"));
       drag->SetFragmentHtml(Text(data, "html"));
@@ -442,6 +462,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
   bool closed_ = false, permissions_ = false, hold_reads_ = false, deny_reads_ = false;
   bool hold_writes_ = false, fail_writes_ = false;
   uint64_t document_ = 0, generation_ = 0, sequence_ = 1;
+  SyntheticGuestFiles files_{[](const char* name, CefRefPtr<CefDictionaryValue> value) { Event(name, value); }};
   CefRefPtr<AlloyGuestSession> session_;
   CefRefPtr<AlloyGuestView> view_;
   CefRefPtr<AlloyGuestStream> stream_;

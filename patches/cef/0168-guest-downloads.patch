@@ -1,0 +1,22 @@
+--- a/libcef/browser/download_manager_delegate_impl.cc
++++ b/libcef/browser/download_manager_delegate_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/download_manager_delegate_impl.h"
++#include "base/process/alloy_guest_runtime.h"
+ 
+ #include <tuple>
+ 
+@@ -403,6 +404,11 @@
+ bool CefDownloadManagerDelegateImpl::DetermineDownloadTarget(
+     DownloadItem* item,
+     download::DownloadTargetCallback* callback) {
++  if (alloy_guest_is_runtime()) {
++    // Naming metadata only; the app destination was captured before item creation.
++    RunDownloadTargetCallback(std::move(*callback), item->GetForcedFilePath());
++    return true;
++  }
+   // This callback may arrive before OnDownloadCreated, so we allow association
+   // from either method.
+   CefRefPtr<CefBrowserHostBase> browser = GetOrAssociateBrowser(item);

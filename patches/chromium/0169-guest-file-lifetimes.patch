@@ -1,0 +1,225 @@
+--- a/components/download/public/common/download_save_info.h
++++ b/components/download/public/common/download_save_info.h
+@@ -40,7 +40,9 @@
+       base::WeakPtr<DownloadDestinationObserver>)>;
+   // Native embedder-injected destination. No app filesystem descriptor/path.
+   AppDestinationFactory app_destination_factory;
++  // Captured before asynchronous native checks; invoked only on UI.
++  base::RepeatingCallback<bool()> app_source_live;
+   base::RepeatingCallback<void(DownloadItem*)> app_item_created;
+   DownloadSaveInfo();
+ 
+   DownloadSaveInfo(const DownloadSaveInfo&) = delete;
+--- a/components/download/public/common/download_url_parameters.h
++++ b/components/download/public/common/download_url_parameters.h
+@@ -387,6 +387,8 @@
+ 
+   // STATE CHANGING: All save_info_ sub-objects will be in an indeterminate
+   // state following this call.
++  const base::RepeatingCallback<bool()>& alloy_source_live() const { return save_info_.app_source_live; }
++  void set_alloy_source_live(base::RepeatingCallback<bool()> live) { save_info_.app_source_live = std::move(live); }
+   DownloadSaveInfo TakeSaveInfo() { return std::move(save_info_); }
+ 
+   const net::NetworkTrafficAnnotationTag& GetNetworkTrafficAnnotation() {
+--- a/content/browser/download/download_manager_impl.h
++++ b/content/browser/download/download_manager_impl.h
+@@ -292,6 +292,7 @@
+ 
+   void InterceptNavigationOnChecksComplete(
+       FrameTreeNodeId frame_tree_node_id,
++      base::RepeatingCallback<bool()> app_source_live,
+       std::unique_ptr<network::ResourceRequest> resource_request,
+       std::vector<GURL> url_chain,
+       net::CertStatus cert_status,
+--- a/content/browser/download/download_manager_impl.cc
++++ b/content/browser/download/download_manager_impl.cc
+@@ -877,7 +877,7 @@
+     download::InProgressDownloadManager::StartDownloadItemCallback callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   if (alloy_guest_is_runtime() && info->result == download::DOWNLOAD_INTERRUPT_REASON_NONE)
+-    PrepareAlloyGuestDownload(info.get());
++    PrepareAlloyGuestDownload(info.get(), GetDownloadByGuid(info->guid));
+ 
+   download::DownloadItemImpl* download =
+       static_cast<download::DownloadItemImpl*>(GetDownloadByGuid(info->guid));
+@@ -955,6 +955,7 @@
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+   download::DownloadItemImpl* download = CreateActiveItem(id, *info);
++  if (alloy_guest_is_runtime()) RememberAlloyGuestDownloadSource(download, *info);
+   if (delegate_ && info->save_info) {
+     info->needs_obfuscation = delegate_->ShouldObfuscateDownload(download);
+     info->save_info->needs_obfuscation = info->needs_obfuscation;
+@@ -1205,6 +1206,10 @@
+     FrameTreeNodeId frame_tree_node_id,
+     bool from_download_cross_origin_redirect) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  auto* source_node = FrameTreeNode::GloballyFindByID(frame_tree_node_id);
++  auto app_source_live = alloy_guest_is_runtime()
++      ? CaptureAlloyGuestDownloadSource(source_node ? source_node->current_frame_host() : nullptr, true)
++      : base::RepeatingCallback<bool()>();
+   if (!delegate_) {
+     DropDownload();
+     return;
+@@ -1224,7 +1229,7 @@
+   base::OnceCallback<void(bool /* download allowed */)>
+       on_download_checks_done = base::BindOnce(
+           &DownloadManagerImpl::InterceptNavigationOnChecksComplete,
+-          weak_factory_.GetWeakPtr(), frame_tree_node_id,
++          weak_factory_.GetWeakPtr(), frame_tree_node_id, std::move(app_source_live),
+           std::move(resource_request), std::move(url_chain), cert_status,
+           std::move(response_head), std::move(response_body),
+           std::move(url_loader_client_endpoints));
+@@ -1594,6 +1599,7 @@
+ 
+ void DownloadManagerImpl::InterceptNavigationOnChecksComplete(
+     FrameTreeNodeId frame_tree_node_id,
++    base::RepeatingCallback<bool()> app_source_live,
+     std::unique_ptr<network::ResourceRequest> resource_request,
+     std::vector<GURL> url_chain,
+     net::CertStatus cert_status,
+@@ -1654,7 +1660,7 @@
+       std::move(response_head), std::move(response_body),
+       std::move(url_loader_client_endpoints),
+       CreatePendingSharedURLLoaderFactory(storage_partition, render_frame_host),
+-      is_transient);
++      is_transient, std::move(app_source_live));
+ }
+ 
+ void DownloadManagerImpl::BeginResourceDownloadOnChecksComplete(
+@@ -1899,6 +1905,8 @@
+   auto* rfh = RenderFrameHost::FromID(params->render_process_host_id(),
+                                       params->render_frame_host_routing_id());
+ 
++  if (alloy_guest_is_runtime() && is_new_download)
++    params->set_alloy_source_live(CaptureAlloyGuestDownloadSource(rfh));
+   StoragePartitionConfig storage_partition_config;
+   if (rfh && serialized_embedder_download_data.empty()) {
+     storage_partition_config = rfh->GetSiteInstance()
+--- a/components/download/public/common/in_progress_download_manager.h
++++ b/components/download/public/common/in_progress_download_manager.h
+@@ -132,7 +132,7 @@
+       network::mojom::URLLoaderClientEndpointsPtr url_loader_client_endpoints,
+       std::unique_ptr<network::PendingSharedURLLoaderFactory>
+           pending_url_loader_factory,
+-      bool is_transient);
++      bool is_transient, base::RepeatingCallback<bool()> app_source_live = {});
+ 
+   void StartDownload(std::unique_ptr<DownloadCreateInfo> info,
+                      std::unique_ptr<InputStream> stream,
+--- a/components/download/internal/common/in_progress_download_manager.cc
++++ b/components/download/internal/common/in_progress_download_manager.cc
+@@ -140,7 +140,7 @@
+     const URLSecurityPolicy& url_security_policy,
+     mojo::PendingRemote<device::mojom::WakeLockProvider> wake_lock_provider,
+     const scoped_refptr<base::SingleThreadTaskRunner>& main_task_runner,
+-    bool is_transient) {
++    bool is_transient, base::RepeatingCallback<bool()> app_source_live) {
+   DCHECK(GetIOTaskRunner()->BelongsToCurrentThread());
+ 
+   ResourceDownloader::InterceptNavigationResponse(
+@@ -152,7 +152,7 @@
+       network::SharedURLLoaderFactory::Create(
+           std::move(pending_url_loader_factory)),
+       url_security_policy, std::move(wake_lock_provider), main_task_runner,
+-      is_transient);
++      is_transient, std::move(app_source_live));
+ }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -350,7 +350,7 @@
+     network::mojom::URLLoaderClientEndpointsPtr url_loader_client_endpoints,
+     std::unique_ptr<network::PendingSharedURLLoaderFactory>
+         pending_url_loader_factory,
+-    bool is_transient) {
++    bool is_transient, base::RepeatingCallback<bool()> app_source_live) {
+   mojo::PendingRemote<device::mojom::WakeLockProvider> wake_lock_provider;
+   if (wake_lock_provider_binder_) {
+     wake_lock_provider_binder_.Run(
+@@ -368,7 +368,7 @@
+           std::move(url_loader_client_endpoints),
+           std::move(pending_url_loader_factory), url_security_policy_,
+           std::move(wake_lock_provider),
+-          base::SingleThreadTaskRunner::GetCurrentDefault(), is_transient));
++          base::SingleThreadTaskRunner::GetCurrentDefault(), is_transient, std::move(app_source_live)));
+ }
+ 
+ void InProgressDownloadManager::Initialize(
+--- a/components/download/internal/common/resource_downloader.h
++++ b/components/download/internal/common/resource_downloader.h
+@@ -62,7 +62,7 @@
+       const URLSecurityPolicy& url_security_policy,
+       mojo::PendingRemote<device::mojom::WakeLockProvider> wake_lock_provider,
+       const scoped_refptr<base::SingleThreadTaskRunner>& task_runner,
+-      bool is_transient);
++      bool is_transient, base::RepeatingCallback<bool()> app_source_live = {});
+ 
+   ResourceDownloader(
+       base::WeakPtr<UrlDownloadHandler::Delegate> delegate,
+@@ -134,6 +134,7 @@
+   bool is_new_download_;
+ 
+   int alloy_download_owner_ = 0;
++  base::RepeatingCallback<bool()> app_source_live_;
+ 
+   // GUID of the download, or empty if this is a new download.
+   std::string guid_;
+--- a/components/download/internal/common/resource_downloader.cc
++++ b/components/download/internal/common/resource_downloader.cc
+@@ -108,7 +108,7 @@
+     const URLSecurityPolicy& url_security_policy,
+     mojo::PendingRemote<device::mojom::WakeLockProvider> wake_lock_provider,
+     const scoped_refptr<base::SingleThreadTaskRunner>& task_runner,
+-    bool is_transient) {
++    bool is_transient, base::RepeatingCallback<bool()> app_source_live) {
+   auto downloader = std::make_unique<ResourceDownloader>(
+       delegate, std::move(resource_request), render_process_id, render_frame_id,
+       serialized_embedder_download_data, tab_url, tab_referrer_url, true,
+@@ -123,6 +123,7 @@
+               std::move(downloader).release(),
+               base::OnTaskRunnerDeleter(
+                   base::SingleThreadTaskRunner::GetCurrentDefault()))));
++  raw_downloader->app_source_live_ = std::move(app_source_live);
+   raw_downloader->InterceptResponse(
+       std::move(url_chain), cert_status, std::move(response_head),
+       std::move(response_body), std::move(url_loader_client_endpoints),
+@@ -171,6 +172,7 @@
+                              .unique_id_hash_code;
+   alloy_download_owner_ = net::IsAlloyDownloadContinuation(annotation)
+       ? download_url_parameters->alloy_download_owner() : annotation;
++  app_source_live_ = download_url_parameters->alloy_source_live();
+   callback_ = std::move(download_url_parameters->callback());
+   upload_callback_ = download_url_parameters->upload_callback();
+   guid_ = download_url_parameters->guid();
+@@ -252,6 +254,7 @@
+ void ResourceDownloader::OnResponseStarted(
+     std::unique_ptr<DownloadCreateInfo> download_create_info,
+     mojom::DownloadStreamHandlePtr stream_handle) {
++  if (download_create_info->save_info) download_create_info->save_info->app_source_live = app_source_live_;
+   download_create_info->alloy_download_owner = alloy_download_owner_;
+   download_create_info->is_new_download = is_new_download_;
+   download_create_info->guid = guid_;
+--- a/content/browser/file_system_access/file_system_access_observer_host.cc
++++ b/content/browser/file_system_access/file_system_access_observer_host.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/file_system_access/file_system_access_observer_host.h"
++#include "content/browser/file_system_access/alloy_guest_files.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -86,6 +87,13 @@
+     return;
+   }
+ 
++  // App entries have no platform watcher backing. This experimental
++  // observer endpoint must never turn their lock-only identity into local I/O.
++  if (UsesAlloyGuestExternalFiles(resolved_token->url())) {
++    std::move(callback).Run(file_system_access_error::FromStatus(
++        blink::mojom::FileSystemAccessStatus::kNotSupportedError), mojo::NullReceiver());
++    return;
++  }
+   if (FileSystemAccessHandleBase::IsThirdPartyContext(
+           resolved_token->url(), binding_context_.storage_key)) {
+     std::move(callback).Run(

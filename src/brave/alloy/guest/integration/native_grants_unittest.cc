@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "brave/alloy/site_records/request_context_policy.h"
 #include "brave/alloy/guest/integration/native_requests.h"
+#include "content/browser/download/alloy_guest_download.h"
+#include "content/browser/file_system_access/alloy_guest_file_binding.h"
+#include "base/unguessable_token.h"
 #include "base/functional/bind.h"
 #include "chrome/browser/extensions/chrome_extension_system.h"
 #include "chrome/browser/extensions/chrome_extension_system_factory.h"
@@ -86,6 +89,13 @@ TEST_F(GuestNativeSettingsTest, SubframeNavigationRetiresPendingNativeReadsBefor
   auto parent = bridge->CaptureAdmission(root);
   auto original = bridge->CaptureAdmission(child);
   auto nested = bridge->CaptureAdmission(grandchild);
+  auto download_source = content::CaptureAlloyGuestDownloadSource(child);
+  ASSERT_TRUE(download_source.Run());
+  int parent_retired = 0, child_retired = 0;
+  auto parent_lifetime = bridge->CaptureLifetime(root, base::BindOnce(
+      [](int* count) { ++*count; }, &parent_retired));
+  auto child_lifetime = bridge->CaptureLifetime(child, base::BindOnce(
+      [](int* count) { ++*count; }, &child_retired));
   ASSERT_TRUE(parent.Run()); ASSERT_TRUE(original.Run()); ASSERT_TRUE(nested.Run());
   int completed = 0;
   bridge->Request(child, content::AlloyGuestIntegration::Operation::kClipboardRead, {},
@@ -97,16 +107,52 @@ TEST_F(GuestNativeSettingsTest, SubframeNavigationRetiresPendingNativeReadsBefor
       GURL("https://child.test/replacement"), child);
   navigation->Start();
   EXPECT_EQ(completed, 1);
+  EXPECT_EQ(parent_retired, 0); EXPECT_EQ(child_retired, 1);
   EXPECT_TRUE(parent.Run());
   EXPECT_FALSE(original.Run()); EXPECT_FALSE(nested.Run());
+  EXPECT_FALSE(download_source.Run());
   auto during = bridge->CaptureAdmission(child);
   EXPECT_FALSE(during.Run());
   navigation->Fail(net::ERR_ABORTED);
   // Aborting may permit a new operation on the still-current document, but it
   // cannot resurrect a pending reply/capture from before the navigation.
   EXPECT_FALSE(original.Run()); EXPECT_FALSE(nested.Run());
+  EXPECT_FALSE(download_source.Run());
   EXPECT_TRUE(bridge->CaptureAdmission(child).Run());
   EXPECT_EQ(completed, 1);
+  EXPECT_TRUE(parent_lifetime.Run()); EXPECT_FALSE(child_lifetime.Run());
+  requests.Close();
+  EXPECT_EQ(parent_retired, 1); EXPECT_EQ(child_retired, 1);
+}
+
+TEST_F(GuestNativeSettingsTest, TransferredFileBindingCannotBorrowTheSelectedSourcesWiderLifetime) {
+  site_records::RequestContextPolicy::AttachMemory(*profile());
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://outer.test/"));
+  auto* root = web_contents()->GetPrimaryMainFrame();
+  auto* child = content::RenderFrameHostTester::For(root)->AppendChild("child");
+  child = content::NavigationSimulator::NavigateAndCommitFromDocument(GURL("https://child.test/"), child);
+  const Owner owner{1, 1, 1, 1};
+  NativeRequests requests(owner, [](Owner, std::string, std::string) {},
+      [](Owner) { return true; }, [] { return 1u; }, [] { return 1u; }, {});
+  requests.Bind(web_contents());
+  requests.Call(owner, "start", "", [](ProviderResult, std::string) {});
+  content::AlloyGuestFileMetadata metadata;
+  metadata.capability = base::UnguessableToken::Create().ToString();
+  metadata.identity = base::UnguessableToken::Create().ToString();
+  metadata.name = "selected.txt"; metadata.readable = true;
+  auto source = content::AlloyGuestFileCapability::Create(root, metadata); ASSERT_TRUE(source);
+  auto issuer = content::AlloyGuestFileBinding::Create(child, source); ASSERT_TRUE(issuer);
+  auto receiver = content::AlloyGuestFileBinding::Create(root, source, issuer); ASSERT_TRUE(receiver);
+  int retired = 0;
+  auto subscription = receiver->OnRetired(base::BindOnce([](int* count) { ++*count; }, &retired));
+  auto navigation = content::NavigationSimulator::CreateRendererInitiated(GURL("https://child.test/replaced"), child);
+  navigation->Start();
+  EXPECT_TRUE(source->Admitted()); EXPECT_FALSE(issuer->Admitted()); EXPECT_FALSE(receiver->Admitted());
+  EXPECT_EQ(retired, 1);
+  navigation->Fail(net::ERR_ABORTED);
+  EXPECT_TRUE(source->Admitted()); EXPECT_FALSE(issuer->Admitted()); EXPECT_FALSE(receiver->Admitted());
+  EXPECT_FALSE(content::AlloyGuestFileBinding::Create(root, source, issuer));
+  requests.Close(); EXPECT_EQ(retired, 1);
 }
 
 TEST_F(GuestNativeSettingsTest, NativeIntegrationPreservesExistingEmbeddedScopeSelection) {

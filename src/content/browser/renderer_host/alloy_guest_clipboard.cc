@@ -14,6 +14,10 @@
 #include "base/unguessable_token.h"
 #include "content/public/browser/alloy_document_state.h"
 #include "content/public/browser/clipboard_types.h"
+#include "content/browser/file_system_access/alloy_guest_uploads.h"
+#include "content/public/browser/browser_context.h"
+#include "content/public/browser/storage_partition.h"
+#include "storage/browser/file_system/file_system_context.h"
 #include "ui/base/clipboard/clipboard_constants.h"
 #include "ui/base/clipboard/custom_data_helper.h"
 #include "ui/gfx/codec/png_codec.h"
@@ -253,12 +257,23 @@ void AlloyGuestClipboard::ReadDataTransferCustomData(ui::ClipboardBuffer buffer,
 void AlloyGuestClipboard::ReadFilenames(ui::ClipboardBuffer buffer,
     const std::optional<ui::DataTransferEndpoint>&,
     ReadFilenamesCallback callback) const {
-  // File capabilities are resolved by the native file adapter, never by
-  // interpreting app strings as paths in the browser's filesystem namespace.
-  Read(buffer, "@files", base::BindOnce(
-      [](ReadFilenamesCallback callback, Result) {
-        std::move(callback).Run({});
-      }, std::move(callback)));
+  auto* original = document_.AsRenderFrameHostIfValid();
+  if (!original || !receiver_admitted_.Run()) { std::move(callback).Run({}); return; }
+  auto admitted = base::BindRepeating([](std::shared_ptr<const AlloyGuestClipboard> self,
+      base::TimeTicks deadline) {
+    return self->receiver_admitted_.Run() && base::TimeTicks::Now() < deadline;
+  }, shared_from_this(), base::TimeTicks::Now() + AlloyGuestIntegration::kClipboardReadTimeout);
+  base::DictValue details; details.Set("mode", "clipboard-files"); details.Set("buffer", Buffer(buffer));
+  AlloyGuestFileCapability::Select(original, std::move(details), base::BindOnce(
+      [](std::shared_ptr<const AlloyGuestClipboard> self, base::RepeatingCallback<bool()> admitted, ReadFilenamesCallback callback,
+          std::optional<AlloyGuestFileCapability::Entries> entries) {
+        if (!entries || !admitted.Run() || entries->empty()) { std::move(callback).Run({}); return; }
+        SnapshotAlloyGuestFiles(self->document_.AsRenderFrameHostIfValid(), std::move(*entries), false,
+            base::BindOnce([](std::shared_ptr<const AlloyGuestClipboard> self, ReadFilenamesCallback callback,
+                std::optional<AlloyGuestUploadFiles> snapshot) {
+              std::move(callback).Run(snapshot && self->receiver_admitted_.Run() ? snapshot->files : std::vector<ui::FileInfo>());
+            }, self, std::move(callback)), admitted);
+      }, shared_from_this(), admitted, std::move(callback)), admitted);
 }
 void AlloyGuestClipboard::ReadURL(const std::optional<ui::DataTransferEndpoint>&,
     ReadUrlCallback callback) const {
@@ -333,8 +348,19 @@ void AlloyGuestClipboard::WriteSvg(std::string_view markup) {
 void AlloyGuestClipboard::WriteRTF(std::string_view rtf) {
   Add("text/rtf", std::string(rtf));
 }
-void AlloyGuestClipboard::WriteFilenames(std::vector<ui::FileInfo>) {
-  transaction_valid_ = false;
+void AlloyGuestClipboard::WriteFilenames(std::vector<ui::FileInfo> files) {
+  auto* original = document_.AsRenderFrameHostIfValid();
+  if (!original) { transaction_valid_ = false; return; }
+  base::ListValue tokens;
+  for (const auto& file : files) {
+    const auto url = original->GetStoragePartition()->GetFileSystemContext()->CreateCrackedFileSystemURL(
+        blink::StorageKey(), storage::kFileSystemTypeLocal, file.path);
+    auto cap = AlloyGuestFileCapability::FromURL(original->GetBrowserContext(), url);
+    if (!cap || !cap->Admitted()) { transaction_valid_ = false; return; }
+    tokens.Append(cap->metadata().capability);
+  }
+  transaction_.details.Set("file-capabilities", std::move(tokens));
+  Add("@files", {});
 }
 void AlloyGuestClipboard::WriteURL(const ui::ClipboardUrlInfo& url) {
   std::u16string bookmark = url.url.is_valid() ? base::UTF8ToUTF16(url.url.spec()) : std::u16string();

@@ -1112,6 +1112,41 @@
       "patch": "cef/0164-guest-edit-context.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0165-guest-files.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0166-guest-file-bindings.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0167-guest-upload-snapshots.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0168-guest-downloads.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0168-guest-downloads.patch",
+      "root": "cef",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0169-guest-file-lifetimes.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
+      "patch": "cef/0169-guest-drag-sequence.patch",
+      "root": "cef",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

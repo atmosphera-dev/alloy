@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <deque>
 #include <limits>
+#include <set>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -15,14 +16,17 @@
 
 #include "brave/alloy/guest/stream/input.h"
 #include "base/unguessable_token.h"
+#include "base/strings/string_number_conversions.h"
 #include "brave/alloy/guest/integration/clipboard.h"
+#include "cef/include/cef_api_hash.h"
+#include "cef/libcef/common/api_version_util.h"
 
 namespace alloy::guest::integration {
 namespace {
 // Chunk size is derived from the existing message envelope, not a content-size
 // quota. One acknowledged chunk at a time gives the integration lane credit.
 constexpr size_t kChunk = kMaxControlPayload / 2;
-using Post = std::function<void(std::function<void()>)>;
+using Post = std::function<bool(std::function<void()>)>;
 struct Read;
 struct Request : public std::enable_shared_from_this<Request> {
   Owner owner;
@@ -32,8 +36,12 @@ struct Request : public std::enable_shared_from_this<Request> {
   std::vector<uint64_t> sizes;
   ExtensionEndpoint endpoint;
   Post post;
-  std::atomic<bool> active{true}, replied{false}, announced{false};
+  std::atomic<bool> active{true}, replied{false}, announced{false}, file_reply_queued{false};
   std::mutex mutex;
+  CefRefPtr<AlloyGuestFile> file, destination;
+  std::vector<CefRefPtr<AlloyGuestFile>> files;
+  std::function<CefRefPtr<CefListValue>(const std::vector<CefRefPtr<AlloyGuestFile>>&)> register_files;
+  std::function<void()> rollback_files;
   std::vector<std::weak_ptr<Read>> reads;
   std::function<bool(std::shared_ptr<Read>)> track_read;
   std::function<void(Read*)> retire_read;
@@ -43,10 +51,13 @@ struct Request : public std::enable_shared_from_this<Request> {
   }
   void End();
   bool Respond(std::string metadata, std::vector<std::string> bytes,
-                 std::string source = "app-integration", uint64_t capture = 0);
+                 std::string source = "app-integration", uint64_t capture = 0, bool reserved = false);
   bool IsUiReply() const {
     return announced && (kind == "clipboard-write" || kind == "menu" ||
-                         kind == "drag-source" || kind == "fullscreen");
+                         kind == "drag-source" || kind == "fullscreen" ||
+                         kind == "select-files" || kind == "download" ||
+                         (kind.starts_with("file-") &&
+                          details->GetBool("interaction")));
   }
   std::optional<stream::InteractionData> UiReply(bool allow, std::string metadata,
                                                  std::string source, uint64_t capture) const {
@@ -189,7 +200,7 @@ struct Upload : public std::enable_shared_from_this<Upload> {
 };
 
 bool Request::Respond(std::string metadata, std::vector<std::string> bytes,
-                        std::string source, uint64_t capture) {
+                        std::string source, uint64_t capture, bool reserved) {
   if (!active || metadata.empty()) return false;
   // Validate the final action before consuming the single-use reply or sending
   // its upload preamble. An unqueueable action must leave the request usable
@@ -206,7 +217,7 @@ bool Request::Respond(std::string metadata, std::vector<std::string> bytes,
   std::string lengths, payload;
   if (!PackFields(extents, &lengths) || !PackFields(
        {std::to_string(id), std::to_string(extents.size()), lengths}, &payload)) return false;
-  if (!active || replied.exchange(true)) return false;
+  if (!active || (reserved ? !file_reply_queued.load() : replied.exchange(true))) return false;
   const bool queued = Call("respond", std::move(payload),
        [upload](ProviderResult result, uint64_t, std::string) {
          if (result != ProviderResult::kOk) { upload->Failed(); return; }
@@ -254,6 +265,10 @@ std::string String(CefRefPtr<CefDictionaryValue> value, const char* key) {
 }
 class ClipboardRequest final : public AlloyGuestClipboardRequest {
  public:
+  size_t GetFileCount() override { return request_->files.size(); }
+  CefRefPtr<AlloyGuestFile> GetFile(size_t index) override {
+    return index < request_->files.size() ? request_->files[index] : nullptr;
+  }
   explicit ClipboardRequest(std::shared_ptr<Request> request) : request_(std::move(request)) {}
   ~ClipboardRequest() override { request_->Abandon(); }
   uint64_t GetId() override { return request_->id; }
@@ -379,6 +394,10 @@ class FullscreenRequest final : public AlloyGuestFullscreenRequest {
 };
 class DragRequest final : public AlloyGuestDragRequest {
  public:
+  size_t GetFileCount() override { return request_->files.size(); }
+  CefRefPtr<AlloyGuestFile> GetFile(size_t index) override {
+    return index < request_->files.size() ? request_->files[index] : nullptr;
+  }
   explicit DragRequest(std::shared_ptr<Request> request) : request_(std::move(request)) {}
   ~DragRequest() override { request_->Abandon(); }
   uint64_t GetId() override { return request_->id; }
@@ -408,9 +427,218 @@ class DragRequest final : public AlloyGuestDragRequest {
   IMPLEMENT_REFCOUNTING(DragRequest);
 };
 
+bool FileName(const std::string& name) {
+  return !name.empty() && name != "." && name != ".." &&
+      name.find_first_of("/\\") == std::string::npos && name.find('\0') == std::string::npos;
+}
+CefRefPtr<CefDictionaryValue> FileMetadata(CefRefPtr<AlloyGuestFile> file) {
+  if (!file) return nullptr;
+  const auto name = file->GetName().ToString();
+  const auto identity = file->GetIdentifier().ToString();
+  const auto size = file->GetSize();
+  if (!FileName(name) || !base::UnguessableToken::DeserializeFromString(identity) ||
+      size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return nullptr;
+  auto value = CefDictionaryValue::Create();
+  value->SetString("name", name); value->SetString("size", std::to_string(size));
+  value->SetString("identity", identity);
+  std::vector<CefString> ancestry; file->GetAncestorIdentifiers(ancestry);
+  auto ancestors = CefListValue::Create(); ancestors->SetSize(ancestry.size());
+  std::set<std::string> seen{identity};
+  for (size_t index = 0; index < ancestry.size(); ++index) {
+    const auto id = ancestry[index].ToString();
+    if (!base::UnguessableToken::DeserializeFromString(id) || !seen.insert(id).second) return nullptr;
+    ancestors->SetString(index, id);
+  }
+  value->SetList("ancestors", ancestors);
+  value->SetString("modified-ms", std::to_string(file->GetModifiedTimeMs()));
+  value->SetString("mime", file->GetMimeType()); value->SetBool("directory", file->IsDirectory());
+  value->SetBool("readable", file->CanRead()); value->SetBool("writable", file->CanWrite());
+  return value;
+}
+bool FileResponse(const std::shared_ptr<Request>& request,
+    CefRefPtr<CefDictionaryValue> details, std::vector<std::string> bytes,
+    const std::string& source = "app-file", uint64_t capture = 0, bool reserved = false) {
+  return request->Respond(stream::WriteDetails(details), std::move(bytes), source, capture, reserved);
+}
+bool FileMetadataReply(const std::shared_ptr<Request>& request, std::function<bool()> reply) {
+  bool expected = false;
+  if (!request->active || !request->replied.compare_exchange_strong(expected, true)) return false;
+  request->file_reply_queued = true;
+  const bool queued = request->post([request, reply = std::move(reply)] {
+    const bool sent = request->active && reply();
+    request->file_reply_queued = false;
+    if (!sent && request->active) { request->replied = false; request->Deny(); }
+  });
+  if (!queued) { request->file_reply_queued = false; request->replied = false; }
+  return queued;
+}
+bool FileEntries(const std::shared_ptr<Request>& request,
+    const std::vector<CefRefPtr<AlloyGuestFile>>& files, const std::string& source, uint64_t capture) {
+  if (!request->active || !request->file_reply_queued || !request->register_files) return false;
+  auto entries = request->register_files(files);
+  if (!entries) return false;
+  auto body = CefDictionaryValue::Create(); body->SetList("entries", entries);
+  auto details = CefDictionaryValue::Create(); details->SetString("status", "ok");
+  const bool queued = FileResponse(request, details, {stream::WriteDetails(body)}, source, capture, true);
+  if (!queued && request->rollback_files) request->rollback_files();
+  return queued;
+}
+class FileSelection final : public AlloyGuestFileSelection {
+ public:
+  explicit FileSelection(std::shared_ptr<Request> request) : request_(std::move(request)) {}
+  ~FileSelection() override { request_->Abandon(); }
+  uint64_t GetId() override { return request_->id; }
+  uint64_t GetDocumentId() override { return request_->owner.document; }
+  CefString GetMode() override { return String(request_->details, "mode"); }
+  CefString GetRequestingOrigin() override { return String(request_->details, "requesting-origin"); }
+  CefString GetTitle() override { return String(request_->details, "title"); }
+  CefString GetSuggestedName() override { return String(request_->details, "suggested-name"); }
+  CefString GetSourceUrl() override { return String(request_->details, "source-url"); }
+  CefString GetDownloadId() override { return String(request_->details, "download-id"); }
+  size_t GetAcceptTypeCount() override {
+    auto values = request_->details->GetList("accept"); return values ? values->GetSize() : 0;
+  }
+  CefString GetAcceptType(size_t index) override {
+    auto values = request_->details->GetList("accept");
+    return values && index < values->GetSize() ? values->GetString(index) : CefString();
+  }
+  bool Complete(const std::vector<CefRefPtr<AlloyGuestFile>>& files,
+      const CefString& source, uint64_t capture) override {
+    if (source.empty()) return false;
+    return FileMetadataReply(request_, [request = request_, files, source = source.ToString(), capture] {
+      return FileEntries(request, files, source, capture);
+    });
+  }
+  void Deny() override { request_->Deny(); }
+ private:
+  const std::shared_ptr<Request> request_;
+  IMPLEMENT_REFCOUNTING(FileSelection);
+};
+class FileOperation final : public AlloyGuestFileOperation {
+ public:
+  explicit FileOperation(std::shared_ptr<Request> request) : request_(std::move(request)) {}
+  ~FileOperation() override { request_->Abandon(); }
+  uint64_t GetId() override { return request_->id; }
+  uint64_t GetDocumentId() override { return request_->owner.document; }
+  CefString GetKind() override { return String(request_->details, "operation"); }
+  uint64_t GetOffset() override { return Unsigned("offset"); }
+  uint64_t GetLength() override { return Unsigned("length"); }
+  int64_t GetExpectedModifiedTimeMs() override {
+    int64_t value = 0;
+    base::StringToInt64(String(request_->details, "expected-modified-ms"), &value); return value;
+  }
+  CefString GetName() override { return String(request_->details, "name"); }
+  bool GetCreate() override { return request_->details->GetBool("create"); }
+  bool GetRecursive() override { return request_->details->GetBool("recursive"); }
+  bool GetKeepExistingData() override { return request_->details->GetBool("keep-existing"); }
+  bool GetExclusiveWrite() override { return request_->details->GetBool("exclusive"); }
+  bool GetWritePermission() override { return request_->details->GetBool("write"); }
+  CefRefPtr<AlloyGuestFile> GetDestination() override { return request_->destination; }
+  CefRefPtr<AlloyGuestData> GetData() override {
+    return request_->sizes.size() == 1 ? CefRefPtr<AlloyGuestData>(new Data(request_, 0)) : nullptr;
+  }
+  bool Complete() override {
+    const auto kind = GetKind();
+    if (kind != "stat" && kind != "write" && kind != "truncate" && kind != "close" &&
+        kind != "abort" && kind != "remove" && kind != "rename" && kind != "move") return false;
+    auto details = CefDictionaryValue::Create(); details->SetString("status", "ok");
+    if (kind != "stat") return FileResponse(request_, details, {});
+    return FileMetadataReply(request_, [request = request_, details] {
+      auto metadata = FileMetadata(request->file);
+      return metadata && FileResponse(request, details, {stream::WriteDetails(metadata)}, "app-file", 0, true);
+    });
+  }
+  bool CompleteRead(CefRefPtr<CefBinaryValue> value) override {
+    if (GetKind() != "read" || (value && value->GetSize() > GetLength())) return false;
+    std::string bytes(value ? value->GetSize() : 0, '\0');
+    if (value && value->GetData(bytes.data(), bytes.size(), 0) != bytes.size()) return false;
+    auto details = CefDictionaryValue::Create(); details->SetString("status", "ok");
+    return FileResponse(request_, details, {std::move(bytes)});
+  }
+  bool CompleteEntries(const std::vector<CefRefPtr<AlloyGuestFile>>& files) override {
+    const auto kind = GetKind();
+    if (kind != "entries" && kind != "child-entry" && kind != "child-file" && kind != "child-directory" &&
+        kind != "open-write") return false;
+    return FileMetadataReply(request_, [request = request_, files] { return FileEntries(request, files, "app-file", 0); });
+  }
+  bool CompleteRelation(bool related, const std::vector<CefString>& path) override {
+    if (GetKind() != "permission" && GetKind() != "compare" && GetKind() != "resolve") return false;
+    auto body = CefDictionaryValue::Create(); body->SetBool("related", related);
+    auto values = CefListValue::Create(); values->SetSize(path.size());
+    for (size_t index = 0; index < path.size(); ++index) {
+      if (!FileName(path[index].ToString())) return false;
+      values->SetString(index, path[index]);
+    }
+    body->SetList("path", values);
+    auto details = CefDictionaryValue::Create();
+    details->SetString("status", GetKind() == "permission" && !related ? "denied" : "ok");
+    return FileResponse(request_, details, {stream::WriteDetails(body)});
+  }
+  bool Fail(const CefString& error) override {
+    const std::string value = error;
+    if (value != "not-found" && value != "denied" && value != "exists" &&
+        value != "not-directory" && value != "not-file" && value != "not-empty" &&
+        value != "aborted" && value != "failed") return false;
+    auto details = CefDictionaryValue::Create(); details->SetString("status", value);
+    return FileResponse(request_, details, {});
+  }
+ private:
+  uint64_t Unsigned(const char* name) const {
+    uint64_t value = 0; ParseUnsigned(String(request_->details, name), &value); return value;
+  }
+  const std::shared_ptr<Request> request_;
+  IMPLEMENT_REFCOUNTING(FileOperation);
+};
+
+class FilesContext final : public ExtensionClientState {
+ public:
+  struct Record { Owner owner; CefRefPtr<AlloyGuestFile> file; };
+  static bool SameDocument(Owner first, Owner second) {
+    return first.view == second.view && first.document == second.document;
+  }
+  CefRefPtr<AlloyGuestFile> Find(const std::string& token, std::optional<Owner> owner = {}) {
+    std::lock_guard lock(mutex_);
+    auto found = files_.find(token);
+    return found != files_.end() && (!owner || SameDocument(found->second.owner, *owner))
+        ? found->second.file : nullptr;
+  }
+  void Add(std::string token, Owner owner, CefRefPtr<AlloyGuestFile> file) {
+    std::lock_guard lock(mutex_); files_.emplace(std::move(token), Record{owner, std::move(file)});
+  }
+  std::vector<CefRefPtr<AlloyGuestFile>> Remove(const std::string& token, std::optional<Owner> owner = {}) {
+    std::vector<CefRefPtr<AlloyGuestFile>> removed;
+    std::lock_guard lock(mutex_);
+    auto found = files_.find(token);
+    if (found != files_.end() && (!owner || SameDocument(found->second.owner, *owner))) {
+      removed.push_back(std::move(found->second.file)); files_.erase(found);
+    }
+    return removed;
+  }
+  std::vector<CefRefPtr<AlloyGuestFile>> RetireView(uint64_t view, std::optional<uint64_t> keep_document = {}) {
+    std::vector<CefRefPtr<AlloyGuestFile>> removed;
+    std::lock_guard lock(mutex_);
+    for (auto it = files_.begin(); it != files_.end();) {
+      if (it->second.owner.view == view && (!keep_document || it->second.owner.document != *keep_document)) {
+        removed.push_back(std::move(it->second.file)); it = files_.erase(it);
+      } else { ++it; }
+    }
+    return removed;
+  }
+ private:
+  std::mutex mutex_;
+  std::map<std::string, Record> files_;
+};
+
+std::shared_ptr<FilesContext> FileContext(const ExtensionEndpoint& endpoint) {
+  auto shared = endpoint.shared_state ? endpoint.shared_state(Feature::kIntegration,
+      [] { return std::make_shared<FilesContext>(); }) : nullptr;
+  return shared ? std::static_pointer_cast<FilesContext>(std::move(shared)) : std::make_shared<FilesContext>();
+}
+
 class State final : public ExtensionSink, public std::enable_shared_from_this<State> {
  public:
-  explicit State(ExtensionEndpoint endpoint) : endpoint_(std::move(endpoint)) {}
+  explicit State(ExtensionEndpoint endpoint) : endpoint_(std::move(endpoint)), files_(FileContext(endpoint_)) {}
   bool Start(CefRefPtr<AlloyGuestIntegrationHandler> handler) {
     if (!handler) return false;
     {
@@ -450,11 +678,12 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
                                     source.ToString(), std::move(kind), {}, json};
     return endpoint_.interact(Feature::kIntegration, original, "ui", std::move(action));
   }
-  void PostTask(std::function<void()> task) {
+  bool PostTask(std::function<void()> task) {
     std::lock_guard lock(mutex_);
-    if (finishing_ || done_) return;
+    if (finishing_ || done_) return false;
     tasks_.push_back(std::move(task));
     cv_.notify_one();
+    return true;
   }
   bool TrackRead(std::shared_ptr<Read> read) {
     std::lock_guard lock(mutex_);
@@ -467,6 +696,25 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
     reads_.erase(read); cv_.notify_all();
   }
   void Event(Owner owner, std::string operation, std::string payload) override {
+    if (operation == "download-state") {
+      auto details = stream::ParseDetails(payload);
+      int64_t received = 0, total = 0;
+      const auto id = String(details, "download-id"), state = String(details, "state");
+      if (!base::UnguessableToken::DeserializeFromString(id) ||
+          (state != "preparing" && state != "active" && state != "paused" && state != "complete" && state != "cancelled" && state != "interrupted") ||
+          !base::StringToInt64(String(details, "received"), &received) ||
+          !base::StringToInt64(String(details, "total"), &total)) { Unavailable(); return; }
+      PostTask([this, id, state, received, total] { handler_->OnDownloadProgress(id, state, received, total); });
+      return;
+    }
+    if (operation == "file-retired") {
+      auto details = stream::ParseDetails(payload);
+      const auto token = String(details, "capability");
+      if (!base::UnguessableToken::DeserializeFromString(token)) { Unavailable(); return; }
+      auto removed = files_->Remove(token, owner);
+      PostTask([removed = std::move(removed)] {});
+      return;
+    }
     if (operation == "fullscreen-changed" || operation == "drag-cursor") {
       auto details = stream::ParseDetails(payload);
       uint64_t generation = 0;
@@ -502,13 +750,21 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
     request->details = stream::ParseDetails(fields[2]);
     request->endpoint = endpoint_;
     request->post = [weak = weak_from_this()](std::function<void()> task) {
-      if (auto self = weak.lock()) self->PostTask(std::move(task));
+      auto self = weak.lock(); return self && self->PostTask(std::move(task));
     };
     request->track_read = [weak = weak_from_this()](std::shared_ptr<Read> read) {
       auto self = weak.lock(); return self && self->TrackRead(std::move(read));
     };
     request->retire_read = [weak = weak_from_this()](Read* read) {
       if (auto self = weak.lock()) self->RetireRead(read);
+    };
+    request->register_files = [weak = weak_from_this(), owner, id](
+        const std::vector<CefRefPtr<AlloyGuestFile>>& files) {
+      auto self = weak.lock();
+      return self ? self->RegisterFiles(owner, id, files) : CefRefPtr<CefListValue>();
+    };
+    request->rollback_files = [weak = weak_from_this(), id] {
+      if (auto self = weak.lock()) self->DropIssuedFiles(id, false);
     };
     std::vector<std::string> lengths;
     if (!request->details || !UnpackFields(fields[4], static_cast<size_t>(count), &lengths)) {
@@ -521,7 +777,10 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
     }
     if (request->kind != "clipboard-read" && request->kind != "clipboard-write" &&
         request->kind != "clipboard-sequence" && request->kind != "clipboard-permission" &&
-        request->kind != "menu" && request->kind != "drag-source" && request->kind != "fullscreen") {
+        request->kind != "menu" && request->kind != "drag-source" && request->kind != "fullscreen" &&
+        request->kind != "select-files" && request->kind != "download" &&
+        request->kind != "file-read" && request->kind != "file-write" &&
+        request->kind != "file-truncate" && request->kind != "file-close") {
       request->Deny(); return;
     }
     if ((request->kind == "drag-source" && request->sizes.size() != 2) ||
@@ -534,13 +793,40 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
         if (formats->GetType(index) != VTYPE_STRING) { request->Deny(); return; }
     }
     {
-      std::lock_guard lock(mutex_);
+      std::unique_lock lock(mutex_);
       if (retiring_ || owner != owner_ || requests_.contains(id)) return;
+      if (request->details->HasKey("file-capabilities")) {
+        auto tokens = request->details->GetList("file-capabilities");
+        if (!tokens || (request->kind != "clipboard-write" && request->kind != "drag-source")) {
+          lock.unlock(); request->Deny(); return;
+        }
+        for (size_t index = 0; index < tokens->GetSize(); ++index) {
+          auto file = tokens->GetType(index) == VTYPE_STRING ? files_->Find(tokens->GetString(index), owner) : nullptr;
+          if (!file) { lock.unlock(); request->Deny(); return; }
+          request->files.push_back(std::move(file));
+        }
+      }
+      if (request->kind.starts_with("file-")) {
+        request->file = files_->Find(String(request->details, "capability"), owner);
+        if (!request->file) {
+          lock.unlock(); request->Deny(); return;
+        }
+        const auto destination = String(request->details, "destination");
+        if (!destination.empty()) {
+          request->destination = files_->Find(destination);
+          if (!request->destination) {
+            lock.unlock(); request->Deny(); return;
+          }
+        }
+      }
       requests_.emplace(id, request);
       tasks_.push_back([this, request] {
         if (!request->active) return;
         request->announced = true;
-        if (request->kind == "menu") handler_->OnMenuRequest(new MenuRequest(request));
+        if (request->kind == "select-files" || request->kind == "download")
+          handler_->OnFileSelection(new FileSelection(request));
+        else if (request->kind.starts_with("file-")) request->file->OnOperation(new FileOperation(request));
+        else if (request->kind == "menu") handler_->OnMenuRequest(new MenuRequest(request));
         else if (request->kind == "fullscreen") handler_->OnFullscreenRequest(new FullscreenRequest(request));
         else if (request->kind == "drag-source") handler_->OnDragRequest(new DragRequest(request));
         else handler_->OnClipboardRequest(new ClipboardRequest(request));
@@ -561,20 +847,26 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
         } else { ++found; }
       }
     }
-    for (auto& request : ended) request->End();
+    auto removed_files = files_->RetireView(owner.view, owner.document);
+    PostTask([removed_files = std::move(removed_files)] {});
+    for (auto& request : ended) { DropIssuedFiles(request->id, false); request->End(); }
   }
   void ViewRetired(uint64_t) override {}
   void Retire() override {
     std::map<uint64_t, std::shared_ptr<Request>> pending;
+    uint64_t view = 0;
     std::vector<std::shared_ptr<Read>> reads;
     {
       std::lock_guard lock(mutex_);
       if (retiring_) return;
       retiring_ = true;
       pending.swap(requests_);
+      view = owner_.view; file_issuances_.clear();
       for (const auto& [id, request] : pending) QueueEnded(request, "retired");
       for (const auto& [key, read] : reads_) reads.push_back(read);
     }
+    auto removed_files = files_->RetireView(view);
+    PostTask([removed_files = std::move(removed_files)] {});
     for (auto& [id, request] : pending) request->End();
     for (auto& read : reads) read->Finish(false);
     {
@@ -588,6 +880,45 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
     cv_.wait(lock, [this] { return done_; });
   }
  private:
+  static bool SameDocument(Owner first, Owner second) {
+    return first.view == second.view && first.document == second.document;
+  }
+  CefRefPtr<CefListValue> RegisterFiles(Owner owner, uint64_t id,
+      const std::vector<CefRefPtr<AlloyGuestFile>>& files) {
+    std::vector<CefRefPtr<CefDictionaryValue>> metadata;
+    for (const auto& file : files) {
+      auto details = FileMetadata(file);
+      if (!details) return nullptr;
+      metadata.push_back(details);
+    }
+    auto result = CefListValue::Create(); result->SetSize(files.size());
+    std::lock_guard lock(mutex_);
+    auto request = requests_.find(id);
+    if (retiring_ || request == requests_.end() || !request->second->active ||
+        (request->second->replied && !request->second->file_reply_queued) || !SameDocument(owner, owner_)) return nullptr;
+    for (size_t index = 0; index < files.size(); ++index) {
+      const auto token = base::UnguessableToken::Create().ToString();
+      metadata[index]->SetString("capability", token);
+      files_->Add(token, owner, files[index]);
+      file_issuances_[id].push_back(token);
+      result->SetDictionary(index, metadata[index]);
+    }
+    return result;
+  }
+  void DropIssuedFiles(uint64_t id, bool keep) {
+    std::vector<std::string> tokens;
+    {
+      std::lock_guard lock(mutex_);
+      auto found = file_issuances_.find(id);
+      if (found == file_issuances_.end()) return;
+      if (!keep) tokens = std::move(found->second);
+      file_issuances_.erase(found);
+    }
+    for (const auto& token : tokens) {
+      auto removed = files_->Remove(token);
+      PostTask([removed = std::move(removed)] {});
+    }
+  }
   void Unavailable() {
     PostTask([this] { handler_->OnUnavailable(); });
   }
@@ -608,8 +939,9 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
       if (found == requests_.end() || found->second->owner != owner) return;
       request = std::move(found->second);
       requests_.erase(found);
-      QueueEnded(request, std::move(reason));
+      QueueEnded(request, reason);
     }
+    DropIssuedFiles(id, reason == "completed");
     request->End();
   }
   void Run() {
@@ -630,12 +962,14 @@ class State final : public ExtensionSink, public std::enable_shared_from_this<St
     }
   }
   const ExtensionEndpoint endpoint_;
+  const std::shared_ptr<FilesContext> files_;
   std::mutex mutex_;
   std::condition_variable cv_;
   Owner owner_;
   bool started_ = false, retiring_ = false, retired_ = false, finishing_ = false, done_ = false;
   CefRefPtr<AlloyGuestIntegrationHandler> handler_;
   std::map<uint64_t, std::shared_ptr<Request>> requests_;
+  std::map<uint64_t, std::vector<std::string>> file_issuances_;
   std::map<Read*, std::shared_ptr<Read>> reads_;
   std::deque<std::function<void()>> tasks_;
 };
@@ -662,6 +996,19 @@ class Client final : public AlloyGuestIntegration {
     data->SetString("base", drag->GetFragmentBaseURL()); data->SetString("link", drag->GetLinkURL());
     data->SetString("title", drag->GetLinkTitle());
     return state_->Send(document, generation, source, capture, "drag-enter", data);
+  }
+  uint64_t DragEnterFiles(uint64_t document, uint64_t generation, int x, int y, int allowed,
+      int modifiers, const CefString& source, uint64_t capture) override {
+    auto data = Point(x, y, modifiers); data->SetInt("allowed", allowed);
+    return state_->Send(document, generation, source, capture, "drag-enter-files", data);
+  }
+  uint64_t DownloadControl(uint64_t document, uint64_t generation, const CefString& identity,
+      const CefString& operation, const CefString& source, uint64_t capture) override {
+    const auto command = operation.ToString();
+    if (!base::UnguessableToken::DeserializeFromString(identity.ToString()) ||
+        (command != "cancel" && command != "pause" && command != "resume")) return 0;
+    auto data = CefDictionaryValue::Create(); data->SetString("download-id", identity); data->SetString("operation", command);
+    return state_->Send(document, generation, source, capture, "download-control", data);
   }
   uint64_t DragOver(uint64_t document, uint64_t generation, int x, int y, int allowed,
       int modifiers, const CefString& source, uint64_t capture) override {
@@ -694,3 +1041,8 @@ CefRefPtr<AlloyGuestIntegration> MakeClient(ExtensionEndpoint endpoint) {
   return new Client(std::move(endpoint));
 }
 }  // namespace alloy::guest::integration
+
+CefString AlloyCreateGuestFileIdentity() {
+  CEF_API_REQUIRE_ADDED(CEF_EXPERIMENTAL);
+  return base::UnguessableToken::Create().ToString();
+}

@@ -14,6 +14,10 @@
 #include "content/public/browser/alloy_guest_integration.h"
 #include "content/public/browser/web_contents.h"
 #include "url/gurl.h"
+#include "content/browser/file_system_access/alloy_guest_uploads.h"
+#include "content/browser/download/alloy_guest_download.h"
+#include "content/public/browser/storage_partition.h"
+#include "storage/browser/file_system/file_system_context.h"
 
 namespace alloy::guest::integration {
 namespace {
@@ -67,14 +71,54 @@ void Actions::SetOwner(Owner owner) {
   Reset(); owner_ = owner;
 }
 void Actions::Reset() {
-  if (target_ && browser_) browser_->GetHost()->DragTargetDragLeave();
+  // The native owner may still be awaiting a renderer acknowledgement after a
+  // terminal drop was accepted by this protocol. Cancel that work as well.
+  if (browser_) browser_->GetHost()->DragTargetDragLeave();
   target_ = false;
   if (source_) source_->Finish(0, 0, DRAG_OPERATION_NONE);
   source_.reset();
 }
 
 void Actions::Dispatch(Owner original, const stream::InteractionData& action,
-                          std::function<void(std::string)> completion) {
+                           std::function<void(std::string)> completion) {
+  if (action.kind == "drag-enter-files") {
+    if (!browser_ || original != owner_ || target_ || !live_(original, action.generation)) {
+      completion("rejected:stale-generation"); return;
+    }
+    auto* contents = CefBrowserHostBase::FromBrowser(browser_)->GetWebContents();
+    auto* frame = contents ? contents->GetPrimaryMainFrame() : nullptr;
+    content::AlloyGuestIntegrationData selection;
+    selection.details.Set("mode", "drop-files");
+    content::AlloyGuestFileCapability::Select(frame, std::move(selection.details), base::BindOnce(
+        [](base::WeakPtr<Actions> self, Owner original, stream::InteractionData action,
+            std::function<void(std::string)> completion,
+            std::optional<content::AlloyGuestFileCapability::Entries> entries) {
+          if (!self || !entries || entries->empty() || !self->browser_ || !self->live_(original, action.generation)) {
+            completion("rejected:stale-generation"); return;
+          }
+          auto* contents = CefBrowserHostBase::FromBrowser(self->browser_)->GetWebContents();
+          content::SnapshotAlloyGuestFiles(contents ? contents->GetPrimaryMainFrame() : nullptr,
+              std::move(*entries), false, base::BindOnce(
+              [](base::WeakPtr<Actions> self, Owner original, stream::InteractionData action,
+                  std::function<void(std::string)> completion, std::optional<content::AlloyGuestUploadFiles> files) {
+                if (!self || !files || !self->browser_ || self->target_ || !self->live_(original, action.generation)) {
+                  completion("rejected:stale-generation"); return;
+                }
+                auto data = stream::ParseDetails(action.details);
+                int x = 0, y = 0, modifiers = 0, allowed = 0; CefMouseEvent event;
+                if (!data || !Integer(data, "x", &x) || !Integer(data, "y", &y) ||
+                    !Integer(data, "modifiers", &modifiers) || !Integer(data, "allowed", &allowed) ||
+                    !Mask(allowed) || modifiers < 0 || !self->point_(original.document, action.generation,
+                        action.surface, x, y, false, &event)) { completion("rejected:invalid"); return; }
+                auto drag = CefDragData::Create();
+                for (const auto& file : files->files) drag->AddFile(file.path.AsUTF8Unsafe(), file.display_name.AsUTF8Unsafe());
+                event.modifiers = modifiers;
+                self->browser_->GetHost()->DragTargetDragEnter(drag, event, static_cast<cef_drag_operations_mask_t>(allowed));
+                self->target_ = true; completion("accepted");
+              }, self, original, std::move(action), std::move(completion)));
+        }, weak_.GetWeakPtr(), original, action, std::move(completion)));
+    return;
+  }
   if (action.kind != "edit") { completion(DispatchNow(original, action)); return; }
   if (!browser_ || original != owner_ || !live_(original, action.generation)) {
     completion("rejected:stale-generation"); return;
@@ -100,6 +144,11 @@ std::string Actions::DispatchNow(Owner original, const stream::InteractionData& 
   auto data = stream::ParseDetails(action.details);
   if (!data) return "rejected:invalid";
   auto host = browser_->GetHost();
+  if (action.kind == "download-control") {
+    auto* contents = CefBrowserHostBase::FromBrowser(browser_)->GetWebContents();
+    return content::ControlAlloyGuestDownload(contents, data->GetString("download-id"), data->GetString("operation"))
+        ? "accepted" : "rejected:invalid";
+  }
   if (action.kind == "exit-fullscreen") {
     auto* contents = CefBrowserHostBase::FromBrowser(browser_)->GetWebContents();
     if (!contents) return "rejected:invalid";
@@ -159,6 +208,19 @@ bool Actions::StartDragging(CefRefPtr<CefDragData> drag, int allowed, int x, int
   auto source = std::make_shared<Source>(); source->browser = browser_;
   source_ = source;
   content::AlloyGuestIntegrationData data;
+  std::vector<CefString> paths;
+  drag->GetFilePaths(paths);
+  if (!paths.empty()) {
+    base::ListValue files;
+    for (const auto& path : paths) {
+      const auto url = original->GetStoragePartition()->GetFileSystemContext()->CreateCrackedFileSystemURL(
+          blink::StorageKey(), storage::kFileSystemTypeLocal, base::FilePath::FromUTF8Unsafe(path.ToString()));
+      auto cap = content::AlloyGuestFileCapability::FromURL(original->GetBrowserContext(), url);
+      if (!cap || !cap->Admitted()) { source_.reset(); return false; }
+      files.Append(cap->metadata().capability);
+    }
+    data.details.Set("file-capabilities", std::move(files));
+  }
   data.details.Set("generation", std::to_string(generation));
   data.details.Set("allowed", allowed); data.details.Set("x", x); data.details.Set("y", y);
   data.details.Set("text", drag->GetFragmentText().ToString());

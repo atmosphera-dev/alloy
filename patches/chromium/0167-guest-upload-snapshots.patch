@@ -1,0 +1,227 @@
+--- a/chrome/browser/file_select_helper.cc
++++ b/chrome/browser/file_select_helper.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/file_select_helper.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "content/browser/file_system_access/alloy_guest_uploads.h"
+ 
+ #include <stddef.h>
+ 
+@@ -72,6 +74,24 @@
+ 
+ namespace {
+ 
++class AlloyGuestFileSelectListener final : public content::FileSelectListener {
++ public:
++  using Reply = base::OnceCallback<void(
++      std::vector<blink::mojom::FileChooserFileInfoPtr>, base::FilePath)>;
++  explicit AlloyGuestFileSelectListener(Reply reply) : reply_(std::move(reply)) {}
++  void FileSelected(std::vector<blink::mojom::FileChooserFileInfoPtr> files,
++      const base::FilePath& directory, blink::mojom::FileChooserParams::Mode) override {
++    if (reply_) std::move(reply_).Run(std::move(files), directory);
++  }
++  void FileSelectionCanceled() override {
++    if (reply_) std::move(reply_).Run({}, {});
++  }
++ private:
++  ~AlloyGuestFileSelectListener() override = default;
++  Reply reply_;
++};
++
++
+ void DeleteFiles(std::vector<base::FilePath> paths) {
+   for (auto& file_path : paths)
+     base::DeleteFile(file_path);
+@@ -753,6 +773,27 @@
+   }
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
++  if (alloy_guest_is_runtime()) {
++    ChromeSelectFilePolicy policy(web_contents_);
++    if (!policy.CanOpenSelectFileDialog()) { RunFileChooserEnd(); return; }
++    dialog_mode_ = params->mode;
++    dialog_type_ = params->mode == FileChooserParams::Mode::kUploadFolder
++        ? ui::SelectFileDialog::SELECT_UPLOAD_FOLDER
++        : ui::SelectFileDialog::SELECT_OPEN_FILE;
++    auto original = render_frame_host_->GetWeakDocumentPtr();
++    content::SelectAlloyGuestUploadFiles(render_frame_host_, *params,
++        base::MakeRefCounted<AlloyGuestFileSelectListener>(base::BindOnce(
++            [](scoped_refptr<FileSelectHelper> self, content::WeakDocumentPtr original,
++                std::vector<blink::mojom::FileChooserFileInfoPtr> files, base::FilePath directory) {
++              if (!self->listener_) return;
++              if (!original.AsRenderFrameHostIfValid() || self->AbortIfWebContentsDestroyed() || files.empty()) {
++                self->RunFileChooserEnd(); return;
++              }
++              self->base_dir_ = directory;
++              self->PerformContentAnalysisIfNeeded(std::move(files));
++            }, base::WrapRefCounted(this), original)));
++    return;
++  }
+   select_file_dialog_ = ui::SelectFileDialog::Create(
+       this, std::make_unique<ChromeSelectFilePolicy>(web_contents_));
+   if (!select_file_dialog_)
+--- a/content/browser/web_contents/file_chooser_impl.h
++++ b/content/browser/web_contents/file_chooser_impl.h
+@@ -11,6 +11,7 @@
+ #include "content/common/content_export.h"
+ #include "content/public/browser/file_select_listener.h"
+ #include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "third_party/blink/public/mojom/choosers/file_chooser.mojom.h"
+ 
+@@ -94,6 +95,7 @@
+   RenderFrameHostImpl* render_frame_host();
+ 
+   const GlobalRenderFrameHostId render_frame_host_id_;
++  const WeakDocumentPtr guest_document_;
+   scoped_refptr<FileSelectListenerImpl> listener_impl_;
+   base::OnceCallback<void(blink::mojom::FileChooserResultPtr)> callback_;
+ 
+--- a/content/browser/web_contents/file_chooser_impl.cc
++++ b/content/browser/web_contents/file_chooser_impl.cc
+@@ -5,6 +5,9 @@
+ #include "content/browser/web_contents/file_chooser_impl.h"
+ 
+ #include <algorithm>
++#include <map>
++#include "base/process/alloy_guest_runtime.h"
++#include "content/browser/file_system_access/alloy_guest_uploads.h"
+ 
+ #include "base/files/file_util.h"
+ #include "base/logging.h"
+@@ -27,15 +30,22 @@
+ 
+ namespace {
+ 
+-// Removes any file that is a symlink or is inside a directory symlink.
++using UploadProofs = std::map<base::FilePath, AlloyGuestUploadProof>;
++
++// Ordinary folder uploads still reject symlinks. Guest uploads instead require
++// proof of a native selected, sealed RAM snapshot, never arbitrary OS paths.
+ // For |kUploadFolder| mode only. |base_dir| is the folder being uploaded.
+ std::vector<blink::mojom::FileChooserFileInfoPtr> RemoveSymlinks(
+     std::vector<blink::mojom::FileChooserFileInfoPtr> files,
+-    base::FilePath base_dir) {
+-  CHECK(!base_dir.empty(), base::NotFatalUntil::M158);
++    base::FilePath base_dir, UploadProofs proofs, bool guest_snapshots) {
++  CHECK(guest_snapshots || !base_dir.empty(), base::NotFatalUntil::M158);
+   auto to_remove = std::ranges::remove_if(
+       files,
+-      [&base_dir](const base::FilePath& file_path) {
++      [&base_dir, &proofs, guest_snapshots](const base::FilePath& file_path) {
++        if (guest_snapshots) {
++          auto found = proofs.find(file_path);
++          return found == proofs.end() || !found->second.verify.Run();
++        }
+         if (base::IsLink(file_path))
+           return true;
+         // Walk up the ancestors of `file_path`, up to and including
+@@ -102,16 +112,38 @@
+   if (!owner_)
+     return;
+ 
+-  if (mode != blink::mojom::FileChooserParams::Mode::kUploadFolder) {
++  const bool guest_snapshots = alloy_guest_is_runtime();
++  if (!guest_snapshots && mode != blink::mojom::FileChooserParams::Mode::kUploadFolder) {
+     owner_->FileSelected(base_dir, mode, std::move(files));
+     return;
+   }
+ 
++  UploadProofs proofs;
++  if (guest_snapshots) {
++    for (const auto& file : files) {
++      if (!file->is_native_file()) { owner_->FileSelectionCanceled(); return; }
++      auto proof = GetAlloyGuestUploadProof(owner_->render_frame_host(), file->get_native_file()->file_path);
++      if (proof) proofs.emplace(file->get_native_file()->file_path, std::move(*proof));
++    }
++  }
++  auto worker_proofs = proofs;
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE,
+       {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+-      base::BindOnce(&RemoveSymlinks, std::move(files), base_dir),
+-      base::BindOnce(&FileChooserImpl::FileSelected, owner_, base_dir, mode));
++      base::BindOnce(&RemoveSymlinks, std::move(files), base_dir, std::move(worker_proofs), guest_snapshots),
++      base::BindOnce([](base::WeakPtr<FileChooserImpl> owner, base::FilePath directory,
++          blink::mojom::FileChooserParams::Mode mode, UploadProofs proofs, bool guest,
++          std::vector<blink::mojom::FileChooserFileInfoPtr> files) {
++        if (!owner) return;
++        if (guest) {
++          std::erase_if(files, [&proofs](const auto& file) {
++            auto found = proofs.find(file->get_native_file()->file_path);
++            return found == proofs.end() || !found->second.admitted.Run();
++          });
++          if (files.empty()) { owner->FileSelectionCanceled(); return; }
++        }
++        owner->FileSelected(directory, mode, std::move(files));
++      }, owner_, base_dir, mode, std::move(proofs), guest_snapshots));
+ }
+ 
+ void FileChooserImpl::FileSelectListenerImpl::FileSelectionCanceled() {
+@@ -161,7 +193,8 @@
+ }
+ 
+ FileChooserImpl::FileChooserImpl(RenderFrameHostImpl* render_frame_host)
+-    : render_frame_host_id_(render_frame_host->GetGlobalId()) {}
++    : render_frame_host_id_(render_frame_host->GetGlobalId()),
++      guest_document_(alloy_guest_is_runtime() ? render_frame_host->GetWeakDocumentPtr() : WeakDocumentPtr()) {}
+ 
+ FileChooserImpl::~FileChooserImpl() = default;
+ 
+@@ -286,7 +319,9 @@
+ }
+ 
+ RenderFrameHostImpl* FileChooserImpl::render_frame_host() {
+-  RenderFrameHostImpl* rfh = RenderFrameHostImpl::FromID(render_frame_host_id_);
++  RenderFrameHostImpl* rfh = alloy_guest_is_runtime()
++      ? RenderFrameHostImpl::From(guest_document_.AsRenderFrameHostIfValid())
++      : RenderFrameHostImpl::FromID(render_frame_host_id_);
+   return (rfh && rfh->IsRenderFrameLive()) ? rfh : nullptr;
+ }
+ 
+--- a/third_party/blink/renderer/core/html/forms/file_input_type.cc
++++ b/third_party/blink/renderer/core/html/forms/file_input_type.cc
+@@ -21,6 +21,10 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/html/forms/file_input_type.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_LINUX)
++#include "base/process/alloy_guest_runtime.h"
++#endif
+ 
+ #include "third_party/blink/public/platform/file_path_conversion.h"
+ #include "third_party/blink/public/strings/grit/blink_strings.h"
+@@ -324,12 +328,16 @@
+             FilePathToString(file->get_native_file()->file_path.BaseName());
+       }
+       String relative_path;
++      bool use_display_subdirs = false;
++#if BUILDFLAG(IS_LINUX)
++      // Guest snapshots use native opaque RAM aliases. Relative names are
++      // selected app metadata, not a host path or a backing filename.
++      use_display_subdirs = alloy_guest_is_runtime() && !file->get_native_file()->base_subdirs.empty();
++#endif
+ #if BUILDFLAG(IS_ANDROID)
+-      // Android content-URIs or virtual document paths do not use tree paths
+-      // with separators like posix, so we build relative path using pre-filled
+-      // base_subdirs.
+-      if (base_dir.IsContentUri() ||
+-          !file->get_native_file()->base_subdirs.empty()) {
++      use_display_subdirs = base_dir.IsContentUri() || !file->get_native_file()->base_subdirs.empty();
++#endif
++      if (use_display_subdirs) {
+         StringBuilder builder;
+         for (const auto& subdir : file->get_native_file()->base_subdirs) {
+           builder.Append(subdir);
+@@ -338,7 +346,6 @@
+         builder.Append(display_name);
+         relative_path = builder.ToString();
+       }
+-#endif
+       if (relative_path.empty()) {
+         DCHECK(
+             string_path.StartsWithIgnoringAsciiCase(FilePathToString(base_dir)))

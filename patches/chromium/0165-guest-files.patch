@@ -1,0 +1,23 @@
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1634,6 +1634,20 @@
+     "renderer_host/browsing_context_state.h",
+     "renderer_host/alloy_guest_clipboard.cc",
+     "renderer_host/alloy_guest_clipboard.h",
++    "file_system_access/alloy_guest_file_capability.cc",
++    "file_system_access/alloy_guest_file_capability.h",
++    "file_system_access/alloy_guest_file_binding.cc",
++    "file_system_access/alloy_guest_file_binding.h",
++    "file_system_access/alloy_guest_file_streams.cc",
++    "file_system_access/alloy_guest_file_streams.h",
++    "file_system_access/alloy_guest_file_writer.cc",
++    "file_system_access/alloy_guest_file_writer.h",
++    "file_system_access/alloy_guest_files.cc",
++    "file_system_access/alloy_guest_files.h",
++    "file_system_access/alloy_guest_uploads.cc",
++    "file_system_access/alloy_guest_uploads.h",
++    "download/alloy_guest_download.cc",
++    "download/alloy_guest_download.h",
+     "renderer_host/clipboard_host_impl.cc",
+     "renderer_host/clipboard_host_impl.h",
+     "renderer_host/code_cache_host_impl.cc",

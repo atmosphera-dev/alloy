@@ -40,7 +40,8 @@ class NativeRequests : public content::WebContentsObserver {
                 content::AlloyGuestIntegrationData data,
                 content::AlloyGuestIntegration::Reply reply);
   base::RepeatingCallback<bool()> Capture(content::RenderFrameHost* original,
-                                             bool document_only);
+      bool document_only, base::OnceClosure retired = {}, int64_t download_navigation = 0);
+  std::vector<base::OnceClosure> TakeRetiredCaptures();
   Owner owner_;
   const Event event_;
   const Owns owns_;

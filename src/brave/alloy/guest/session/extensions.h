@@ -30,6 +30,12 @@ class ExtensionSink {
   virtual void Retire() = 0;
   virtual void Wait() = 0;
 };
+// App-side feature state can be shared by views in this one session without
+// importing the session consumer or exposing any native pointer over IPC.
+class ExtensionClientState {
+ public:
+  virtual ~ExtensionClientState() = default;
+};
 struct ExtensionEndpoint {
   ExtensionCall call;
   std::function<bool(Feature, std::shared_ptr<ExtensionSink>)> attach;
@@ -39,6 +45,8 @@ struct ExtensionEndpoint {
   // One per-view allocator/tracker for all action producers, not one private
   // counter/feed per stream, menu or AX adapter. Uses the same ordered call lane.
   std::function<uint64_t(Feature, Owner, std::string, stream::InteractionData)> interact;
+  std::function<std::shared_ptr<ExtensionClientState>(Feature,
+      std::function<std::shared_ptr<ExtensionClientState>()>)> shared_state;
 };
 
 struct ExtensionRequest {

@@ -1,0 +1,169 @@
+--- a/libcef/browser/osr/browser_platform_delegate_osr.h
++++ b/libcef/browser/osr/browser_platform_delegate_osr.h
+@@ -6,6 +6,7 @@
+ #define CEF_LIBCEF_BROWSER_OSR_BROWSER_PLATFORM_DELEGATE_OSR_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "cef/libcef/browser/osr/alloy_guest_drag_sequence.h"
+ #include "cef/libcef/browser/alloy/browser_platform_delegate_alloy.h"
+ #include "cef/libcef/browser/native/browser_platform_delegate_native.h"
+ 
+@@ -137,6 +138,7 @@
+   // document has registered an interest in the dropped data and the renderer
+   // process should pass the data to the document on drop.
+   bool document_is_handling_drag_ = false;
++  AlloyGuestDragSequence guest_drag_sequence_;
+ };
+ 
+ #endif  // CEF_LIBCEF_BROWSER_OSR_BROWSER_PLATFORM_DELEGATE_OSR_H_
+--- a/libcef/browser/osr/browser_platform_delegate_osr.cc
++++ b/libcef/browser/osr/browser_platform_delegate_osr.cc
+@@ -7,6 +7,9 @@
+ #include <utility>
+ 
+ #include "base/task/current_thread.h"
++#include "base/process/alloy_guest_runtime.h"
++#include "build/build_config.h"
++#include "content/public/browser/render_widget_host.h"
+ #include "cef/libcef/browser/image_impl.h"
+ #include "cef/libcef/browser/osr/osr_accessibility_util.h"
+ #include "cef/libcef/browser/osr/render_widget_host_view_osr.h"
+@@ -20,6 +23,21 @@
+ #include "ui/display/screen.h"
+ #include "ui/events/base_event_utils.h"
+ 
++namespace {
++bool UsesGuestDragSequence() {
++#if BUILDFLAG(IS_LINUX)
++  return alloy_guest_is_runtime();
++#else
++  return false;
++#endif
++}
++content::RenderWidgetHost::DragOperationCallback GuestDragReply(AlloyGuestDragSequence& sequence) {
++  if (!UsesGuestDragSequence()) return base::DoNothing();
++  return base::BindOnce([](base::OnceCallback<void(bool)> reply,
++      ui::mojom::DragOperation, bool handling) { std::move(reply).Run(handling); }, sequence.Reply());
++}
++}  // namespace
++
+ CefBrowserPlatformDelegateOsr::CefBrowserPlatformDelegateOsr(
+     std::unique_ptr<CefBrowserPlatformDelegateNative> native_delegate,
+     bool use_shared_texture,
+@@ -56,6 +74,10 @@
+ 
+ void CefBrowserPlatformDelegateOsr::WebContentsDestroyed(
+     content::WebContents* web_contents) {
++  if (UsesGuestDragSequence()) {
++    guest_drag_sequence_.Reset(); drag_data_ = nullptr;
++    current_rwh_for_drag_.reset(); current_rvh_for_drag_ = nullptr;
++  }
+   DCHECK_EQ(web_contents, web_contents_);
+   if (auto* view = GetOSRHostView()) {
+     view->ReleaseCompositor();
+@@ -87,6 +109,10 @@
+ 
+ void CefBrowserPlatformDelegateOsr::BrowserDestroyed(
+     CefBrowserHostBase* browser) {
++  if (UsesGuestDragSequence()) {
++    guest_drag_sequence_.Reset(); drag_data_ = nullptr;
++    current_rwh_for_drag_.reset(); current_rvh_for_drag_ = nullptr;
++  }
+   view_osr_ = nullptr;
+   current_rvh_for_drag_ = nullptr;
+   CefBrowserPlatformDelegateAlloy::BrowserDestroyed(browser);
+@@ -313,6 +339,7 @@
+     CefRefPtr<CefDragData> drag_data,
+     const CefMouseEvent& event,
+     cef_drag_operations_mask_t allowed_ops) {
++  if (UsesGuestDragSequence()) guest_drag_sequence_.Reset();
+   content::WebContentsImpl* web_contents =
+       static_cast<content::WebContentsImpl*>(web_contents_);
+   if (!web_contents) {
+@@ -369,7 +396,7 @@
+ 
+   current_rwh_for_drag_->DragTargetDragEnter(*drop_data, transformed_pt,
+                                              gfx::PointF(screen_pt), ops,
+-                                             modifiers, base::DoNothing());
++                                             modifiers, GuestDragReply(guest_drag_sequence_));
+ }
+ 
+ void CefBrowserPlatformDelegateOsr::DragTargetDragOver(
+@@ -394,6 +421,10 @@
+       web_contents->GetInputEventRouter()->GetRenderWidgetHostViewInputAtPoint(
+           web_contents->GetRenderViewHost()->GetWidget()->GetView(),
+           gfx::PointF(client_pt), &transformed_pt);
++  if (UsesGuestDragSequence() && !view) {
++    guest_drag_sequence_.Reset(); drag_data_ = nullptr;
++    current_rwh_for_drag_.reset(); return;
++  }
+   auto* target_rwh = content::RenderWidgetHostImpl::From(
+       static_cast<content::RenderWidgetHostViewBase*>(view)
+           ->GetRenderWidgetHost());
+@@ -431,10 +462,16 @@
+   int modifiers = TranslateWebEventModifiers(event.modifiers);
+ 
+   target_rwh->DragTargetDragOver(transformed_pt, gfx::PointF(screen_pt), ops,
+-                                 modifiers, base::DoNothing());
++                                 modifiers, GuestDragReply(guest_drag_sequence_));
+ }
+ 
+ void CefBrowserPlatformDelegateOsr::DragTargetDragLeave() {
++  if (UsesGuestDragSequence()) {
++    guest_drag_sequence_.Reset();
++    if (!web_contents_ || current_rvh_for_drag_ != web_contents_->GetRenderViewHost()) {
++      drag_data_ = nullptr; current_rwh_for_drag_.reset(); return;
++    }
++  }
+   if (current_rvh_for_drag_ != web_contents_->GetRenderViewHost() ||
+       !drag_data_) {
+     return;
+@@ -468,6 +505,10 @@
+       web_contents->GetInputEventRouter()->GetRenderWidgetHostViewInputAtPoint(
+           web_contents->GetRenderViewHost()->GetWidget()->GetView(),
+           gfx::PointF(client_pt), &transformed_pt);
++  if (UsesGuestDragSequence() && !view) {
++    guest_drag_sequence_.Reset(); drag_data_ = nullptr;
++    current_rwh_for_drag_.reset(); return;
++  }
+   auto* target_rwh = content::RenderWidgetHostImpl::From(
+       static_cast<content::RenderWidgetHostViewBase*>(view)
+           ->GetRenderWidgetHost());
+@@ -494,10 +535,19 @@
+                                                  transformed_screen_point);
+     }
+     DragTargetDragEnter(drag_data_, event, drag_allowed_ops_);
++    if (UsesGuestDragSequence()) DragTargetDragOver(event, drag_allowed_ops_);
+   }
+ 
+   if (!drag_data_) {
+     return;
++  }
++
++  if (UsesGuestDragSequence()) {
++    if (guest_drag_sequence_.DeferDropIfPending(base::BindOnce(
++            &CefBrowserPlatformDelegateOsr::DragTargetDrop, base::Unretained(this), event))) return;
++    auto handling = guest_drag_sequence_.Handling();
++    if (!handling) { drag_data_ = nullptr; return; }
++    document_is_handling_drag_ = *handling;
+   }
+ 
+   {
+@@ -514,6 +564,7 @@
+   }
+ 
+   drag_data_ = nullptr;
++  if (UsesGuestDragSequence()) guest_drag_sequence_.Reset();
+ }
+ 
+ void CefBrowserPlatformDelegateOsr::StartDragging(
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -701,6 +701,7 @@
+     "libcef/browser/net_service/url_loader_factory_getter.h",
+     "libcef/browser/origin_whitelist_impl.cc",
+     "libcef/browser/origin_whitelist_impl.h",
++    "libcef/browser/osr/alloy_guest_drag_sequence.h",
+     "libcef/browser/osr/browser_platform_delegate_osr.cc",
+     "libcef/browser/osr/browser_platform_delegate_osr.h",
+     "libcef/browser/osr/host_display_client_osr.cc",

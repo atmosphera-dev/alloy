@@ -101,7 +101,7 @@ class NativeView final : public CefClient,
          create_popup_(std::move(create_popup)), created_(std::move(created)),
          abort_popup_(std::move(abort_popup)), pending_popup_(pending_popup) {
      auto weak = weak_.GetWeakPtr();
-     menus_ = new integration::Menus([weak] { return weak ? weak->stream_.generation() : 0; });
+      menus_ = new integration::Menus([weak] { return weak ? weak->stream_.generation() : 0; });
      actions_ = std::make_unique<integration::Actions>(owner,
          [weak](Owner original, uint64_t generation) {
            return weak && !weak->closing_ && weak->DocumentReady() &&
@@ -118,7 +118,7 @@ class NativeView final : public CefClient,
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
    CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
-   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return menus_; }
+    CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return menus_; }
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
     rect = stream_.rect();
   }
@@ -378,7 +378,7 @@ class NativeView final : public CefClient,
    stream::View stream_;
    integration::NativeRequests integration_;
    CefRefPtr<integration::Menus> menus_;
-   std::unique_ptr<integration::Actions> actions_;
+    std::unique_ptr<integration::Actions> actions_;
   const CreatePopup create_popup_;
   const Created created_;
   const std::function<void(uint64_t)> abort_popup_;
@@ -412,6 +412,11 @@ class HostApp final : public CefApp, public CefBrowserProcessHandler {
     command->AppendSwitchWithValue("use-gl", "angle");
     command->AppendSwitchWithValue("use-angle", "swiftshader");
     command->AppendSwitch("disable-breakpad");
+    // Brave disables this native web API by default. The dedicated guest has
+    // app-owned external-file adapters; ordinary in-process apps stay unchanged.
+    auto features = command->GetSwitchValue("enable-features").ToString();
+    if (!features.empty()) features += ",";
+    command->AppendSwitchWithValue("enable-features", features + "FileSystemAccessAPI");
     if (!data_.empty())
       command->AppendSwitchWithValue("alloy-data-dir", data_);
   }

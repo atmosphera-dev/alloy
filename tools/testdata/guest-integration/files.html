@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>files-loading</title>
+<style>body{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px;font:14px sans-serif}button,input{min-height:36px}iframe{height:70px;grid-column:1/-1;width:100%;border:0}</style>
+<button id="open">Open app file</button><button id="save">Save app file</button>
+<button id="write">Write selected file</button><button id="read">Read retained handle</button>
+<button id="directory">Directory operations</button><button id="share">Share native handle</button>
+<input id="upload" type="file"><input id="uploadDirectory" type="file" webkitdirectory>
+<input id="uploadMultiple" type="file" multiple>
+<button id="download">Download</button><button id="change">Change child document</button>
+<button id="locks">Native file/directory locks</button><div id="fileDrop">File drop target</div>
+<div id="filePaste" contenteditable>File paste target</div>
+<button id="largeWrite">Large native write</button>
+<iframe id="peer"></iframe>
+<script>
+const state={kind:'ready',serial:0};let fileHandle;let sharedReady=false;
+function report(kind,extra={}){Object.assign(state,extra);state.kind=kind;++state.serial;
+ state.rectangles=Object.fromEntries([...document.querySelectorAll('[id]')].map(e=>{const r=e.getBoundingClientRect();return[e.id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));
+ document.title=JSON.stringify(state);}
+async function digest(bytes){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(x=>x.toString(16).padStart(2,'0')).join('');}
+async function contents(file){const bytes=await file.arrayBuffer();return {name:file.name,size:bytes.byteLength,sha256:await digest(bytes)};}
+function action(id,fn){document.getElementById(id).onclick=()=>Promise.resolve().then(fn).catch(e=>report('file-error',{action:id,error:e.name,message:e.message}));}
+action('open',async()=>{[fileHandle]=await showOpenFilePicker();report('file-read',await contents(await fileHandle.getFile()));});
+action('save',async()=>{fileHandle=await showSaveFilePicker({suggestedName:'saved.txt'});report('save-selected');await writeSelected();});
+async function writeSelected(){const writer=await fileHandle.createWritable({keepExistingData:false});report('writer-opened');
+ await writer.write('native-save-bytes');report('write-accepted');await writer.close();report('save-complete',await contents(await fileHandle.getFile()));}
+action('write',writeSelected);
+action('largeWrite',async()=>{const bytes=new Uint8Array(2*1024*1024+13);for(let i=0;i<bytes.length;++i)bytes[i]=(i*37+11)%256;
+ const writer=await fileHandle.createWritable();await writer.write(bytes);report('write-accepted');await writer.close();report('save-complete',await contents(await fileHandle.getFile()));});
+action('read',async()=>report('file-read',await contents(await fileHandle.getFile())));
+action('directory',async()=>{const root=await showDirectoryPicker({mode:'readwrite'});const names=[];
+ for await(const [name] of root.entries())names.push(name);
+ const nested=await root.getDirectoryHandle('nested');const child=await nested.getFileHandle('child.txt');
+ const path=await root.resolve(child);const read=await contents(await child.getFile());
+ const created=await root.getFileHandle('created.txt',{create:true});const writer=await created.createWritable();
+ await writer.write('directory-created-bytes');await writer.close();const createdRead=await contents(await created.getFile());
+ await root.removeEntry('created.txt');let missing='';try{await root.getFileHandle('created.txt');}catch(e){missing=e.name;}
+ report('directory-complete',{names:names.sort(),path,child:read,created:createdRead,missing});});
+action('share',async()=>{if(!sharedReady)throw new Error('child not ready');peer.contentWindow.postMessage({handle:fileHandle},location.origin);});
+action('change',async()=>{peer.src='/files-child.html?replacement=1';});
+action('download',async()=>{const a=document.createElement('a');const marker=new URLSearchParams(location.search).get('downloadCase');
+ a.href='/file-download.bin'+(marker?'?case='+encodeURIComponent(marker):'');a.download='download.bin';a.click();report('download-started');});
+action('locks',async()=>{[fileHandle]=await showOpenFilePicker();const writer=await fileHandle.createWritable();
+ try{const root=await showDirectoryPicker({mode:'readwrite'});let child='',parent='';
+  try{await root.removeEntry('selected.txt');}catch(e){child=e.name;}
+  try{await root.remove({recursive:true});}catch(e){parent=e.name;}
+  await root.removeEntry('nested',{recursive:true});report('locks-complete',{child,parent,siblingRemoved:true});
+ }finally{await writer.abort();}});
+fileDrop.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='copy';};
+fileDrop.ondrop=async event=>{event.preventDefault();const files=[];for(const file of event.dataTransfer.files)files.push(await contents(file));report('file-drop',{files});};
+filePaste.onpaste=async event=>{event.preventDefault();const files=[];for(const file of event.clipboardData.files)files.push(await contents(file));report('file-paste',{files});};
+for(const id of ['upload','uploadDirectory','uploadMultiple'])document.getElementById(id).onchange=async event=>{
+ const files=[];for(const file of event.target.files)files.push({...await contents(file),relative:file.webkitRelativePath});
+ const form=new FormData();for(const file of event.target.files)form.append('upload',file);
+ const response=await fetch('/file-upload',{method:'POST',body:form});const uploaded=await response.json();report('upload-complete',{files,uploaded});};
+window.addEventListener('message',event=>{if(event.origin!==location.origin)return;if(event.data.kind==='child-ready')sharedReady=true;
+ if(event.data.handle)fileHandle=event.data.handle;const child={...event.data};delete child.handle;report('file-child',{child});});
+peer.src='/files-child.html';report('ready');
+</script>

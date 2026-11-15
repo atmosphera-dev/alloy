@@ -12,6 +12,9 @@ class AlloyGuestDataHandler;
 class AlloyGuestMenuRequest;
 class AlloyGuestDragRequest;
 class AlloyGuestFullscreenRequest;
+class AlloyGuestFile;
+class AlloyGuestFileOperation;
+class AlloyGuestFileSelection;
 
 ///
 /// EXPERIMENTAL: Immutable request-owned bytes. Read is asynchronous and copies
@@ -129,6 +132,16 @@ class AlloyGuestClipboardRequest : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual size_t GetFormatCount() = 0;
   ///
+  /// Selected app files carried by a native clipboard write, never OS paths.
+  ///
+  /*--cef()--*/
+  virtual size_t GetFileCount() = 0;
+  ///
+  /// Original selected app object at the checked index, or empty.
+  ///
+  /*--cef()--*/
+  virtual CefRefPtr<AlloyGuestFile> GetFile(size_t index) = 0;
+  ///
   /// Exact format name at index, including opaque Chromium custom formats.
   /// Standard text uses UTF-8, images image/png, other bytes are opaque.
   ///
@@ -234,7 +247,25 @@ class AlloyGuestIntegration : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual uint64_t DragEnter(uint64_t document_id, uint64_t generation,
       CefRefPtr<CefDragData> data, int x, int y, int allowed_operations,
-      int modifiers, const CefString& source, uint64_t app_capture_time_us) = 0;
+       int modifiers, const CefString& source, uint64_t app_capture_time_us) = 0;
+  ///
+  /// Enter a file drag. The app supplies typed objects through OnFileSelection
+  /// with mode drop-files; native RAM snapshots feed the normal drop pipeline.
+  /// Wait for the interaction dispatch receipt before continuing the drag.
+  ///
+  /*--cef()--*/
+  virtual uint64_t DragEnterFiles(uint64_t document_id, uint64_t generation,
+      int x, int y, int allowed_operations, int modifiers,
+      const CefString& source, uint64_t app_capture_time_us) = 0;
+  ///
+  /// Pause, resume or cancel the identified native download under its original
+  /// document/view, using operation pause, resume or cancel. Uses the same
+  /// ordered interaction feed; zero means unqueued, not a native outcome.
+  ///
+  /*--cef()--*/
+  virtual uint64_t DownloadControl(uint64_t document_id, uint64_t generation,
+      const CefString& download_id, const CefString& operation,
+      const CefString& source, uint64_t app_capture_time_us) = 0;
   ///
   /// Continue a target drag using view-DIP coordinates and native effect mask.
   ///
@@ -369,6 +400,16 @@ class AlloyGuestFullscreenRequest : public virtual CefBaseRefCounted {
 class AlloyGuestDragRequest : public virtual CefBaseRefCounted {
  public:
   ///
+  /// Selected app files in this source drag, not guest filesystem paths.
+  ///
+  /*--cef()--*/
+  virtual size_t GetFileCount() = 0;
+  ///
+  /// Selected app file at the checked index, or empty.
+  ///
+  /*--cef()--*/
+  virtual CefRefPtr<AlloyGuestFile> GetFile(size_t index) = 0;
+  ///
   /// Native pending request identity.
   ///
   /*--cef()--*/
@@ -458,11 +499,280 @@ class AlloyGuestDragRequest : public virtual CefBaseRefCounted {
 };
 
 ///
+/// EXPERIMENTAL: An app-owned selected file, directory or write transaction.
+/// GetIdentifier preserves entry identity across translated wrappers/views. All
+/// methods run on the integration callback sequence. No app path/FD crosses.
+/// A transaction returned for open-write commits only when close succeeds;
+/// abort or releasing its last library reference must not commit partial data.
+///
+/*--cef(source=client,added=experimental)--*/
+class AlloyGuestFile : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Stable opaque entry identity allocated by AlloyCreateGuestFileIdentity.
+  /// Reuse it for the same entry, not for different files or transactions.
+  /// No native path or OS handle is used as this identity.
+  ///
+  /*--cef()--*/
+  virtual CefString GetIdentifier() = 0;
+  ///
+  /// Canonical parent entry identities, root first, excluding this entry.
+  /// These are opaque IDs allocated like GetIdentifier, never app paths. Reuse
+  /// the same ancestry when selecting an entry separately or via a directory;
+  /// native file/directory locks must protect the same hierarchy in both cases.
+  ///
+  /*--cef()--*/
+  virtual void GetAncestorIdentifiers(std::vector<CefString>& identifiers) = 0;
+  ///
+  /// Display basename only, never a host path; child names must be distinct.
+  ///
+  /*--cef()--*/
+  virtual CefString GetName() = 0;
+  ///
+  /// True for a directory, false for a file or file write transaction.
+  ///
+  /*--cef()--*/
+  virtual bool IsDirectory() = 0;
+  ///
+  /// Whether this app capability permits reading current bytes/entries.
+  ///
+  /*--cef()--*/
+  virtual bool CanRead() = 0;
+  ///
+  /// Whether the app permits writes, in addition to native permission checks.
+  ///
+  /*--cef()--*/
+  virtual bool CanWrite() = 0;
+  ///
+  /// Current logical byte length, zero for directories.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetSize() = 0;
+  ///
+  /// Last modification time as Unix milliseconds, not a host-local date string.
+  ///
+  /*--cef()--*/
+  virtual int64_t GetModifiedTimeMs() = 0;
+  ///
+  /// App-supplied MIME type, or empty for native well-known-type inference.
+  ///
+  /*--cef()--*/
+  virtual CefString GetMimeType() = 0;
+  ///
+  /// Asynchronous native operation. Retain while performing app I/O; dropping
+  /// the last unanswered operation denies it. Native revocation wins over a
+  /// late completion. The app must not commit a failed or aborted transaction.
+  ///
+  /*--cef()--*/
+  virtual void OnOperation(CefRefPtr<AlloyGuestFileOperation> operation) = 0;
+};
+
+///
+/// EXPERIMENTAL: One app-file operation, scoped to its original native owner.
+/// All extents are checked. Writes use one acknowledged chunk at a time. A
+/// successful close means the app's actual sink committed, not merely queued.
+///
+/*--cef(source=library,added=experimental)--*/
+class AlloyGuestFileOperation : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Existing integration request identity, also reported by OnRequestEnded.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetId() = 0;
+  ///
+  /// Original integration document, not a replacement-document grant.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetDocumentId() = 0;
+  ///
+  /// stat, read, open-write, write, truncate, close, abort, entries, child-file,
+  /// child-directory, child-entry, remove, rename, move, permission, compare or resolve.
+  ///
+  /*--cef()--*/
+  virtual CefString GetKind() = 0;
+  ///
+  /// Byte offset for read/write, otherwise zero.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetOffset() = 0;
+  ///
+  /// Maximum read extent, exact write size or requested truncate length.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetLength() = 0;
+  ///
+  /// Expected source modification time for a read snapshot, in Unix milliseconds.
+  /// Fail a changed source rather than splice different versions into one read.
+  ///
+  /*--cef()--*/
+  virtual int64_t GetExpectedModifiedTimeMs() = 0;
+  ///
+  /// Child/destination basename, not a host path.
+  ///
+  /*--cef()--*/
+  virtual CefString GetName() = 0;
+  ///
+  /// Whether a child lookup may create a missing entry.
+  ///
+  /*--cef()--*/
+  virtual bool GetCreate() = 0;
+  ///
+  /// Whether a remove operation includes directory descendants.
+  ///
+  /*--cef()--*/
+  virtual bool GetRecursive() = 0;
+  ///
+  /// Whether an open-write transaction starts with current file bytes.
+  ///
+  /*--cef()--*/
+  virtual bool GetKeepExistingData() = 0;
+  ///
+  /// Whether open-write requests native exclusive rather than siloed mode.
+  /// App providers preserve their filesystem's transaction/locking semantics.
+  ///
+  /*--cef()--*/
+  virtual bool GetExclusiveWrite() = 0;
+  ///
+  /// Whether a permission operation asks to write rather than read.
+  /// Native security/gesture checks already precede this app decision.
+  ///
+  /*--cef()--*/
+  virtual bool GetWritePermission() = 0;
+  ///
+  /// Selected destination for move/compare/resolve, or empty otherwise.
+  ///
+  /*--cef()--*/
+  virtual CefRefPtr<AlloyGuestFile> GetDestination() = 0;
+  ///
+  /// Immutable request data for write, empty for other operations.
+  ///
+  /*--cef()--*/
+  virtual CefRefPtr<AlloyGuestData> GetData() = 0;
+  ///
+  /// Acknowledge a fully performed operation. stat refreshes the target object's
+  /// metadata; write acknowledges its entire chunk; close acknowledges commit.
+  ///
+  /*--cef()--*/
+  virtual bool Complete() = 0;
+  ///
+  /// Complete a read, including a successful empty EOF. Size cannot exceed the
+  /// requested length. The native reader checks metadata/ranges again.
+  ///
+  /*--cef(optional_param=data)--*/
+  virtual bool CompleteRead(CefRefPtr<CefBinaryValue> data) = 0;
+  ///
+  /// Return directory children, a requested child, or an open-write transaction.
+  /// Objects gain only this original operation's lifetime, never a new document.
+  ///
+  /*--cef()--*/
+  virtual bool CompleteEntries(const std::vector<CefRefPtr<AlloyGuestFile>>& entries) = 0;
+  ///
+  /// Return permission/comparison result, or a directory-relative path for resolve.
+  /// A false resolve result means the entry is not a descendant.
+  ///
+  /*--cef()--*/
+  virtual bool CompleteRelation(bool related, const std::vector<CefString>& path) = 0;
+  ///
+  /// Fail with not-found, denied, exists, not-directory, not-file, not-empty,
+  /// aborted or failed. No error activates a guest filesystem fallback.
+  ///
+  /*--cef()--*/
+  virtual bool Fail(const CefString& error) = 0;
+};
+
+///
+/// EXPERIMENTAL: App-owned picker/download selection after native preflight.
+/// Retain while deciding. Dropping or denying the request cancels it.
+///
+/*--cef(source=library,added=experimental)--*/
+class AlloyGuestFileSelection : public virtual CefBaseRefCounted {
+ public:
+  ///
+  /// Existing native request identity.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetId() = 0;
+  ///
+  /// Original integration document identity.
+  ///
+  /*--cef()--*/
+  virtual uint64_t GetDocumentId() = 0;
+  ///
+  /// upload, upload-multiple, upload-directory, open, open-multiple, save,
+  /// directory, download, clipboard-files or drop-files.
+  ///
+  /*--cef()--*/
+  virtual CefString GetMode() = 0;
+  ///
+  /// Native original requesting origin.
+  ///
+  /*--cef()--*/
+  virtual CefString GetRequestingOrigin() = 0;
+  ///
+  /// App presentation text, never a host destination path.
+  ///
+  /*--cef()--*/
+  virtual CefString GetTitle() = 0;
+  ///
+  /// Suggested basename for save/download, not authority.
+  ///
+  /*--cef()--*/
+  virtual CefString GetSuggestedName() = 0;
+  ///
+  /// Browser-captured download source URL, empty for ordinary file selection.
+  ///
+  /*--cef()--*/
+  virtual CefString GetSourceUrl() = 0;
+  ///
+  /// Opaque native download identity used by OnDownloadProgress, empty for pickers.
+  ///
+  /*--cef()--*/
+  virtual CefString GetDownloadId() = 0;
+  ///
+  /// Number of native accept MIME/extension filters.
+  ///
+  /*--cef()--*/
+  virtual size_t GetAcceptTypeCount() = 0;
+  ///
+  /// Native accept filter at the checked index.
+  ///
+  /*--cef()--*/
+  virtual CefString GetAcceptType(size_t index) = 0;
+  ///
+  /// Complete the selected objects through the shared interaction route.
+  /// Success is queue admission, not proof of upload or sink completion.
+  ///
+  /*--cef()--*/
+  virtual bool Complete(const std::vector<CefRefPtr<AlloyGuestFile>>& files,
+      const CefString& source, uint64_t app_capture_time_us) = 0;
+  ///
+  /// Cancel the original picker or download without any native UI fallback.
+  ///
+  /*--cef()--*/
+  virtual void Deny() = 0;
+};
+
+///
 /// EXPERIMENTAL: The app's native-integration provider, with no OS fallback.
 ///
 /*--cef(source=client,added=experimental)--*/
 class AlloyGuestIntegrationHandler : public virtual CefBaseRefCounted {
  public:
+  ///
+  /// Native download state after app stream acknowledgements. States are preparing, active,
+  /// paused, complete, cancelled or interrupted. Complete means the app committed bytes
+  /// and the native download item reached completion, not just sink admission.
+  ///
+  /*--cef()--*/
+  virtual void OnDownloadProgress(const CefString& download_id, const CefString& state,
+      int64_t received_bytes, int64_t total_bytes) = 0;
+  ///
+  /// App-owned file/directory selection and download destination. No native
+  /// path/FD is returned; selected app objects receive asynchronous operations.
+  ///
+  /*--cef()--*/
+  virtual void OnFileSelection(CefRefPtr<AlloyGuestFileSelection> request) = 0;
   ///
   /// App-owned clipboard content and document-specific permission. Missing or
   /// refused replies never activate a guest system clipboard or portal.
@@ -513,5 +823,11 @@ class AlloyGuestIntegrationHandler : public virtual CefBaseRefCounted {
   /*--cef()--*/
   virtual void OnClosed() = 0;
 };
+///
+/// EXPERIMENTAL: Allocate an opaque file-entry identity without CefInitialize.
+/// Retain it with the app object representing that entry; it is not authority.
+///
+/*--cef(added=experimental)--*/
+CefString AlloyCreateGuestFileIdentity();
 #endif
 #endif

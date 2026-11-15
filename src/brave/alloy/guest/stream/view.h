@@ -19,10 +19,12 @@ class View {
   void Bind(CefRefPtr<CefBrowser> browser);
   bool InitialGeometry(int width, int height, double scale);
   bool started() const { return started_ && !retired_; }
+  uint64_t generation() const { return generation_; }
+  double scale() const { return scale_; }
+  bool PixelSize(CefSize& size) const;
   void SetOwner(Owner owner);
   void Retire();
   CefRect rect() const { return CefRect(0, 0, width_, height_); }
-  uint64_t generation() const { return generation_; }
   bool Point(uint64_t document, uint64_t generation, uint64_t surface,
                 int x, int y, bool outside, CefMouseEvent* result) const;
   bool Screen(CefScreenInfo& screen) const;

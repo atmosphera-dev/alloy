@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
 source_set("accessibility") {
-  sources = [ "provider.cc" ]
-  deps = [ "..:provider_api" ]
+  sources = [ "provider.cc", "tree_stream.cc", "tree_stream.h",
+              "model.cc", "model.h", "ax_actions.cc", "ax_actions.h" ]
+  sources += [ "projection.cc", "projection.h" ]
+  deps = [ "..:provider_api", "//base", "//ui/accessibility" ]
 }

@@ -7,6 +7,7 @@
 #include "content/browser/file_system_access/fixed_file_system_access_permission_grant.h"
 #include "cef/libcef/browser/osr/alloy_guest_drag_sequence.h"
 #include <fcntl.h>
+#include <atomic>
 #include <linux/magic.h>
 #include <sys/vfs.h>
 #include <unistd.h>
@@ -21,12 +22,18 @@
 #include "base/test/test_future.h"
 #include "base/unguessable_token.h"
 #include "chrome/test/base/chrome_render_view_host_test_harness.h"
+#include "components/file_access/scoped_file_access.h"
+#include "components/file_access/scoped_file_access_delegate.h"
 #include "content/public/browser/storage_partition.h"
+#include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/render_process_host.h"
 #include "content/browser/blob_storage/file_backed_blob_factory_frame_impl.h"
 #include "content/browser/security/cpsp/child_process_security_policy_impl.h"
+#include "content/browser/renderer_host/render_frame_host_impl.h"
+#include "content/browser/web_contents/file_chooser_impl.h"
 #include "content/public/test/test_utils.h"
 #include "mojo/public/cpp/bindings/associated_remote.h"
+#include "mojo/public/cpp/system/data_pipe_drainer.h"
 #include "third_party/blink/public/mojom/blob/blob.mojom.h"
 #include "third_party/blink/public/mojom/blob/data_element.mojom.h"
 #include "third_party/blink/public/mojom/file_system_access/file_system_access_data_transfer_token.mojom.h"
@@ -44,12 +51,28 @@ Metadata Entry() {
 }
 class FileProvider final : public content::AlloyGuestIntegration {
  public:
+  std::vector<Metadata> selected;
   int reads = 0;
   bool live = true;
   std::vector<base::OnceClosure> retired;
   std::vector<std::string> releases;
   void Request(content::RenderFrameHost*, Operation operation,
-      content::AlloyGuestIntegrationData data, Reply reply) override {
+    content::AlloyGuestIntegrationData data, Reply reply) override {
+    if (operation == Operation::kSelectFiles) {
+      base::ListValue entries;
+      for (const auto& meta : selected) {
+        base::DictValue entry;
+        entry.Set("capability", meta.capability); entry.Set("identity", meta.identity);
+        entry.Set("name", meta.name); entry.Set("mime", meta.mime);
+        entry.Set("size", std::to_string(meta.size)); entry.Set("modified-ms", std::to_string(meta.modified_ms));
+        entry.Set("directory", false); entry.Set("readable", true); entry.Set("writable", false);
+        entry.Set("ancestors", base::ListValue()); entries.Append(std::move(entry));
+      }
+      base::DictValue body; body.Set("entries", std::move(entries));
+      content::AlloyGuestIntegrationData result; result.details.Set("status", "ok");
+      std::string bytes; EXPECT_TRUE(base::JSONWriter::Write(body, &bytes)); result.bytes.push_back(bytes);
+      std::move(reply).Run(std::move(result)); return;
+    }
     EXPECT_EQ(operation, Operation::kFileRead);
     EXPECT_TRUE(data.admitted && data.admitted.Run());
     content::AlloyGuestIntegrationData result;
@@ -81,6 +104,173 @@ class FileProvider final : public content::AlloyGuestIntegration {
   }
 };
 class GuestNativeFilesTest : public ChromeRenderViewHostTestHarness {};
+
+struct SnapshotAccessState {
+  std::atomic<bool> allowed{false};
+  std::atomic<int> reads{0};
+  std::vector<GURL> destinations;
+};
+class SnapshotAccess final : public file_access::ScopedFileAccessDelegate {
+ public:
+  explicit SnapshotAccess(std::shared_ptr<SnapshotAccessState> state) : state_(std::move(state)) {}
+  ~SnapshotAccess() override = default;
+  void RequestFilesAccess(const std::vector<base::FilePath>&, const GURL&,
+      base::OnceCallback<void(file_access::ScopedFileAccess)> callback) override {
+    std::move(callback).Run(file_access::ScopedFileAccess::Denied());
+  }
+  void RequestFilesAccessForSystem(const std::vector<base::FilePath>&,
+      base::OnceCallback<void(file_access::ScopedFileAccess)> callback) override {
+    std::move(callback).Run(file_access::ScopedFileAccess::Denied());
+  }
+  void RequestDefaultFilesAccess(const std::vector<base::FilePath>&,
+      base::OnceCallback<void(file_access::ScopedFileAccess)> callback) override {
+    std::move(callback).Run(file_access::ScopedFileAccess::Denied());
+  }
+  RequestFilesAccessIOCallback CreateFileAccessCallback(const GURL& destination) const override {
+    state_->destinations.push_back(destination);
+    return base::BindRepeating([](std::shared_ptr<SnapshotAccessState> state,
+        const std::vector<base::FilePath>&, base::OnceCallback<void(file_access::ScopedFileAccess)> callback) {
+      ++state->reads;
+      // Match the real DlpScopedFileAccessDelegate's queued IO reply. Inline
+      // denial reenters the pinned BlobReader before Read installs its callback.
+      content::GetIOThreadTaskRunner({})->PostTask(FROM_HERE, base::BindOnce(std::move(callback),
+          state->allowed ? file_access::ScopedFileAccess::Allowed() : file_access::ScopedFileAccess::Denied()));
+    }, state_);
+  }
+ private:
+  std::shared_ptr<SnapshotAccessState> state_;
+};
+class SnapshotBlobRead final : public mojo::DataPipeDrainer::Client {
+ public:
+  std::string Read(blink::mojom::Blob& blob) {
+    mojo::ScopedDataPipeProducerHandle producer; mojo::ScopedDataPipeConsumerHandle consumer;
+    CHECK_EQ(mojo::CreateDataPipe(nullptr, producer, consumer), MOJO_RESULT_OK);
+    blob.ReadAll(std::move(producer), mojo::NullRemote());
+    mojo::DataPipeDrainer drain(this, std::move(consumer));
+    EXPECT_TRUE(complete_.Wait()); return bytes_;
+  }
+  void OnDataAvailable(base::span<const uint8_t> bytes) override { bytes_.append(bytes.begin(), bytes.end()); }
+  void OnDataComplete() override { complete_.SetValue(); }
+ private:
+  std::string bytes_;
+  base::test::TestFuture<void> complete_;
+};
+
+TEST_F(GuestNativeFilesTest, NativeSnapshotBlobPreservesDestinationFileAccessChecks) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get();
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame(); auto cap = Cap::Create(frame, Entry());
+  base::test::TestFuture<std::optional<content::AlloyGuestUploadFiles>> result;
+  content::SnapshotAlloyGuestFiles(frame, {cap}, false, result.GetCallback());
+  auto selected = result.Take(); ASSERT_TRUE(selected); const auto path = selected->files[0].path;
+  ASSERT_FALSE(file_access::ScopedFileAccessDelegate::HasInstance());
+  auto state = std::make_shared<SnapshotAccessState>(); SnapshotAccess access(state);
+  auto snapshot = content::CreateAlloyGuestUploadBlob(frame, path); ASSERT_TRUE(snapshot);
+  EXPECT_EQ(state->destinations, std::vector<GURL>{frame->GetLastCommittedURL()});
+  mojo::Remote<blink::mojom::Blob> blob(std::move(snapshot->blob));
+  EXPECT_TRUE(SnapshotBlobRead().Read(*blob).empty());
+  EXPECT_GE(state->reads.load(), 1);
+  state->allowed = true;
+  EXPECT_EQ(SnapshotBlobRead().Read(*blob), "abcdef");
+  EXPECT_GE(state->reads.load(), 2);
+  selected.reset(); content::RunAllTasksUntilIdle(); EXPECT_TRUE(base::PathExists(path));
+  blob.reset(); content::RunAllTasksUntilIdle(); EXPECT_FALSE(base::PathExists(path));
+  app->Revoke();
+}
+
+class SelectedFiles final : public content::FileSelectListener {
+ public:
+  std::vector<blink::mojom::FileChooserFileInfoPtr> files;
+  base::test::TestFuture<void> ready;
+  void FileSelected(std::vector<blink::mojom::FileChooserFileInfoPtr> result,
+      const base::FilePath&, blink::mojom::FileChooserParams::Mode) override {
+    files = std::move(result); ready.SetValue();
+  }
+  void FileSelectionCanceled() override { ready.SetValue(); }
+ private:
+  ~SelectedFiles() override = default;
+};
+
+TEST_F(GuestNativeFilesTest, RoundTwoDiscardedNativeChooserDeliveryReleasesBacking) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get(); app->selected = {Entry()};
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame();
+  auto listener = base::MakeRefCounted<SelectedFiles>();
+  blink::mojom::FileChooserParams params;
+  content::SelectAlloyGuestUploadFiles(frame, params, listener);
+  ASSERT_TRUE(listener->ready.Wait()); ASSERT_EQ(listener->files.size(), 1u);
+  const auto path = listener->files[0]->get_native_file()->file_path;
+  ASSERT_TRUE(base::PathExists(path));
+  listener->files.clear(); content::RunAllTasksUntilIdle();
+  EXPECT_FALSE(base::PathExists(path));
+  EXPECT_FALSE(content::GetAlloyGuestUploadProof(frame, path));
+  EXPECT_TRUE(app->live); app->Revoke();
+}
+
+TEST_F(GuestNativeFilesTest, RoundTwoPartiallyFilteredSelectionDoesNotPinTheLastBlob) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get();
+  auto other = Entry(); other.name = "other.txt"; app->selected = {Entry(), other};
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame();
+  auto listener = base::MakeRefCounted<SelectedFiles>();
+  blink::mojom::FileChooserParams params; params.mode = blink::mojom::FileChooserParams::Mode::kOpenMultiple;
+  content::SelectAlloyGuestUploadFiles(frame, params, listener);
+  ASSERT_TRUE(listener->ready.Wait()); ASSERT_EQ(listener->files.size(), 2u);
+  const auto accepted = listener->files[0]->get_native_file()->file_path;
+  const auto discarded = listener->files[1]->get_native_file()->file_path;
+  listener->files.erase(listener->files.begin() + 1);
+  content::ChildProcessSecurityPolicyImpl::GetInstance()->GrantReadFile(frame->GetProcess()->GetID(), accepted);
+  mojo::AssociatedRemote<blink::mojom::FileBackedBlobFactory> factory;
+  content::FileBackedBlobFactoryFrameImpl::CreateForCurrentDocument(frame, factory.BindNewEndpointAndPassDedicatedReceiver());
+  mojo::Remote<blink::mojom::Blob> blob; base::test::TestFuture<void> registered;
+  factory->RegisterBlobSync(blob.BindNewPipeAndPassReceiver(), base::UnguessableToken::Create().ToString(),
+      "text/plain", blink::mojom::DataElementFile::New(accepted, 0, 6, std::nullopt), registered.GetCallback());
+  ASSERT_TRUE(registered.Wait()); listener->files.clear(); content::RunAllTasksUntilIdle();
+  std::string bytes; EXPECT_TRUE(base::ReadFileToString(accepted, &bytes)); EXPECT_EQ(bytes, "abcdef");
+  blob.reset(); content::RunAllTasksUntilIdle();
+  EXPECT_FALSE(base::PathExists(accepted)); EXPECT_FALSE(base::PathExists(discarded));
+  EXPECT_TRUE(app->live); app->Revoke();
+}
+
+TEST_F(GuestNativeFilesTest, RoundTwoNativeFileCopyOutlivesSourceHandoffUntilConsumption) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get();
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame(); auto cap = Cap::Create(frame, Entry());
+  base::test::TestFuture<std::optional<content::AlloyGuestUploadFiles>> result;
+  content::SnapshotAlloyGuestFiles(frame, {cap}, false, result.GetCallback());
+  auto source = result.Take(); ASSERT_TRUE(source); ASSERT_EQ(source->files.size(), 1u);
+  auto delivered = source->files; const auto path = delivered[0].path;
+  source.reset(); content::RunAllTasksUntilIdle();
+  ASSERT_TRUE(content::GetAlloyGuestUploadProof(frame, path));
+  auto consumer = content::AcquireAlloyGuestUploadConsumer(frame, path); ASSERT_TRUE(consumer);
+  delivered.clear(); content::RunAllTasksUntilIdle();
+  std::string bytes; EXPECT_TRUE(base::ReadFileToString(path, &bytes)); EXPECT_EQ(bytes, "abcdef");
+  std::move(consumer).Run(); content::RunAllTasksUntilIdle();
+  EXPECT_FALSE(base::PathExists(path)); EXPECT_TRUE(app->live); app->Revoke();
+}
+
+TEST_F(GuestNativeFilesTest, RoundTwoDisconnectedNativeChooserDropsDeliveredBacking) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get(); app->selected = {Entry()};
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame();
+  auto [chooser, remote] = content::FileChooserImpl::CreateForTesting(content::RenderFrameHostImpl::From(frame));
+  auto native_listener = base::MakeRefCounted<content::FileChooserImpl::FileSelectListenerImpl>(chooser);
+  native_listener->SetFullscreenBlock(base::ScopedClosureRunner(base::DoNothing()));
+  auto selected = base::MakeRefCounted<SelectedFiles>(); blink::mojom::FileChooserParams params;
+  content::SelectAlloyGuestUploadFiles(frame, params, selected);
+  ASSERT_TRUE(selected->ready.Wait()); ASSERT_EQ(selected->files.size(), 1u);
+  const auto path = selected->files[0]->get_native_file()->file_path;
+  remote.reset(); content::RunAllTasksUntilIdle();
+  native_listener->FileSelected(std::move(selected->files), {}, params.mode);
+  content::RunAllTasksUntilIdle();
+  EXPECT_FALSE(base::PathExists(path)); EXPECT_FALSE(content::GetAlloyGuestUploadProof(frame, path));
+  EXPECT_TRUE(app->live); app->Revoke();
+}
 
 TEST_F(GuestNativeFilesTest, ScopedLookupAndReadsRetireWithoutFilesystemFallback) {
   content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
@@ -159,6 +349,7 @@ TEST_F(GuestNativeFilesTest, ReviewUploadBackingEndsAtLastNativeBlobConsumerNotD
   base::test::TestFuture<std::optional<content::AlloyGuestUploadFiles>> result;
   content::SnapshotAlloyGuestFiles(frame, {cap}, false, result.GetCallback());
   ASSERT_TRUE(result.Get()); const auto path = result.Get()->files[0].path;
+  auto selection = result.Take();
   auto* manager = static_cast<content::FileSystemAccessManagerImpl*>(
       frame->GetStoragePartition()->GetFileSystemAccessEntryFactory());
   const auto url = manager->context()->CreateCrackedFileSystemURL(
@@ -176,6 +367,8 @@ TEST_F(GuestNativeFilesTest, ReviewUploadBackingEndsAtLastNativeBlobConsumerNotD
   factory->RegisterBlobSync(blob.BindNewPipeAndPassReceiver(), base::UnguessableToken::Create().ToString(),
       "text/plain", blink::mojom::DataElementFile::New(path, 0, 6, std::nullopt), registered.GetCallback());
   ASSERT_TRUE(registered.Wait());
+  // Release the source handoff only after the real native Blob acquired it.
+  selection.reset();
   blob->Clone(clone.BindNewPipeAndPassReceiver()); blob.FlushForTesting();
   blob.reset(); content::RunAllTasksUntilIdle();
   EXPECT_TRUE(base::PathExists(path)); EXPECT_TRUE(app->live);

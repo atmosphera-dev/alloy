@@ -1,0 +1,327 @@
+--- a/ui/base/clipboard/file_info.h
++++ b/ui/base/clipboard/file_info.h
+@@ -10,6 +10,8 @@
+ 
+ #include "base/component_export.h"
+ #include "base/files/file_path.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/ref_counted.h"
+ 
+ namespace ui {
+ 
+@@ -22,6 +24,9 @@
+ 
+   base::FilePath path;
+   base::FilePath display_name;  // Optional.
++  // Optional native resource ownership, copied with the selected file. This
++  // retains backing through native filtering; it confers no path authority.
++  scoped_refptr<base::RefCountedData<base::ScopedClosureRunner>> native_file_lifetime;
+ };
+ 
+ // Returns UTF8 file:// URL. |file_path| is expected to be an absolute path, and
+--- a/third_party/blink/public/mojom/choosers/file_chooser.mojom
++++ b/third_party/blink/public/mojom/choosers/file_chooser.mojom
+@@ -8,6 +8,7 @@
+ import "mojo/public/mojom/base/string16.mojom";
+ import "mojo/public/mojom/base/time.mojom";
+ import "url/mojom/url.mojom";
++import "third_party/blink/public/mojom/blob/serialized_blob.mojom";
+ 
+ // FileChooserParams stores arguments for an operation to open a file
+ // chooser dialog.
+@@ -98,6 +99,9 @@
+   // 'root/subdir/file.txt' like posix or windows so we need base_subdirs =
+   // ['root', 'subdir'] to get all the information required.
+   array<mojo_base.mojom.String16> base_subdirs;
++  // A browser-owned snapshot carries its native backing until consumed or
++  // discarded. Older/native disk selections leave this field unset.
++  [MinVersion=1] SerializedBlob? serialized_blob;
+ };
+ 
+ struct FileSystemFileInfo {
+--- a/third_party/blink/public/mojom/data_transfer/data_transfer.mojom
++++ b/third_party/blink/public/mojom/data_transfer/data_transfer.mojom
+@@ -6,6 +6,7 @@
+ 
+ import "mojo/public/mojom/base/file_path.mojom";
+ import "third_party/blink/public/mojom/file_system_access/file_system_access_data_transfer_token.mojom";
++import "third_party/blink/public/mojom/blob/serialized_blob.mojom";
+ 
+ // Used for a list of files in clipboard or drag-and-drop.
+ struct DataTransferFile {
+@@ -17,4 +18,6 @@
+   // browser in mojo FileSystemAccessManager GetEntryFromDataTransferToken() to
+   // retrieve a FileSystemAccessEntry.
+   pending_remote<FileSystemAccessDataTransferToken>? file_system_access_token;
++  // Native backing ownership is independent of the capability-only token.
++  [MinVersion=1] SerializedBlob? serialized_blob;
+ };
+--- a/content/browser/renderer_host/data_transfer_util.cc
++++ b/content/browser/renderer_host/data_transfer_util.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/renderer_host/data_transfer_util.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_LINUX)
++#include "base/process/alloy_guest_runtime.h"
++#include "content/browser/file_system_access/alloy_guest_uploads.h"
++#endif
+ 
+ #include <optional>
+ #include <string>
+@@ -104,6 +109,13 @@
+         blink::mojom::DataTransferFile::New();
+     file->path = file_info.path;
+     file->display_name = file_info.display_name;
++#if BUILDFLAG(IS_LINUX)
++    if (file_info.native_file_lifetime || alloy_guest_is_runtime()) {
++      file->serialized_blob = CreateAlloyGuestUploadBlobForChild(
++          file_system_access_manager, child_id, file_info.path);
++      if (!file->serialized_blob) continue;
++    }
++#endif
+     mojo::PendingRemote<blink::mojom::FileSystemAccessDataTransferToken>
+         pending_token;
+     base::FilePath entry_path = file_info.path;
+--- a/third_party/blink/public/platform/web_drag_data.h
++++ b/third_party/blink/public/platform/web_drag_data.h
+@@ -73,6 +73,7 @@
+     WebString filename;
+     WebString display_name;
+     scoped_refptr<FileSystemAccessDropData> file_system_access_entry;
++    WebBlobInfo blob_info;
+   };
+ 
+   // An image being dragged out of the renderer. Contains a buffer holding
+--- a/third_party/blink/renderer/platform/mojo/drag_mojom_traits.h
++++ b/third_party/blink/renderer/platform/mojo/drag_mojom_traits.h
+@@ -52,6 +52,8 @@
+   static mojo::PendingRemote<
+       blink::mojom::blink::FileSystemAccessDataTransferToken>
+   file_system_access_token(const blink::WebDragData::FilenameItem& item);
++  static scoped_refptr<blink::BlobDataHandle> serialized_blob(
++      const blink::WebDragData::FilenameItem& item);
+   static bool Read(blink::mojom::DataTransferFileDataView data,
+                    blink::WebDragData::FilenameItem* out);
+ };
+--- a/third_party/blink/renderer/platform/mojo/drag_mojom_traits.cc
++++ b/third_party/blink/renderer/platform/mojo/drag_mojom_traits.cc
+@@ -104,6 +104,14 @@
+ }
+ 
+ // static
++scoped_refptr<blink::BlobDataHandle>
++StructTraits<blink::mojom::DataTransferFileDataView,
++             blink::WebDragData::FilenameItem>::
++    serialized_blob(const blink::WebDragData::FilenameItem& item) {
++  return item.blob_info.GetBlobHandle();
++}
++
++// static
+ bool StructTraits<blink::mojom::DataTransferFileDataView,
+                   blink::WebDragData::FilenameItem>::
+     Read(blink::mojom::DataTransferFileDataView data,
+@@ -113,6 +121,9 @@
+       !data.ReadDisplayName(&display_name_data))
+     return false;
+ 
++  scoped_refptr<blink::BlobDataHandle> blob;
++  if (!data.ReadSerializedBlob(&blob)) return false;
++  if (blob) out->blob_info = blink::WebBlobInfo(std::move(blob));
+   out->filename = blink::FilePathToWebString(filename_data);
+   out->display_name = blink::FilePathToWebString(display_name_data);
+   mojo::PendingRemote<::blink::mojom::blink::FileSystemAccessDataTransferToken>
+--- a/third_party/blink/renderer/core/fileapi/file.h
++++ b/third_party/blink/renderer/core/fileapi/file.h
+@@ -99,6 +99,10 @@
+                                       wtf_size_t& index);
+   static String PathFromControlState(const FormControlState& state,
+                                      wtf_size_t& index);
++
++  // Adopt a browser-supplied native snapshot instead of rebuilding a path Blob.
++  static File* CreateWithNativeSnapshot(const String& path, const String& name,
++      const String& relative_path, scoped_refptr<BlobDataHandle> handle);
+ 
+   static File* CreateWithRelativePath(ExecutionContext* context,
+                                       const String& path,
+--- a/third_party/blink/renderer/core/fileapi/file.cc
++++ b/third_party/blink/renderer/core/fileapi/file.cc
+@@ -185,6 +185,14 @@
+ }
+ 
+ // static
++File* File::CreateWithNativeSnapshot(const String& path, const String& name,
++    const String& relative_path, scoped_refptr<BlobDataHandle> handle) {
++  return CreateFromSerialization(path,
++      name.empty() ? FilePathToString(StringToFilePath(path).BaseName()) : name,
++      relative_path, kIsUserVisible, false, 0, std::nullopt, std::move(handle));
++}
++
++// static
+ File* File::CreateForFileSystemFile(ExecutionContext& context,
+                                     const KURL& url,
+                                     const FileMetadata& metadata,
+--- a/third_party/blink/renderer/core/clipboard/data_object.h
++++ b/third_party/blink/renderer/core/clipboard/data_object.h
+@@ -45,6 +45,7 @@
+ namespace blink {
+ 
+ class KURL;
++class BlobDataHandle;
+ class SystemClipboard;
+ class WebDragData;
+ class ExecutionContext;
+@@ -109,7 +110,8 @@
+                    const String& display_name,
+                    const String& file_system_id,
+                    scoped_refptr<FileSystemAccessDropData>
+-                       file_system_access_entry = nullptr);
++                       file_system_access_entry = nullptr,
++                   scoped_refptr<BlobDataHandle> native_blob = nullptr);
+ 
+   // Used for dragging in filesystem from the desktop.
+   void SetFilesystemId(const String& file_system_id) {
+--- a/third_party/blink/renderer/core/clipboard/data_object.cc
++++ b/third_party/blink/renderer/core/clipboard/data_object.cc
+@@ -85,7 +85,8 @@
+                 context, FilePathToString(file->path),
+                 FilePathToString(file->display_name), files->file_system_id,
+                 base::MakeRefCounted<FileSystemAccessDropData>(
+-                    std::move(file->file_system_access_token)));
++                    std::move(file->file_system_access_token)),
++                std::move(file->serialized_blob));
+           }
+         }
+       }
+@@ -309,9 +310,13 @@
+     const String& filename,
+     const String& display_name,
+     const String& file_system_id,
+-    scoped_refptr<FileSystemAccessDropData> file_system_access_entry) {
++    scoped_refptr<FileSystemAccessDropData> file_system_access_entry,
++    scoped_refptr<BlobDataHandle> native_blob) {
++  File* file = native_blob
++      ? File::CreateWithNativeSnapshot(filename, display_name, String(), std::move(native_blob))
++      : File::CreateForUserProvidedFile(context, filename, display_name);
+   InternalAddFileItem(DataObjectItem::CreateFromFileWithFileSystemId(
+-      File::CreateForUserProvidedFile(context, filename, display_name),
++      file,
+       file_system_id, std::move(file_system_access_entry)));
+ }
+ 
+@@ -392,7 +397,8 @@
+               has_file_system = true;
+               data_object->AddFilename(context, item.filename,
+                                        item.display_name, data.FilesystemId(),
+-                                       item.file_system_access_entry);
++                                       item.file_system_access_entry,
++                                       item.blob_info.GetBlobHandle());
+             },
+             [&](const WebDragData::BinaryDataItem& item) {
+               data_object->AddFileSharedBuffer(
+--- a/third_party/blink/renderer/core/html/forms/file_input_type.cc
++++ b/third_party/blink/renderer/core/html/forms/file_input_type.cc
+@@ -33,6 +33,7 @@
+ #include "third_party/blink/renderer/core/dom/shadow_root.h"
+ #include "third_party/blink/renderer/core/events/keyboard_event.h"
+ #include "third_party/blink/renderer/core/fileapi/file.h"
++#include "third_party/blink/renderer/core/clipboard/data_object.h"
+ #include "third_party/blink/renderer/core/fileapi/file_list.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/html/forms/form_controller.h"
+@@ -353,17 +354,21 @@
+             << " should start with " << FilePathToString(base_dir);
+         relative_path = string_path.substr(root_length).Replace('\\', '/');
+       }
+-      file_list->Append(File::CreateWithRelativePath(
+-          &context, string_path, display_name, relative_path));
++      auto snapshot = file->get_native_file()->serialized_blob;
++      file_list->Append(snapshot
++          ? File::CreateWithNativeSnapshot(string_path, display_name, relative_path, std::move(snapshot))
++          : File::CreateWithRelativePath(&context, string_path, display_name, relative_path));
+     }
+     return file_list;
+   }
+ 
+   for (const auto& file : files) {
+     if (file->is_native_file()) {
+-      file_list->Append(File::CreateForUserProvidedFile(
+-          &context, FilePathToString(file->get_native_file()->file_path),
+-          file->get_native_file()->display_name));
++      const auto& native = file->get_native_file();
++      file_list->Append(native->serialized_blob
++          ? File::CreateWithNativeSnapshot(FilePathToString(native->file_path),
++                native->display_name, String(), native->serialized_blob)
++          : File::CreateForUserProvidedFile(&context, FilePathToString(native->file_path), native->display_name));
+     } else {
+       const auto& fs_info = file->get_file_system();
+       FileMetadata metadata;
+@@ -561,6 +566,26 @@
+ }
+ 
+ bool FileInputType::ReceiveDroppedFiles(const DragData* drag_data) {
++#if BUILDFLAG(IS_LINUX)
++  if (alloy_guest_is_runtime() && !GetElement().FastHasAttribute(html_names::kWebkitdirectoryAttr)) {
++    // The DataObject already owns native snapshot Blobs. Reconstructing Files
++    // from their paths would detach that handoff across a second native IPC.
++    auto* files = MakeGarbageCollected<FileList>();
++    auto* data = drag_data->PlatformData();
++    for (uint32_t i = 0; i < data->length(); ++i) {
++      auto* item = data->Item(i);
++      if (!item->IsFilename()) continue;
++      auto* file = item->GetAsFile();
++      if (!file || !file->HasBackingFile()) continue;
++      files->Append(file->Clone());
++      if (!GetElement().Multiple()) break;
++    }
++    if (files->IsEmpty()) return false;
++    dropped_file_system_id_ = drag_data->DroppedFileSystemId();
++    SetFilesAndDispatchEvents(files);
++    return true;
++  }
++#endif
+   Vector<String> paths;
+   drag_data->AsFilePaths(paths);
+   if (paths.empty())
+--- a/chrome/browser/file_select_helper.cc
++++ b/chrome/browser/file_select_helper.cc
+@@ -278,9 +278,9 @@
+   }
+ 
+   std::vector<FileChooserFileInfoPtr> chooser_files;
+-  for (const auto& native_file : entry->results_) {
++  for (auto& native_file : entry->results_) {
+     chooser_files.push_back(
+-        FileChooserFileInfo::NewNativeFile(native_file->Clone()));
++        FileChooserFileInfo::NewNativeFile(std::move(native_file)));
+   }
+ 
+   if (dialog_type_ == ui::SelectFileDialog::SELECT_UPLOAD_FOLDER) {
+--- a/content/browser/blob_storage/file_backed_blob_factory_base.cc
++++ b/content/browser/blob_storage/file_backed_blob_factory_base.cc
+@@ -13,6 +13,7 @@
+ #include "build/build_config.h"
+ #if BUILDFLAG(IS_LINUX)
+ #include "content/browser/file_system_access/alloy_guest_uploads.h"
++#include "base/process/alloy_guest_runtime.h"
+ #endif
+ #include "storage/browser/blob/shareable_file_reference.h"
+ #include "content/browser/security/cpsp/child_process_security_policy_impl.h"
+@@ -140,7 +141,7 @@
+     RegisterBlobSyncCallback finish_callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
+ 
+-  const bool security_check_success =
++  bool security_check_success =
+       ChildProcessSecurityPolicyImpl::GetInstance()->CanReadFile(process_id_,
+                                                                  file->path);
+ 
+@@ -155,6 +156,7 @@
+   base::OnceClosure guest_consumer;
+ #if BUILDFLAG(IS_LINUX)
+   guest_consumer = AcquireAlloyGuestUploadConsumer(GetFileSelectionFrame(), file->path);
++  if (alloy_guest_is_runtime() && !guest_consumer) security_check_success = false;
+ #endif
+   content::GetIOThreadTaskRunner({})->PostTask(
+       FROM_HERE,

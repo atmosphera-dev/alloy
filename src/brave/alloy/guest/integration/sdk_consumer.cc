@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -120,7 +121,13 @@ class Stream final : public AlloyGuestStreamHandler {
 struct Write : public std::enable_shared_from_this<Write> {
   CefRefPtr<AlloyGuestClipboardRequest> request;
   std::map<std::string, std::string> formats;
+  // Consumer::mutex_ publishes completion, acceptance intent and cancellation.
+  // The callback sequence alone owns formats until this completed map exists.
+  std::optional<std::map<std::string, std::string>> ready_formats;
+  bool accept_requested = false;
   std::function<void(std::shared_ptr<Write>, bool)> done;
+  // Synthetic app gate for deterministic acceptance-during-read coverage.
+  std::function<void(std::function<void()>)> deliver_data;
   size_t index = 0;
   uint64_t offset = 0;
   void Next() {
@@ -133,16 +140,18 @@ struct Write : public std::enable_shared_from_this<Write> {
     CefRefPtr<Reader> reader = new Reader(
         [self = shared_from_this(), size = data->GetSize(), count, name]
         (bool success, uint64_t offset, CefRefPtr<CefBinaryValue> bytes) {
-          if (!success || offset != self->offset || (bytes ? bytes->GetSize() : 0) != count) {
-            self->done(self, false); return;
-          }
-          std::string copied(count, '\0');
-          if (bytes && bytes->GetData(copied.data(), copied.size(), 0) != copied.size()) {
-            self->done(self, false); return;
-          }
-          self->formats[name].append(copied); self->offset += count;
-          if (self->offset == size) { ++self->index; self->offset = 0; }
-          self->Next();
+          self->deliver_data([self, size, count, name, success, offset, bytes] {
+            if (!success || offset != self->offset || (bytes ? bytes->GetSize() : 0) != count) {
+              self->done(self, false); return;
+            }
+            std::string copied(count, '\0');
+            if (bytes && bytes->GetData(copied.data(), copied.size(), 0) != copied.size()) {
+              self->done(self, false); return;
+            }
+            self->formats[name].append(copied); self->offset += count;
+            if (self->offset == size) { ++self->index; self->offset = 0; }
+            self->Next();
+          });
         });
     if (!data->Read(offset, count, reader)) done(shared_from_this(), false);
   }
@@ -202,7 +211,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     closed_ = true; cv_.notify_all();
   }
   void OnClosed() override {
-    std::lock_guard lock(mutex_); reads_.clear(); menus_.clear(); drags_.clear(); fullscreen_.clear(); writes_.clear();
+    std::lock_guard lock(mutex_); reads_.clear(); menus_.clear(); drags_.clear(); fullscreen_.clear(); writes_.clear(); write_data_.clear();
     Event("integration-closed");
   }
   void OnUnavailable() override { Event("integration-unavailable"); }
@@ -219,7 +228,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
       if (auto found = menus_.find(id); found != menus_.end()) retired_menus_[id] = found->second;
       if (auto found = drags_.find(id); found != drags_.end()) retired_drags_[id] = found->second;
       if (auto found = fullscreen_.find(id); found != fullscreen_.end()) retired_fullscreen_[id] = found->second;
-      reads_.erase(id); menus_.erase(id); drags_.erase(id); fullscreen_.erase(id); writes_.erase(id); }
+      reads_.erase(id); menus_.erase(id); drags_.erase(id); fullscreen_.erase(id); writes_.erase(id); write_data_.erase(id); }
     auto event = CefDictionaryValue::Create(); event->SetString("request", std::to_string(id));
     event->SetString("reason", reason); Event("request-ended", event);
   }
@@ -245,6 +254,17 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
       { std::lock_guard lock(mutex_); writes_[request->GetId()] = write; }
       auto self = CefRefPtr<Consumer>(this);
       write->done = [self](std::shared_ptr<Write> value, bool success) { self->WriteReady(value, success); };
+      write->deliver_data = [self, id = request->GetId()](std::function<void()> deliver) {
+        bool held = false;
+        { std::lock_guard lock(self->mutex_);
+          if (!self->writes_.contains(id)) return;
+          held = self->hold_write_data_;
+          if (held) self->write_data_[id] = std::move(deliver); }
+        if (held) {
+          auto event = CefDictionaryValue::Create(); event->SetString("request", std::to_string(id));
+          Event("write-data-held", event);
+        } else deliver();
+      };
       write->Next(); return;
     }
     const auto format = request->GetRequestedFormat().ToString();
@@ -267,20 +287,32 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     request->CompleteRead(binary, "https://clipboard-source.test/", 0, end);
   }
   void WriteReady(std::shared_ptr<Write> write, bool success) {
-    if (!success) { Event("write-aborted"); return; }
     bool hold = false, fail = false;
-    { std::lock_guard lock(mutex_); hold = hold_writes_; fail = fail_writes_; }
+    { std::lock_guard lock(mutex_);
+      const auto found = writes_.find(write->request->GetId());
+      if (found == writes_.end() || found->second != write) return;
+      if (!success) writes_.erase(found);
+      else {
+        write->ready_formats = std::move(write->formats);
+        hold = hold_writes_ && !write->accept_requested;
+        fail = fail_writes_;
+        if (fail) writes_.erase(found);
+      }
+    }
+    if (!success) { write->request->Deny(); Event("write-aborted"); return; }
     auto event = CefDictionaryValue::Create(); event->SetString("request", std::to_string(write->request->GetId()));
     Event("write-ready", event);
-    if (hold) return;
     if (fail) { write->request->Deny(); Event("sink-failed", event); return; }
+    if (hold) return;
     StoreWrite(std::move(write));
   }
   void StoreWrite(std::shared_ptr<Write> write) {
     { std::lock_guard lock(mutex_);
       const auto found = writes_.find(write->request->GetId());
       if (found == writes_.end() || found->second != write) return;
-      clipboard_ = write->formats; ++sequence_; writes_.erase(found); }
+      write->accept_requested = true;
+      if (!write->ready_formats) return;
+      clipboard_ = std::move(*write->ready_formats); ++sequence_; writes_.erase(found); }
     const bool queued = write->request->CompleteWrite("app-clipboard", 54321);
     auto event = CefDictionaryValue::Create(); event->SetBool("ok", queued);
     event->SetString("request", std::to_string(write->request->GetId())); Event("clipboard-stored", event);
@@ -339,6 +371,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
       permissions_ = data->GetBool("permissions"); hold_reads_ = data->GetBool("hold_reads");
       deny_reads_ = data->GetBool("deny_reads"); hold_writes_ = data->GetBool("hold_writes");
       fail_writes_ = data->GetBool("fail_writes"); queued = true;
+      hold_write_data_ = data->GetBool("hold_write_data");
     } else if (op == "files-configure") {
       files_.Configure(data); queued = true;
     } else if (op == "files-get") {
@@ -370,6 +403,12 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
        { std::lock_guard lock(mutex_); auto found = writes_.find(U(data, "request"));
          if (found != writes_.end()) write = found->second; }
       if (write) { StoreWrite(std::move(write)); queued = true; }
+    } else if (op == "release-write-data") {
+      std::function<void()> deliver;
+      { std::lock_guard lock(mutex_); hold_write_data_ = false;
+        auto found = write_data_.find(U(data, "request"));
+        if (found != write_data_.end()) { deliver = std::move(found->second); write_data_.erase(found); } }
+      if (deliver) { deliver(); queued = true; }
     } else if (op == "menu-select") {
       CefRefPtr<AlloyGuestMenuRequest> request;
       { std::lock_guard lock(mutex_); const auto number = U(data, "request");
@@ -464,6 +503,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
   std::condition_variable cv_;
   bool closed_ = false, permissions_ = false, hold_reads_ = false, deny_reads_ = false;
   bool hold_writes_ = false, fail_writes_ = false;
+  bool hold_write_data_ = false;
   uint64_t document_ = 0, generation_ = 0, sequence_ = 1;
   SyntheticGuestFiles files_{[](const char* name, CefRefPtr<CefDictionaryValue> value) { Event(name, value); }};
   CefRefPtr<AlloyGuestSession> session_;
@@ -473,6 +513,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
   std::map<std::string, std::string> clipboard_;
   std::map<uint64_t, CefRefPtr<AlloyGuestClipboardRequest>> reads_;
   std::map<uint64_t, std::shared_ptr<Write>> writes_;
+  std::map<uint64_t, std::function<void()>> write_data_;
   std::map<uint64_t, CefRefPtr<AlloyGuestMenuRequest>> menus_;
   std::map<uint64_t, CefRefPtr<AlloyGuestDragRequest>> drags_;
   std::map<uint64_t, CefRefPtr<AlloyGuestFullscreenRequest>> fullscreen_;

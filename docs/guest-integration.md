@@ -165,6 +165,11 @@ clones, slices, reads and multipart requests. The last consumer releases RAM
 without waiting for navigation; original-document retirement still revokes it
 immediately. Guest multipart bodies use the existing Blob-backed path rather
 than detaching ownership into raw filename elements.
+The native handoff itself is scoped: copied FileInfo values retain it during
+filtering, and native chooser/clipboard/drop messages carry a SerializedBlob.
+Discarding a result or disconnecting the receiver releases that ownership;
+consumed Files adopt the supplied Blob. A later drag does not revoke an already
+delivered File. No path-counted pending selection remains pinned until close.
 Unredeemed paste/drop tokens retain the selected app capability, not snapshot
 backing. Their last clone releases it; redemption still uses native process,
 document and permission checks.

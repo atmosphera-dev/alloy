@@ -367,7 +367,7 @@ void AlloyGuestClipboard::ReadFilenamesAtSequence(ui::ClipboardBuffer buffer,
               self->ConfirmSequence(buffer, expected, admitted, base::BindOnce(
                   [](ReadFilenamesCallback callback, std::optional<AlloyGuestUploadFiles> snapshot, bool valid) {
                     if (!valid) { std::move(callback).Run({}); return; }
-                    snapshot->Delivered(); std::move(callback).Run(std::move(snapshot->files));
+                    std::move(callback).Run(std::move(snapshot->files));
                   }, std::move(callback), std::move(snapshot)));
             }, self, buffer, expected, admitted, std::move(callback)), admitted);
       }, shared_from_this(), buffer, expected, admitted, std::move(callback)), admitted);

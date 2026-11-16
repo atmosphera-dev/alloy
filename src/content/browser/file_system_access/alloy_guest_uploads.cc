@@ -24,8 +24,21 @@
 #include "base/task/thread_pool.h"
 #include "base/task/bind_post_task.h"
 #include "base/unguessable_token.h"
+#include "base/uuid.h"
+#include "components/file_access/scoped_file_access_delegate.h"
+#include "content/browser/blob_storage/chrome_blob_storage_context.h"
+#include "content/browser/file_system_access/file_system_access_manager_impl.h"
+#include "content/public/browser/browser_task_traits.h"
+#include "content/public/browser/browser_thread.h"
+#include "content/public/browser/render_process_host.h"
 #include "content/public/browser/storage_partition.h"
+#include "content/public/common/child_process_id.h"
 #include "net/base/mime_util.h"
+#include "storage/browser/blob/blob_data_builder.h"
+#include "storage/browser/blob/blob_impl.h"
+#include "storage/browser/blob/blob_storage_context.h"
+#include "storage/browser/blob/shareable_file_reference.h"
+#include "storage/browser/file_system/file_system_context.h"
 
 namespace content {
 namespace {
@@ -159,6 +172,23 @@ class Backing final : public base::RefCountedDeleteOnSequence<Backing> {
   bool revoked_ = false;
 };
 
+void BindSnapshotBlob(scoped_refptr<ChromeBlobStorageContext> context,
+    base::FilePath path, std::string uuid, std::string mime, uint64_t size,
+    file_access::ScopedFileAccessDelegate::RequestFilesAccessIOCallback file_access,
+    base::OnceClosure consumer, mojo::PendingReceiver<blink::mojom::Blob> receiver) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  auto reference = storage::ShareableFileReference::GetOrCreate(path,
+      storage::ShareableFileReference::DONT_DELETE_ON_FINAL_RELEASE,
+      GetIOThreadTaskRunner({}).get());
+  reference->AddFinalReleaseCallback(base::BindOnce(
+      [](base::OnceClosure consumer, const base::FilePath&) { std::move(consumer).Run(); },
+      std::move(consumer)));
+  auto builder = std::make_unique<storage::BlobDataBuilder>(uuid);
+  if (size) builder->AppendFile(path, 0, size, base::Time(), std::move(file_access));
+  builder->set_content_type(mime);
+  storage::BlobImpl::Create(context->context()->AddFinishedBlob(std::move(builder)), std::move(receiver));
+}
+
 class Snapshot final : public base::RefCounted<Snapshot> {
  public:
   Snapshot(RenderFrameHost* frame, Cap::Entries entries, bool directory, AlloyGuestUploadsReply reply,
@@ -196,36 +226,62 @@ class Snapshot final : public base::RefCounted<Snapshot> {
     proof.verify = base::BindRepeating([](scoped_refptr<Backing> backing, size_t index,
         base::FilePath path, std::shared_ptr<std::atomic<bool>> live) {
       return live->load() && backing->Verify(index, path) && live->load();
-    }, backing_, found->second, path, live_flag_);
+    }, backing_, found->second.index, path, live_flag_);
     return proof;
   }
   base::OnceClosure AcquireConsumer(RenderFrameHost* original, const base::FilePath& path) {
     if (!finished_ || !Proof(original, path)) return {};
-    ++consumers_; pending_consumers_.erase(path);
     return base::BindPostTask(base::SequencedTaskRunner::GetCurrentDefault(),
-        base::BindOnce(&Snapshot::ReleaseConsumer, weak_.GetWeakPtr()));
+        base::BindOnce([](scoped_refptr<Snapshot>) {}, base::WrapRefCounted(this)));
+  }
+  blink::mojom::SerializedBlobPtr Blob(RenderFrameHost* original, const base::FilePath& path) {
+    auto proof = Proof(original, path);
+    auto consumer = AcquireConsumer(original, path);
+    if (!proof || !consumer) return nullptr;
+    file_access::ScopedFileAccessDelegate::RequestFilesAccessIOCallback access_callback;
+    if (file_access::ScopedFileAccessDelegate::HasInstance()) {
+      const auto& destination = original->GetLastCommittedURL();
+      if (!destination.is_valid()) return nullptr;
+      access_callback = file_access::ScopedFileAccessDelegate::Get()->CreateFileAccessCallback(destination);
+    }
+    auto* manager = static_cast<FileSystemAccessManagerImpl*>(
+        original->GetStoragePartition()->GetFileSystemAccessEntryFactory());
+    const auto& alias = aliases_.at(path);
+    auto blob = blink::mojom::SerializedBlob::New();
+    blob->uuid = base::Uuid::GenerateRandomV4().AsLowercaseString();
+    blob->content_type = alias.mime; blob->size = alias.size;
+    // The pending native Blob owns the handoff even if the receiving message
+    // is discarded before registration finishes. No UI thread waits for I/O.
+    worker_->PostTaskAndReplyWithResult(FROM_HERE, proof->verify, base::BindOnce(
+        [](base::WeakPtr<Snapshot> self, scoped_refptr<ChromeBlobStorageContext> context,
+            base::FilePath path, std::string uuid, std::string mime, uint64_t size,
+            file_access::ScopedFileAccessDelegate::RequestFilesAccessIOCallback file_access,
+            base::OnceClosure consumer, mojo::PendingReceiver<blink::mojom::Blob> receiver, bool verified) {
+          if (!self || !verified || !self->Admitted()) return;
+          GetIOThreadTaskRunner({})->PostTask(FROM_HERE, base::BindOnce(&BindSnapshotBlob,
+              std::move(context), std::move(path), std::move(uuid), std::move(mime), size,
+              std::move(file_access), std::move(consumer), std::move(receiver)));
+        }, weak_.GetWeakPtr(), base::WrapRefCounted(manager->blob_context()), path,
+           blob->uuid, blob->content_type, blob->size, std::move(access_callback), std::move(consumer),
+           blob->blob.InitWithNewPipeAndPassReceiver()));
+    return blob;
   }
  private:
   friend class base::RefCounted<Snapshot>;
-  ~Snapshot() = default;
+  ~Snapshot() { RevokeBacking(); }
   struct Pending { scoped_refptr<Cap> cap; base::FilePath relative; std::set<std::string> ancestors; };
+  struct Alias { size_t index; uint64_t size; std::string mime; };
   bool Admitted() const { return live_ && admitted_ && admitted_.Run() && (!extra_ || extra_.Run()); }
-  void ReleaseConsumer() {
-    CHECK_GT(consumers_, 0u);
-    --consumers_;
-    if (!consumers_ && pending_consumers_.empty()) Retire();
-  }
-  void AbandonHandoff() {
-    pending_consumers_.clear();
-    if (!consumers_) Retire();
-  }
   void Finish(bool success) {
     auto retained = base::WrapRefCounted(this);
     success = success && Admitted();
     if (success) {
       extra_.Reset();  // Consumer leases retain document life, not a read deadline/receiver.
       finished_ = true;
-      result_.abandon = base::ScopedClosureRunner(base::BindOnce(&Snapshot::AbandonHandoff, weak_.GetWeakPtr()));
+      for (auto& file : result_.files) {
+        file.native_file_lifetime = base::MakeRefCounted<base::RefCountedData<base::ScopedClosureRunner>>(
+            base::ScopedClosureRunner(AcquireConsumer(document_.AsRenderFrameHostIfValid(), file.path)));
+      }
     }
     if (reply_) {
       auto reply = std::move(reply_);
@@ -235,16 +291,21 @@ class Snapshot final : public base::RefCounted<Snapshot> {
       } else std::move(reply).Run(std::nullopt);
     }
     if (!success) Retire();
+    else self_.reset();  // Only native handoff/Blob owners retain completed snapshots.
   }
   void Retire() {
     if (!live_) return;
     auto retained = base::WrapRefCounted(this);
+    RevokeBacking(); self_.reset();
+  }
+  void RevokeBacking() {
+    if (!live_) return;
     live_ = false; live_flag_->store(false);
     if (registry_) for (const auto& [path, index] : aliases_) registry_->Remove(path);
     weak_.InvalidateWeakPtrs();
     if (reply_) std::move(reply_).Run(std::nullopt);
     if (backing_) worker_->PostTask(FROM_HERE, base::BindOnce(&Backing::Revoke, backing_));
-    queue_.clear(); current_.reset(); retained_.clear(); backing_.reset(); self_.reset();
+    queue_.clear(); current_.reset(); retained_.clear(); backing_.reset();
   }
   void Next() {
     if (!Admitted()) { Finish(false); return; }
@@ -314,8 +375,10 @@ class Snapshot final : public base::RefCounted<Snapshot> {
               for (const auto& name : self->current_->relative.DirName().GetComponents())
                 directories.push_back(base::FilePath(name).AsUTF16Unsafe());
             }
-             self->aliases_.emplace(*path, self->index_);
-             self->pending_consumers_.insert(*path);
+             std::string mime = self->current_->cap->metadata().mime;
+             if (mime.empty()) net::GetWellKnownMimeTypeFromFile(
+                 base::FilePath::FromUTF8Unsafe(self->current_->cap->metadata().name), &mime);
+             self->aliases_.emplace(*path, Alias{self->index_, self->size_, std::move(mime)});
             if (self->registry_) self->registry_->Add(*path, self->weak_.GetWeakPtr());
             self->Next();
           }, weak_.GetWeakPtr()));
@@ -356,10 +419,8 @@ class Snapshot final : public base::RefCounted<Snapshot> {
   size_t index_ = 0;
   int64_t modified_ = 0;
   bool live_ = true, finished_ = false;
-  size_t consumers_ = 0;
-  std::set<base::FilePath> pending_consumers_;
   base::FilePath alias_;
-  std::map<base::FilePath, size_t> aliases_;
+  std::map<base::FilePath, Alias> aliases_;
   base::WeakPtr<SnapshotRegistry> registry_;
   std::shared_ptr<std::atomic<bool>> live_flag_ = std::make_shared<std::atomic<bool>>(true);
   base::WeakPtrFactory<Snapshot> weak_{this};
@@ -369,7 +430,8 @@ class Snapshot final : public base::RefCounted<Snapshot> {
 std::optional<AlloyGuestUploadProof> GetAlloyGuestUploadProof(RenderFrameHost* original, const base::FilePath& path) {
   if (!original) return std::nullopt;
   auto* contents = WebContents::FromRenderFrameHost(original)->GetOutermostWebContents();
-  auto snapshot = SnapshotRegistry::Get(contents)->Find(path);
+  auto* registry = SnapshotRegistry::Existing(contents);
+  auto snapshot = registry ? registry->Find(path) : nullptr;
   return snapshot ? snapshot->Proof(original, path) : std::nullopt;
 }
 
@@ -379,6 +441,26 @@ base::OnceClosure AcquireAlloyGuestUploadConsumer(RenderFrameHost* original, con
   auto* registry = SnapshotRegistry::Existing(contents);
   auto snapshot = registry ? registry->Find(path) : nullptr;
   return snapshot ? snapshot->AcquireConsumer(original, path) : base::OnceClosure();
+}
+
+blink::mojom::SerializedBlobPtr CreateAlloyGuestUploadBlob(RenderFrameHost* original, const base::FilePath& path) {
+  if (!original) return nullptr;
+  auto* registry = SnapshotRegistry::Existing(WebContents::FromRenderFrameHost(original)->GetOutermostWebContents());
+  auto snapshot = registry ? registry->Find(path) : nullptr;
+  return snapshot ? snapshot->Blob(original, path) : nullptr;
+}
+
+blink::mojom::SerializedBlobPtr CreateAlloyGuestUploadBlobForChild(
+    FileSystemAccessManagerImpl* manager, int renderer_id, const base::FilePath& path) {
+  auto* process = RenderProcessHost::FromID(ChildProcessId::FromUnsafeValue(renderer_id));
+  if (!process) return nullptr;
+  const auto url = manager->context()->CreateCrackedFileSystemURL(
+      blink::StorageKey(), storage::kFileSystemTypeLocal, path);
+  auto cap = Cap::FromURL(process->GetBrowserContext(), url);
+  auto* original = cap && cap->Admitted() ? cap->original() : nullptr;
+  if (!original || original->GetProcess() != process ||
+      original->GetStoragePartition()->GetFileSystemAccessEntryFactory() != manager) return nullptr;
+  return CreateAlloyGuestUploadBlob(original, path);
 }
 
 void SnapshotAlloyGuestFiles(RenderFrameHost* original, Cap::Entries entries, bool directory,
@@ -409,18 +491,21 @@ void SelectAlloyGuestUploadFiles(RenderFrameHost* original, const blink::mojom::
           listener->FileSelectionCanceled(); return;
         }
         SnapshotAlloyGuestFiles(document.AsRenderFrameHostIfValid(), std::move(*entries), directory,
-            base::BindOnce([](Mode mode, scoped_refptr<FileSelectListener> listener, std::optional<AlloyGuestUploadFiles> snapshot) {
-              if (!snapshot) { listener->FileSelectionCanceled(); return; }
+            base::BindOnce([](WeakDocumentPtr document, Mode mode, scoped_refptr<FileSelectListener> listener, std::optional<AlloyGuestUploadFiles> snapshot) {
+              auto* original = document.AsRenderFrameHostIfValid();
+              if (!snapshot || !original) { listener->FileSelectionCanceled(); return; }
               std::vector<blink::mojom::FileChooserFileInfoPtr> files;
               for (const auto& file : snapshot->files) {
                 auto found = snapshot->relative_directories.find(file.path);
                 auto directories = found == snapshot->relative_directories.end() ? std::vector<std::u16string>() : found->second;
-                files.push_back(blink::mojom::FileChooserFileInfo::NewNativeFile(
-                    blink::mojom::NativeFileInfo::New(file.path, file.display_name.AsUTF16Unsafe(), std::move(directories))));
+                auto native = blink::mojom::NativeFileInfo::New(
+                    file.path, file.display_name.AsUTF16Unsafe(), std::move(directories));
+                native->serialized_blob = CreateAlloyGuestUploadBlob(original, file.path);
+                if (!native->serialized_blob) { listener->FileSelectionCanceled(); return; }
+                files.push_back(blink::mojom::FileChooserFileInfo::NewNativeFile(std::move(native)));
               }
-              snapshot->Delivered();
               listener->FileSelected(std::move(files), snapshot->directory, mode);
-            }, mode, std::move(listener)));
+            }, document, mode, std::move(listener)));
       }, original->GetWeakDocumentPtr(), params.mode, directory, std::move(listener)));
 }
 }  // namespace content

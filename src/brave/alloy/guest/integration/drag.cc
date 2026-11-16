@@ -10,6 +10,7 @@
 #include "brave/alloy/guest/stream/input.h"
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/libcef/browser/frame_host_impl.h"
+#include "cef/libcef/common/drag_data_impl.h"
 #include "content/public/browser/alloy_document_state.h"
 #include "content/public/browser/alloy_guest_integration.h"
 #include "content/public/browser/web_contents.h"
@@ -74,7 +75,6 @@ void Actions::Reset() {
   // The native owner may still be awaiting a renderer acknowledgement after a
   // terminal drop was accepted by this protocol. Cancel that work as well.
   if (browser_) browser_->GetHost()->DragTargetDragLeave();
-  target_files_.RunAndReset();
   target_ = false;
   if (source_) source_->Finish(0, 0, DRAG_OPERATION_NONE);
   source_.reset();
@@ -111,10 +111,10 @@ void Actions::Dispatch(Owner original, const stream::InteractionData& action,
                     !Integer(data, "modifiers", &modifiers) || !Integer(data, "allowed", &allowed) ||
                     !Mask(allowed) || modifiers < 0 || !self->point_(original.document, action.generation,
                         action.surface, x, y, false, &event)) { completion("rejected:invalid"); return; }
-                auto drag = CefDragData::Create();
-                for (const auto& file : files->files) drag->AddFile(file.path.AsUTF8Unsafe(), file.display_name.AsUTF8Unsafe());
-                 event.modifiers = modifiers;
-                 self->target_files_ = std::move(files->abandon);
+                 content::DropData drop;
+                 drop.filenames = std::move(files->files);
+                 CefRefPtr<CefDragData> drag = new CefDragDataImpl(drop);
+                  event.modifiers = modifiers;
                  self->browser_->GetHost()->DragTargetDragEnter(drag, event, static_cast<cef_drag_operations_mask_t>(allowed));
                 self->target_ = true; completion("accepted");
               }, self, original, std::move(action), std::move(completion)));
@@ -159,7 +159,7 @@ std::string Actions::DispatchNow(Owner original, const stream::InteractionData& 
   }
   if (action.kind == "drag-leave") {
     if (!target_) return "rejected:invalid";
-    host->DragTargetDragLeave(); target_files_.RunAndReset(); target_ = false; return "accepted";
+    host->DragTargetDragLeave(); target_ = false; return "accepted";
   }
   int x = 0, y = 0, modifiers = 0, allowed = 0;
   if (!Integer(data, "x", &x) || !Integer(data, "y", &y) ||
@@ -174,7 +174,6 @@ std::string Actions::DispatchNow(Owner original, const stream::InteractionData& 
     if (target_ || data->GetType("text") != VTYPE_STRING || data->GetType("html") != VTYPE_STRING ||
         data->GetType("link") != VTYPE_STRING || data->GetType("title") != VTYPE_STRING)
        return "rejected:invalid";
-    target_files_.RunAndReset();
     auto drag = CefDragData::Create();
     drag->SetFragmentText(data->GetString("text")); drag->SetFragmentHtml(data->GetString("html"));
     if (data->GetType("base") == VTYPE_STRING && !data->GetString("base").empty())

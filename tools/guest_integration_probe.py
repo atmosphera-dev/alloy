@@ -400,6 +400,38 @@ def menus(client, base, server):
     return {'original_frame_after_focus_change': True, 'held_callback_revoked': True}
 
 
+def clipboard_accept_before_ready(client, base):
+    page = client.page(base); client.action(op='focus', focused=True)
+    client.clipboard(**{'text/plain': b'unchanged-before-accumulation'})
+    client.configure(hold_writes=True, hold_write_data=True)
+    after = len(client.events); client.click(page['rectangles']['writeRich'])
+    held = client.wait('write-data-held', after=after)
+    client.command(op='accept-write', request=held['request'])
+    before_ready = client.content()
+    assert before_ready.get('text/plain') == b'unchanged-before-accumulation', before_ready
+    assert not any(e['event'] == 'clipboard-stored' for e in client.events[after:])
+    client.command(op='release-write-data', request=held['request'])
+    client.wait('clipboard-stored', after=after)
+    content = client.content()
+    assert content['text/plain'] == b'rich-native' and b'<em>rich-native</em>' in content['text/html'], content
+    assert content['image/png'].startswith(b'\x89PNG\r\n\x1a\n'), content
+    return dict(early_accept_waited_for_data=True, atomic_complete_formats=True)
+
+
+def clipboard_early_accept_retirement(client, base):
+    page = client.page(base); client.action(op='focus', focused=True)
+    client.clipboard(**{'text/plain': b'not-published-after-retirement'})
+    client.configure(hold_writes=True, hold_write_data=True)
+    after = len(client.events); client.click(page['rectangles']['writeRich'])
+    held = client.wait('write-data-held', after=after)
+    client.command(op='accept-write', request=held['request'])
+    client.command(op='stop-provider')
+    client.wait('request-ended', lambda value: value['request'] == held['request'], after)
+    assert client.content().get('text/plain') == b'not-published-after-retirement'
+    assert not client.command(op='release-write-data', request=held['request'])['ok']
+    return dict(early_accept_cancelled_before_publication=True, old_clipboard_preserved=True)
+
+
 def quick_menu(client, base):
     page = client.page(base)
     client.action(op='focus', focused=True)
@@ -1002,11 +1034,30 @@ def native_grants(out, evidence):
     return [{'case': 'native-grants-unit', 'status': 'passed'}]
 
 
+def file_input_drop_after_new_drag(client, base):
+    page = client.page(base, 'files.html?retainDrop=1'); client.action(op='focus', focused=True)
+    target = page['rectangles']['upload']; x, y = round(target['x'] + 20), round(target['y'] + 18)
+    after = len(client.events)
+    client.action(op='drag-file-enter', x=x, y=y, allowed=1, modifiers=0)
+    client.action(op='drag-over', x=x, y=y, allowed=1, modifiers=0); client.drag_effect(1, after)
+    client.action(op='drag-drop', x=x, y=y, modifiers=0)
+    assert client.title('upload-retained', after)['count'] == 1
+    target = page['rectangles']['fileDrop']; x, y = round(target['x'] + 20), round(target['y'] + 18)
+    client.action(op='drag-enter', x=x, y=y, allowed=1, modifiers=0, text='later-native-drag', html='')
+    client.action(op='drag-leave')
+    after = len(client.events); client.click(page['rectangles']['read'])
+    read = client.title('file-read', after)
+    assert read['sha256'] == hashlib.sha256(b'app-selected-bytes').hexdigest(), read
+    return dict(native_file_input_drop=True, later_drag_did_not_revoke_file=True, exact_retained_bytes=True)
+
+
 def file_outcomes(out, evidence, base, server, results):
     for name, check in file_checks(base, server):
         results.append(case(out, evidence, name, check))
     results.append(case(out, evidence, 'native-file-stateless-external',
                         lambda client: file_handles(client, base), mode='stateless'))
+    results.append(case(out, evidence, 'native-file-input-drop-retained-across-drag',
+                        lambda client: file_input_drop_after_new_drag(client, base)))
     def removed_child(client):
         page = client.page(base, 'files.html'); client.action(op='focus', focused=True)
         after = len(client.events); client.click(page['rectangles']['recursive'])
@@ -1057,7 +1108,9 @@ def main(argv=None):
                 print('GUEST_FILES_PASS', flush=True)
                 return
             for name, check in [('clipboard-edit-keyboard', lambda client: clipboard_ui(client, base)),
-                                ('async-clipboard-formats-sinks', lambda client: async_clipboard(client, base)),
+                                 ('async-clipboard-formats-sinks', lambda client: async_clipboard(client, base)),
+                                 ('clipboard-accept-before-ready', lambda client: clipboard_accept_before_ready(client, base)),
+                                 ('clipboard-early-accept-retirement', lambda client: clipboard_early_accept_retirement(client, base)),
                                  ('menus-original-owner', lambda client: menus(client, base, server)),
                                  ('menu-inline-selection', lambda client: inline_selection(client, base)),
                                  ('menu-cross-node-selection', lambda client: inline_selection(client, base, True)),

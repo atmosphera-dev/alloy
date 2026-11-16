@@ -14,7 +14,7 @@
 <button id="recursive">Remove retained child's parent</button>
 <iframe id="peer"></iframe>
 <script>
-const state={kind:'ready',serial:0};let fileHandle;let sharedReady=false;
+const state={kind:'ready',serial:0};let fileHandle,retainedUpload;let sharedReady=false;
 function report(kind,extra={}){Object.assign(state,extra);state.kind=kind;++state.serial;
  state.rectangles=Object.fromEntries([...document.querySelectorAll('[id]')].map(e=>{const r=e.getBoundingClientRect();return[e.id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));
  document.title=JSON.stringify(state);}
@@ -28,7 +28,7 @@ async function writeSelected(){const writer=await fileHandle.createWritable({kee
 action('write',writeSelected);
 action('largeWrite',async()=>{const bytes=new Uint8Array(2*1024*1024+13);for(let i=0;i<bytes.length;++i)bytes[i]=(i*37+11)%256;
  const writer=await fileHandle.createWritable();await writer.write(bytes);report('write-accepted');await writer.close();report('save-complete',await contents(await fileHandle.getFile()));});
-action('read',async()=>report('file-read',await contents(await fileHandle.getFile())));
+action('read',async()=>report('file-read',await contents(retainedUpload||await fileHandle.getFile())));
 action('recursive',async()=>{const root=await showDirectoryPicker({mode:'readwrite'});
  const nested=await root.getDirectoryHandle('nested'),child=await nested.getFileHandle('child.txt');
  const before=await contents(await child.getFile());await root.removeEntry('nested',{recursive:true});
@@ -56,6 +56,7 @@ fileDrop.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect
 fileDrop.ondrop=async event=>{event.preventDefault();const files=[];for(const file of event.dataTransfer.files)files.push(await contents(file));report('file-drop',{files});};
 filePaste.onpaste=async event=>{event.preventDefault();const files=[];for(const file of event.clipboardData.files)files.push(await contents(file));report('file-paste',{files});};
 for(const id of ['upload','uploadDirectory','uploadMultiple'])document.getElementById(id).onchange=async event=>{
+ if(new URLSearchParams(location.search).has('retainDrop')){retainedUpload=event.target.files[0];report('upload-retained',{count:event.target.files.length});return;}
  const files=[];for(const file of event.target.files)files.push({...await contents(file),relative:file.webkitRelativePath});
  const form=new FormData();for(const file of event.target.files)form.append('upload',file);
  const response=await fetch('/file-upload',{method:'POST',body:form});const uploaded=await response.json();report('upload-complete',{files,uploaded});};

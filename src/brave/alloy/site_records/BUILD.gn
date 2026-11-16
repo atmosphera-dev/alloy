@@ -612,6 +612,7 @@ test("alloy_native_grants_unittests") {
     ":profile_adblock_service",
     ":native_profile_preferences",
     "//components/supervised_user/core/browser",
+    "//components/file_access",
     "//brave/browser/brave_shields:brave_shields_impl",
     ":embedded_state",
     "//base/test:test_support",

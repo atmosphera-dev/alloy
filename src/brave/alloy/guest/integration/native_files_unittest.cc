@@ -30,12 +30,14 @@
 #include "content/browser/blob_storage/file_backed_blob_factory_frame_impl.h"
 #include "content/browser/security/cpsp/child_process_security_policy_impl.h"
 #include "content/browser/renderer_host/render_frame_host_impl.h"
+#include "content/browser/renderer_host/data_transfer_util.h"
 #include "content/browser/web_contents/file_chooser_impl.h"
 #include "content/public/test/test_utils.h"
 #include "mojo/public/cpp/bindings/associated_remote.h"
 #include "mojo/public/cpp/system/data_pipe_drainer.h"
 #include "third_party/blink/public/mojom/blob/blob.mojom.h"
 #include "third_party/blink/public/mojom/blob/data_element.mojom.h"
+#include "third_party/blink/public/mojom/drag/drag.mojom.h"
 #include "third_party/blink/public/mojom/file_system_access/file_system_access_data_transfer_token.mojom.h"
 #include "content/public/test/web_contents_tester.h"
 #include "storage/browser/file_system/file_system_context.h"
@@ -176,6 +178,44 @@ TEST_F(GuestNativeFilesTest, NativeSnapshotBlobPreservesDestinationFileAccessChe
   EXPECT_GE(state->reads.load(), 2);
   selected.reset(); content::RunAllTasksUntilIdle(); EXPECT_TRUE(base::PathExists(path));
   blob.reset(); content::RunAllTasksUntilIdle(); EXPECT_FALSE(base::PathExists(path));
+  app->Revoke();
+}
+
+TEST_F(GuestNativeFilesTest, RendererReturnRelayRetainsSnapshotThroughNativeCopiesAndConsumption) {
+  content::WebContentsTester::For(web_contents())->NavigateAndCommit(GURL("https://files.test/"));
+  auto provider = std::make_unique<FileProvider>(); auto* app = provider.get();
+  content::AlloyGuestIntegration::Install(web_contents(), std::move(provider));
+  auto* frame = web_contents()->GetPrimaryMainFrame(); auto cap = Cap::Create(frame, Entry()); ASSERT_TRUE(cap);
+  base::test::TestFuture<std::optional<content::AlloyGuestUploadFiles>> result;
+  content::SnapshotAlloyGuestFiles(frame, {cap}, false, result.GetCallback());
+  auto selected = result.Take(); ASSERT_TRUE(selected); const auto path = selected->files[0].path;
+  auto incoming = blink::mojom::DragData::New();
+  auto item = blink::mojom::DataTransferFile::New(); item->path = path;
+  item->display_name = base::FilePath::FromUTF8Unsafe(cap->metadata().name);
+  item->serialized_blob = content::CreateAlloyGuestUploadBlob(frame, path); ASSERT_TRUE(item->serialized_blob);
+  incoming->items.push_back(blink::mojom::DragItem::NewFile(std::move(item)));
+  auto native = content::DragDataToDropData(*incoming);
+  EXPECT_TRUE(incoming->items[0]->get_file()->serialized_blob->blob.is_valid());
+  auto relay = native; native.filenames.clear(); incoming.reset(); selected.reset();
+  content::RunAllTasksUntilIdle();
+  EXPECT_TRUE(relay.filenames[0].native_file_lifetime);
+  EXPECT_TRUE(base::PathExists(path));
+  if (!base::PathExists(path)) { app->Revoke(); return; }
+  auto* manager = static_cast<content::FileSystemAccessManagerImpl*>(
+      frame->GetStoragePartition()->GetFileSystemAccessEntryFactory());
+  auto received = content::FileInfosToDataTransferFiles(relay.filenames, manager, frame->GetProcess()->GetID().GetUnsafeValue());
+  ASSERT_EQ(received.size(), 1u); ASSERT_TRUE(received[0]->serialized_blob);
+  mojo::Remote<blink::mojom::Blob> blob(std::move(received[0]->serialized_blob->blob));
+  relay.filenames.clear(); content::RunAllTasksUntilIdle();
+  EXPECT_EQ(SnapshotBlobRead().Read(*blob), "abcdef");
+  blob.reset(); received.clear(); content::RunAllTasksUntilIdle();
+  EXPECT_FALSE(base::PathExists(path));
+  auto ordinary = blink::mojom::DragData::New(); auto plain = blink::mojom::DataTransferFile::New();
+  plain->path = base::FilePath("/unopened-path-only-selection");
+  ordinary->items.push_back(blink::mojom::DragItem::NewFile(std::move(plain)));
+  auto fallback = content::DragDataToDropData(*ordinary);
+  ASSERT_EQ(fallback.filenames.size(), 1u); EXPECT_FALSE(fallback.filenames[0].native_file_lifetime);
+  EXPECT_EQ(fallback.filenames[0].path, base::FilePath("/unopened-path-only-selection"));
   app->Revoke();
 }
 

@@ -106,7 +106,12 @@ class Stream final : public AlloyGuestStreamHandler {
     event->SetString("dispatch_us", std::to_string(interaction->GetDispatchTimeUs()));
     event->SetString("outcome", interaction->GetOutcome()); Event("interaction", event);
   }
-  void OnPopup(bool, const CefRect&, uint64_t) override {}
+  void OnPopup(bool visible, const CefRect& bounds, uint64_t generation) override {
+    auto event = CefDictionaryValue::Create(); event->SetBool("visible", visible);
+    event->SetString("generation", std::to_string(generation));
+    event->SetInt("x", bounds.x); event->SetInt("y", bounds.y);
+    event->SetInt("width", bounds.width); event->SetInt("height", bounds.height); Event("popup", event);
+  }
   void OnWindowOpen(CefRefPtr<AlloyGuestPopup> popup, const CefString&, const CefString&,
                     int, bool, const CefRect&) override { popup->Deny(); }
   void OnWindowRetired(uint64_t, const CefString&) override {}
@@ -329,6 +334,11 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     auto event = CefDictionaryValue::Create(); event->SetString("request", std::to_string(request->GetId()));
     event->SetString("text", request->GetText()); event->SetString("html", request->GetHtml());
     event->SetString("link", request->GetLinkUrl()); event->SetInt("allowed", request->GetAllowedOperations());
+    event->SetInt("files", request->GetFileCount());
+    if (request->GetFileCount()) {
+      auto file = request->GetFile(0);
+      if (file) event->SetString("file_name", file->GetName());
+    }
     event->SetString("file_bytes", std::to_string(request->GetFileData()->GetSize()));
     event->SetString("image_bytes", std::to_string(request->GetImagePng()->GetSize())); Event("drag-source", event);
   }

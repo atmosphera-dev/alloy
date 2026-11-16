@@ -51,10 +51,12 @@ class MemoryWriter final : public CefWriteHandler {
 
 struct Actions::Source {
   CefRefPtr<CefBrowser> browser;
+  CefRefPtr<CefDragData> native_handoff;
   bool live = true, starting = true;
   void Finish(int x, int y, int operation) {
     if (!live) return;
     live = false;
+    native_handoff = nullptr;
     if (starting || !browser) return;
     browser->GetHost()->DragSourceEndedAt(x, y,
         static_cast<cef_drag_operations_mask_t>(operation));
@@ -213,6 +215,7 @@ bool Actions::StartDragging(CefRefPtr<CefDragData> drag, int allowed, int x, int
   std::vector<CefString> paths;
   drag->GetFilePaths(paths);
   if (!paths.empty()) {
+    source->native_handoff = drag;
     base::ListValue files;
     for (const auto& path : paths) {
       const auto url = original->GetStoragePartition()->GetFileSystemContext()->CreateCrackedFileSystemURL(

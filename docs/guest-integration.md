@@ -170,6 +170,9 @@ filtering, and native chooser/clipboard/drop messages carry a SerializedBlob.
 Discarding a result or disconnecting the receiver releases that ownership;
 consumed Files adopt the supplied Blob. A later drag does not revoke an already
 delivered File. No path-counted pending selection remains pinned until close.
+Renderer-originated file drags carry that same Blob lifetime back through
+native filtering and the pending source request. Returned bytes/UUIDs never
+replace native selected-capability or path/grant validation.
 Unredeemed paste/drop tokens retain the selected app capability, not snapshot
 backing. Their last clone releases it; redemption still uses native process,
 document and permission checks.

@@ -1,0 +1,60 @@
+--- a/third_party/blink/renderer/core/clipboard/data_object.cc
++++ b/third_party/blink/renderer/core/clipboard/data_object.cc
+@@ -29,6 +29,10 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/clipboard/data_object.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_LINUX)
++#include "base/process/alloy_guest_runtime.h"
++#endif
+ 
+ #include <utility>
+ #include <variant>
+@@ -536,6 +540,12 @@
+                 item_list[i].emplace<WebDragData::FilenameItem>();
+             filename_item.filename = file->GetPath();
+             filename_item.display_name = file->name();
++#if BUILDFLAG(IS_LINUX)
++            // Guest path-backed Files are selected native RAM snapshots. Carry
++            // their existing Blob owner back through the native drag message.
++            if (alloy_guest_is_runtime())
++              filename_item.blob_info = WebBlobInfo(file->GetBlobDataHandle());
++#endif
+           } else if (!file->FileSystemURL().IsEmpty()) {
+             auto& file_system_file_item =
+                 item_list[i].emplace<WebDragData::FileSystemFileItem>();
+--- a/content/browser/renderer_host/data_transfer_util.cc
++++ b/content/browser/renderer_host/data_transfer_util.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/renderer_host/data_transfer_util.h"
++#include "base/task/bind_post_task.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "third_party/blink/public/mojom/blob/blob.mojom.h"
+ #include "build/build_config.h"
+ #if BUILDFLAG(IS_LINUX)
+ #include "base/process/alloy_guest_runtime.h"
+@@ -442,6 +446,20 @@
+         const blink::mojom::DataTransferFilePtr& file_item = item->get_file();
+         // TODO(varunjain): This only works on chromeos. Support win/mac/gtk.
+         result.filenames.emplace_back(file_item->path, file_item->display_name);
++        if (file_item->serialized_blob && file_item->serialized_blob->blob.is_valid()) {
++          // The renderer-provided Blob is a lifetime carrier, not authority for
++          // bytes or grants. StartDragging still filters paths with CanReadFile;
++          // destination delivery resolves the existing selected capability.
++          mojo::Remote<blink::mojom::Blob> incoming(std::move(file_item->serialized_blob->blob));
++          mojo::PendingRemote<blink::mojom::Blob> held;
++          incoming->Clone(held.InitWithNewPipeAndPassReceiver());
++          file_item->serialized_blob->blob = incoming.Unbind();
++          auto release = base::BindPostTask(GetUIThreadTaskRunner({}), base::BindOnce(
++              [](mojo::Remote<blink::mojom::Blob>) {}, mojo::Remote<blink::mojom::Blob>(std::move(held))));
++          result.filenames.back().native_file_lifetime =
++              base::MakeRefCounted<base::RefCountedData<base::ScopedClosureRunner>>(
++                  base::ScopedClosureRunner(std::move(release)));
++        }
+         break;
+       }
+       case blink::mojom::DragItemDataView::Tag::kFileSystemFile: {

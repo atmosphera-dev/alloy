@@ -491,12 +491,14 @@ def popup_drag_retirement(client, base):
     client.action(op='drag-enter', x=x, y=y, allowed=1, modifiers=0, text='old-popup-drag', html='')
     client.action(op='drag-over', x=x, y=y, allowed=1, modifiers=0); client.drag_effect(1, after)
     after = len(client.events); client.click(page['rectangles']['popup'])
-    client.wait('configured', after=after)
+    opened = client.wait('popup', lambda value: value['visible'] and value['width'] > 0 and value['height'] > 0,
+                         after=after)
     after = len(client.events)
     client.action(op='key', type='rawdown', key=27, native=9, modifiers=0, character=0)
-    # Closing the native popup changes the geometry lease. Observe that native
-    # barrier before releasing the key against the replacement generation.
-    client.wait('configured', after=after)
+    # Size changes also emit configured. Only the typed visibility callback
+    # proves closure before releasing the key and starting a replacement drag.
+    closed = client.wait('popup', lambda value: not value['visible'] and
+                         int(value['generation']) > int(opened['generation']), after=after)
     client.action(op='key', type='up', key=27, native=9, modifiers=0, character=0)
     stale = client.action(outcome='rejected:invalid', op='drag-drop', x=x, y=y, modifiers=0)
     assert stale['outcome'] != 'accepted', stale
@@ -506,7 +508,8 @@ def popup_drag_retirement(client, base):
     client.action(op='drag-over', x=x, y=y, allowed=1, modifiers=0); client.drag_effect(1, after)
     client.action(op='drag-drop', x=x, y=y, modifiers=0)
     assert client.title('drop', after)['dropText'] == 'new-popup-drag'
-    return dict(popup_geometry_retires_drag=True, stale_drop_refused=True, fresh_drag_delivered=True)
+    return dict(popup_geometry_retires_drag=True, stale_drop_refused=True, fresh_drag_delivered=True,
+                popup_open_generation=opened['generation'], popup_closed_generation=closed['generation'])
 
 
 def drags(client, base):
@@ -1051,6 +1054,26 @@ def file_input_drop_after_new_drag(client, base):
     return dict(native_file_input_drop=True, later_drag_did_not_revoke_file=True, exact_retained_bytes=True)
 
 
+def renderer_file_source_handoff(client, base):
+    page = client.page(base, 'files.html?retainDrop=1'); client.action(op='focus', focused=True)
+    after = len(client.events); client.click(page['rectangles']['upload'])
+    assert client.title('upload-retained', after)['count'] == 1
+    source = page['rectangles']['fileDrop']
+    sx, sy = round(source['x'] + source['width'] / 2), round(source['y'] + source['height'] / 2)
+    after = len(client.events)
+    client.action(op='pointer', action='down', x=sx, y=sy, button=0, clicks=1, modifiers=16)
+    for delta in (5, 15, 30):
+        client.action(op='pointer', action='move', x=sx+delta, y=sy+delta, button=0, clicks=0, modifiers=16)
+    request = client.wait('drag-source', after=after)
+    client.title('file-source-selection-cleared', after)
+    assert request['files'] == 1 and request['file_name'] == 'selected.txt', request
+    assert request['text'] == 'native-file-source', request
+    assert client.command(op='drag-finish', request=request['request'], x=sx+30, y=sy+30, operation=1)['ok']
+    client.action(op='pointer', action='up', x=sx+30, y=sy+30, button=0, clicks=1, modifiers=0)
+    client.title('file-source-ended', after)
+    return dict(real_renderer_file_drag=True, input_selection_cleared=True, typed_file_preserved=True, native_source_completed=True)
+
+
 def file_outcomes(out, evidence, base, server, results):
     for name, check in file_checks(base, server):
         results.append(case(out, evidence, name, check))
@@ -1058,6 +1081,8 @@ def file_outcomes(out, evidence, base, server, results):
                         lambda client: file_handles(client, base), mode='stateless'))
     results.append(case(out, evidence, 'native-file-input-drop-retained-across-drag',
                         lambda client: file_input_drop_after_new_drag(client, base)))
+    results.append(case(out, evidence, 'native-renderer-file-source-handoff',
+                        lambda client: renderer_file_source_handoff(client, base)))
     def removed_child(client):
         page = client.page(base, 'files.html'); client.action(op='focus', focused=True)
         after = len(client.events); client.click(page['rectangles']['recursive'])

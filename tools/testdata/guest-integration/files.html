@@ -54,6 +54,11 @@ action('locks',async()=>{[fileHandle]=await showOpenFilePicker();const writer=aw
  }finally{await writer.abort();}});
 fileDrop.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='copy';};
 fileDrop.ondrop=async event=>{event.preventDefault();const files=[];for(const file of event.dataTransfer.files)files.push(await contents(file));report('file-drop',{files});};
+fileDrop.draggable=true;
+fileDrop.ondragstart=event=>{if(!retainedUpload){event.preventDefault();return;}
+ event.dataTransfer.items.add(retainedUpload);event.dataTransfer.setData('text/plain','native-file-source');
+ event.dataTransfer.effectAllowed='copy';retainedUpload=undefined;upload.value='';report('file-source-selection-cleared');};
+fileDrop.ondragend=()=>report('file-source-ended');
 filePaste.onpaste=async event=>{event.preventDefault();const files=[];for(const file of event.clipboardData.files)files.push(await contents(file));report('file-paste',{files});};
 for(const id of ['upload','uploadDirectory','uploadMultiple'])document.getElementById(id).onchange=async event=>{
  if(new URLSearchParams(location.search).has('retainDrop')){retainedUpload=event.target.files[0];report('upload-retained',{count:event.target.files.length});return;}

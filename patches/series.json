@@ -1154,6 +1154,11 @@
       "stage": "after-prune"
     },
     {
+      "patch": "chromium/0167-guest-native-drag-return.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
       "patch": "chromium/0168-guest-downloads.patch",
       "root": ".",
       "stage": "after-prune"

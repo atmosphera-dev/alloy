@@ -828,6 +828,8 @@ def file_data_handle_retirement(client, base, route):
 
 def file_locks(client, base):
     page = client.page(base, 'files.html'); client.action(op='focus', focused=True)
+    after = len(client.events); client.click(page['rectangles']['open'])
+    client.title('file-read', after)
     after = len(client.events); client.click(page['rectangles']['locks'])
     result = client.title('locks-complete', after)
     assert result['child'] == result['parent'] == 'NoModificationAllowedError' and result['siblingRemoved'], result

@@ -46,7 +46,9 @@ action('share',async()=>{if(!sharedReady)throw new Error('child not ready');peer
 action('change',async()=>{peer.src='/files-child.html?replacement=1';});
 action('download',async()=>{const a=document.createElement('a');const marker=new URLSearchParams(location.search).get('downloadCase');
  a.href='/file-download.bin'+(marker?'?case='+encodeURIComponent(marker):'');a.download='download.bin';a.click();report('download-started');});
-action('locks',async()=>{[fileHandle]=await showOpenFilePicker();const writer=await fileHandle.createWritable();
+// Selection and the new write permission use distinct gestures, rather than
+// racing the picker's activation reconciliation against createWritable.
+action('locks',async()=>{const writer=await fileHandle.createWritable();
  try{const root=await showDirectoryPicker({mode:'readwrite'});let child='',parent='';
   try{await root.removeEntry('selected.txt');}catch(e){child=e.name;}
   try{await root.remove({recursive:true});}catch(e){parent=e.name;}

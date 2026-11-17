@@ -54,7 +54,8 @@ int alloy_lock_scratch_valid(void) {
   }
   return fd >= 0 && !fstat(fd, &st) && !fstatfs(fd, &fs) &&
       S_ISDIR(st.st_mode) && st.st_uid == getuid() && st.st_nlink > 0 &&
-      (st.st_mode & 0777) == 0700 && fs.f_type == TMPFS_MAGIC && fs.f_bavail > 0;
+      (st.st_mode & 0777) == 0700 && fs.f_type == TMPFS_MAGIC && fs.f_bavail > 0 &&
+      (!fs.f_files || fs.f_ffree > 0);
 }
 
 int alloy_lock_prepare_scratch(void) {
@@ -106,7 +107,16 @@ static void remove_children(int fd) {
     struct stat st;
     if (fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
     if (S_ISDIR(st.st_mode)) {
-      int child = openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      // O_PATH pins even a mode-000 directory without following symlinks.
+      // Restore access through that pin, never through the mutable entry name.
+      int pin = openat(fd, entry->d_name, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (pin < 0) continue;
+      char path[64];
+      snprintf(path, sizeof(path), "/proc/self/fd/%d", pin);
+      int child = -1;
+      if (!chmod(path, 0700))
+        child = openat(pin, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      close(pin);
       if (child >= 0) {
         remove_children(child);
         close(child);

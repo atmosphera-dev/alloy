@@ -6,9 +6,10 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guest_lock_probe import inventory, inventory_equal, protected, role_of
+from guest_lock_probe import bus_calls, inventory, inventory_equal, protected, role_of, wait_bus_output
 
 
 class LockReceipts(unittest.TestCase):
@@ -37,6 +38,29 @@ class LockReceipts(unittest.TestCase):
         self.assertEqual(role_of(dict(argv='engine --type=renderer --x=y')), 'renderer')
         self.assertEqual(role_of(dict(argv='host --alloy-supervisor')), 'supervisor')
         self.assertEqual(role_of(dict(argv='engine')), 'browser')
+
+    def test_bus_count_excludes_only_explicit_control_senders(self):
+        text = ('method call sender=:1.1 member=ListNames\n'
+                'method call sender=:1.10 member=Unexpected\n')
+        self.assertEqual(bus_calls(text, {':1.1'}), ['method call sender=:1.10 member=Unexpected'])
+
+    def test_bus_observation_waits_for_marker_after_delayed_guest_call(self):
+        path = Mock()
+        path.read_text.side_effect = ['', 'method call sender=:1.9 member=Unexpected\n',
+                                     'method call sender=:1.9 member=Unexpected\nBARRIER\n']
+        monitor = Mock()
+        monitor.poll.return_value = None
+        with patch('guest_lock_probe.time.sleep'):
+            text = wait_bus_output(path, monitor, lambda value: 'BARRIER\n' in value)
+        self.assertEqual(len(bus_calls(text, set())), 1)
+        self.assertEqual(path.read_text.call_count, 3)
+
+    def test_bus_observation_rejects_monitor_exit_before_barrier(self):
+        path, monitor = Mock(), Mock()
+        path.read_text.return_value = ''
+        monitor.poll.return_value = 1
+        with self.assertRaisesRegex(AssertionError, 'monitor exited'):
+            wait_bus_output(path, monitor, lambda value: 'BARRIER\n' in value)
 
 
 if __name__ == '__main__':

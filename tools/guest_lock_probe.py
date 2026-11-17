@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import socket
@@ -425,15 +426,17 @@ def mode_and_app(out, evidence, fixtures):
     return rows
 
 
-def pressure(out, evidence, fixtures):
+def pressure(out, evidence, fixtures, *, inodes=False):
     # A private mount namespace bounds the pressure fixture to a new 128 MiB
     # tmpfs. Never fill the task VM's shared /dev/shm or its disk workspace.
+    options = 'size=128m,mode=1777' + (',nr_inodes=4096' if inodes else '')
     script = ('mount --make-rprivate /\n'
-              'mount -t tmpfs -o size=128m,mode=1777 tmpfs /dev/shm\n'
+              'mount -t tmpfs -o ' + options + ' tmpfs /dev/shm\n'
               'exec sudo -n -u builder env -i PATH=/usr/bin:/bin HOME=/home/builder '
               'TMPDIR=/home/builder/work/tmp LD_LIBRARY_PATH="' + str(out) + '" "$@"')
     prefix = ['sudo', '-n', 'unshare', '--mount', '--fork', 'bash', '-euc', script, '--']
-    with Client(out, evidence / 'pressure', launch_prefix=prefix) as client:
+    kind = 'inodes' if inodes else 'blocks'
+    with Client(out, evidence / ('pressure-' + kind), launch_prefix=prefix) as client:
         report = client.start(required='data-writes-denied')
         protected(report)
         client.active()
@@ -445,20 +448,59 @@ import errno,json,os,sys
 p='/proc/'+sys.argv[1]+'/fd/'+sys.argv[2]
 assert os.stat(p).st_dev != os.stat('/dev/shm').st_dev
 assert os.statvfs(p).f_blocks*os.statvfs(p).f_frsize <= 128*1024*1024
-fd=os.open(p+'/pressure-fixture',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+root=os.open(p,os.O_RDONLY|os.O_DIRECTORY)
 total=0
 try:
-    while True: total+=os.write(fd,b'X'*(1024*1024))
+    if sys.argv[3]=='inodes':
+        while True:
+            fd=os.open('pressure-'+str(total),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=root)
+            os.close(fd)
+            total+=1
+    else:
+        fd=os.open('pressure-fixture',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=root)
+        try:
+            while True: total+=os.write(fd,b'X'*(1024*1024))
+        finally: os.close(fd)
 except OSError as e:
     assert e.errno==errno.ENOSPC,e
-finally: os.close(fd)
-print(json.dumps(dict(bytes=total,error='ENOSPC')))
+    if sys.argv[3]=='inodes': assert os.fstatvfs(root).f_bavail>0
+finally: os.close(root)
+print(json.dumps(dict(amount=total,resource=sys.argv[3],error='ENOSPC')))
 '''
-            filled = json.loads(run(['sudo', '-n', 'python3', '-c', code, pid, fd], capture_output=True).stdout)
+            filled = json.loads(run(['sudo', '-n', 'python3', '-c', code, pid, fd, kind], capture_output=True).stdout)
             client.closed(reason='failed')
             members.exited()
         client.finish()
-    return [dict(case='private-tmpfs-ENOSPC-ends-session-without-disk-fallback', report=report, fill=filled)]
+    return [dict(case='private-tmpfs-' + kind + '-ENOSPC-ends-session-without-disk-fallback', report=report, fill=filled)]
+
+
+def wait_bus_output(path, monitor, predicate):
+    deadline = time.monotonic() + 10
+    while True:
+        text = path.read_text()
+        if predicate(text):
+            return text
+        assert monitor.poll() is None, 'D-Bus monitor exited before observation completed'
+        assert time.monotonic() < deadline, 'D-Bus observation barrier timed out'
+        time.sleep(0.01)
+
+
+def bus_calls(text, controls):
+    return [line for line in text.splitlines() if line.startswith('method call ') and
+            not any('sender=' + sender + ' ' in line for sender in controls)]
+
+
+def bus_barrier(address, path, monitor):
+    reply = run(['dbus-send', '--bus=' + address, '--dest=org.freedesktop.DBus', '--print-reply',
+                 '/org/freedesktop/DBus', 'org.freedesktop.DBus.ListNames'], capture_output=True).stdout
+    sender = re.search(r'destination=(:[0-9]+\.[0-9]+)', reply).group(1)
+    # Finished guest processes must have no live bus connections whose queued
+    # traffic could arrive after the marker. BecomeMonitor relinquishes its name.
+    assert set(re.findall(r'string "([^"]+)"', reply)) == {sender, 'org.freedesktop.DBus'}, reply
+    text = wait_bus_output(path, monitor, lambda text: any(
+        'sender=' + sender + ' ' in line and 'member=ListNames' in line
+        for line in text.splitlines() if line.endswith('member=ListNames')))
+    return sender, text
 
 
 def native_writers(out, evidence, fixtures):
@@ -478,13 +520,11 @@ def native_writers(out, evidence, fixtures):
             assert daemon.stdout.readline().strip().startswith(address)
             monitor = subprocess.Popen(['stdbuf', '-oL', 'dbus-monitor', '--address', address,
                 "type='method_call'"], stdout=monitor_log, stderr=daemon_log)
-            time.sleep(0.5)
-            assert monitor.poll() is None
-            run(['dbus-send', '--bus=' + address, '--dest=org.freedesktop.DBus', '--print-reply',
-                 '/org/freedesktop/DBus', 'org.freedesktop.DBus.ListNames'], capture_output=True)
-            time.sleep(0.5)
-            before = bus_log.read_text().count('method call ')
-            assert before > 0, 'Positive service-double control was not observed'
+            wait_bus_output(bus_log, monitor, lambda text: 'member=NameLost\n' in text)
+            first_control, observed = bus_barrier(address, bus_log, monitor)
+            before = bus_calls(observed, {first_control})
+            positive_controls = len(bus_calls(observed, set())) - len(before)
+            assert positive_controls > 0, 'Positive service-double control was not observed'
             env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=address, DBUS_SYSTEM_BUS_ADDRESS=address)
             with log.open('x') as stream:
                 run([executable, '/usr/bin/python3', REPO / 'tools/testdata/guest-lock/native_writers.py'],
@@ -498,8 +538,8 @@ def native_writers(out, evidence, fixtures):
                 client.send('close guest')
                 client.closed()
                 client.finish()
-            time.sleep(0.5)
-            assert bus_log.read_text().count('method call ') == before, bus_log
+            final_control, observed = bus_barrier(address, bus_log, monitor)
+            assert bus_calls(observed, {first_control, final_control}) == before, bus_log
         finally:
             if monitor is not None:
                 monitor.terminate()
@@ -511,7 +551,7 @@ def native_writers(out, evidence, fixtures):
               if line.startswith('GUEST_NATIVE_WRITERS ')]
     assert len(marker) == 1, log
     return [dict(case='native-fontconfig-NSS-memory-GSettings-and-no-ambient-bus-calls',
-                 consumer=json.loads(marker[0]), bus_positive_controls=before, guest_bus_calls=0)]
+                  consumer=json.loads(marker[0]), bus_positive_controls=positive_controls, guest_bus_calls=0)]
 
 
 def package_proof(out, evidence, fixtures):
@@ -611,6 +651,7 @@ def main():
                 result['cases'] += lifecycle(out, evidence, fixtures)
                 result['cases'] += mode_and_app(out, evidence, fixtures)
                 result['cases'] += pressure(out, evidence, fixtures)
+                result['cases'] += pressure(out, evidence, fixtures, inodes=True)
             if args.check in ('all', 'package'):
                 result['cases'] += package_proof(out, evidence, fixtures)
         result['status'] = 'passed'

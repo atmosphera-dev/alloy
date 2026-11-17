@@ -170,6 +170,51 @@ TEST_F(LinuxLockTest, VerifiedRamWritesAndNativePaths) {
   }), 0);
 }
 
+TEST_F(LinuxLockTest, RemovesUnreadableChildrenWithoutFollowingSymlinks) {
+  struct stat before;
+  ASSERT_EQ(stat(disk_.GetPath().value().c_str(), &before), 0);
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+  if (!pid) {
+    if (!alloy_lock_prepare_scratch()) _exit(10);
+    int root = alloy_lock_scratch_fd();
+    char alias[64], path[PATH_MAX];
+    snprintf(alias, sizeof(alias), "/proc/self/fd/%d", root);
+    ssize_t count = readlink(alias, path, sizeof(path) - 1);
+    if (count <= 0) _exit(11);
+    path[count] = 0;
+    if (mkdirat(root, "blocked", 0700)) _exit(12);
+    int child = openat(root, "blocked", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (child < 0 || mkdirat(child, "nested", 0700)) _exit(12);
+    int nested = openat(child, "nested", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (nested < 0) _exit(12);
+    int data = openat(nested, "data", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (data < 0) _exit(12);
+    close(data);
+    if (symlinkat(disk_.GetPath().value().c_str(), child, "outside") ||
+        symlinkat(disk_.GetPath().value().c_str(), root, "outside") ||
+        fchmod(nested, 0000) || fchmod(child, 0000)) _exit(12);
+    alloy_lock_remove_scratch();
+    bool removed = access(path, F_OK) && errno == ENOENT;
+    // Bound fixture leftovers even on the failing implementation.
+    if (!removed) {
+      if (fchmod(child, 0700) || fchmod(nested, 0700)) _exit(14);
+      if (!base::DeletePathRecursively(base::FilePath(path))) _exit(14);
+    }
+    close(nested);
+    close(child);
+    _exit(removed ? 0 : 13);
+  }
+  int status;
+  ASSERT_EQ(waitpid(pid, &status, 0), pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  struct stat after;
+  ASSERT_EQ(stat(disk_.GetPath().value().c_str(), &after), 0);
+  EXPECT_EQ(after.st_mode, before.st_mode);
+  EXPECT_TRUE(Unchanged());
+}
+
 TEST_F(LinuxLockTest, DeniesDurableWritesAndBothTruncateForms) {
   EXPECT_EQ(Run([this] {
     int fd = open(sentinel_.c_str(), O_WRONLY | O_CLOEXEC);

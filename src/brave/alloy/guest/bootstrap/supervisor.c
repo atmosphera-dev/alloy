@@ -5,6 +5,8 @@
 #endif
 #include "base/process/alloy_guest_runtime.h"
 #include "brave/alloy/guest/protocol/wire.h"
+#include "brave/alloy/guest/linux_lock/protection.h"
+#include "brave/alloy/guest/linux_lock/child_launch.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,7 +37,8 @@ struct members {
 
 static void reap(void) {
   for (;;) {
-    pid_t process = waitpid(-1, NULL, WNOHANG);
+    int status = 0;
+    pid_t process = waitpid(-1, &status, WNOHANG);
     if (process > 0 || (process < 0 && errno == EINTR))
       continue;
     break;
@@ -248,9 +251,7 @@ static int flush_forward(int to, struct forwarding* forward) {
   return 1;
 }
 
-int alloy_guest_supervise(const char* bootstrap) {
-  if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0))
-    return 125;
+static int supervise_prepared(const char* bootstrap) {
   int registration[2], browser_control[2];
   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, registration) ||
       socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, browser_control))
@@ -260,20 +261,18 @@ int alloy_guest_supervise(const char* bootstrap) {
                  &enabled, sizeof(enabled)))
     return 125;
   posix_spawn_file_actions_t actions;
-  if (posix_spawn_file_actions_init(&actions))
+  const struct alloy_lock_fd_map maps[] = {
+      {registration[1], ALLOY_GUEST_REGISTRATION_FD},
+      {browser_control[1], ALLOY_GUEST_CONTROL_FD},
+      {ALLOY_GUEST_RESOURCE_FD, ALLOY_GUEST_RESOURCE_FD}};
+  int copies[3];
+  if (!alloy_lock_spawn_actions(&actions, maps, 3, copies))
     return 125;
-  int setup = posix_spawn_file_actions_adddup2(&actions, registration[1],
-                                               ALLOY_GUEST_REGISTRATION_FD) ||
-              posix_spawn_file_actions_adddup2(&actions, browser_control[1],
-                                               ALLOY_GUEST_CONTROL_FD);
-  if (!setup)
-    setup = posix_spawn_file_actions_adddup2(&actions, ALLOY_GUEST_RESOURCE_FD,
-                                            ALLOY_GUEST_RESOURCE_FD);
   char* arguments[] = {(char*)bootstrap, NULL};
   pid_t browser = -1;
-  int launched = setup ? -1 : posix_spawn(&browser, bootstrap, &actions,
-                                         NULL, arguments, environ);
-  posix_spawn_file_actions_destroy(&actions);
+  int launched = posix_spawn(&browser, bootstrap, &actions,
+                             NULL, arguments, environ);
+  alloy_lock_spawn_actions_destroy(&actions, 3, copies);
   close(registration[1]);
   close(browser_control[1]);
   close(ALLOY_GUEST_RESOURCE_FD);
@@ -295,6 +294,9 @@ int alloy_guest_supervise(const char* bootstrap) {
   int browser_eof = 0;
   int result = 0;
   for (;;) {
+    reap();
+    if (!alloy_lock_scratch_valid())
+      break;
     struct pollfd events[] = {
         {ALLOY_GUEST_CONTROL_FD, (short)((to_browser.count ? 0 : POLLIN) |
                                          (to_app.count ? POLLOUT : 0)), 0},
@@ -303,7 +305,7 @@ int alloy_guest_supervise(const char* bootstrap) {
                                       (to_browser.count ? POLLOUT : 0)), 0},
         {registration[0], POLLIN, 0},
         {browser_dead ? -1 : browser_pidfd, POLLIN, 0}};
-    int observed = poll(events, 4, -1);
+    int observed = poll(events, 4, 100);
     if (observed < 0 && errno == EINTR)
       continue;
     if (observed < 0)
@@ -342,10 +344,8 @@ int alloy_guest_supervise(const char* bootstrap) {
       close(registration[0]);
       registration[0] = -1;
     }
-    if (registration[0] >= 0 && events[2].revents) {
-      if (!admit(registration[0], &members))
-        break;
-    }
+    if (registration[0] >= 0 && events[2].revents && !admit(registration[0], &members))
+      break;
     if (browser_dead && browser_eof && !to_app.count)
       break;
     for (size_t i = 0; i < members.count;) {
@@ -373,5 +373,14 @@ int alloy_guest_supervise(const char* bootstrap) {
   close(browser_pidfd);
   reap();
   close(ALLOY_GUEST_CONTROL_FD);
+  return result;
+}
+
+int alloy_guest_supervise(const char* bootstrap) {
+  if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) return 125;
+  int result = alloy_lock_prepare_scratch() ? supervise_prepared(bootstrap) : 125;
+  // One owner cleans all preparation and launch failures, not just the normal
+  // loop exit. The remover checks the descriptor's exact current RAM identity.
+  alloy_lock_remove_scratch();
   return result;
 }

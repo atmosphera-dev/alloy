@@ -111,6 +111,8 @@ def foundation(out, evidence, fixtures):
     subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-I', str(REPO / 'src'), '-I', str(WORK / 'src'),
                     str(REPO / 'tools/guest_test_support/registration_exit.c'),
+                    *[str(REPO / 'src/brave/alloy/guest/linux_lock' / (leaf + '.c'))
+                      for leaf in ('ram_scratch', 'child_launch')],
                     '-o', str(registration)], check=True)
     with (evidence / 'registration-exit.log').open('x') as log:
         subprocess.run([str(registration)], stdout=log, stderr=subprocess.STDOUT,
@@ -276,7 +278,7 @@ def foundation(out, evidence, fixtures):
             processes.close()
     with Client(out, evidence / 'lifecycle') as client:
         report = client.start(policy='manual')
-        assert report['filesystem'] == 'unavailable' and report['stream_available']
+        assert report['filesystem'] == 'data-writes-denied' and report['stream_available']
         assert not report['extensions_unavailable']
         client.send('create guest ' + fixtures.base + '/title/NOT_ADMITTED')
         assert not client.wait('guest', 'create-queued')['ok']
@@ -298,7 +300,7 @@ def foundation(out, evidence, fixtures):
                      'page': page, 'processes_exited': processes,
                      'callback_threads': list(callback_threads)})
     for policy, required, reason in (('refuse', 'unavailable', 'closed'),
-                                     ('auto', 'data-writes-denied', 'refused'),
+                                     ('auto', 'read-only-view', 'refused'),
                                      ('queue-close', 'unavailable', 'closed')):
         with Client(out, evidence / ('admission-' + policy + '-' + required)) as client:
             client.start(policy=policy, required=required)

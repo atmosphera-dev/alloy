@@ -17,6 +17,11 @@ _implementation = [
   "stream/interaction.h", "stream/interaction.cc", "stream/popup.h", "stream/popup.cc",
   "protocol/session.cc", "protocol/session.h", "protocol/wire.h",
   "providers.cc", "providers.h", "linux_lock/provider.cc", "stream/provider.cc",
+  "linux_lock/protection.h", "linux_lock/ram_scratch.c",
+  "linux_lock/writer_paths.c", "linux_lock/landlock.c",
+  "linux_lock/child_launch.c", "linux_lock/child_launch.h",
+  "linux_lock/linux_uapi.h",
+  "linux_lock/protection.cc", "linux_lock/sandbox_preflight.h",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
   "accessibility/tree_stream.h", "accessibility/tree_stream.cc",
   "accessibility/model.h", "accessibility/model.cc",
@@ -131,6 +136,8 @@ _implementation = [
   "//cef/libcef/browser/chrome/chrome_web_contents_view_delegate_cef.cc",
   "//cef/libcef/browser/chrome/extensions/chrome_mime_handler_view_guest_delegate_cef.cc",
   "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h",
+  "//base/process/launch_posix.cc",
+  "//content/browser/zygote_host/zygote_host_impl_linux.cc",
   "//cef/include/alloy/alloy_guest_session.h",
   "//cef/include/alloy/alloy_guest_protection.h",
   "//cef/include/alloy/alloy_guest_stream.h",
@@ -167,6 +174,10 @@ action("alloy_guest_host") {
   testonly = true
   script = "bootstrap/build_bootstrap.py"
   inputs = [ "bootstrap/main.c", "bootstrap/supervisor.c", "protocol/wire.h",
+             "linux_lock/protection.h", "linux_lock/ram_scratch.c",
+             "linux_lock/writer_paths.c", "linux_lock/landlock.c",
+             "linux_lock/child_launch.c", "linux_lock/child_launch.h",
+             "linux_lock/linux_uapi.h",
              "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h" ]
   outputs = [ "$root_out_dir/alloy_guest_host" ]
   args = [ "--root", rebase_path("//", root_build_dir),

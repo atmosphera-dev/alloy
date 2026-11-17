@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #endif
 #include "base/process/alloy_guest_runtime.h"
+#include "brave/alloy/guest/linux_lock/protection.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -24,6 +25,8 @@
 int alloy_guest_supervise(const char* bootstrap);
 
 static int granted(int fd, int supervisor, int child) {
+  if (alloy_lock_preserves(fd))
+    return 1;
   if (fd == ALLOY_GUEST_REGISTRATION_FD)
     return !supervisor;
   if (fd == ALLOY_GUEST_CONTROL_FD)
@@ -81,8 +84,10 @@ static int sanitize_environment(void) {
   const char* names[] = {"PATH", "LANG", "HOME", "TMPDIR", "XDG_CONFIG_HOME",
       "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
       "ALLOY_GUEST_RUNTIME", "ALLOY_GUEST_BOOTSTRAP", "GSETTINGS_BACKEND",
-      "GIO_USE_VFS", "DBUS_SESSION_BUS_ADDRESS", "NO_AT_BRIDGE",
-      "MESA_SHADER_CACHE_DISABLE", "__GL_SHADER_DISK_CACHE",
+      "GIO_USE_VFS", "DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS", "NO_AT_BRIDGE",
+       "MESA_SHADER_CACHE_DISABLE", "__GL_SHADER_DISK_CACHE",
+      "ALLOY_GUEST_SCRATCH_FD", "ALLOY_GUEST_LOCK_ABI", "ALLOY_GUEST_CEF_ROOT",
+      "FONTCONFIG_FILE", "ALLOY_GUEST_PRESERVE_FDS",
       // Chromium's namespace_sandbox.cc sets these on its child launch. They
       // preserve its native boot/sandbox handshake, not app-supplied authority.
       // The initial app -> supervisor allowlist never copies them from the app.
@@ -107,6 +112,7 @@ static int sanitize_environment(void) {
 }
 
 int main(int argc, char** argv) {
+  unsigned int inherited_nnp = (unsigned int)prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
   int supervisor = argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0;
   int child = 0;
   for (int i = 1; i < argc; ++i) {
@@ -143,9 +149,17 @@ int main(int argc, char** argv) {
   // This is supplementary to the liveness channel, never its replacement.
   if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() == 1)
     return 125;
+  // Ordinary entries inherit both the kernel domain and managed writer paths.
+  // Only initial/external entries borrow the supervisor's RAM setup descriptor.
+  // Landlock itself pins its grant; keeping an open directory in the engine
+  // would bypass Chromium's chroot and fail its mandatory open-directory check.
+  int needs_setup = !getenv("ALLOY_GUEST_LOCK_ABI");
+  if ((needs_setup && (!alloy_lock_writer_paths() || !alloy_lock_enforce())) ||
+      !alloy_lock_drop_setup_capability())
+    return 125;
   struct alloy_guest_bootstrap_facts facts = {
       ALLOY_GUEST_FACTS_MAGIC, getpid(), 1, 1,
-      (unsigned int)prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), !child};
+      inherited_nnp, !child};
   int facts_fd = (int)syscall(SYS_memfd_create, "alloy-bootstrap", MFD_ALLOW_SEALING);
   if (facts_fd < 0 || write(facts_fd, &facts, sizeof(facts)) != sizeof(facts) ||
       fcntl(facts_fd, F_ADD_SEALS,

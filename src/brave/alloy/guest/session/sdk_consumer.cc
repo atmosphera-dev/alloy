@@ -17,6 +17,8 @@
 #include <memory>
 #include <mutex>
 #include <poll.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -72,8 +74,10 @@ class Guest final : public AlloyGuestSessionHandler,
     Event(name_, "prepared", ",\"id\":" + Quote(session->GetId().ToString()) +
           ",\"filesystem\":" + Quote(protection->GetFilesystem().ToString()) +
           ",\"coverage\":" + Quote(protection->GetProcessCoverage().ToString()) +
-           ",\"scratch\":" + Quote(protection->GetScratchBacking().ToString()) +
-          ",\"stream_available\":" + (capabilities->IsAvailable("stream") ? "true" : "false") +
+            ",\"scratch\":" + Quote(protection->GetScratchBacking().ToString()) +
+           ",\"stream_available\":" + (capabilities->IsAvailable("stream") ? "true" : "false") +
+           ",\"sandbox\":" + Quote(protection->GetSandbox().ToString()) +
+           ",\"limits\":" + Quote(protection->GetLimits().ToString()) +
            ",\"extensions_unavailable\":" + (unavailable ? "true" : "false"));
     if (policy_ == "refuse")
       session->Close();
@@ -226,6 +230,26 @@ class App final : public CefApp, public CefBrowserProcessHandler {
  private:
   IMPLEMENT_REFCOUNTING(App);
 };
+class EncryptedReady final : public AlloyRequestContextCallback {
+ public:
+  void OnComplete(alloy_site_settings_result_t result,
+                  CefRefPtr<CefRequestContext> context) override {
+    context_ = result == ALLOY_SETTINGS_OK ? context : nullptr;
+    done_ = true;
+  }
+  bool done_ = false;
+  CefRefPtr<CefRequestContext> context_;
+ private:
+  IMPLEMENT_REFCOUNTING(EncryptedReady);
+};
+class Locked final : public AlloyProfileLockCallback {
+ public:
+  void OnComplete(alloy_site_settings_result_t result) override {
+    Event("app", "locked", ",\"ok\":" + std::string(result == ALLOY_SETTINGS_OK ? "true" : "false"));
+  }
+ private:
+  IMPLEMENT_REFCOUNTING(Locked);
+};
 class AppView final : public CefClient, public CefRenderHandler,
                       public CefDisplayHandler, public CefLifeSpanHandler {
  public:
@@ -254,6 +278,19 @@ int main(int argc, char** argv) {
   if (child >= 0)
     return child;
   std::vector<int> reserved;
+  void* inherited_mapping = MAP_FAILED;
+  size_t inherited_mapping_size = 0;
+  if (const char* path = getenv("ALLOY_FIXTURE_DISK_CAPABILITY")) {
+    int fd = open(path, O_RDWR);  // Deliberately inheritable admission fixture.
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) || st.st_size <= 0) return 1;
+    inherited_mapping_size = st.st_size;
+    inherited_mapping = mmap(nullptr, inherited_mapping_size,
+        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (inherited_mapping == MAP_FAILED) return 1;
+    reserved.push_back(fd);
+    Event("driver", "inherited-capability", ",\"fd\":" + std::to_string(fd));
+  }
   if (const char* ceiling = getenv("ALLOY_FIXTURE_FD_CEILING")) {
     int last = -1;
     while (last < std::stoi(ceiling)) {
@@ -263,7 +300,9 @@ int main(int argc, char** argv) {
     }
     Event("driver", "descriptor-ceiling", ",\"last\":" + std::to_string(last));
   }
-  bool flexible = argc == 3 && std::string(argv[1]) == "--flexible";
+  bool encrypted = argc == 3 && std::string(argv[1]) == "--flexible-encrypted";
+  bool flexible = encrypted || (argc == 3 && std::string(argv[1]) == "--flexible");
+  CefRefPtr<AlloyProfile> app_profile;
   CefRefPtr<CefRequestContext> app_context;
   CefRefPtr<CefBrowser> app_browser;
   CefRefPtr<AppView> app_view;
@@ -272,11 +311,25 @@ int main(int argc, char** argv) {
     settings.windowless_rendering_enabled = true;
     settings.log_severity = LOGSEVERITY_DISABLE;
     CefString(&settings.root_cache_path) = argv[2];
+    if (encrypted) {
+      std::thread create([&] {
+        app_profile = AlloyCreateProfile(std::string(argv[2]) + "-encrypted", "synthetic-M2-password");
+      });
+      create.join();
+      if (!app_profile) return 1;
+    }
     if (!CefInitialize(args, settings, app, nullptr))
       return 1;
     while (!app->ready) CefDoMessageLoopWork();
     auto ready = std::make_shared<bool>(false);
-    app_context = AlloyCreateMemoryRequestContext(new ContextReady(ready));
+    if (encrypted) {
+      CefRefPtr<EncryptedReady> callback = new EncryptedReady;
+      if (!AlloyCreateEncryptedRequestContext(app_profile, new ContextReady(ready), callback)) return 1;
+      while (!callback->done_) CefDoMessageLoopWork();
+      app_context = callback->context_;
+    } else {
+      app_context = AlloyCreateMemoryRequestContext(new ContextReady(ready));
+    }
     if (!app_context) return 1;
     while (!*ready) CefDoMessageLoopWork();
     CefWindowInfo window;
@@ -324,6 +377,8 @@ int main(int argc, char** argv) {
         if (app_browser) app_browser->GetHost()->CloseBrowser(true);
       } else if (operation == "app" && app_browser) {
         app_browser->GetMainFrame()->LoadURL(name);
+      } else if (operation == "app-lock" && app_profile) {
+        if (!app_profile->LockAsync(new Locked)) return 1;
       } else if (operation == "start") {
         std::string policy, mode, required, developmental, data;
         command >> policy >> mode >> required >> developmental >> data;
@@ -366,6 +421,8 @@ int main(int argc, char** argv) {
     CefShutdown();
   }
   Event("driver", "finished");
+  app_profile = nullptr;
+  if (inherited_mapping != MAP_FAILED) munmap(inherited_mapping, inherited_mapping_size);
   for (int descriptor : reserved) close(descriptor);
   return 0;
 }

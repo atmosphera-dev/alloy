@@ -2,13 +2,13 @@
 <!-- SPDX-License-Identifier: LGPL-3.0-or-later -->
 # Experimental guest sessions
 
-M1 is the process foundation, not completed guest mode or write containment.
-Its Linux backend reports filesystem enforcement **unavailable** and scratch
-**disk-possible**. M3 adds the experimental CPU stream capability described in
-`guest-streaming.md`; later media/native connectors remain unavailable. An app
-must explicitly request and accept developmental unavailable enforcement to
-activate this foundation. Required protection that is unavailable refuses
-admission; it never selects an in-process or weaker-session fallback.
+Linux guest sessions apply pre-engine Landlock write refusal and verified RAM
+scratch, with Chromium's user-namespace sandbox. See `guest-protection-linux.md`
+for the actual limits, including same-user procfs control writes and metadata.
+M3 adds the experimental CPU stream capability described in `guest-streaming.md`;
+native integration and accessibility have separate capability reports. Required
+protection that is unavailable refuses admission; it never selects an in-process
+or weaker-session fallback. No user namespaces means no guest activation.
 
 The app keeps control of policy. Existing `Cef*` APIs and in-process contexts
 keep their behavior. Starting a session does not call `CefInitialize`, alter
@@ -36,11 +36,11 @@ read-only list data. CUT is stateless-only. No encrypted-profile root or key is
 accepted. Unsupported platforms return unavailable through null factories;
 macOS/Windows backend parity is not claimed.
 
-For the developmental foundation, settings can be created as follows:
+For Landlock data-write refusal, settings can be created as follows:
 
 ```cpp
-auto settings = AlloyCreateGuestSettings("memory", "keep", "unavailable",
-                                          true, "");
+auto settings = AlloyCreateGuestSettings("memory", "keep", "data-writes-denied",
+                                          false, "");
 auto session = AlloyStartGuestSession(settings, handler);
 ```
 
@@ -90,7 +90,8 @@ observations under their explicit evidence directories.
 The app uses `posix_spawn`. Its fixed static entry closes ungranted inherited
 handles and stdio, sanitizes loader/plugin/desktop environment, registers the
 runtime with the supervisor, and seals actual pre-engine facts before the fixed
-engine exec. This is a startup fact, not proof of write denial.
+engine exec. The Linux lock adds actual write refusal and managed RAM paths;
+bootstrap startup facts alone are not the enforcement proof.
 
 The supervisor obtains kernel sender credentials and pidfds before acknowledging
 each entry. Native exec and zygote-fork routes preserve registration capability

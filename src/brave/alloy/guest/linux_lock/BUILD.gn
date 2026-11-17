@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import("//testing/test.gni")
+
 source_set("linux_lock") {
-  sources = [ "provider.cc" ]
-  deps = [ "..:provider_api" ]
+  sources = [ "provider.cc", "protection.cc", "child_launch.c" ]
+  deps = [ "..:provider_api", "//base" ]
+}
+
+test("alloy_guest_lock_unittests") {
+  sources = [ "protection_unittest.cc", "protection.cc", "ram_scratch.c", "writer_paths.c", "landlock.c", "child_launch.c" ]
+  deps = [ "//base", "//base/test:run_all_unittests", "//base/test:test_support", "//testing/gtest" ]
 }

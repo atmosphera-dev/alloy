@@ -96,6 +96,15 @@ class GuestProbeTests(unittest.TestCase):
             self.assertTrue(client.aborted)
             self.assertTrue(client.log.closed)
 
+    def test_prefixed_launcher_uses_injected_owned_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            client = self.exited_client(Path(temporary), None, [])
+            client.abort_callback = Mock()
+            client.abort()
+            client.abort_callback.assert_called_once_with(client.process)
+            self.assertTrue(client.aborted)
+            self.assertTrue(client.log.closed)
+
     def test_role_survives_chromium_process_title_rewrite(self):
         for role in ('zygote', 'renderer', 'gpu-process', 'utility'):
             self.assertEqual(role, process_role([b'/engine', b'--type=' + role.encode(), b'']))

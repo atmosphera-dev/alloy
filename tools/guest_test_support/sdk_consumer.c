@@ -55,11 +55,14 @@ static void CEF_CALLBACK prepared(alloy_guest_session_handler_t* self,
     alloy_guest_capabilities_t* capabilities) {
   handler_t* handler = (handler_t*)self;
   cef_string_userfree_t filesystem = protection->get_filesystem(protection);
-  if (!equals(filesystem, "unavailable") || !session->accept(session)) {
+  cef_string_userfree_t scratch = protection->get_scratch_backing(protection);
+  if (!equals(filesystem, "data-writes-denied") || !equals(scratch, "verified-tmpfs") ||
+      !session->accept(session)) {
     fputs("FAIL prepared-protection-or-accept\n", stderr);
     handler->failed = 1;
   }
   cef_string_userfree_free(filesystem);
+  cef_string_userfree_free(scratch);
   protection->base.release(&protection->base);
   capabilities->base.release(&capabilities->base);
   session->base.release(&session->base);
@@ -112,8 +115,8 @@ int main(void) {
   handler.api.on_state_changed = state;
   handler.api.on_closed = closed;
   cef_string_t mode = string("memory"), network = string("keep");
-  cef_string_t required = string("unavailable"), data = {0};
-  alloy_guest_settings_t* settings = alloy_create_guest_settings(&mode, &network, &required, 1, &data);
+  cef_string_t required = string("data-writes-denied"), data = {0};
+  alloy_guest_settings_t* settings = alloy_create_guest_settings(&mode, &network, &required, 0, &data);
   if (!settings) { fputs("FAIL create-settings\n", stderr); return 1; }
   settings->base.add_ref(&settings->base);
   add(&handler.api.base);

@@ -561,6 +561,7 @@ class SessionImpl final : public AlloyGuestSession {
       report.bootstrap_before_engine = true;
       report.inherited_handles_closed = true;
       report.runtime_supervision = true;
+      report.ram_scratch = fields[2] == "verified-tmpfs";
       if (!session->Prepared(report))
         return false;
       StateChanged("PREPARED");

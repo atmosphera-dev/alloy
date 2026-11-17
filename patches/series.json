@@ -1059,6 +1059,11 @@
       "stage": "after-prune"
     },
     {
+      "patch": "chromium/0133-guest-linux-lock.patch",
+      "root": ".",
+      "stage": "after-prune"
+    },
+    {
       "patch": "cef/0140-guest-extension-stream.patch",
       "root": "cef",
       "stage": "after-prune"

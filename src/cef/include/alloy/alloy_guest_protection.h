@@ -8,8 +8,9 @@
 #if CEF_API_ADDED(CEF_EXPERIMENTAL)
 ///
 /// EXPERIMENTAL: Copied achieved protection, separate from feature availability.
-/// The foundation reports "unavailable" enforcement, never write containment.
-/// Linux enforcement fields and backends are extended by the protection owner.
+/// Linux reports pre-engine write enforcement and verified scratch separately
+/// from native sandbox, IPC/device restrictions and unavailable package routes.
+/// Landlock data-write refusal is not a read-only filesystem or no-swap claim.
 ///
 /*--cef(source=library,added=experimental)--*/
 class AlloyGuestProtection : public virtual CefBaseRefCounted {

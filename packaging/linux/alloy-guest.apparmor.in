@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Alex Indigo
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Substitute the two exact absolute installed paths and unique profile names.
+# This permits Chromium's inner userns sandbox. It is not a filesystem/IPC
+# policy and never grants a setuid-helper route to guest mode.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile @@PROFILE@@-bootstrap @@BOOTSTRAP@@ flags=(unconfined) {
+  userns,
+}
+
+profile @@PROFILE@@-engine @@ENGINE@@ flags=(unconfined) {
+  userns,
+}

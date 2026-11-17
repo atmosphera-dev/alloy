@@ -1,0 +1,11 @@
+--- a/content/browser/zygote_host/zygote_host_impl_linux.cc
++++ b/content/browser/zygote_host/zygote_host_impl_linux.cc
+@@ -21,2 +21,3 @@
+ #include "base/process/memory.h"
++#include "base/process/alloy_guest_runtime.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -118,3 +119,4 @@
+   } else if (!command_line.HasSwitch(
+                  sandbox::policy::switches::kDisableSetuidSandbox) &&
++             !alloy_guest_is_runtime() &&
+              !sandbox_binary_.empty()) {

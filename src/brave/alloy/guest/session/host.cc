@@ -11,11 +11,14 @@
 #include "brave/alloy/guest/integration/menus.h"
 #include "brave/alloy/guest/integration/drag.h"
 #include "brave/alloy/guest/accessibility/ownership.h"
+#include "brave/alloy/guest/linux_lock/sandbox_preflight.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <deque>
 #include <fcntl.h>
 #include <functional>
+#include <limits.h>
 #include <map>
 #include <memory>
 #include <poll.h>
@@ -24,7 +27,6 @@
 #include <utility>
 
 #include "base/files/file_path.h"
-#include "base/files/scoped_temp_dir.h"
 #include "base/process/alloy_guest_runtime.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/token.h"
@@ -457,6 +459,9 @@ class HostApp final : public CefApp, public CefBrowserProcessHandler {
     auto features = command->GetSwitchValue("enable-features").ToString();
     if (!features.empty()) features += ",";
     command->AppendSwitchWithValue("enable-features", features + "FileSystemAccessAPI");
+    // Chromium's pathname shared-memory fallback must use the verified RAM
+    // TMPDIR, not the ambient /dev/shm hierarchy outside this session's root.
+    command->AppendSwitch("disable-dev-shm-usage");
     if (!data_.empty())
       command->AppendSwitchWithValue("alloy-data-dir", data_);
   }
@@ -465,6 +470,26 @@ class HostApp final : public CefApp, public CefBrowserProcessHandler {
   const std::shared_ptr<bool> ready_;
   IMPLEMENT_REFCOUNTING(HostApp);
 };
+
+// A missing native sandbox is reported without initializing CEF. This session
+// never becomes ACTIVE, even if the app requested developmental enforcement.
+// The existing report and lifecycle route carries the unavailable reason; no
+// second extension dispatcher or weaker retry is introduced.
+int UnavailableBrowser(Peer& peer, const std::string& reason) {
+  std::string payload;
+  if (!PackFields({"unavailable", "{\"before_engine\":true,\"native_sandbox\":\"unavailable\"}",
+        "verified-tmpfs", "{\"route\":\"unavailable\",\"setuid_helper\":\"disabled\"}",
+        reason, "1", "1", "1", "0"}, &payload) ||
+      !peer.Send(ALLOY_GUEST_CONTROL_FD, {Message::kPrepared, {}, 0, {}, std::move(payload)}))
+    return 125;
+  Envelope request;
+  if (!peer.Receive(ALLOY_GUEST_CONTROL_FD, &request)) return 125;
+  if (request.message == Message::kClose) {
+    return peer.Send(ALLOY_GUEST_CONTROL_FD, {Message::kClosed, {}, 0, {}, {}}) ? 0 : 125;
+  }
+  peer.Send(ALLOY_GUEST_CONTROL_FD, {Message::kFailure, {}, 0, {}, reason});
+  return 125;
+}
 
 int RunBrowser(const CefMainArgs& args) {
   Envelope hello;
@@ -496,15 +521,18 @@ int RunBrowser(const CefMainArgs& args) {
       !facts.before_engine || !facts.handles_closed ||
       fcntl(ALLOY_GUEST_LIVENESS_FD, F_GETOWN) != getpid())
     return 125;
-  // Foundation scratch is private but not promised RAM. M2 replaces the scratch
-  // owner and unavailable protection provider together, before libcef loading.
-  base::ScopedTempDir scratch;
-  if (!scratch.CreateUniqueTempDir())
+  const char* scratch = getenv("ALLOY_GUEST_CEF_ROOT");
+  const char* lock_abi = getenv("ALLOY_GUEST_LOCK_ABI");
+  int abi = 0;
+  if (!scratch || !lock_abi || !base::StringToInt(lock_abi, &abi) || abi < 3 ||
+      prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1)
     return 125;
+  const std::string unavailable = LinuxUserNamespaceUnavailableReason();
+  if (!unavailable.empty()) return UnavailableBrowser(peer, unavailable);
   CefSettings cef_settings;
   cef_settings.windowless_rendering_enabled = true;
   cef_settings.log_severity = LOGSEVERITY_DISABLE;
-  CefString(&cef_settings.root_cache_path) = scratch.GetPath().value();
+  CefString(&cef_settings.root_cache_path) = scratch;
   CefString(&cef_settings.browser_subprocess_path) = BundledBootstrap();
   auto global_ready = std::make_shared<bool>(false);
   auto context_ready = std::make_shared<bool>(false);
@@ -564,6 +592,8 @@ int RunBrowser(const CefMainArgs& args) {
   report.bootstrap_before_engine = true;
   report.inherited_handles_closed = true;
   report.runtime_supervision = true;
+  report.filesystem = Protection::kDataWritesDenied;
+  report.ram_scratch = true;
   ControlQueue outgoing;
   Envelope prepared;
   prepared.message = Message::kPrepared;
@@ -573,11 +603,7 @@ int RunBrowser(const CefMainArgs& args) {
       features |= uint64_t{1} << index;
   features &= supported_features;
   static_assert(kMaxControlPayload >= url::kMaxURLChars + 4);
-  PackFields({"unavailable", "static pre-engine browser; registered exec/zygote entries",
-              "disk-possible", "Chromium enabled; per-role status not yet observed",
-              "Developmental foundation: no write refusal or OS IPC/device containment; "
-              "media and native connectors unavailable; private scratch is not verified RAM",
-              "1", "1", "1", std::to_string(features)}, &prepared.payload);
+  CefRefPtr<LinuxSandboxPreflight> preflight;
   bool prepared_queued = false;
   bool prepared_delivered = false;
   auto gpu_epoch = std::make_unique<GpuEpoch>([&views] {
@@ -662,6 +688,7 @@ int RunBrowser(const CefMainArgs& args) {
     providers.Close();
     popups->Close();
     session.BeginClose();
+    if (preflight) preflight->Cancel();
     for (auto& [id, view] : views)
       view->Close();
   };
@@ -669,6 +696,7 @@ int RunBrowser(const CefMainArgs& args) {
     // External pumping is scheduled by downstream progress, never by an
     // unbounded producer queue. Control I/O stays live while native work yields.
     outgoing.Pump(ALLOY_GUEST_CONTROL_FD, closing);
+    if (preflight) preflight->Drain();
     if (!closing && *global_ready && !context) {
       CefRefPtr<ContextReady> handler = new ContextReady(context_ready);
       context = settings.mode == "memory"
@@ -680,8 +708,18 @@ int RunBrowser(const CefMainArgs& args) {
         close();
       }
     }
-    if (!closing && *context_ready && !prepared_queued) {
-      if (!session.Prepared(report)) {
+    if (!closing && *context_ready && !preflight) {
+      preflight = new LinuxSandboxPreflight;
+      if (!preflight->Start(context)) {
+        failed = true;
+        close();
+      }
+    }
+    if (!closing && preflight && preflight->done() && !prepared_queued) {
+      auto protection = LinuxProtectionFields(abi, preflight->facts());
+      if (!protection || !PackFields({(*protection)[0], (*protection)[1], (*protection)[2],
+              (*protection)[3], (*protection)[4], "1", "1", "1", std::to_string(features)},
+              &prepared.payload) || !session.Prepared(report)) {
         failed = true;
         close();
       } else {
@@ -700,7 +738,7 @@ int RunBrowser(const CefMainArgs& args) {
       } else
         ++found;
     }
-    if (closing && views.empty() && outgoing.empty())
+    if (closing && views.empty() && (!preflight || preflight->done()) && outgoing.empty())
       break;
     pollfd event = {ALLOY_GUEST_CONTROL_FD,
                     static_cast<short>((closing || !outgoing.CanProduce() ? 0 : POLLIN) |
@@ -829,6 +867,7 @@ int RunBrowser(const CefMainArgs& args) {
   }
   views.clear();
   gpu_epoch.reset();
+  preflight = nullptr;
   context = nullptr;
   CefShutdown();
   // The app's final acknowledgement also waits for supervisor-owned children.

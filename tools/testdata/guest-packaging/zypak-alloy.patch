@@ -1,0 +1,126 @@
+diff --git a/src/dbus/bus_writable_message.h b/src/dbus/bus_writable_message.h
+index dc1dcd0..8d71dab 100644
+--- a/src/dbus/bus_writable_message.h
++++ b/src/dbus/bus_writable_message.h
+@@ -85,7 +85,12 @@ class WritableMessage : public Message {
+   MessageWriter OpenWriter() { return MessageWriter(message()); }
+ 
+  protected:
+-  using Message::Message;
++  // Writable messages are created here, not borrowed from a bus callback.
++  // Message keeps one reference; release the factory's initial reference so
++  // every attached launch capability is retired with the last message owner.
++  WritableMessage(DBusMessage* message) : Message(message) {
++    dbus_message_unref(message);
++  }
+ };
+ 
+ // A D-Bus method call message.
+diff --git a/src/dbus/flatpak_portal_proxy.cc b/src/dbus/flatpak_portal_proxy.cc
+index 1b28728..826c46b 100644
+--- a/src/dbus/flatpak_portal_proxy.cc
++++ b/src/dbus/flatpak_portal_proxy.cc
+@@ -160,6 +160,14 @@ MethodCall FlatpakPortalProxy::BuildSpawnMethodCall(SpawnCall spawn) {
+         array_writer.Write<TypeCode::kHandle>(fd.get());
+       }
+     }
++    if (!spawn.options.sandbox_expose_rw.empty()) {
++      MessageWriter pair_writer = options_writer.EnterContainer<TypeCode::kDictEntry>();
++      pair_writer.Write<TypeCode::kString>("sandbox-expose-fd");
++      MessageWriter value_writer = pair_writer.EnterContainer<TypeCode::kVariant>("ah");
++      MessageWriter array_writer = value_writer.EnterContainer<TypeCode::kArray>("h");
++      for (const unique_fd& fd : spawn.options.sandbox_expose_rw)
++        array_writer.Write<TypeCode::kHandle>(fd.get());
++    }
+   }
+ 
+   return call;
+diff --git a/src/dbus/flatpak_portal_proxy.h b/src/dbus/flatpak_portal_proxy.h
+index 51674d5..d2fd9aa 100644
+--- a/src/dbus/flatpak_portal_proxy.h
++++ b/src/dbus/flatpak_portal_proxy.h
+@@ -70,6 +70,7 @@ class FlatpakPortalProxy {
+     SandboxFlags sandbox_flags = kNoSandboxFlags;
+ 
+     std::vector<unique_fd> sandbox_expose_ro;
++    std::vector<unique_fd> sandbox_expose_rw;
+ 
+     void ExposePathRo(cstring_view path);
+   };
+diff --git a/src/preload/host/spawn_strategy/spawn_launcher_delegate.cc b/src/preload/host/spawn_strategy/spawn_launcher_delegate.cc
+index cba77b4..035097a 100644
+--- a/src/preload/host/spawn_strategy/spawn_launcher_delegate.cc
++++ b/src/preload/host/spawn_strategy/spawn_launcher_delegate.cc
+@@ -5,6 +5,10 @@
+ #include "preload/host/spawn_strategy/spawn_launcher_delegate.h"
+ 
+ #include <nickle.h>
++#include <algorithm>
++#include <climits>
++#include <fcntl.h>
++#include "base/env.h"
+ 
+ #include "base/container_util.h"
+ #include "base/debug.h"
+@@ -29,9 +33,41 @@ bool SpawnLauncherDelegate::Spawn(const Launcher::Helper& helper, std::vector<st
+   // Since we map the descriptors ourselves via the portal API, there's no need for zypak-helper to
+   // adjust them as well.
+   ExtendContainerMove(&spawn.argv, helper.BuildCommandWrapper(FdMap()));
+-  ExtendContainerMove(&spawn.argv, std::move(command));
+ 
+-  spawn.fds = &fd_map;
++  FdMap alloy_fds;
++  if (Env::Test("ALLOY_GUEST_RUNTIME")) {
++    std::string bootstrap(Env::Require("ALLOY_GUEST_BOOTSTRAP"));
++    if (command.empty() || command.front() != bootstrap) return false;
++    auto cef = Env::Require("ALLOY_GUEST_CEF_ROOT");
++    if (!cef.ends_with("/cef")) return false;
++    std::string ram(cef.data(), cef.size() - 4);
++    unique_fd directory(open(ram.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
++    unique_fd exposed(open(ram.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
++    if (directory.invalid() || exposed.invalid()) return false;
++    int scratch_target = 256;
++    std::string manifest;
++    for (const auto& assignment : fd_map) {
++      if (assignment.target() == INT_MAX) return false;
++      scratch_target = std::max(scratch_target, assignment.target() + 1);
++      unique_fd copy(fcntl(assignment.fd().get(), F_DUPFD_CLOEXEC, 3));
++      if (copy.invalid()) return false;
++      alloy_fds.emplace_back(std::move(copy), assignment.target());
++      if (!manifest.empty()) manifest += ",";
++      manifest += std::to_string(assignment.target());
++    }
++    alloy_fds.emplace_back(std::move(directory), scratch_target);
++    spawn.options.sandbox_expose_rw.push_back(std::move(exposed));
++    // Launcher::EnvMap borrows string_views. Dynamic values belong directly
++    // to the owning spawn request, not to locals that die before serialization.
++    spawn.env["ALLOY_GUEST_RUNTIME"] = "1";
++    spawn.env["ALLOY_GUEST_BOOTSTRAP"] = bootstrap;
++    spawn.env["ALLOY_GUEST_SCRATCH_FD"] = std::to_string(scratch_target);
++    spawn.env["ALLOY_GUEST_PRESERVE_FDS"] = std::move(manifest);
++    spawn.fds = &alloy_fds;
++  } else {
++    spawn.fds = &fd_map;
++  }
++  ExtendContainerMove(&spawn.argv, std::move(command));
+ 
+   for (const auto& [var, value] : env) {
+     spawn.env.emplace(var, value);
+diff --git a/src/sandbox/main.cc b/src/sandbox/main.cc
+index e7ca4e6..5eac2d4 100644
+--- a/src/sandbox/main.cc
++++ b/src/sandbox/main.cc
+@@ -76,6 +76,13 @@ bool RunCatOnFd(int fd) {
+ }
+ 
+ bool SanitizeStdio() {
++  if (Env::Test("ALLOY_GUEST_RUNTIME")) {
++    // The static Alloy entry has already replaced all three streams. Do not
++    // introduce unregistered cat helpers or preserve new output capabilities.
++    unique_fd null(open("/dev/null", O_RDWR | O_CLOEXEC));
++    return !null.invalid() && dup2(null.get(), 0) != -1 &&
++        dup2(null.get(), 1) != -1 && dup2(null.get(), 2) != -1;
++  }
+   // http://crbug.com/376567
+   // We do it here instead of in a wrapper script so that Electron apps that want to mess with stdin
+   // still can.

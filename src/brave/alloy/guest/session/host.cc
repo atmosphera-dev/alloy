@@ -12,6 +12,7 @@
 #include "brave/alloy/guest/integration/drag.h"
 #include "brave/alloy/guest/accessibility/ownership.h"
 #include "brave/alloy/guest/linux_lock/sandbox_preflight.h"
+#include "brave/alloy/guest/namespace_lock/packaging_protection.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -538,7 +539,8 @@ int RunBrowser(const CefMainArgs& args) {
   if (!scratch || !lock_abi || !base::StringToInt(lock_abi, &abi) || abi < 3 ||
       prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1)
     return 125;
-  const std::string unavailable = LinuxUserNamespaceUnavailableReason();
+  const std::string unavailable = alloy_guest_uses_flatpak_broker()
+      ? std::string() : LinuxUserNamespaceUnavailableReason();
   if (!unavailable.empty()) return UnavailableBrowser(peer, unavailable);
   CefSettings cef_settings;
   cef_settings.windowless_rendering_enabled = true;
@@ -727,7 +729,8 @@ int RunBrowser(const CefMainArgs& args) {
       }
     }
     if (!closing && preflight && preflight->done() && !prepared_queued) {
-      auto protection = LinuxProtectionFields(abi, preflight->facts());
+      auto protection = PackagingProtectionFields(abi, preflight->facts(),
+          alloy_guest_uses_flatpak_broker());
       if (!protection || !PackFields({(*protection)[0], (*protection)[1], (*protection)[2],
               (*protection)[3], (*protection)[4], "1", "1", "1", std::to_string(features)},
               &prepared.payload) || !session.Prepared(report)) {

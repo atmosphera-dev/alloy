@@ -1,0 +1,8 @@
+--- a/content/browser/zygote_host/zygote_host_impl_linux.cc
++++ b/content/browser/zygote_host/zygote_host_impl_linux.cc
+@@ -120,3 +120,4 @@
+-             !alloy_guest_is_runtime() &&
++             (!alloy_guest_is_runtime() ||
++              alloy_guest_uses_flatpak_broker()) &&
+              !sandbox_binary_.empty()) {
+     use_suid_sandbox_ = true;

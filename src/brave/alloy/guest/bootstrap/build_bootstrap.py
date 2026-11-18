@@ -16,7 +16,8 @@ sources = ['base/process/alloy_guest_runtime.c',
            'brave/alloy/guest/linux_lock/ram_scratch.c',
            'brave/alloy/guest/linux_lock/writer_paths.c',
            'brave/alloy/guest/linux_lock/landlock.c',
-           'brave/alloy/guest/linux_lock/child_launch.c']
+            'brave/alloy/guest/linux_lock/child_launch.c']
+sources.append('brave/alloy/guest/namespace_lock/flatpak_entry.c')
 subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
                 '-fstack-protector-strong', '-D_FORTIFY_SOURCE=2',
                 '-I', str(args.root), *[str(args.root / name) for name in sources],

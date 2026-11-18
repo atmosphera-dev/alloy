@@ -30,7 +30,9 @@ _implementation = [
   "accessibility/ownership.h", "accessibility/ownership.cc",
   "accessibility/accessibility_client.h", "accessibility/accessibility_client.cc",
   "//cef/include/alloy/alloy_guest_accessibility.h",
-  "namespace_lock/provider.cc", "capture/provider.cc",
+   "namespace_lock/provider.cc", "capture/provider.cc",
+   "namespace_lock/flatpak_entry.h", "namespace_lock/flatpak_entry.c",
+   "namespace_lock/packaging_protection.h", "namespace_lock/packaging_protection.cc",
   "integration/request_owner.h", "integration/request_owner.cc",
   "integration/native_requests.h", "integration/native_requests.cc",
   "integration/integration_client.h", "integration/integration_client.cc",
@@ -178,7 +180,8 @@ action("alloy_guest_host") {
              "linux_lock/protection.h", "linux_lock/ram_scratch.c",
              "linux_lock/writer_paths.c", "linux_lock/landlock.c",
              "linux_lock/child_launch.c", "linux_lock/child_launch.h",
-             "linux_lock/linux_uapi.h",
+              "linux_lock/linux_uapi.h",
+              "namespace_lock/flatpak_entry.h", "namespace_lock/flatpak_entry.c",
              "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h" ]
   outputs = [ "$root_out_dir/alloy_guest_host" ]
   args = [ "--root", rebase_path("//", root_build_dir),

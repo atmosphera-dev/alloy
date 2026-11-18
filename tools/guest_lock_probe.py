@@ -554,12 +554,11 @@ def native_writers(out, evidence, fixtures):
                   consumer=json.loads(marker[0]), bus_positive_controls=positive_controls, guest_bus_calls=0)]
 
 
-def package_proof(out, evidence, fixtures):
+def package_proof(out, evidence, fixtures, name='alloy-gm-m2-fixture'):
     os_release = Path('/etc/os-release').read_text()
     assert 'VERSION_ID="24.04"' in os_release, os_release
     restricted = Path('/proc/sys/kernel/apparmor_restrict_unprivileged_userns').read_text().strip()
     assert restricted == '1', restricted
-    name = 'alloy-gm-m2-fixture'
     install = Path('/opt') / name / (out.name + '-' + evidence.name)
     stage = evidence / 'package-root'
     target = stage / install.relative_to('/')

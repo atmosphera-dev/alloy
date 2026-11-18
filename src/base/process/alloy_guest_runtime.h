@@ -25,17 +25,24 @@ struct alloy_guest_bootstrap_facts {
   unsigned int handles_closed;
   unsigned int inherited_nnp;
   unsigned int owns_browser_control;
+  unsigned int flatpak_broker;
 };
 
 // Only the static bootstrap uses pre_engine=1. Registration succeeds only after
 // the supervisor has obtained the kernel sender identity and opened its pidfd.
 int alloy_guest_register_runtime(int pre_engine);
 
+// Check the acknowledged per-process liveness capability, not the numeric
+// parent PID. A brokered entry can legitimately have a namespace-init parent.
+int alloy_guest_supervisor_alive(void);
+
 // No-op outside explicitly launched guests. The marker selects the code path,
 // not authority: the inherited socket, sealed facts and live supervisor handshake
 // establish that. Calls on a forked child register a fresh runtime identity.
 void alloy_guest_initialize_runtime(void);
 int alloy_guest_is_runtime(void);
+// Bootstrap-sealed packaging fact, not a caller environment switch.
+int alloy_guest_uses_flatpak_broker(void);
 // Async-signal-safe child side of a native fork. Raw clone routes call this
 // explicitly; pthread_atfork handles ordinary forks. No browser peer endpoint
 // survives in a probe/helper/zygote descendant and falsely holds it alive.

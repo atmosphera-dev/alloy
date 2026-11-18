@@ -155,8 +155,8 @@ def assert_navigation_outcomes(client, observation):
 
 class Client:
     def __init__(self, out: Path, root: Path, flexible=False, trusted_certificate=None,
-                 reserve_descriptors=None, launch_prefix=None, launch_environment=None,
-                 encrypted_app=False, abort_callback=None):
+                  reserve_descriptors=None, launch_prefix=None, launch_environment=None,
+                  encrypted_app=False, abort_callback=None, executable=None, app_profile=None):
         self.out = out
         self.root = root
         self.finished = False
@@ -181,9 +181,10 @@ class Client:
                 subprocess.run(['certutil', '-A', '-d', 'sql:' + str(nss), '-n', 'Alloy guest fixture',
                     '-t', 'C,,', '-i', str(trusted_certificate)], env=self.env,
                     stdout=log, stderr=subprocess.STDOUT, check=True, timeout=20)
-        command = [str(out / 'alloy_guest_sdk_consumer')]
+        command = [str(executable or out / 'alloy_guest_sdk_consumer')]
         if flexible or encrypted_app:
-            command += ['--flexible-encrypted' if encrypted_app else '--flexible', str(root / 'app-profile')]
+            command += ['--flexible-encrypted' if encrypted_app else '--flexible',
+                        str(app_profile or root / 'app-profile')]
         self.log = (root / 'consumer.log').open('x')
         self.stderr = (root / 'stderr.log').open('x')
         self.process = subprocess.Popen(list(launch_prefix or []) + command, cwd=out, env=self.env,

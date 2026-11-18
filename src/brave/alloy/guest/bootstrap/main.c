@@ -6,6 +6,7 @@
 #endif
 #include "base/process/alloy_guest_runtime.h"
 #include "brave/alloy/guest/linux_lock/protection.h"
+#include "brave/alloy/guest/namespace_lock/flatpak_entry.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -25,6 +26,8 @@
 int alloy_guest_supervise(const char* bootstrap);
 
 static int granted(int fd, int supervisor, int child) {
+  if (child && alloy_flatpak_preserves(fd))
+    return 1;
   if (alloy_lock_preserves(fd))
     return 1;
   if (fd == ALLOY_GUEST_REGISTRATION_FD)
@@ -91,7 +94,8 @@ static int sanitize_environment(void) {
       // Chromium's namespace_sandbox.cc sets these on its child launch. They
       // preserve its native boot/sandbox handshake, not app-supplied authority.
       // The initial app -> supervisor allowlist never copies them from the app.
-      "SBX_USER_NS", "SBX_PID_NS", "SBX_NET_NS"};
+       "SBX_USER_NS", "SBX_PID_NS", "SBX_NET_NS", "SBX_D", "SBX_HELPER_PID",
+       "SBX_CHROME_API_PRV"};
   char* values[sizeof(names) / sizeof(names[0])];
   memset(values, 0, sizeof(values));
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -129,6 +133,9 @@ int main(int argc, char** argv) {
   if (length <= 0 || (size_t)length >= sizeof(executable) - 1)
     return 125;
   executable[length] = 0;
+  int flatpak = alloy_flatpak_detect(executable);
+  if (flatpak < 0)
+    return 125;
   struct rlimit no_core = {0, 0};
   if (setrlimit(RLIMIT_CORE, &no_core) || !close_ungranted(supervisor, child) ||
       !sanitize_environment())
@@ -147,7 +154,9 @@ int main(int argc, char** argv) {
   if (!alloy_guest_is_runtime() || !alloy_guest_register_runtime(1))
     return 125;
   // This is supplementary to the liveness channel, never its replacement.
-  if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() == 1)
+  // A Flatpak broker's child has namespace init as its parent even while the
+  // acknowledged Alloy supervisor is live. Check that actual capability.
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL) || !alloy_guest_supervisor_alive())
     return 125;
   // Ordinary entries inherit both the kernel domain and managed writer paths.
   // Only initial/external entries borrow the supervisor's RAM setup descriptor.
@@ -155,11 +164,12 @@ int main(int argc, char** argv) {
   // would bypass Chromium's chroot and fail its mandatory open-directory check.
   int needs_setup = !getenv("ALLOY_GUEST_LOCK_ABI");
   if ((needs_setup && (!alloy_lock_writer_paths() || !alloy_lock_enforce())) ||
-      !alloy_lock_drop_setup_capability())
+      !alloy_lock_drop_setup_capability() ||
+      !alloy_flatpak_engine_environment(executable, child))
     return 125;
   struct alloy_guest_bootstrap_facts facts = {
       ALLOY_GUEST_FACTS_MAGIC, getpid(), 1, 1,
-      inherited_nnp, !child};
+       inherited_nnp, !child, flatpak != 0};
   int facts_fd = (int)syscall(SYS_memfd_create, "alloy-bootstrap", MFD_ALLOW_SEALING);
   if (facts_fd < 0 || write(facts_fd, &facts, sizeof(facts)) != sizeof(facts) ||
       fcntl(facts_fd, F_ADD_SEALS,

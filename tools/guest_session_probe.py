@@ -113,7 +113,8 @@ def foundation(out, evidence, fixtures):
                     '-I', str(REPO / 'src'), '-I', str(WORK / 'src'),
                     str(REPO / 'tools/guest_test_support/registration_exit.c'),
                     *[str(REPO / 'src/brave/alloy/guest/linux_lock' / (leaf + '.c'))
-                      for leaf in ('ram_scratch', 'child_launch')],
+                       for leaf in ('ram_scratch', 'child_launch')],
+                    str(REPO / 'src/brave/alloy/guest/namespace_lock/flatpak_entry.c'),
                     '-o', str(registration)], check=True)
     with (evidence / 'registration-exit.log').open('x') as log:
         subprocess.run([str(registration)], stdout=log, stderr=subprocess.STDOUT,
@@ -436,23 +437,27 @@ def recovery(out, evidence, fixtures, client_factory=None, interrupt=None, close
     return rows
 
 
-def smoke(out, evidence, fixtures):
-    with Client(out, evidence / 'client') as client:
+def smoke(out, evidence, fixtures, client_factory=None, close_observer=None):
+    client_factory = client_factory or Client
+    close_observer = close_observer or close_and_observe
+    with client_factory(out, evidence / 'client') as client:
         client.start()
         client.active()
         page = client.page(fixtures.base + '/smoke', 'Internet - Alloy smoke fixture')
         load = client.wait('guest', 'load', lambda v: v['view'] == page['view'] and v['status'] == 200)
-        processes = close_and_observe(client, out)
+        processes = close_observer(client, out)
         return [{'case': 'loopback-internet-title-through-guest', 'page': page,
                  'load': load, 'owned_processes_exited': processes}]
 
 
-def blocking(out, evidence, fixtures, data):
+def blocking(out, evidence, fixtures, data, client_factory=None, close_observer=None):
+    client_factory = client_factory or Client
+    close_observer = close_observer or close_and_observe
     rows = []
     with tracker_loopback_aliases():
         for with_data in (False, True):
             label = 'with-data' if with_data else 'without-data'
-            with Client(out, evidence / label, trusted_certificate=fixtures.certificate) as client:
+            with client_factory(out, evidence / label, trusted_certificate=fixtures.certificate) as client:
                 client.start(data=data if with_data else None)
                 client.active()
                 deadline = time.monotonic() + 40
@@ -478,7 +483,7 @@ def blocking(out, evidence, fixtures, data):
                 assert observed['neutral'] is True, observed
                 assert observed['outcomes'] == ['error' if with_data else 'load'] * 3, observed
                 assert observed['trackerExecuted'] is (not with_data), observed
-                close_and_observe(client, out)
+                close_observer(client, out)
                 rows.append({'case': label, 'query_consumer': query, 'script_consumer': observed})
     return rows
 

@@ -7,6 +7,7 @@
 #include "brave/alloy/guest/protocol/wire.h"
 #include "brave/alloy/guest/linux_lock/protection.h"
 #include "brave/alloy/guest/linux_lock/child_launch.h"
+#include "brave/alloy/guest/namespace_lock/flatpak_entry.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -378,7 +379,7 @@ static int supervise_prepared(const char* bootstrap) {
 
 int alloy_guest_supervise(const char* bootstrap) {
   if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) return 125;
-  int result = alloy_lock_prepare_scratch() ? supervise_prepared(bootstrap) : 125;
+  int result = alloy_flatpak_prepare_scratch() ? supervise_prepared(bootstrap) : 125;
   // One owner cleans all preparation and launch failures, not just the normal
   // loop exit. The remover checks the descriptor's exact current RAM identity.
   alloy_lock_remove_scratch();

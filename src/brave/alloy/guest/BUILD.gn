@@ -139,6 +139,7 @@ _implementation = [
   "//base/process/launch_posix.cc",
   "//content/browser/zygote_host/zygote_host_impl_linux.cc",
   "//cef/include/alloy/alloy_guest_session.h",
+  "//cef/include/internal/alloy_guest_navigation_types.h",
   "//cef/include/alloy/alloy_guest_protection.h",
   "//cef/include/alloy/alloy_guest_stream.h",
 ]

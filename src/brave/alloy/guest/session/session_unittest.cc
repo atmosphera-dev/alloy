@@ -276,6 +276,64 @@ TEST(GuestSession, NavigationOwnershipIsIndependentOfGpuStreamRecovery) {
   ++recovered.request;
   EXPECT_FALSE(SameNavigation(navigation, recovered));
 }
+TEST(GuestSession, QueuedNavigationSurvivesCrashOrGpuGenerationRetirement) {
+  auto session = Active();
+  auto view = session.CreateView();
+  auto document = session.Navigate(view->view);
+  ASSERT_TRUE(document);
+  Owner request = *document;
+  ++request.request;
+  ASSERT_TRUE(session.RestartStream(view->view));
+  EXPECT_FALSE(session.Owns(*document));
+  EXPECT_TRUE(session.CanNavigate(request));
+  ASSERT_TRUE(session.Navigate(view->view));
+  EXPECT_FALSE(session.CanNavigate(request));
+}
+TEST(GuestSession, RetiredViewsNeverAdmitQueuedNavigation) {
+  auto session = Active();
+  auto view = session.CreateView();
+  ASSERT_TRUE(view);
+  EXPECT_TRUE(session.CanNavigate(*view));
+  session.RetireView(view->view);
+  EXPECT_FALSE(session.CanNavigate(*view));
+  auto other = session.CreateView();
+  ASSERT_TRUE(other);
+  session.BeginClose();
+  EXPECT_FALSE(session.CanNavigate(*other));
+}
+TEST(GuestNavigationOutcome, CrashThenLateNativeCompletionHasExactlyOneOutcome) {
+  NavigationOutcome outcome;
+  Owner first{1, 2, 3, 4};
+  EXPECT_FALSE(outcome.Begin(first));
+  Owner crashed = first;
+  ++crashed.generation;
+  ASSERT_TRUE(outcome.Finish(crashed));
+  EXPECT_FALSE(outcome.Finish(crashed));
+  EXPECT_FALSE(outcome.Begin({1, 3, 4, 6}));
+  EXPECT_FALSE(outcome.Finish(first));
+  EXPECT_TRUE(outcome.Finish({1, 3, 4, 6}));
+}
+TEST(GuestNavigationOutcome, CompletedLoadNeverAlsoAbortsOnRendererCrash) {
+  NavigationOutcome outcome;
+  Owner first{1, 2, 3, 4};
+  outcome.Begin(first);
+  EXPECT_TRUE(outcome.Finish(first));
+  ++first.generation;
+  EXPECT_FALSE(outcome.Finish(first));
+  EXPECT_FALSE(outcome.Begin({1, 3, 4, 6}));
+}
+TEST(GuestNavigationOutcome, ReplacementCancelsOnlyAnUncompletedOriginal) {
+  NavigationOutcome outcome;
+  Owner first{1, 2, 3, 4}, second{1, 3, 4, 5};
+  outcome.Begin(first);
+  EXPECT_EQ(first, outcome.Begin(second));
+  EXPECT_FALSE(outcome.Finish(first));
+  EXPECT_TRUE(outcome.Finish(second));
+  EXPECT_FALSE(outcome.Finish(second));
+  outcome.Begin(first);
+  outcome.Retire();
+  EXPECT_FALSE(outcome.Finish(first));
+}
 TEST(GuestControlQueue, SlowConsumerStopsFurtherProducerBatches) {
   base::test::SingleThreadTaskEnvironment tasks;
   ControlQueue queue;

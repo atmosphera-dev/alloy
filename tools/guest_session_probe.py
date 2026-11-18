@@ -16,7 +16,8 @@ import time
 from workspace import validate_output, workspace_path
 from guest_test_support.display import environment
 from guest_test_support.fixtures import Fixtures, tracker_loopback_aliases
-from guest_test_support.session import Client, OwnedProcesses, descendants
+from guest_test_support.session import (Client, OwnedProcesses, descendants, kill_renderers,
+                                       navigate_after_crash, assert_navigation_outcomes)
 
 REPO = Path(__file__).resolve().parents[1]
 WORK = workspace_path(REPO)
@@ -394,6 +395,47 @@ def foundation(out, evidence, fixtures):
     return rows
 
 
+def recovery(out, evidence, fixtures, client_factory=None, interrupt=None, close_observer=None,
+             observe=None):
+    """Race the kill, then separately observe exit: one outcome and next-load recovery."""
+    client_factory = client_factory or Client
+    close_observer = close_observer or close_and_observe
+    if interrupt is None:
+        def interrupt(client, wait_for_exit):
+            processes = OwnedProcesses(client.process.pid, out)
+            try:
+                return kill_renderers(zip(processes.members, processes.handles), wait_for_exit)
+            finally:
+                processes.close()
+    if observe is None:
+        def observe(client):
+            processes = OwnedProcesses(client.process.pid, out)
+            try:
+                return processes.members
+            finally:
+                processes.close()
+    rows = []
+    for mode in ('race', 'exited'):
+        with client_factory(out, evidence / mode / 'client') as client:
+            client.start()
+            client.active()
+            page = client.page(fixtures.base + '/title/BEFORE_IMMEDIATE_CRASH', 'BEFORE_IMMEDIATE_CRASH')
+            client.wait('guest', 'load', lambda value: value['view'] == page['view'] and value['status'] == 200)
+            killed = interrupt(client, mode == 'exited')
+            observation = navigate_after_crash(client, page['view'],
+                fixtures.base + '/title/IMMEDIATE_CRASH_RECOVERED', 'IMMEDIATE_CRASH_RECOVERED')
+            assert observation['loaded']['document'] > page['document'], observation
+            replacements = [row for row in observe(client) if row['role'] == 'renderer' and
+                            row['pid'] not in {item['pid'] for item in killed}]
+            assert replacements, 'No replacement renderer after the crash'
+            close_observer(client, out)
+            client.finish()
+            assert_navigation_outcomes(client, observation)
+            rows.append(dict(case='renderer-crash-navigation-' + mode, killed=killed,
+                             outcomes=observation['outcomes'], replacements=replacements))
+    return rows
+
+
 def smoke(out, evidence, fixtures):
     with Client(out, evidence / 'client') as client:
         client.start()
@@ -444,7 +486,7 @@ def blocking(out, evidence, fixtures, data):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=('foundation', 'smoke', 'blocking'), required=True)
+    parser.add_argument('--check', choices=('foundation', 'smoke', 'blocking', 'recovery'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     parser.add_argument('--alloy-data-dir', type=Path)
     args = parser.parse_args(argv)
@@ -466,13 +508,15 @@ def main(argv=None):
                 rows = foundation(out, evidence, fixtures)
             elif args.check == 'smoke':
                 rows = smoke(out, evidence, fixtures)
+            elif args.check == 'recovery':
+                rows = recovery(out, evidence, fixtures)
             else:
                 rows = blocking(out, evidence, fixtures, args.alloy_data_dir.resolve())
             (evidence / 'fixture-requests.json').write_text(json.dumps(fixtures.requests, indent=2) + '\n')
         result.update(status='passed', cases=rows, seconds=time.monotonic() - started)
         (evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         marker = {'foundation': 'GUEST_FOUNDATION_PASS', 'smoke': 'GUEST_SMOKE_PASS',
-                  'blocking': 'GUEST_BLOCKING_PASS'}[args.check]
+                  'blocking': 'GUEST_BLOCKING_PASS', 'recovery': 'GUEST_RECOVERY_PASS'}[args.check]
         print(marker, flush=True)
         return 0
     except BaseException as error:

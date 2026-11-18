@@ -6,6 +6,7 @@
 #pragma once
 
 #include "include/cef_app.h"
+#include "include/internal/alloy_guest_navigation_types.h"
 #include "include/alloy/alloy_guest_protection.h"
 #include "include/alloy/alloy_guest_stream.h"
 #include "include/alloy/alloy_guest_media.h"
@@ -89,7 +90,10 @@ class AlloyGuestViewHandler : public virtual CefBaseRefCounted {
   virtual void OnTitleChanged(CefRefPtr<AlloyGuestView> view,
                               uint64_t document, const CefString& title) = 0;
   ///
-  /// Main-document load completed with native |status| (HTTP or negative error).
+  /// Main-document load completed once with |status|: HTTP/native negative error,
+  /// or ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED for a renderer-crash abort,
+  /// distinct from app/user cancellation (ERR_ABORTED). There is no automatic
+  /// retry; the next app-requested navigation can recover in a new renderer.
   /// This event observes page loading, not display/media transport availability.
   ///
   /*--cef()--*/

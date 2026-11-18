@@ -132,7 +132,9 @@ class Guest final : public AlloyGuestSessionHandler,
                               uint64_t document, int status) override {
     Event(name_, "load", ",\"view\":" + std::to_string(view->GetId()) +
           ",\"document\":" + std::to_string(document) +
-          ",\"status\":" + std::to_string(status));
+          ",\"status\":" + std::to_string(status) +
+          ",\"reason\":" + Quote(status == ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED
+              ? "renderer-crash" : status == -3 ? "cancelled" : "native"));
   }
   void OnClosed(CefRefPtr<AlloyGuestView> view, const CefString& reason) override {
     // Retain the retired SDK object deliberately so the driver can prove stale

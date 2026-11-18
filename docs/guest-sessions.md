@@ -57,6 +57,19 @@ Invalid URLs return false from Navigate before admission; they do not change
 the live document or emit a load-completion callback for it. Native URL
 normalization is shared with CEF, including bare-hostname scheme insertion.
 
+A queued navigation belongs to its view and original document, not the stream
+generation. Renderer/GPU recovery cannot silently discard it. One single-use
+completion owner arbitrates native load/error, renderer crash and replacement.
+A navigation racing an external kill either loads or completes with
+`ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED` (-10000), distinguishable from native
+app/user cancellation (`ERR_ABORTED`, -3). The constant is declared in
+`include/internal/alloy_guest_navigation_types.h` for C and C++ consumers.
+The app receives an actual outcome, not just the earlier queue acknowledgement.
+There is no automatic retry: after a crash abort the next app-requested navigation
+loads in a new renderer. A replacement document or closed view still retires
+the original intent explicitly. No process-readiness check can serialize a
+navigation with a kill sent outside the browser before that process exits.
+
 ## Sequences, ownership and shutdown
 
 | # | Contract | Behavior |

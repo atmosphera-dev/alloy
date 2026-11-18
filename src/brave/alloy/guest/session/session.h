@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "brave/alloy/guest/protocol/session.h"
 
@@ -18,6 +19,27 @@ inline bool SameNavigation(const Owner& original, const Owner& current) {
   return original.view == current.view && original.document == current.document &&
          original.request == current.request;
 }
+
+// One completion owner per native navigation, independent of stream epochs.
+// Crash, native load/error and replacement compete for this same single use.
+class NavigationOutcome {
+ public:
+  std::optional<Owner> Begin(Owner owner) {
+    return std::exchange(pending_, owner);
+  }
+  bool Owns(const Owner& current) const {
+    return pending_ && SameNavigation(*pending_, current);
+  }
+  std::optional<Owner> Finish(const Owner& current) {
+    if (!Owns(current)) return std::nullopt;
+    auto original = std::exchange(pending_, std::nullopt);
+    original->generation = current.generation;
+    return original;
+  }
+  void Retire() { pending_.reset(); }
+ private:
+  std::optional<Owner> pending_;
+};
 
 enum class State { kStarting, kPrepared, kActive, kClosing, kClosed, kFailed };
 enum class Protection { kUnavailable, kNamedWritersOnly, kDataWritesDenied,
@@ -59,6 +81,9 @@ class Session {
   bool ObserveGeneration(const Owner& owner);
   bool RetireView(uint64_t view);
   bool Owns(const Owner& owner) const;
+  // Navigation is a view/document intent, not a stream-generation operation.
+  // A renderer/GPU recovery does not invalidate an already queued intent.
+  bool CanNavigate(const Owner& origin) const;
   std::optional<Owner> RestartStream(uint64_t view);
 
  private:

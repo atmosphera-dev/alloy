@@ -32,6 +32,7 @@ permits portal calls even without an explicit talk policy. Failure cleanup pins
 package process identities, including portal-spawned entries.
 
 These are local verification assets, not store publication or a completed
-package-coverage claim. Snap is unverified and blocked on its denied
-pidfd_send_signal prerequisite; no Snap adapter or weaker lifetime fallback
-is provided here.
+package-coverage claim. Snap guest mode is unsupported because its strict
+policy denies pidfd_send_signal. `deny_pidfd_signal.c` supplies an inherited
+seccomp denial for the SDK refusal test, with an unfiltered positive control;
+there is no Snap adapter or weaker lifetime fallback here.

@@ -16,7 +16,9 @@ struct Supervisor {
 
 // Resolve only the bootstrap bundled beside this library, never a caller path.
 std::string BundledBootstrap();
-bool LaunchSupervisor(Supervisor* child);
+// A denied mandatory teardown operation is reported before spawning anything.
+// The diagnostic describes the actual operation, not an environment marker.
+bool LaunchSupervisor(Supervisor* child, std::string* unavailable);
 // Close control, then reap the exact direct child. Never terminate by a numeric
 // PID received from a message or a process group that could contain app work.
 void ReapSupervisor(Supervisor* child);

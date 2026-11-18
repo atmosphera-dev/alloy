@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Local Flatpak/native package acceptance; Snap remains explicitly blocked."""
+"""Local Flatpak/native acceptance and startup refusal; Snap guest mode is unsupported."""
 import argparse
 import fcntl
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import re
 import signal
+import subprocess
 import time
 
 from workspace import validate_output, workspace_path
@@ -17,8 +18,9 @@ from guest_test_support.fixtures import Fixtures
 from guest_packaging_support import LocalFlatpak, PackageMembers
 from guest_lock_probe import inventory, inventory_equal, package_proof
 from guest_lock_probe import native_writers, defaults, lifecycle, mode_and_app, pressure
-from guest_session_probe import smoke, blocking, recovery
-from guest_test_support.session import (kill_renderers, navigate_after_crash,
+from guest_session_probe import smoke, blocking, recovery, close_and_observe
+from guest_test_support.session import (Client, OwnedProcesses, descendants,
+                                       kill_renderers, navigate_after_crash,
                                        assert_navigation_outcomes)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -38,7 +40,7 @@ def protected(report):
     assert native['renderer']['effective_capabilities_decimal'] == '0', native
     assert coverage['before_engine'], coverage
     assert coverage['flatpak_external_entries'].startswith('fixed-bootstrap-per-entry'), coverage
-    assert coverage['snap_external_entries'].startswith('unverified-blocked:'), coverage
+    assert coverage['snap_external_entries'].startswith('unsupported:'), coverage
     assert 'native-namespace-view-absent' in limits['namespace_filesystem_and_packages'], limits
     assert limits['metadata_and_atime'] == 'not-refused-by-Landlock', limits
     return report
@@ -247,8 +249,9 @@ def missing_helper(package, evidence):
 
 
 def native_acceptance(out, evidence, fixtures):
+    cases = teardown_refusal(out, evidence / 'teardown', fixtures)
     with Fixtures(REPO, tls_root=evidence / 'native-tls') as tls:
-        cases = native_writers(out, evidence, tls) + defaults(out, evidence, tls)
+        cases += native_writers(out, evidence, tls) + defaults(out, evidence, tls)
     cases += lifecycle(out, evidence, fixtures)
     cases += mode_and_app(out, evidence, fixtures)
     cases += pressure(out, evidence, fixtures)
@@ -257,10 +260,67 @@ def native_acceptance(out, evidence, fixtures):
     return cases
 
 
+def teardown_refusal(out, evidence, fixtures):
+    evidence.mkdir(parents=True, exist_ok=True)
+    wrapper = evidence / 'pidfd-signal-policy'
+    subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+        REPO / 'tools/testdata/guest-packaging/deny_pidfd_signal.c', '-o', wrapper], check=True)
+    rows = []
+    for developmental in (False, True):
+        label = 'developmental' if developmental else 'required'
+        with Client(out, evidence / label, launch_prefix=[wrapper, 'deny'],
+                    launch_environment={k: v for k, v in os.environ.items()
+                                        if not k.startswith('SNAP')}) as client:
+            client.send('start guest auto memory ' +
+                        ('unavailable 1 -' if developmental else 'data-writes-denied 0 -'))
+            report = client.wait('guest', 'prepared')
+            processes = OwnedProcesses(client.process.pid, out)
+            try:
+                assert report['filesystem'] == 'unavailable', report
+                assert report['limits'] == ('process policy denies pidfd_send_signal: '
+                                            'identity-bound process teardown unavailable'), report
+                assert report['scratch'] == 'unavailable' and report['extensions_unavailable'], report
+                assert not report['stream_available'], report
+                assert json.loads(report['coverage'])['runtime_supervision'] is False, report
+                assert not client.wait('guest', 'accept-queued')['ok']
+                client.closed(reason='failed')
+                client.send('create guest ' + fixtures.base + '/title/NOT_ADMITTED')
+                assert not client.wait('guest', 'create-queued')['ok']
+                client.finish()
+                assert not processes.members and not descendants(client.process.pid), processes.members
+                assert not any(v['event'] == 'view-ready' or v.get('state') == 'ACTIVE'
+                               for v in client.events), client.events
+                assert 'PIDFD_SIGNAL_FILTER_DENIED=1' in (client.root / 'consumer.log').read_text()
+                rows.append(dict(case='pidfd-signal-denied-' + label, report=report,
+                                 runtime_entries=0, navigations=0))
+            finally:
+                # The pre-correction red test can reach the old engine. Cleanup
+                # uses identities pinned by the unfiltered harness, never a
+                # product numeric-PID fallback or a relaxed guest policy.
+                for handle in processes.handles:
+                    try:
+                        signal.pidfd_send_signal(handle, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                processes.exited()
+                processes.close()
+    with Client(out, evidence / 'positive', launch_prefix=[wrapper, 'allow'],
+                launch_environment=dict(os.environ, SNAP='fixture-marker-only')) as client:
+        client.start(required='data-writes-denied')
+        client.active()
+        page = client.page(fixtures.base + '/title/TEARDOWN_POLICY_ALLOWED', 'TEARDOWN_POLICY_ALLOWED')
+        client.wait('guest', 'load', lambda v: v['document'] == page['document'] and v['status'] == 200)
+        close_and_observe(client, out)
+        client.finish()
+        rows.append(dict(case='pidfd-signal-allowed-loads', page=page))
+    assert not any(v['path'] == '/title/NOT_ADMITTED' for v in fixtures.requests)
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=('feasibility', 'recovery', 'flatpak', 'native', 'all'), required=True)
+    parser.add_argument('--check', choices=('feasibility', 'teardown', 'recovery', 'flatpak', 'native', 'all'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     args = parser.parse_args(argv)
     out = args.out.resolve()
@@ -268,20 +328,22 @@ def main(argv=None):
     if os.uname().nodename != 'alloy-gm-m7' or os.getuid() == 0:
         parser.error('Run unprivileged inside the assigned alloy-gm-m7 cloud guest')
     if args.check == 'all':
-        parser.error('Snap is unverified and blocked on pidfd_send_signal; all-package acceptance is unavailable')
+        parser.error('Snap guest mode is unsupported; use flatpak/native/teardown acceptance')
     evidence = args.evidence.resolve()
     if not evidence.is_relative_to(WORK) or evidence.is_relative_to(Path('/tmp')):
         parser.error('Evidence must remain in the assigned disk-backed workspace')
     evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     started = time.monotonic()
-    result = dict(check=args.check, out=str(out), status='running', snap='unverified-blocked')
+    result = dict(check=args.check, out=str(out), status='running', snap='unsupported')
     lock = (WORK / 'guest-packaging.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         full = args.check == 'flatpak'
         with Fixtures(REPO, tls_root=evidence / 'tls' if full or args.check == 'recovery' else None,
                       tracker_https=full) as fixtures:
-            if args.check == 'native':
+            if args.check == 'teardown':
+                cases = teardown_refusal(out, evidence, fixtures)
+            elif args.check == 'native':
                 cases = native_acceptance(out, evidence, fixtures)
             else:
                 with LocalFlatpak(REPO, out, evidence) as package:
@@ -316,7 +378,7 @@ def main(argv=None):
         result.update(status='passed', cases=cases, seconds=time.monotonic() - started)
         marker = dict(feasibility='GUEST_FLATPAK_FEASIBILITY_PASS', recovery='GUEST_FLATPAK_RECOVERY_PASS',
                       flatpak='GUEST_FLATPAK_PASS',
-                      native='GUEST_NATIVE_PACKAGE_PASS')[args.check]
+                       native='GUEST_NATIVE_PACKAGE_PASS', teardown='GUEST_TEARDOWN_REFUSAL_PASS')[args.check]
         print(marker, flush=True)
         return 0
     except BaseException as error:

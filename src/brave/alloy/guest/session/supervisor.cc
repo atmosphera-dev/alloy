@@ -32,7 +32,30 @@ std::string BundledBootstrap() {
   return library.substr(0, separator + 1) + "alloy_guest_host";
 }
 
-bool LaunchSupervisor(Supervisor* child) {
+bool LaunchSupervisor(Supervisor* child, std::string* unavailable) {
+  unavailable->clear();
+  // Signal 0 checks the real syscall policy without changing process state.
+  // Check before launching a supervisor whose forced teardown would otherwise
+  // be denied. No Snap marker, numeric-PID signal or weaker route substitutes.
+  int identity = static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0));
+  if (identity < 0) {
+    *unavailable = std::string("identity-bound process teardown unavailable: pidfd_open: ") +
+                   strerror(errno);
+    return false;
+  }
+  int signalled;
+  do {
+    signalled = static_cast<int>(syscall(SYS_pidfd_send_signal, identity, 0, nullptr, 0));
+  } while (signalled < 0 && errno == EINTR);
+  int error = errno;
+  close(identity);
+  if (signalled < 0) {
+    *unavailable = error == EPERM || error == EACCES
+        ? "process policy denies pidfd_send_signal: identity-bound process teardown unavailable"
+        : std::string("identity-bound process teardown unavailable: pidfd_send_signal: ") +
+              strerror(error);
+    return false;
+  }
   std::string bootstrap = BundledBootstrap();
   if (bootstrap.empty() || access(bootstrap.c_str(), X_OK))
     return false;

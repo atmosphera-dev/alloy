@@ -494,6 +494,10 @@ class SessionImpl final : public AlloyGuestSession {
   void Terminate() override { core_->Terminate(); }
 
  private:
+  void ReportPrepared(std::vector<std::string> fields, uint64_t features) {
+    handler_->OnPrepared(this, new ProtectionImpl(std::move(fields)),
+                         new CapabilitiesImpl(features));
+  }
   void StateChanged(const std::string& state) {
     core_->SetState(state);
     handler_->OnStateChanged(this, state);
@@ -566,8 +570,7 @@ class SessionImpl final : public AlloyGuestSession {
         return false;
       StateChanged("PREPARED");
       if (!core_->IsClosing())
-        handler_->OnPrepared(this, new ProtectionImpl(std::move(fields)),
-                             new CapabilitiesImpl(features));
+        ReportPrepared(std::move(fields), features);
       return true;
     }
     if (envelope.message == Message::kActive) {
@@ -651,7 +654,18 @@ class SessionImpl final : public AlloyGuestSession {
     std::unique_ptr<stream::ResourceLane> resources;
     std::string reason = "failed";
     StateChanged("STARTING");
-    bool launched = !core_->IsClosing() && LaunchSupervisor(&child);
+    std::string unavailable;
+    bool launched = !core_->IsClosing() && LaunchSupervisor(&child, &unavailable);
+    if (!unavailable.empty() && !core_->IsClosing()) {
+      // A startup prerequisite failed, so no supervised runtime exists. Publish
+      // the precise unavailable report through the normal callback owner, but
+      // close admission first: even developmental acceptance cannot start it.
+      core_->Close();
+      StateChanged("PREPARED");
+      ReportPrepared({"unavailable",
+          "{\"before_engine\":true,\"runtime_supervision\":false,\"process_teardown\":\"unavailable\"}",
+          "unavailable", "{\"route\":\"unavailable\"}", unavailable}, 0);
+    }
     if (launched)
       core_->SetChannel(child.channel);
     if (launched)
@@ -832,7 +846,7 @@ class SessionImpl final : public AlloyGuestSession {
     }
     if (!close_reason.empty())
       reason = close_reason;
-    else if (core_->IsClosing())
+    else if (core_->IsClosing() && unavailable.empty())
       reason = "closed";
     core_->Close();
     session.BeginClose();

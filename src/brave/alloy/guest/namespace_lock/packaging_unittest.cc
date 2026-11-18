@@ -22,7 +22,8 @@ TEST(GuestPackaging, NativeDoesNotClaimExternalFlatpakEntries) {
   auto coverage = base::JSONReader::ReadDict((*fields)[1], base::JSON_PARSE_RFC);
   ASSERT_TRUE(coverage);
   EXPECT_EQ(*coverage->FindString("flatpak_external_entries"), "unavailable");
-  EXPECT_NE(coverage->FindString("snap_external_entries")->find("unverified-blocked"), std::string::npos);
+  EXPECT_EQ(*coverage->FindString("snap_external_entries"),
+            "unsupported:strict-Snap-policy-denies-pidfd_send_signal");
   auto native = base::JSONReader::ReadDict((*fields)[3], base::JSON_PARSE_RFC);
   ASSERT_TRUE(native);
   EXPECT_EQ(*native->FindString("route"), "userns");

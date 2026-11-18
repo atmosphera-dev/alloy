@@ -56,14 +56,23 @@ exceptions without engine payload. Ordinary exec/zygote descendants inherit
 Landlock. The report distinguishes those paths and does not advertise the
 deferred namespace/read-only view.
 
-## Snap is blocked, not verified
+## Snap guest mode is unsupported
 
 A real strict local package with connected browser-support/allow-sandbox on
 snapd 2.78 allowed pidfd_open but denied pidfd_send_signal to its own child with
 EPERM. Alloy's identity-bound forced termination requires the latter. No Snap
-coverage is claimed, and no devmode/classic package, numeric-PID fallback or
-snapd policy modification substitutes for it. The lifetime route needs a
-separate decision before Snap can be admitted.
+coverage is claimed. Before launching any supervisor or engine, Alloy checks
+the actual operation with signal 0 against its own pinned process identity.
+A policy denial reports `unavailable` with the reason `process policy denies
+pidfd_send_signal: identity-bound process teardown unavailable`. No features,
+scratch or supervised runtime are claimed, and acceptance is closed even for
+developmental settings. The check is not selected by a Snap environment marker:
+the same refusal applies to a denial imposed by any inherited process policy.
+
+There is no weaker teardown, numeric-PID fallback or devmode/classic substitute.
+Snap support would require a separately verified identity-bound teardown
+mechanism or a snapd policy change admitting the required syscall. This work
+does neither and does not modify snapd policy.
 
 ## Verification status
 
@@ -81,7 +90,11 @@ Negative RAM tests use a fresh package identity and assert actual carrier
 absence: revoking a grant on a previously used app can leave usable private RAM.
 Flatpak 1.14.6's default filter permits portal calls, so removing a talk policy does
 not prove IPC loss; that test verifies absence of the session-bus socket.
-Both configurations passed 20 Flatpak and 15 native/package cases, plus shared
+Both configurations passed 20 Flatpak and 18 native/package cases, plus shared
 foundation, smoke and blocking checks. Native recovery also passed on Release.
-Snap remains blocked and is not a passing case.
+The startup-refusal regression inherits a real seccomp filter denying
+`pidfd_send_signal` and checks the SDK's unavailable report, rejected acceptance,
+zero runtime entries and no navigation. An unfiltered control loads normally,
+including with a synthetic Snap marker. This is refusal proof, not Snap support.
+It runs as `--check teardown` and is included in native package acceptance.
 Local test packages are never published to a store.

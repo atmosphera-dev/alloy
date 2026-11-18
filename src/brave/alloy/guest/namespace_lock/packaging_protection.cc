@@ -23,9 +23,9 @@ std::optional<std::array<std::string, 5>> PackagingProtectionFields(
   auto native = base::JSONReader::ReadDict((*fields)[3], base::JSON_PARSE_RFC);
   auto limits = base::JSONReader::ReadDict((*fields)[4], base::JSON_PARSE_RFC);
   if (!coverage || !native || !limits) return std::nullopt;
-  coverage->Set("snap_external_entries", "unverified-blocked:strict-Snap-denies-pidfd_send_signal");
+  coverage->Set("snap_external_entries", "unsupported:strict-Snap-policy-denies-pidfd_send_signal");
   limits->Set("namespace_filesystem_and_packages",
-      "native-namespace-view-absent; Snap-unverified-blocked-on-pidfd_send_signal");
+      "native-namespace-view-absent; Snap-unsupported-policy-denies-pidfd_send_signal");
   if (flatpak_broker) {
     coverage->Set("flatpak_external_entries", "fixed-bootstrap-per-entry; explicit-verified-RAM-and-launch-capabilities");
     auto* trusted = coverage->FindList("trusted_setup");
@@ -34,7 +34,7 @@ std::optional<std::array<std::string, 5>> PackagingProtectionFields(
     native->Set("route", sandbox.route);
     native->Set("setuid_helper", "never-used; zypak-adapts-the-native-helper-handshake-to-Flatpak-user-namespaces");
     limits->Set("namespace_filesystem_and_packages",
-        "native-namespace-view-absent; Flatpak-brokered-entries; Snap-unverified-blocked-on-pidfd_send_signal");
+        "native-namespace-view-absent; Flatpak-brokered-entries; Snap-unsupported-policy-denies-pidfd_send_signal");
   }
   auto encoded_coverage = base::WriteJson(*coverage);
   auto encoded_native = base::WriteJson(*native);

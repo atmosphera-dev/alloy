@@ -20,7 +20,7 @@ def report():
     return dict(filesystem='data-writes-denied', scratch='verified-tmpfs',
         coverage=json.dumps(dict(before_engine=True,
             flatpak_external_entries='fixed-bootstrap-per-entry',
-            snap_external_entries='unverified-blocked:strict-Snap-denies-pidfd_send_signal')),
+            snap_external_entries='unsupported:strict-Snap-policy-denies-pidfd_send_signal')),
         sandbox=json.dumps(dict(route='flatpak-brokered-userns', browser=dict(no_new_privs=True),
             renderer=dict(observed_after_blank_load=True, no_new_privs=True, seccomp=2,
                           effective_capabilities_decimal='0'))),

@@ -23,13 +23,14 @@ std::optional<std::array<std::string, 5>> PackagingProtectionFields(
   auto native = base::JSONReader::ReadDict((*fields)[3], base::JSON_PARSE_RFC);
   auto limits = base::JSONReader::ReadDict((*fields)[4], base::JSON_PARSE_RFC);
   if (!coverage || !native || !limits) return std::nullopt;
+  auto* trusted = coverage->FindList("trusted_setup");
+  if (!trusted) return std::nullopt;
+  trusted->Append("fixed-static-bootstrap-teardown-probe; no-engine-payload");
   coverage->Set("snap_external_entries", "unsupported:strict-Snap-policy-denies-pidfd_send_signal");
   limits->Set("namespace_filesystem_and_packages",
       "native-namespace-view-absent; Snap-unsupported-policy-denies-pidfd_send_signal");
   if (flatpak_broker) {
     coverage->Set("flatpak_external_entries", "fixed-bootstrap-per-entry; explicit-verified-RAM-and-launch-capabilities");
-    auto* trusted = coverage->FindList("trusted_setup");
-    if (!trusted) return std::nullopt;
     trusted->Append("Flatpak-portal,bubblewrap,pinned-unprivileged-zypak-setup; no-engine-payload");
     native->Set("route", sandbox.route);
     native->Set("setuid_helper", "never-used; zypak-adapts-the-native-helper-handshake-to-Flatpak-user-namespaces");

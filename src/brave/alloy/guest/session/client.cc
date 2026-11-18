@@ -187,10 +187,11 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     std::lock_guard guard(mutex);
     return closing;
   }
-  void SetState(const std::string& value) {
+  bool SetState(const std::string& value) {
     std::lock_guard guard(mutex);
-    if (!closing || value == "CLOSED" || value == "FAILED")
-      state = value;
+    if (closing && value != state && value != "CLOSED" && value != "FAILED") return false;
+    state = value;
+    return true;
   }
   std::deque<Command> TakeCommands() {
     std::lock_guard guard(mutex);
@@ -499,8 +500,7 @@ class SessionImpl final : public AlloyGuestSession {
                          new CapabilitiesImpl(features));
   }
   void StateChanged(const std::string& state) {
-    core_->SetState(state);
-    handler_->OnStateChanged(this, state);
+    if (core_->SetState(state)) handler_->OnStateChanged(this, state);
   }
   void CancelView(uint64_t id, const std::string& reason) {
     auto found = views_.find(id);
@@ -661,7 +661,6 @@ class SessionImpl final : public AlloyGuestSession {
       // the precise unavailable report through the normal callback owner, but
       // close admission first: even developmental acceptance cannot start it.
       core_->Close();
-      StateChanged("PREPARED");
       ReportPrepared({"unavailable",
           "{\"before_engine\":true,\"runtime_supervision\":false,\"process_teardown\":\"unavailable\"}",
           "unavailable", "{\"route\":\"unavailable\"}", unavailable}, 0);
@@ -861,7 +860,11 @@ class SessionImpl final : public AlloyGuestSession {
     // EOF is a close request to the supervisor, which serializes it against
     // registration, terminates/reaps members, and only then exits.
     core_->SetChannel(-1);
-    ReapSupervisor(&child);
+    if (ReapSupervisor(&child) != 0) {
+      bool notify = reason != "failed";
+      reason = "failed";
+      if (notify) StateChanged("FAILED");
+    }
     core_->WaitExtensions();
     session.Closed();
     core_->SetState("CLOSED");

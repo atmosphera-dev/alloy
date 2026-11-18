@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from guest_test_support.process_identity import identity
+
 root = Path(sys.argv[1])
 assert os.getuid() == 0 and root.is_absolute() and root.is_dir()
 executables = [root / name for name in ('alloy_guest_host', 'alloy_guest_engine', 'alloy_guest_sdk_consumer')]
@@ -16,7 +19,10 @@ rows = []
 for proc in Path('/proc').iterdir():
     if not proc.name.isdecimal():
         continue
+    handle = -1
     try:
+        handle = os.pidfd_open(int(proc.name))
+        original = identity(int(proc.name), handle)
         info = (proc / 'exe').stat()
         executable = identities.get((info.st_dev, info.st_ino))
         if executable is None:
@@ -42,10 +48,15 @@ for proc in Path('/proc').iterdir():
                 if field.startswith('--type='):
                     role = field.removeprefix('--type=')
                     break
-        rows.append(dict(pid=int(proc.name), exe=str(executable), role=role, argv=argv,
+        if identity(int(proc.name), handle) != original:
+            continue  # An exec during observation cannot relabel another image.
+        rows.append(dict(pid=int(proc.name), identity=original, exe=str(executable), role=role, argv=argv,
             status={k: v.strip() for k, v in status.items()}, fds=fds,
             namespaces={n: str((proc / 'ns' / n).readlink()) for n in ('user', 'pid', 'net', 'mnt')},
             apparmor=(proc / 'attr/current').read_text().strip()))
     except (FileNotFoundError, ProcessLookupError):
         pass
+    finally:
+        if handle >= 0:
+            os.close(handle)
 print(json.dumps(rows))

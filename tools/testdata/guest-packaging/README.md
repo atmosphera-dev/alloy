@@ -13,6 +13,8 @@ The patch also fixes the pinned writable-message owner's extra reference,
 which otherwise keeps duplicated launch/RAM descriptors open after send. The
 real adapter message regression `message_fds.cc` must observe zero retained FDs
 after the final message owner is destroyed, including copied owners.
+Its disk-backed staging directory is an explicit argument, not an ambient
+TMPDIR dependency.
 
 Dynamic environment values go directly into the owning spawn request, not the
 launcher's borrowed string-view map. `spawn_environment.cc` exercises the actual
@@ -29,10 +31,14 @@ Negative RAM permission variants use fresh app identities and assert carrier
 absence: updating a used app can retain usable private RAM. Launch-IPC refusal
 uses `flatpak run --no-session-bus` and verifies socket absence; Flatpak 1.14.6
 permits portal calls even without an explicit talk policy. Failure cleanup pins
-package process identities, including portal-spawned entries.
+package process identities, including portal-spawned entries. The observer pins
+before reading birth/executable facts; consumers revalidate those facts after
+pinning and before signaling, including through the VM-root helper.
 
 These are local verification assets, not store publication or a completed
 package-coverage claim. Snap guest mode is unsupported because its strict
-policy denies pidfd_send_signal. `deny_pidfd_signal.c` supplies an inherited
-seccomp denial for the SDK refusal test, with an unfiltered positive control;
+policy denies pidfd_send_signal. `deny_pidfd_signal.c` supplies blanket and
+SIGKILL-only inherited seccomp denials for the SDK refusal test, with an
+unfiltered positive control. `teardown_policy.c` checks real supervisor error
+propagation and retained ownership using trusted EOF-released fixture children;
 there is no Snap adapter or weaker lifetime fallback here.

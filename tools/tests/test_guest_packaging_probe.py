@@ -3,6 +3,7 @@
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,7 @@ TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 import guest_packaging_probe as probe
 from guest_packaging_support import LocalFlatpak, PackageClient, PackageMembers
+from guest_test_support.process_identity import identity
 
 
 def report():
@@ -78,11 +80,56 @@ class GuestPackagingTests(unittest.TestCase):
     def test_external_members_are_not_limited_to_app_descendants(self):
         rows = [dict(pid=100, role='app'), dict(pid=200, role='renderer')]
         with patch('guest_packaging_support.os.pidfd_open', return_value=9) as opened, \
-             patch('guest_packaging_support.os.close') as closed:
+             patch('guest_packaging_support.os.close') as closed, \
+             patch.object(PackageMembers, '_validate_identities') as validate:
             with PackageMembers(rows) as members:
                 self.assertEqual([rows[1]], members.rows)
                 opened.assert_called_once_with(200)
+                validate.assert_called_once()
             closed.assert_called_once_with(9)
+
+    def test_snapshot_validation_accepts_only_the_pinned_birth_and_executable(self):
+        handle = os.pidfd_open(os.getpid())
+        try:
+            original = identity(os.getpid(), handle)
+        finally:
+            os.close(handle)
+        row = dict(pid=os.getpid(), role='app', identity=original)
+        with PackageMembers([row], include_app=True) as members:
+            self.assertEqual([row], members.rows)
+        for field in ('start_ticks', 'exe_inode', 'exe_device'):
+            stale = copy.deepcopy(row)
+            stale['identity'][field] = (str(int(original[field]) + 1) if field == 'start_ticks'
+                                        else original[field] + 1)
+            with self.subTest(field=field), \
+                 patch('guest_packaging_support.signal.pidfd_send_signal') as signalled:
+                with self.assertRaisesRegex(AssertionError, 'process identity changed'):
+                    with PackageMembers([stale], include_app=True):
+                        pass
+                signalled.assert_not_called()
+
+    def test_snapshot_exit_after_pin_is_retired_without_signaling(self):
+        process = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        opened = os.pidfd_open(process.pid)
+        try:
+            row = dict(pid=process.pid, role='app', identity=identity(process.pid, opened))
+        finally:
+            os.close(opened)
+        real_open = os.pidfd_open
+        def pin_then_exit(pid):
+            handle = real_open(pid)
+            process.communicate(timeout=15)
+            return handle
+        try:
+            with patch('guest_packaging_support.os.pidfd_open', side_effect=pin_then_exit), \
+                 patch('guest_packaging_support.signal.pidfd_send_signal') as signalled:
+                with PackageMembers([row], include_app=True) as members:
+                    self.assertFalse(members.rows)
+                    self.assertFalse(members.handles)
+                signalled.assert_not_called()
+        finally:
+            if process.poll() is None:
+                process.communicate(timeout=15)
 
     def test_failed_package_command_preserves_its_diagnostic(self):
         package = LocalFlatpak(TOOLS.parent, Path('/out'), Path('/evidence'))

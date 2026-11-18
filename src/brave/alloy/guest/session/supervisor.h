@@ -21,6 +21,8 @@ std::string BundledBootstrap();
 bool LaunchSupervisor(Supervisor* child, std::string* unavailable);
 // Close control, then reap the exact direct child. Never terminate by a numeric
 // PID received from a message or a process group that could contain app work.
-void ReapSupervisor(Supervisor* child);
+// Return the original direct child's wait status (zero if none was launched),
+// or -1 on a reaping error. A failed teardown must not become a successful close.
+int ReapSupervisor(Supervisor* child);
 }  // namespace alloy::guest
 #endif

@@ -25,6 +25,17 @@
 
 int alloy_guest_supervise(const char* bootstrap);
 
+static int teardown_probe(void) {
+  // Trusted static setup only: no registration, writer setup or engine load.
+  // EOF is a cooperative escape solely for this disposable pre-admission probe.
+  if (send(ALLOY_GUEST_CONTROL_FD, "P", 1, MSG_NOSIGNAL) != 1) return 125;
+  char byte;
+  ssize_t received;
+  do { received = recv(ALLOY_GUEST_CONTROL_FD, &byte, 1, 0); }
+  while (received < 0 && errno == EINTR);
+  return received == 0 ? 0 : 125;
+}
+
 static int granted(int fd, int supervisor, int child) {
   if (child && alloy_flatpak_preserves(fd))
     return 1;
@@ -118,6 +129,7 @@ static int sanitize_environment(void) {
 int main(int argc, char** argv) {
   unsigned int inherited_nnp = (unsigned int)prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
   int supervisor = argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0;
+  int probe = argc == 2 && strcmp(argv[1], ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT) == 0;
   int child = 0;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--type=", 7) == 0)
@@ -133,11 +145,11 @@ int main(int argc, char** argv) {
   if (length <= 0 || (size_t)length >= sizeof(executable) - 1)
     return 125;
   executable[length] = 0;
-  int flatpak = alloy_flatpak_detect(executable);
+  int flatpak = probe ? 0 : alloy_flatpak_detect(executable);
   if (flatpak < 0)
     return 125;
   struct rlimit no_core = {0, 0};
-  if (setrlimit(RLIMIT_CORE, &no_core) || !close_ungranted(supervisor, child) ||
+  if (setrlimit(RLIMIT_CORE, &no_core) || !close_ungranted(supervisor || probe, child) ||
       !sanitize_environment())
     return 125;
   int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -149,6 +161,8 @@ int main(int argc, char** argv) {
   }
   if (null_fd > 2)
     close(null_fd);
+  if (probe)
+    return teardown_probe();
   if (supervisor)
     return alloy_guest_supervise(executable);
   if (!alloy_guest_is_runtime() || !alloy_guest_register_runtime(1))

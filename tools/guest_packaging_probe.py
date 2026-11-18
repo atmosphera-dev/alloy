@@ -260,15 +260,27 @@ def native_acceptance(out, evidence, fixtures):
     return cases
 
 
-def teardown_refusal(out, evidence, fixtures):
+def teardown_refusal(out, evidence, fixtures, filters=('deny', 'deny-kill')):
     evidence.mkdir(parents=True, exist_ok=True)
     wrapper = evidence / 'pidfd-signal-policy'
     subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
         REPO / 'tools/testdata/guest-packaging/deny_pidfd_signal.c', '-o', wrapper], check=True)
-    rows = []
-    for developmental in (False, True):
-        label = 'developmental' if developmental else 'required'
-        with Client(out, evidence / label, launch_prefix=[wrapper, 'deny'],
+    checked_teardown = evidence / 'checked-supervisor-teardown'
+    subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+        '-I', REPO / 'src', '-I', WORK / 'src',
+        REPO / 'tools/testdata/guest-packaging/teardown_policy.c',
+        *[REPO / 'src/brave/alloy/guest/linux_lock' / (name + '.c')
+          for name in ('ram_scratch', 'child_launch')],
+        REPO / 'src/brave/alloy/guest/namespace_lock/flatpak_entry.c',
+        '-o', checked_teardown], check=True)
+    with (evidence / 'checked-supervisor-teardown.log').open('x') as log:
+        subprocess.run([checked_teardown], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30)
+    assert 'GUEST_TEARDOWN_ERROR_REPORTED=1' in (evidence / 'checked-supervisor-teardown.log').read_text()
+    rows = [dict(case='supervisor-signaling-failure-is-fatal', checked=True)]
+    for policy, developmental in ((policy, developmental) for policy in filters
+                                  for developmental in (False, True)):
+        label = policy + ('-developmental' if developmental else '-required')
+        with Client(out, evidence / label, launch_prefix=[wrapper, policy],
                     launch_environment={k: v for k, v in os.environ.items()
                                         if not k.startswith('SNAP')}) as client:
             client.send('start guest auto memory ' +
@@ -290,8 +302,10 @@ def teardown_refusal(out, evidence, fixtures):
                 assert not processes.members and not descendants(client.process.pid), processes.members
                 assert not any(v['event'] == 'view-ready' or v.get('state') == 'ACTIVE'
                                for v in client.events), client.events
+                states = [v for v in client.events if v['name'] == 'guest' and v['event'] == 'state']
+                assert all(v['state'] == v['observed_state'] for v in states), states
                 assert 'PIDFD_SIGNAL_FILTER_DENIED=1' in (client.root / 'consumer.log').read_text()
-                rows.append(dict(case='pidfd-signal-denied-' + label, report=report,
+                rows.append(dict(case='pidfd-signal-' + label, report=report,
                                  runtime_entries=0, navigations=0))
             finally:
                 # The pre-correction red test can reach the old engine. Cleanup
@@ -320,7 +334,7 @@ def teardown_refusal(out, evidence, fixtures):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=('feasibility', 'teardown', 'recovery', 'flatpak', 'native', 'all'), required=True)
+    parser.add_argument('--check', choices=('feasibility', 'teardown', 'teardown-kill', 'recovery', 'flatpak', 'native', 'all'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     args = parser.parse_args(argv)
     out = args.out.resolve()
@@ -341,8 +355,9 @@ def main(argv=None):
         full = args.check == 'flatpak'
         with Fixtures(REPO, tls_root=evidence / 'tls' if full or args.check == 'recovery' else None,
                       tracker_https=full) as fixtures:
-            if args.check == 'teardown':
-                cases = teardown_refusal(out, evidence, fixtures)
+            if args.check in ('teardown', 'teardown-kill'):
+                cases = teardown_refusal(out, evidence, fixtures,
+                    filters=('deny-kill',) if args.check == 'teardown-kill' else ('deny', 'deny-kill'))
             elif args.check == 'native':
                 cases = native_acceptance(out, evidence, fixtures)
             else:
@@ -378,7 +393,8 @@ def main(argv=None):
         result.update(status='passed', cases=cases, seconds=time.monotonic() - started)
         marker = dict(feasibility='GUEST_FLATPAK_FEASIBILITY_PASS', recovery='GUEST_FLATPAK_RECOVERY_PASS',
                       flatpak='GUEST_FLATPAK_PASS',
-                       native='GUEST_NATIVE_PACKAGE_PASS', teardown='GUEST_TEARDOWN_REFUSAL_PASS')[args.check]
+                       native='GUEST_NATIVE_PACKAGE_PASS', teardown='GUEST_TEARDOWN_REFUSAL_PASS')[
+                           'teardown' if args.check == 'teardown-kill' else args.check]
         print(marker, flush=True)
         return 0
     except BaseException as error:

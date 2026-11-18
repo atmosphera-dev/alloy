@@ -61,8 +61,11 @@ deferred namespace/read-only view.
 A real strict local package with connected browser-support/allow-sandbox on
 snapd 2.78 allowed pidfd_open but denied pidfd_send_signal to its own child with
 EPERM. Alloy's identity-bound forced termination requires the latter. No Snap
-coverage is claimed. Before launching any supervisor or engine, Alloy checks
-the actual operation with signal 0 against its own pinned process identity.
+coverage is claimed. Before launching a guest supervisor or engine, Alloy sends
+SIGKILL through a pidfd to a disposable fixed static-bootstrap probe and verifies
+that the original probe died from that signal. The probe loads no engine. If
+the call is denied, closing its private endpoint releases only that trusted
+pre-admission probe cooperatively; this is not a runtime teardown fallback.
 A policy denial reports `unavailable` with the reason `process policy denies
 pidfd_send_signal: identity-bound process teardown unavailable`. No features,
 scratch or supervised runtime are claimed, and acceptance is closed even for
@@ -73,6 +76,13 @@ There is no weaker teardown, numeric-PID fallback or devmode/classic substitute.
 Snap support would require a separately verified identity-bound teardown
 mechanism or a snapd policy change admitting the required syscall. This work
 does neither and does not modify snapd policy.
+
+Both supervisor termination paths check signaling failures. A failed termination
+makes the final session result failed, never a successful close. Original pidfds
+remain owned until exit is confirmed; there is no timeout that abandons a live
+admitted process. A later kernel-policy loss cannot create new kill authority.
+The unavailable report is delivered with admission already closed, without a
+rejected PREPARED state notification.
 
 ## Verification status
 
@@ -90,11 +100,18 @@ Negative RAM tests use a fresh package identity and assert actual carrier
 absence: revoking a grant on a previously used app can leave usable private RAM.
 Flatpak 1.14.6's default filter permits portal calls, so removing a talk policy does
 not prove IPC loss; that test verifies absence of the session-bus socket.
-Both configurations passed 20 Flatpak and 18 native/package cases, plus shared
-foundation, smoke and blocking checks. Native recovery also passed on Release.
+Both configurations passed 20 Flatpak and 21 native/package cases, plus shared
+recovery, foundation, smoke and blocking checks. Each also passed six teardown
+checks, 36 Python fixture tests and 26/14/4 session/lock/packaging unit tests.
 The startup-refusal regression inherits a real seccomp filter denying
-`pidfd_send_signal` and checks the SDK's unavailable report, rejected acceptance,
+`pidfd_send_signal` either entirely or only for SIGKILL, and checks the SDK's
+unavailable report, truthful state notifications, rejected acceptance,
 zero runtime entries and no navigation. An unfiltered control loads normally,
 including with a synthetic Snap marker. This is refusal proof, not Snap support.
 It runs as `--check teardown` and is included in native package acceptance.
+Failing-first SDK runs reproduced both incorrect SIGKILL-only admission and the
+rejected PREPARED notification before the correction. A minimal real Flatpak
+also confirmed actual pidfd SIGKILL and the original child's signal-9 wait status.
+Package observation pins before inspecting birth/executable identity, and the
+consumer revalidates that identity after pinning before any signaling helper.
 Local test packages are never published to a store.

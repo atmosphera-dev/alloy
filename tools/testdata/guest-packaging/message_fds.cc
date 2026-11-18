@@ -29,10 +29,9 @@ int Copies(int original) {
   return copies;
 }
 
-int main() {
-  const char* temporary = getenv("TMPDIR");
-  assert(temporary);
-  std::string name = std::string(temporary) + "/alloy-message-fd-XXXXXX";
+int main(int argc, char** argv) {
+  assert(argc == 2);
+  std::string name = std::string(argv[1]) + "/alloy-message-fd-XXXXXX";
   int fd = mkstemp(name.data());
   assert(fd >= 0 && !unlink(name.c_str()));
   assert(Copies(fd) == 1);

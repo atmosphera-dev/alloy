@@ -87,7 +87,8 @@ class Guest final : public AlloyGuestSessionHandler,
   void OnStateChanged(CefRefPtr<AlloyGuestSession> session,
                         const CefString& state) override {
     Attach(session);
-    Event(name_, "state", ",\"state\":" + Quote(state.ToString()));
+    Event(name_, "state", ",\"state\":" + Quote(state.ToString()) +
+          ",\"observed_state\":" + Quote(session->GetState().ToString()));
     if (state == "STARTING" && policy_ == "terminate-start")
       session->Terminate();
     if (state == "ACTIVE" && policy_ == "queue-close") {

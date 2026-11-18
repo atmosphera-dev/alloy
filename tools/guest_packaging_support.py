@@ -88,7 +88,7 @@ class LocalFlatpak(AbstractContextManager):
             source / 'src/dbus/bus_writable_message.cc',
             *shlex.split(self.run(['pkg-config', '--cflags', '--libs', 'dbus-1'])),
             '-o', message_test])
-        self.run([message_test])
+        self.run([message_test, self.stage])
         environment_test = source / 'alloy-spawn-environment'
         self.run(['g++', '-std=c++20', '-O1', '-g', '-Wall', '-Werror',
             '-fsanitize=address', '-fsanitize-address-use-after-scope', '-fno-omit-frame-pointer',
@@ -328,9 +328,46 @@ class PackageMembers(Members):
                     self.handles.append((row, os.pidfd_open(row['pid'])))
                 except ProcessLookupError:
                     pass
+            self._validate_identities()
         except BaseException:
             self.close()
             raise
+
+    def _validate_identities(self):
+        if not self.handles:
+            self.rows = []
+            return
+        # The observer's numeric PID is only a lookup hint. Revalidate the live
+        # birth/executable identity after pinning, before any signal or root
+        # signaling helper can receive this capability.
+        channel, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        script = Path(__file__).parent / 'guest_test_support/process_identity.py'
+        try:
+            helper = subprocess.Popen(['sudo', '-n', 'python3', '-B', str(script)], stdin=child)
+        except BaseException:
+            child.close()
+            channel.close()
+            raise
+        child.close()
+        live = []
+        try:
+            for row, handle in self.handles:
+                payload = json.dumps(dict(pid=row['pid'], identity=row['identity'])).encode()
+                channel.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                             array.array('i', [handle]))])
+                result = channel.recv(1)
+                assert result in (b'V', b'E', b'R'), 'Process identity validation failed'
+                assert result != b'R', ('Observed package process identity changed', row)
+                if result == b'V':
+                    live.append((row, handle))
+            retired = {handle for row, handle in self.handles} - {handle for row, handle in live}
+            for handle in retired:
+                os.close(handle)
+            self.handles = live
+            self.rows = [row for row, handle in live]
+        finally:
+            channel.close()
+            assert helper.wait(timeout=15) == 0, 'Process identity validator failed'
 
     def terminate(self):
         for row, handle in self.handles:

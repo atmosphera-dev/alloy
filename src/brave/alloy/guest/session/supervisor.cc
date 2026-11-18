@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <spawn.h>
 #include <string>
 #include <sys/socket.h>
@@ -32,33 +33,9 @@ std::string BundledBootstrap() {
   return library.substr(0, separator + 1) + "alloy_guest_host";
 }
 
-bool LaunchSupervisor(Supervisor* child, std::string* unavailable) {
-  unavailable->clear();
-  // Signal 0 checks the real syscall policy without changing process state.
-  // Check before launching a supervisor whose forced teardown would otherwise
-  // be denied. No Snap marker, numeric-PID signal or weaker route substitutes.
-  int identity = static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0));
-  if (identity < 0) {
-    *unavailable = std::string("identity-bound process teardown unavailable: pidfd_open: ") +
-                   strerror(errno);
-    return false;
-  }
-  int signalled;
-  do {
-    signalled = static_cast<int>(syscall(SYS_pidfd_send_signal, identity, 0, nullptr, 0));
-  } while (signalled < 0 && errno == EINTR);
-  int error = errno;
-  close(identity);
-  if (signalled < 0) {
-    *unavailable = error == EPERM || error == EACCES
-        ? "process policy denies pidfd_send_signal: identity-bound process teardown unavailable"
-        : std::string("identity-bound process teardown unavailable: pidfd_send_signal: ") +
-              strerror(error);
-    return false;
-  }
-  std::string bootstrap = BundledBootstrap();
-  if (bootstrap.empty() || access(bootstrap.c_str(), X_OK))
-    return false;
+namespace {
+bool SpawnBootstrap(const std::string& bootstrap, const char* role,
+                    Supervisor* child, int* identity_error = nullptr) {
   int pair[2];
   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
     return false;
@@ -103,8 +80,9 @@ bool LaunchSupervisor(Supervisor* child, std::string* unavailable) {
   for (auto& field : environment)
     env.push_back(field.data());
   env.push_back(nullptr);
-  char role[] = "--alloy-supervisor";
-  char* argv[] = {bootstrap.data(), role, nullptr};
+  std::string executable = bootstrap;
+  std::string argument = role;
+  char* argv[] = {executable.data(), argument.data(), nullptr};
   posix_spawn_file_actions_t actions;
   int setup = posix_spawn_file_actions_init(&actions);
   if (setup) {
@@ -134,15 +112,66 @@ bool LaunchSupervisor(Supervisor* child, std::string* unavailable) {
   child->channel = pair[0];
   child->resources = resources[0];
   child->pidfd = static_cast<int>(syscall(SYS_pidfd_open, process, 0));
-  if (child->pidfd < 0 ||
-      fcntl(child->channel, F_SETFL, O_NONBLOCK) < 0) {
+  if (child->pidfd < 0) {
+    if (identity_error) *identity_error = errno;
+    ReapSupervisor(child);
+    return false;
+  }
+  return true;
+}
+}  // namespace
+
+bool LaunchSupervisor(Supervisor* child, std::string* unavailable) {
+  unavailable->clear();
+  std::string bootstrap = BundledBootstrap();
+  if (bootstrap.empty() || access(bootstrap.c_str(), X_OK)) return false;
+  Supervisor probe;
+  int identity_error = 0;
+  if (!SpawnBootstrap(bootstrap, ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT, &probe, &identity_error)) {
+    if (identity_error)
+      *unavailable = std::string("identity-bound process teardown unavailable: pidfd_open: ") +
+                     strerror(identity_error);
+    return false;
+  }
+  char ready = 0;
+  ssize_t received;
+  do { received = recv(probe.channel, &ready, 1, MSG_TRUNC); }
+  while (received < 0 && errno == EINTR);
+  if (received != 1 || ready != 'P') {
+    ReapSupervisor(&probe);
+    *unavailable = "identity-bound process teardown unavailable: trusted probe did not become ready";
+    return false;
+  }
+  // Exercise the actual forced-teardown operation, not signal 0 or our own PID.
+  // The fixed static probe loads no engine. If signaling is denied, closing its
+  // private endpoint releases this trusted pre-admission process cooperatively.
+  int signalled;
+  do { signalled = static_cast<int>(syscall(SYS_pidfd_send_signal, probe.pidfd,
+                                           SIGKILL, nullptr, 0)); }
+  while (signalled < 0 && errno == EINTR);
+  int error = errno;
+  int status = ReapSupervisor(&probe);
+  if (signalled < 0) {
+    *unavailable = error == EPERM || error == EACCES
+        ? "process policy denies pidfd_send_signal: identity-bound process teardown unavailable"
+        : std::string("identity-bound process teardown unavailable: pidfd_send_signal: ") +
+              strerror(error);
+    return false;
+  }
+  if (status < 0 || !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+    *unavailable = "identity-bound process teardown unavailable: probe did not terminate by SIGKILL";
+    return false;
+  }
+  if (!SpawnBootstrap(bootstrap, "--alloy-supervisor", child)) return false;
+  if (fcntl(child->channel, F_SETFL, O_NONBLOCK) < 0) {
     ReapSupervisor(child);
     return false;
   }
   return true;
 }
 
-void ReapSupervisor(Supervisor* child) {
+int ReapSupervisor(Supervisor* child) {
+  int status = 0;
   if (child->resources >= 0) {
     close(child->resources);
     child->resources = -1;
@@ -152,12 +181,15 @@ void ReapSupervisor(Supervisor* child) {
     child->channel = -1;
   }
   if (child->process > 0) {
-    while (waitpid(child->process, nullptr, 0) < 0 && errno == EINTR) {}
+    pid_t reaped;
+    do { reaped = waitpid(child->process, &status, 0); } while (reaped < 0 && errno == EINTR);
+    if (reaped != child->process) status = -1;
     child->process = -1;
   }
   if (child->pidfd >= 0) {
     close(child->pidfd);
     child->pidfd = -1;
   }
+  return status;
 }
 }  // namespace alloy::guest

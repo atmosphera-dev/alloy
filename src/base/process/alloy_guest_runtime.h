@@ -13,6 +13,7 @@
 #define ALLOY_GUEST_RESOURCE_FD 200
 #define ALLOY_GUEST_REGISTRATION_MAGIC 0x41475231u
 #define ALLOY_GUEST_FACTS_MAGIC 0x41474231u
+#define ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT "--alloy-teardown-probe"
 
 #ifdef __cplusplus
 extern "C" {

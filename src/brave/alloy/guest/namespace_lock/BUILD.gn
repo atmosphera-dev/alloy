@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import("//testing/test.gni")
 source_set("namespace_lock") {
-  sources = [ "provider.cc" ]
-  deps = [ "..:provider_api" ]
+  sources = [ "provider.cc", "packaging_protection.cc", "packaging_protection.h" ]
+  deps = [ "..:provider_api", "//base" ]
+}
+
+test("alloy_guest_packaging_unittests") {
+  sources = [ "packaging_unittest.cc", "packaging_protection.cc", "../linux_lock/protection.cc" ]
+  deps = [ "//base", "//base/test:run_all_unittests", "//base/test:test_support", "//testing/gtest" ]
 }

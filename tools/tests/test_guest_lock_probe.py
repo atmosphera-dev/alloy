@@ -37,6 +37,7 @@ class LockReceipts(unittest.TestCase):
     def test_role_does_not_confuse_browser_with_subprocess(self):
         self.assertEqual(role_of(dict(argv='engine --type=renderer --x=y')), 'renderer')
         self.assertEqual(role_of(dict(argv='host --alloy-supervisor')), 'supervisor')
+        self.assertEqual(role_of(dict(argv='host --alloy-wait-owner')), 'wait-owner')
         self.assertEqual(role_of(dict(argv='engine')), 'browser')
 
     def test_bus_count_excludes_only_explicit_control_senders(self):

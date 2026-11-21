@@ -9,6 +9,7 @@
 extern "C" {
 #endif
 int alloy_lock_prepare_scratch(void);
+int alloy_lock_prepare_scratch_in(const char* parent_path);
 int alloy_lock_scratch_fd(void);
 int alloy_lock_scratch_valid(void);
 int alloy_lock_drop_setup_capability(void);

@@ -59,15 +59,21 @@ int alloy_lock_scratch_valid(void) {
 }
 
 int alloy_lock_prepare_scratch(void) {
+  return alloy_lock_prepare_scratch_in("/dev/shm");
+}
+
+int alloy_lock_prepare_scratch_in(const char* parent_path) {
   // Do not trust HOME, TMPDIR, XDG_RUNTIME_DIR, or a pathname that merely looks
   // like a runtime directory. No disk-possible alternative is selected.
-  int parent = open("/dev/shm", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int parent = open(parent_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   struct statfs fs;
   struct stat before, after;
-  if (parent < 0 || fstatfs(parent, &fs) || fs.f_type != TMPFS_MAGIC)
+  if (parent < 0 || fstatfs(parent, &fs) || fs.f_type != TMPFS_MAGIC) {
+    if (parent >= 0) close(parent);
     return 0;
-  if (snprintf(owned_path, sizeof(owned_path), "/dev/shm/alloy-guest-%lu-XXXXXX",
-               (unsigned long)getuid()) >= (int)sizeof(owned_path) ||
+  }
+  if (snprintf(owned_path, sizeof(owned_path), "%s/alloy-guest-%lu-XXXXXX",
+               parent_path, (unsigned long)getuid()) >= (int)sizeof(owned_path) ||
       !mkdtemp(owned_path)) {
     close(parent);
     return 0;

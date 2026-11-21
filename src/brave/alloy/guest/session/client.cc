@@ -187,10 +187,11 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     std::lock_guard guard(mutex);
     return closing;
   }
-  void SetState(const std::string& value) {
+  bool SetState(const std::string& value) {
     std::lock_guard guard(mutex);
-    if (!closing || value == "CLOSED" || value == "FAILED")
-      state = value;
+    if (closing && value != state && value != "CLOSED" && value != "FAILED") return false;
+    state = value;
+    return true;
   }
   std::deque<Command> TakeCommands() {
     std::lock_guard guard(mutex);
@@ -494,9 +495,12 @@ class SessionImpl final : public AlloyGuestSession {
   void Terminate() override { core_->Terminate(); }
 
  private:
+  void ReportPrepared(std::vector<std::string> fields, uint64_t features) {
+    handler_->OnPrepared(this, new ProtectionImpl(std::move(fields)),
+                         new CapabilitiesImpl(features));
+  }
   void StateChanged(const std::string& state) {
-    core_->SetState(state);
-    handler_->OnStateChanged(this, state);
+    if (core_->SetState(state)) handler_->OnStateChanged(this, state);
   }
   void CancelView(uint64_t id, const std::string& reason) {
     auto found = views_.find(id);
@@ -566,8 +570,7 @@ class SessionImpl final : public AlloyGuestSession {
         return false;
       StateChanged("PREPARED");
       if (!core_->IsClosing())
-        handler_->OnPrepared(this, new ProtectionImpl(std::move(fields)),
-                             new CapabilitiesImpl(features));
+        ReportPrepared(std::move(fields), features);
       return true;
     }
     if (envelope.message == Message::kActive) {
@@ -651,7 +654,17 @@ class SessionImpl final : public AlloyGuestSession {
     std::unique_ptr<stream::ResourceLane> resources;
     std::string reason = "failed";
     StateChanged("STARTING");
-    bool launched = !core_->IsClosing() && LaunchSupervisor(&child);
+    std::string unavailable;
+    bool launched = !core_->IsClosing() && LaunchSupervisor(&child, &unavailable, core_->wake);
+    if (!unavailable.empty() && !core_->IsClosing()) {
+      // A startup prerequisite failed, so no supervised runtime exists. Publish
+      // the precise unavailable report through the normal callback owner, but
+      // close admission first: even developmental acceptance cannot start it.
+      core_->Close();
+      ReportPrepared({"unavailable",
+          "{\"before_engine\":true,\"runtime_supervision\":false,\"process_teardown\":\"unavailable\"}",
+          "unavailable", "{\"route\":\"unavailable\"}", unavailable}, 0);
+    }
     if (launched)
       core_->SetChannel(child.channel);
     if (launched)
@@ -832,7 +845,7 @@ class SessionImpl final : public AlloyGuestSession {
     }
     if (!close_reason.empty())
       reason = close_reason;
-    else if (core_->IsClosing())
+    else if (core_->IsClosing() && unavailable.empty())
       reason = "closed";
     core_->Close();
     session.BeginClose();
@@ -847,7 +860,11 @@ class SessionImpl final : public AlloyGuestSession {
     // EOF is a close request to the supervisor, which serializes it against
     // registration, terminates/reaps members, and only then exits.
     core_->SetChannel(-1);
-    ReapSupervisor(&child);
+    if (ReapSupervisor(&child) != 0) {
+      bool notify = reason != "failed";
+      reason = "failed";
+      if (notify) StateChanged("FAILED");
+    }
     core_->WaitExtensions();
     session.Closed();
     core_->SetState("CLOSED");

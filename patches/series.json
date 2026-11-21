@@ -1187,6 +1187,11 @@
       "patch": "cef/0170-guest-accessibility.patch",
       "root": "cef",
       "stage": "after-prune"
+    },
+    {
+      "patch": "chromium/0180-guest-flatpak-entry.patch",
+      "root": ".",
+      "stage": "after-prune"
     }
   ],
   "cef_resolutions": [

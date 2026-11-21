@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import select
 import signal
 import subprocess
 import threading
@@ -42,6 +43,8 @@ def process_role(arguments):
     # Chromium rewrites /proc/cmdline to one space-separated process title.
     # Before that rewrite, the same flags are distinct NUL-separated arguments.
     title = b' '.join(arguments)
+    if re.search(rb'(?:^|\s)--alloy-wait-owner(?:\s|$)', title):
+        return 'wait-owner'
     if re.search(rb'(?:^|\s)--alloy-supervisor(?:\s|$)', title):
         return 'supervisor'
     match = re.search(rb'(?:^|\s)--type=([a-z0-9-]+)(?:\s|$)', title)
@@ -100,10 +103,62 @@ class OwnedProcesses:
         self.handles.clear()
 
 
+def kill_renderers(handles, wait_for_exit=True):
+    """Signal original renderer identities; optionally observe their actual exit."""
+    targets = [(row, fd) for row, fd in handles if row['role'] == 'renderer']
+    assert targets, 'No captured renderer for the immediate-crash regression'
+    for row, fd in targets:
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+    if not wait_for_exit:
+        return [row for row, fd in targets]
+    deadline = time.monotonic() + 30
+    for row, fd in targets:
+        event = select.poll()
+        event.register(fd, select.POLLIN)
+        assert event.poll(max(0, int((deadline - time.monotonic()) * 1000))), row
+    return [row for row, fd in targets]
+
+
+RENDERER_CRASH_ABORT = -10000
+
+
+def navigate_after_crash(client, view, url, title):
+    """The app reacts to one crash outcome with one new navigation, never a timer."""
+    after = len(client.events)
+    client.send(f'navigate guest {view} {url}')
+    assert client.wait('guest', 'navigate-queued', after=after)['ok']
+    first = client.wait('guest', 'load', lambda value: value['view'] == view, after=after)
+    assert first['status'] in (200, RENDERER_CRASH_ABORT), first
+    outcomes = [first]
+    loaded = first
+    if first['status'] == RENDERER_CRASH_ABORT:
+        assert first['reason'] == 'renderer-crash', first
+        # This is a new explicit app request made only in response to the abort.
+        following = len(client.events)
+        client.send(f'navigate guest {view} {url}')
+        assert client.wait('guest', 'navigate-queued', after=following)['ok']
+        loaded = client.wait('guest', 'load', lambda value: value['view'] == view,
+                             after=following)
+        assert loaded['status'] == 200 and loaded['document'] > first['document'], loaded
+        outcomes.append(loaded)
+    client.wait('guest', 'title', lambda value: value['view'] == view and
+                value['document'] == loaded['document'] and value['title'] == title, after=after)
+    return dict(after=after, outcomes=outcomes, loaded=loaded)
+
+
+def assert_navigation_outcomes(client, observation):
+    """Check after terminal close/reader drain, not a delay-based quiet window."""
+    expected = observation['outcomes']
+    view = expected[0]['view']
+    actual = [value for value in client.events[observation['after']:]
+              if value['name'] == 'guest' and value['event'] == 'load' and value['view'] == view]
+    assert actual == expected, (actual, expected)
+
+
 class Client:
     def __init__(self, out: Path, root: Path, flexible=False, trusted_certificate=None,
-                 reserve_descriptors=None, launch_prefix=None, launch_environment=None,
-                 encrypted_app=False, abort_callback=None):
+                  reserve_descriptors=None, launch_prefix=None, launch_environment=None,
+                  encrypted_app=False, abort_callback=None, executable=None, app_profile=None):
         self.out = out
         self.root = root
         self.finished = False
@@ -128,9 +183,10 @@ class Client:
                 subprocess.run(['certutil', '-A', '-d', 'sql:' + str(nss), '-n', 'Alloy guest fixture',
                     '-t', 'C,,', '-i', str(trusted_certificate)], env=self.env,
                     stdout=log, stderr=subprocess.STDOUT, check=True, timeout=20)
-        command = [str(out / 'alloy_guest_sdk_consumer')]
+        command = [str(executable or out / 'alloy_guest_sdk_consumer')]
         if flexible or encrypted_app:
-            command += ['--flexible-encrypted' if encrypted_app else '--flexible', str(root / 'app-profile')]
+            command += ['--flexible-encrypted' if encrypted_app else '--flexible',
+                        str(app_profile or root / 'app-profile')]
         self.log = (root / 'consumer.log').open('x')
         self.stderr = (root / 'stderr.log').open('x')
         self.process = subprocess.Popen(list(launch_prefix or []) + command, cwd=out, env=self.env,

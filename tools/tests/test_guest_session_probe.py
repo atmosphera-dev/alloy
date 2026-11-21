@@ -22,10 +22,76 @@ TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 import guest_session_probe as probe
 from guest_test_support.fixtures import Fixtures
-from guest_test_support.session import Client, descendants, process_role
+from guest_test_support.session import (Client, descendants, process_role, kill_renderers,
+    navigate_after_crash, assert_navigation_outcomes, RENDERER_CRASH_ABORT)
 
 
 class GuestProbeTests(unittest.TestCase):
+    def test_crash_regression_observes_all_original_renderers_before_returning(self):
+        handles = [(dict(pid=11, role='renderer'), 21),
+                   (dict(pid=12, role='browser'), 22),
+                   (dict(pid=13, role='renderer'), 23)]
+        poll = Mock()
+        poll.poll.return_value = [(21, 1)]
+        with patch('guest_test_support.session.signal.pidfd_send_signal') as kill, \
+             patch('guest_test_support.session.select.poll', return_value=poll), \
+             patch('guest_test_support.session.time.sleep', side_effect=AssertionError('No crash sleeps')):
+            self.assertEqual([handles[0][0], handles[2][0]], kill_renderers(handles))
+        self.assertEqual([21, 23], [call.args[0] for call in kill.call_args_list])
+        self.assertEqual(2, poll.poll.call_count)
+
+    def test_immediate_crash_does_not_wait_for_exit(self):
+        handles = [(dict(pid=11, role='renderer'), 21)]
+        with patch('guest_test_support.session.signal.pidfd_send_signal') as kill, \
+             patch('guest_test_support.session.select.poll', side_effect=AssertionError('Must race exit')):
+            self.assertEqual([handles[0][0]], kill_renderers(handles, False))
+        kill.assert_called_once()
+
+    def test_crash_abort_drives_one_new_app_request_after_its_outcome(self):
+        client = Mock()
+        client.events = []
+        aborted = dict(name='guest', event='load', view=1, document=2,
+                       status=RENDERER_CRASH_ABORT, reason='renderer-crash')
+        loaded = dict(name='guest', event='load', view=1, document=3, status=200)
+        def wait(name, event, *args, **kwargs):
+            if event == 'navigate-queued':
+                return dict(ok=True)
+            if event == 'load':
+                value = aborted if not client.events else loaded
+                client.events.append(value)
+                return value
+            return dict(title='RECOVERED')
+        client.wait.side_effect = wait
+        observation = navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')
+        self.assertEqual([aborted, loaded], observation['outcomes'])
+        self.assertEqual(2, client.send.call_count)
+        assert_navigation_outcomes(client, observation)
+        client.events.append(loaded)
+        with self.assertRaises(AssertionError):
+            assert_navigation_outcomes(client, observation)
+
+    def test_loaded_crash_race_does_not_request_another_navigation(self):
+        client = Mock(events=[])
+        loaded = dict(name='guest', event='load', view=1, document=2, status=200)
+        client.wait.side_effect = [dict(ok=True), loaded, dict(title='RECOVERED')]
+        observation = navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')
+        self.assertEqual([loaded], observation['outcomes'])
+        client.send.assert_called_once()
+
+    def test_generic_cancellation_is_not_misreported_as_a_renderer_crash(self):
+        client = Mock(events=[])
+        client.wait.side_effect = [dict(ok=True), dict(view=1, document=2, status=-3)]
+        with self.assertRaises(AssertionError):
+            navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')
+        client.send.assert_called_once()
+
+    def test_immediate_crash_regression_does_not_accept_silence_after_queue_ack(self):
+        client = Mock(events=[])
+        client.wait.side_effect = [dict(ok=True),
+                                   AssertionError('No navigation outcome')]
+        with self.assertRaisesRegex(AssertionError, 'No navigation outcome'):
+            navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')
+
     def test_idle_tls_peer_does_not_block_requests_or_shutdown(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch('guest_test_support.fixtures.tracker_https_socket',
@@ -111,6 +177,8 @@ class GuestProbeTests(unittest.TestCase):
             self.assertEqual(role, process_role([b'/engine --type=' + role.encode() + b' --flag', b'']))
         self.assertEqual('browser', process_role([b'/engine', b'']))
         self.assertEqual('supervisor', process_role([b'/host', b'--alloy-supervisor', b'']))
+        self.assertEqual('supervisor', process_role([b'/host', b'--alloy-supervisor', b'--alloy-wait-gate']))
+        self.assertEqual('wait-owner', process_role([b'/host', b'--alloy-wait-owner', b'']))
 
     def test_process_walk_includes_worker_thread_children(self):
         ready, release = threading.Event(), threading.Event()

@@ -12,6 +12,7 @@
 #include "brave/alloy/guest/integration/drag.h"
 #include "brave/alloy/guest/accessibility/ownership.h"
 #include "brave/alloy/guest/linux_lock/sandbox_preflight.h"
+#include "brave/alloy/guest/namespace_lock/packaging_protection.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -273,6 +274,11 @@ class NativeView final : public CefClient,
   void Navigate(uint64_t request, const std::string& url) {
     if (closing_ || !browser_)
       return;
+    if (pending_request_) {
+      Owner original = owner_;
+      original.request = pending_request_;
+      emit_({Message::kCancel, {}, 0, original, {}});
+    }
     pending_request_ = request;
     browser_->GetMainFrame()->LoadURL(url);
   }
@@ -285,6 +291,7 @@ class NativeView final : public CefClient,
     stream_.Retire();
     if (accessibility_) accessibility_->Retire();
     pending_.clear();
+    outcome_.Retire();
     current_token_ = {};
     if (browser_)
       browser_->GetHost()->CloseBrowser(force);
@@ -303,7 +310,9 @@ class NativeView final : public CefClient,
     owner_ = *fresh;
     if (document_lost) {
       current_token_ = {};
-      pending_.clear();
+      // Every native DidStart has a matching DidFinish, including crash aborts.
+      // Keep its original outcome owner until that completion or explicit
+      // supersession; stream retirement must not swallow a requested load.
     }
      integration_.SetOwner(owner_);
      actions_->SetOwner(owner_);
@@ -313,6 +322,9 @@ class NativeView final : public CefClient,
   }
   void PrimaryMainFrameRenderProcessGone(base::TerminationStatus) override {
     StreamLost(true);
+    // Native completion can follow crash retirement, or a committed page can
+    // die before DidFinishLoad. Both use the same original outcome exactly once.
+    CompleteNavigation(ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED);
   }
   void DidStartNavigation(content::NavigationHandle* navigation) override {
     if (closing_ || !navigation->IsInPrimaryMainFrame() || navigation->IsSameDocument())
@@ -328,11 +340,10 @@ class NativeView final : public CefClient,
     }
     owner_ = *owner;
     current_token_ = {};
-    completed_navigation_ = false;
     // Explicitly cancel each original pending navigation before admitting the
     // replacement's document event. Do not silently drop old callback owners.
-    for (const auto& [id, original] : pending_)
-      emit_({Message::kCancel, {}, 0, original, {}});
+    if (auto original = outcome_.Begin(owner_))
+      emit_({Message::kCancel, {}, 0, *original, {}});
     pending_.clear();
      pending_.emplace(navigation->GetNavigationId(), owner_);
      integration_.SetOwner(owner_);
@@ -347,12 +358,12 @@ class NativeView final : public CefClient,
       return;
     Owner original = found->second;
     pending_.erase(found);
-    if (!SameNavigation(original, owner_))
+    if (!SameNavigation(original, owner_) || !outcome_.Owns(owner_))
       return;
     original.generation = owner_.generation;
-    if (navigation->HasCommitted())
+    if (navigation->HasCommitted()) {
       current_token_ = content::AlloyDocumentNoiseIdentity(navigation->GetRenderFrameHost());
-    else {
+    } else {
       // A 204, download or cancelled navigation leaves the previous native
       // document alive. Old session owners stay retired; admit that surviving
       // document only under this latest navigation's fresh owner.
@@ -362,10 +373,7 @@ class NativeView final : public CefClient,
       if (DocumentReady()) browser_->GetHost()->Invalidate(PET_VIEW);
     }
     if (!navigation->HasCommitted() || navigation->GetNetErrorCode() != net::OK) {
-      status_ = static_cast<int>(navigation->GetNetErrorCode());
-      completed_navigation_ = true;
-      emit_({Message::kNavigationComplete, {}, 0, original,
-              std::to_string(static_cast<int>(navigation->GetNetErrorCode()))});
+      CompleteNavigation(static_cast<int>(navigation->GetNetErrorCode()));
       return;
     }
     status_ = navigation->GetResponseHeaders()
@@ -381,13 +389,17 @@ class NativeView final : public CefClient,
       // Read the native page title at completed load as well. A title mutation
       // before DidFinishNavigation must not be lost or attributed to blank.
       emit_({Message::kTitle, {}, 0, owner_, CefString(web_contents()->GetTitle()).ToString()});
-      if (!completed_navigation_) {
-        completed_navigation_ = true;
-        emit_({Message::kNavigationComplete, {}, 0, owner_, std::to_string(status_)});
-      }
+      CompleteNavigation(status_);
     }
   }
  private:
+  void CompleteNavigation(int status) {
+    if (closing_) return;
+    if (auto original = outcome_.Finish(owner_)) {
+      status_ = status;
+      emit_({Message::kNavigationComplete, {}, 0, *original, std::to_string(status)});
+    }
+  }
   void GeometryChanged(uint64_t previous) {
     if (stream_.generation() == previous) return;
     actions_->Reset();
@@ -410,11 +422,11 @@ class NativeView final : public CefClient,
   CefRefPtr<CefBrowser> browser_;
   base::Token current_token_;
   std::map<int64_t, Owner> pending_;
+  NavigationOutcome outcome_;
   uint64_t pending_request_ = 0;
   int status_ = 0;
   bool closing_ = false;
   bool closed_ = false;
-  bool completed_navigation_ = false;
   stream::View stream_;
   integration::NativeRequests integration_;
   CefRefPtr<integration::Menus> menus_;
@@ -527,7 +539,8 @@ int RunBrowser(const CefMainArgs& args) {
   if (!scratch || !lock_abi || !base::StringToInt(lock_abi, &abi) || abi < 3 ||
       prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1)
     return 125;
-  const std::string unavailable = LinuxUserNamespaceUnavailableReason();
+  const std::string unavailable = alloy_guest_uses_flatpak_broker()
+      ? std::string() : LinuxUserNamespaceUnavailableReason();
   if (!unavailable.empty()) return UnavailableBrowser(peer, unavailable);
   CefSettings cef_settings;
   cef_settings.windowless_rendering_enabled = true;
@@ -716,7 +729,8 @@ int RunBrowser(const CefMainArgs& args) {
       }
     }
     if (!closing && preflight && preflight->done() && !prepared_queued) {
-      auto protection = LinuxProtectionFields(abi, preflight->facts());
+      auto protection = PackagingProtectionFields(abi, preflight->facts(),
+          alloy_guest_uses_flatpak_broker());
       if (!protection || !PackFields({(*protection)[0], (*protection)[1], (*protection)[2],
               (*protection)[3], (*protection)[4], "1", "1", "1", std::to_string(features)},
               &prepared.payload) || !session.Prepared(report)) {
@@ -809,10 +823,8 @@ int RunBrowser(const CefMainArgs& args) {
       }
     } else if (request.message == Message::kNavigate) {
       auto found = views.find(request.owner.view);
-      auto owner = session.Find(request.owner.view);
       std::vector<std::string> url;
-      if (found == views.end() || !owner || owner->document != request.owner.document ||
-          owner->generation != request.owner.generation) {
+      if (found == views.end() || !session.CanNavigate(request.owner)) {
         emit({Message::kCancel, {}, 0, request.owner, {}});
         continue;
       }

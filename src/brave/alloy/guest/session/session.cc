@@ -139,4 +139,9 @@ std::optional<Owner> Session::RestartStream(uint64_t view) {
   ++found->second.generation;
   return found->second;
 }
+
+bool Session::CanNavigate(const Owner& origin) const {
+  auto current = Find(origin.view);
+  return current && current->document == origin.document;
+}
 }  // namespace alloy::guest

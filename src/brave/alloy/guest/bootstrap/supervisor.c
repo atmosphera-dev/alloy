@@ -7,6 +7,7 @@
 #include "brave/alloy/guest/protocol/wire.h"
 #include "brave/alloy/guest/linux_lock/protection.h"
 #include "brave/alloy/guest/linux_lock/child_launch.h"
+#include "brave/alloy/guest/namespace_lock/flatpak_entry.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -45,15 +46,23 @@ static void reap(void) {
   }
 }
 
-static void retire(struct members* members) {
+static int terminate_identity(int pidfd) {
+  int result;
+  do { result = (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0); }
+  while (result < 0 && errno == EINTR);
+  return result == 0 || (result < 0 && errno == ESRCH);
+}
+
+static int retire(struct members* members) {
+  int success = 1;
   for (size_t i = 0; i < members->count; ++i) {
     struct member* member = &members->items[i];
     if (member->liveness >= 0) {
       close(member->liveness);
       member->liveness = -1;
     }
-    if (member->pidfd >= 0)
-      syscall(SYS_pidfd_send_signal, member->pidfd, SIGKILL, NULL, 0);
+    if (member->pidfd >= 0 && !terminate_identity(member->pidfd))
+      success = 0;
   }
   // Owned children and orphans reparent to this subreaper. Never report final
   // completion while an admitted pidfd is live, even if its parent is reaping.
@@ -77,6 +86,7 @@ static void retire(struct members* members) {
   free(members->items);
   members->items = NULL;
   members->count = 0;
+  return success;
 }
 
 static int admit(int registration, struct members* members) {
@@ -280,10 +290,11 @@ static int supervise_prepared(const char* bootstrap) {
     return 125;
   int browser_pidfd = (int)syscall(SYS_pidfd_open, browser, 0);
   if (browser_pidfd < 0) {
-    // This is the unreaped direct child from our own spawn, so it cannot have
-    // been recycled. No numeric PID from the guest is trusted here.
-    kill(browser, SIGKILL);
-    waitpid(browser, NULL, 0);
+    // No entry was acknowledged. Closing registration releases the trusted
+    // static bootstrap before engine load, without a numeric-PID kill fallback.
+    close(registration[0]);
+    close(browser_control[0]);
+    while (waitpid(browser, NULL, 0) < 0 && errno == EINTR) {}
     return 125;
   }
   struct members members = {NULL, 0};
@@ -366,8 +377,8 @@ static int supervise_prepared(const char* bootstrap) {
   if (registration[0] >= 0)
     close(registration[0]);
   close(browser_control[0]);
-  syscall(SYS_pidfd_send_signal, browser_pidfd, SIGKILL, NULL, 0);
-  retire(&members);
+  if (!terminate_identity(browser_pidfd)) result = 125;
+  if (!retire(&members)) result = 125;
   struct pollfd event = {browser_pidfd, POLLIN, 0};
   while (poll(&event, 1, -1) < 0 && errno == EINTR) {}
   close(browser_pidfd);
@@ -378,7 +389,7 @@ static int supervise_prepared(const char* bootstrap) {
 
 int alloy_guest_supervise(const char* bootstrap) {
   if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) return 125;
-  int result = alloy_lock_prepare_scratch() ? supervise_prepared(bootstrap) : 125;
+  int result = alloy_flatpak_prepare_scratch() ? supervise_prepared(bootstrap) : 125;
   // One owner cleans all preparation and launch failures, not just the normal
   // loop exit. The remover checks the descriptor's exact current RAM identity.
   alloy_lock_remove_scratch();

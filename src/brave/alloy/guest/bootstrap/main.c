@@ -6,6 +6,7 @@
 #endif
 #include "base/process/alloy_guest_runtime.h"
 #include "brave/alloy/guest/linux_lock/protection.h"
+#include "brave/alloy/guest/namespace_lock/flatpak_entry.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -23,8 +24,23 @@
 #include <unistd.h>
 
 int alloy_guest_supervise(const char* bootstrap);
+int alloy_guest_wait_owner(const char* bootstrap);
 
-static int granted(int fd, int supervisor, int child) {
+static int teardown_probe(void) {
+  // Trusted static setup only: no registration, writer setup or engine load.
+  // EOF is a cooperative escape solely for this disposable pre-admission probe.
+  if (send(ALLOY_GUEST_CONTROL_FD, "P", 1, MSG_NOSIGNAL) != 1) return 125;
+  char byte;
+  ssize_t received;
+  do { received = recv(ALLOY_GUEST_CONTROL_FD, &byte, 1, 0); }
+  while (received < 0 && errno == EINTR);
+  return received == 0 ? 0 : 125;
+}
+
+static int granted(int fd, int supervisor, int child, int wait_owner) {
+  if (wait_owner && fd == ALLOY_GUEST_WAIT_STATUS_FD) return 1;
+  if (child && alloy_flatpak_preserves(fd))
+    return 1;
   if (alloy_lock_preserves(fd))
     return 1;
   if (fd == ALLOY_GUEST_REGISTRATION_FD)
@@ -52,7 +68,7 @@ static int granted(int fd, int supervisor, int child) {
   return 0;
 }
 
-static int close_ungranted(int supervisor, int child) {
+static int close_ungranted(int supervisor, int child, int wait_owner) {
   DIR* directory = opendir("/proc/self/fd");
   if (!directory)
     return 0;
@@ -72,7 +88,7 @@ static int close_ungranted(int supervisor, int child) {
     if (errno || entry->d_name == end || *end || number < 3 ||
         number > INT_MAX || number == directory_fd)
       continue;
-    if (!granted((int)number, supervisor, child) && close((int)number)) {
+    if (!granted((int)number, supervisor, child, wait_owner) && close((int)number)) {
       valid = 0;
       break;
     }
@@ -91,7 +107,8 @@ static int sanitize_environment(void) {
       // Chromium's namespace_sandbox.cc sets these on its child launch. They
       // preserve its native boot/sandbox handshake, not app-supplied authority.
       // The initial app -> supervisor allowlist never copies them from the app.
-      "SBX_USER_NS", "SBX_PID_NS", "SBX_NET_NS"};
+       "SBX_USER_NS", "SBX_PID_NS", "SBX_NET_NS", "SBX_D", "SBX_HELPER_PID",
+       "SBX_CHROME_API_PRV"};
   char* values[sizeof(names) / sizeof(names[0])];
   memset(values, 0, sizeof(values));
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -113,7 +130,11 @@ static int sanitize_environment(void) {
 
 int main(int argc, char** argv) {
   unsigned int inherited_nnp = (unsigned int)prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-  int supervisor = argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0;
+  int gated = argc == 3 && strcmp(argv[1], "--alloy-supervisor") == 0 &&
+              strcmp(argv[2], ALLOY_GUEST_WAIT_GATE_ARGUMENT) == 0;
+  int supervisor = gated || (argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0);
+  int probe = argc == 2 && strcmp(argv[1], ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT) == 0;
+  int wait_owner = argc == 2 && strcmp(argv[1], ALLOY_GUEST_WAIT_OWNER_ARGUMENT) == 0;
   int child = 0;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--type=", 7) == 0)
@@ -129,8 +150,12 @@ int main(int argc, char** argv) {
   if (length <= 0 || (size_t)length >= sizeof(executable) - 1)
     return 125;
   executable[length] = 0;
+  int flatpak = probe || wait_owner ? 0 : alloy_flatpak_detect(executable);
+  if (flatpak < 0)
+    return 125;
   struct rlimit no_core = {0, 0};
-  if (setrlimit(RLIMIT_CORE, &no_core) || !close_ungranted(supervisor, child) ||
+  if (setrlimit(RLIMIT_CORE, &no_core) ||
+      !close_ungranted(supervisor || probe || wait_owner, child, wait_owner || gated) ||
       !sanitize_environment())
     return 125;
   int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -142,12 +167,26 @@ int main(int argc, char** argv) {
   }
   if (null_fd > 2)
     close(null_fd);
+  if (probe)
+    return teardown_probe();
+  if (wait_owner)
+    return alloy_guest_wait_owner(executable);
+  if (gated) {
+    char grant;
+    ssize_t received;
+    do { received = recv(ALLOY_GUEST_WAIT_STATUS_FD, &grant, 1, MSG_TRUNC); }
+    while (received < 0 && errno == EINTR);
+    close(ALLOY_GUEST_WAIT_STATUS_FD);
+    if (received != 1 || grant != 'G') return received == 0 ? 0 : 125;
+  }
   if (supervisor)
     return alloy_guest_supervise(executable);
   if (!alloy_guest_is_runtime() || !alloy_guest_register_runtime(1))
     return 125;
   // This is supplementary to the liveness channel, never its replacement.
-  if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() == 1)
+  // A Flatpak broker's child has namespace init as its parent even while the
+  // acknowledged Alloy supervisor is live. Check that actual capability.
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL) || !alloy_guest_supervisor_alive())
     return 125;
   // Ordinary entries inherit both the kernel domain and managed writer paths.
   // Only initial/external entries borrow the supervisor's RAM setup descriptor.
@@ -155,11 +194,12 @@ int main(int argc, char** argv) {
   // would bypass Chromium's chroot and fail its mandatory open-directory check.
   int needs_setup = !getenv("ALLOY_GUEST_LOCK_ABI");
   if ((needs_setup && (!alloy_lock_writer_paths() || !alloy_lock_enforce())) ||
-      !alloy_lock_drop_setup_capability())
+      !alloy_lock_drop_setup_capability() ||
+      !alloy_flatpak_engine_environment(executable, child))
     return 125;
   struct alloy_guest_bootstrap_facts facts = {
       ALLOY_GUEST_FACTS_MAGIC, getpid(), 1, 1,
-      inherited_nnp, !child};
+       inherited_nnp, !child, flatpak != 0};
   int facts_fd = (int)syscall(SYS_memfd_create, "alloy-bootstrap", MFD_ALLOW_SEALING);
   if (facts_fd < 0 || write(facts_fd, &facts, sizeof(facts)) != sizeof(facts) ||
       fcntl(facts_fd, F_ADD_SEALS,

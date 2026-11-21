@@ -35,6 +35,18 @@ static void supervisor_lost(int signal_number, siginfo_t* info, void* context) {
   _exit(125);
 }
 
+int alloy_guest_supervisor_alive(void) {
+  int flags = fcntl(ALLOY_GUEST_LIVENESS_FD, F_GETFL);
+  if (flags < 0 || !(flags & O_ASYNC) || !(flags & O_NONBLOCK) ||
+      fcntl(ALLOY_GUEST_LIVENESS_FD, F_GETSIG) != SIGRTMIN + 6 ||
+      fcntl(ALLOY_GUEST_LIVENESS_FD, F_GETOWN) != getpid())
+    return 0;
+  char byte;
+  ssize_t result = recv(ALLOY_GUEST_LIVENESS_FD, &byte, 1,
+                        MSG_PEEK | MSG_DONTWAIT);
+  return result == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
+}
+
 static int arm_liveness(void) {
   struct sigaction action;
   memset(&action, 0, sizeof(action));
@@ -58,15 +70,22 @@ static int arm_liveness(void) {
     return 0;
   // Close the acknowledgement-to-arm race. A closed peer must not be admitted
   // just because its EOF occurred before O_ASYNC was installed.
-  char byte;
-  ssize_t result = recv(ALLOY_GUEST_LIVENESS_FD, &byte, 1,
-                        MSG_PEEK | MSG_DONTWAIT);
-  return result == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
+  return alloy_guest_supervisor_alive();
 }
 
 int alloy_guest_is_runtime(void) {
   const char* selected = getenv("ALLOY_GUEST_RUNTIME");
   return selected && strcmp(selected, "1") == 0;
+}
+
+int alloy_guest_uses_flatpak_broker(void) {
+  struct alloy_guest_bootstrap_facts facts;
+  int required = F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+  int seals = fcntl(ALLOY_GUEST_FACTS_FD, F_GET_SEALS);
+  return alloy_guest_is_runtime() && seals >= 0 && (seals & required) == required &&
+      pread(ALLOY_GUEST_FACTS_FD, &facts, sizeof(facts), 0) == sizeof(facts) &&
+      facts.magic == ALLOY_GUEST_FACTS_MAGIC && facts.process == getpid() &&
+      facts.before_engine && facts.flatpak_broker;
 }
 
 int alloy_guest_register_runtime(int pre_engine) {

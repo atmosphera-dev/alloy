@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include "brave/alloy/guest/linux_lock/protection.h"
 #include "base/files/file_util.h"
+#include "base/process/alloy_guest_runtime.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
 #include "cef/include/cef_client.h"
@@ -68,6 +69,8 @@ class LinuxSandboxPreflight final : public CefClient,
     using Status = sandbox::policy::SandboxLinux;
     if (facts_.native_flags & Status::kUserNS) facts_.route = "userns";
     else if (facts_.native_flags & Status::kSUID) facts_.route = "setuid";
+    if (alloy_guest_uses_flatpak_broker() && !facts_.route.empty())
+      facts_.route = "flatpak-brokered-userns";
     Cancel();
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,

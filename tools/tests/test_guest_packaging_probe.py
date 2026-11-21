@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: 2026 Alex Indigo
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import copy
+import ctypes
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -16,11 +19,15 @@ sys.path.insert(0, str(TOOLS))
 import guest_packaging_probe as probe
 from guest_packaging_support import LocalFlatpak, PackageClient, PackageMembers
 from guest_test_support.process_identity import identity
+from guest_test_support.process_fixture import pipe_child, pin_after_exit
+from guest_test_support.launch_trace import RuntimeLaunchTrace
 
 
 def report():
     return dict(filesystem='data-writes-denied', scratch='verified-tmpfs',
         coverage=json.dumps(dict(before_engine=True,
+            trusted_setup=['fixed-static-bootstrap-teardown-probe; no-engine-payload',
+                           'fixed-static-wait-owner; private-kernel-exit-status; no-engine-payload'],
             flatpak_external_entries='fixed-bootstrap-per-entry',
             snap_external_entries='unsupported:strict-Snap-policy-denies-pidfd_send_signal')),
         sandbox=json.dumps(dict(route='flatpak-brokered-userns', browser=dict(no_new_privs=True),
@@ -109,27 +116,122 @@ class GuestPackagingTests(unittest.TestCase):
                 signalled.assert_not_called()
 
     def test_snapshot_exit_after_pin_is_retired_without_signaling(self):
-        process = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        opened = os.pidfd_open(process.pid)
-        try:
-            row = dict(pid=process.pid, role='app', identity=identity(process.pid, opened))
-        finally:
-            os.close(opened)
-        real_open = os.pidfd_open
-        def pin_then_exit(pid):
-            handle = real_open(pid)
-            process.communicate(timeout=15)
-            return handle
-        try:
+        with pipe_child() as process:
+            opened = os.pidfd_open(process.pid)
+            try:
+                row = dict(pid=process.pid, role='app', identity=identity(process.pid, opened))
+            finally:
+                os.close(opened)
+            real_open = os.pidfd_open
+            pinned = []
+            def pin_then_exit(pid):
+                if pid != process.pid:
+                    return real_open(pid)
+                pinned.append(pin_after_exit(process, real_open))
+                return pinned[-1]
             with patch('guest_packaging_support.os.pidfd_open', side_effect=pin_then_exit), \
-                 patch('guest_packaging_support.signal.pidfd_send_signal') as signalled:
+                 patch('guest_packaging_support.signal.pidfd_send_signal') as signalled, \
+                 patch('guest_packaging_support.os.close', wraps=os.close) as closed:
                 with PackageMembers([row], include_app=True) as members:
                     self.assertFalse(members.rows)
                     self.assertFalse(members.handles)
+                    self.assertEqual(1, len(pinned))
+                    closed.assert_any_call(pinned[0])
                 signalled.assert_not_called()
+
+    def test_non_utf8_process_name_does_not_break_birth_identity(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        original = Path('/proc/self/comm').read_bytes().removesuffix(b'\n')
+        handle = os.pidfd_open(os.getpid())
+        try:
+            before = identity(os.getpid(), handle)
+            self.assertEqual(0, libc.prctl(15, ctypes.c_char_p(b'\xff)fixture'), 0, 0, 0))
+            self.assertEqual(before, identity(os.getpid(), handle))
+            self.assertIsInstance(before['start_ticks'], str)
         finally:
-            if process.poll() is None:
-                process.communicate(timeout=15)
+            libc.prctl(15, ctypes.c_char_p(original), 0, 0, 0)
+            os.close(handle)
+
+    def test_validator_deadline_kills_and_reaps_the_pinned_root_helper(self):
+        real_popen = subprocess.Popen
+        stall = TOOLS / 'testdata/guest-packaging/validator_stall.py'
+        handle = os.pidfd_open(os.getpid())
+        try:
+            row = dict(pid=os.getpid(), role='app', identity=identity(os.getpid(), handle))
+        finally:
+            os.close(handle)
+        for before_identity in (False, True):
+            helpers = []
+            def spawn(command, **kwargs):
+                command = list(command)
+                if str(command[-1]).endswith('/process_identity.py'):
+                    command[-1] = str(stall)
+                    if before_identity:
+                        command.append('before-identity')
+                result = real_popen(command, **kwargs)
+                helpers.append(result)
+                return result
+            started = time.monotonic()
+            with self.subTest(before_identity=before_identity), \
+                 patch('guest_packaging_support.subprocess.Popen', side_effect=spawn), \
+                 patch('guest_packaging_support.IDENTITY_EXCHANGE_TIMEOUT', 0.5):
+                with self.assertRaises(TimeoutError):
+                    PackageMembers([row], include_app=True)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertGreaterEqual(len(helpers), 1 if before_identity else 2)
+            self.assertTrue(all(helper.poll() is not None for helper in helpers))
+
+    def test_pipe_child_setup_failure_still_reaps_the_child(self):
+        real_popen = subprocess.Popen
+        children = []
+        def spawn(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+        with patch('guest_test_support.process_fixture.subprocess.Popen', side_effect=spawn), \
+             patch('guest_test_support.process_fixture.os.pidfd_open', side_effect=OSError('fixture pin failure')):
+            with self.assertRaisesRegex(OSError, 'fixture pin failure'):
+                with pipe_child():
+                    self.fail('Fixture unexpectedly entered')
+        self.assertEqual(0, children[0].poll())
+
+    def test_failed_pin_handoff_closes_its_descriptor(self):
+        with pipe_child() as process:
+            handle = os.pidfd_open(process.pid)
+            with patch.object(process, 'communicate', side_effect=RuntimeError('fixture communication failure')):
+                with self.assertRaisesRegex(RuntimeError, 'fixture communication failure'):
+                    pin_after_exit(process, lambda pid: handle)
+            with self.assertRaises(OSError):
+                os.fstat(handle)
+
+    def test_pipe_child_cleanup_timeout_terminates_and_reaps_original_child(self):
+        scope = pipe_child()
+        process = scope.__enter__()
+        original = process.communicate
+        count = 0
+        def communicate(*args, **kwargs):
+            nonlocal count
+            count += 1
+            if count == 1:
+                raise subprocess.TimeoutExpired('fixture', 15)
+            return original(*args, **kwargs)
+        with patch.object(process, 'communicate', side_effect=communicate):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                scope.__exit__(None, None, None)
+        self.assertEqual(-9, process.returncode)
+
+    def test_launch_trace_records_an_engine_that_exits_before_final_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk, engine = root / 'alloy_guest_sdk_consumer', root / 'alloy_guest_engine'
+            shutil.copyfile('/bin/sh', sdk)
+            shutil.copyfile('/bin/true', engine)
+            sdk.chmod(0o700)
+            engine.chmod(0o700)
+            trace = RuntimeLaunchTrace(root, root / 'exec')
+            subprocess.run(trace.command() + [sdk, '-c', '"' + str(engine) + '"'], check=True)
+            launches = trace.launches()
+            self.assertEqual([str(engine)], [entry['executable'] for entry in launches])
 
     def test_failed_package_command_preserves_its_diagnostic(self):
         package = LocalFlatpak(TOOLS.parent, Path('/out'), Path('/evidence'))

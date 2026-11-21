@@ -39,6 +39,8 @@ for proc in Path('/proc').iterdir():
         role = 'browser'
         if name == 'alloy_guest_sdk_consumer':
             role = 'app'
+        elif '--alloy-wait-owner' in argv:
+            role = 'wait-owner'
         elif '--alloy-supervisor' in argv:
             role = 'supervisor'
         elif name.startswith('zypak-'):

@@ -10,11 +10,13 @@ from pathlib import Path
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import time
 
 from workspace import validate_output, workspace_path
 from guest_test_support.fixtures import Fixtures
+from guest_test_support.launch_trace import RuntimeLaunchTrace
 from guest_packaging_support import LocalFlatpak, PackageMembers
 from guest_lock_probe import inventory, inventory_equal, package_proof
 from guest_lock_probe import native_writers, defaults, lifecycle, mode_and_app, pressure
@@ -39,6 +41,8 @@ def protected(report):
     assert native['renderer']['no_new_privs'] and native['renderer']['seccomp'] == 2, native
     assert native['renderer']['effective_capabilities_decimal'] == '0', native
     assert coverage['before_engine'], coverage
+    assert 'fixed-static-bootstrap-teardown-probe; no-engine-payload' in coverage['trusted_setup'], coverage
+    assert 'fixed-static-wait-owner; private-kernel-exit-status; no-engine-payload' in coverage['trusted_setup'], coverage
     assert coverage['flatpak_external_entries'].startswith('fixed-bootstrap-per-entry'), coverage
     assert coverage['snap_external_entries'].startswith('unsupported:'), coverage
     assert 'native-namespace-view-absent' in limits['namespace_filesystem_and_packages'], limits
@@ -94,7 +98,7 @@ def defaults_and_death(package, evidence, fixtures):
     # startup, navigation, live state and teardown, not package installation.
     package.run(['flatpak', 'run', '--user', '--command=/usr/bin/true', package.app_id])
     baseline = inventory([app_data])
-    for death in ('close', 'browser', 'renderer', 'gpu-process', 'supervisor', 'app', 'scratch'):
+    for death in ('close', 'browser', 'renderer', 'gpu-process', 'supervisor', 'wait-owner', 'app', 'scratch'):
         with package.client(evidence / death, trusted_certificate=fixtures.certificate) as client:
             report = protected(client.start(required='data-writes-denied'))
             inventory_equal(baseline, inventory([app_data]))
@@ -260,6 +264,38 @@ def native_acceptance(out, evidence, fixtures):
     return cases
 
 
+def wait_owner_regression(evidence):
+    root = evidence / 'wait-owner'
+    for variant in ('normal', 'failed', 'stopped', 'owner-dead'):
+        (root / variant).mkdir(parents=True)
+    source = REPO / 'src/brave/alloy/guest'
+    subprocess.run(['gcc', '-std=c11', '-static', '-Wall', '-Wextra', '-Werror',
+        '-I', REPO / 'src', REPO / 'tools/testdata/guest-packaging/wait_owner_fixture.c',
+        source / 'bootstrap/wait_owner.c', source / 'linux_lock/child_launch.c',
+        '-o', root / 'normal/alloy_guest_host'], check=True)
+    subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-Werror', '-pthread',
+        '-I', REPO / 'src', REPO / 'tools/testdata/guest-packaging/wait_owner.cc',
+        source / 'session/supervisor.cc', '-ldl', '-o', root / 'normal/driver'], check=True)
+    for variant in ('failed', 'stopped', 'owner-dead'):
+        for name in ('alloy_guest_host', 'driver'):
+            shutil.copy2(root / 'normal' / name, root / variant / name)
+    modes = [('normal', mode) for mode in ('default', 'nochildwait', 'ignored', 'reaper')]
+    modes += [('failed', mode) for mode in ('failed', 'failed-nochildwait', 'failed-ignored', 'failed-reaper')]
+    modes += [('stopped', 'cancel-stopped')]
+    modes += [('owner-dead', 'owner-dead')]
+    modes += [('normal', 'close-receipt')]
+    with (root / 'result.log').open('x') as log:
+        for variant, mode in modes:
+            subprocess.run([root / variant / 'driver', mode], stdout=log,
+                           stderr=subprocess.STDOUT, check=True, timeout=30)
+    result = (root / 'result.log').read_text()
+    assert result.count('APP_SIGNAL_SETUP_UNCHANGED=1') == len(modes), result
+    assert 'STOPPED_PROBE_CANCELLED_AND_REAPED=1' in result, result
+    assert 'OWNER_LOSS_RETAINS_RUNTIME_EXIT_BARRIER=1' in result, result
+    assert 'CANCELLATION_EOF_PRESERVES_FINAL_RECEIPT=1' in result, result
+    return dict(case='static-wait-owner-status-and-cancellation', modes=modes)
+
+
 def teardown_refusal(out, evidence, fixtures, filters=('deny', 'deny-kill')):
     evidence.mkdir(parents=True, exist_ok=True)
     wrapper = evidence / 'pidfd-signal-policy'
@@ -276,11 +312,12 @@ def teardown_refusal(out, evidence, fixtures, filters=('deny', 'deny-kill')):
     with (evidence / 'checked-supervisor-teardown.log').open('x') as log:
         subprocess.run([checked_teardown], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30)
     assert 'GUEST_TEARDOWN_ERROR_REPORTED=1' in (evidence / 'checked-supervisor-teardown.log').read_text()
-    rows = [dict(case='supervisor-signaling-failure-is-fatal', checked=True)]
+    rows = [dict(case='supervisor-signaling-failure-is-fatal', checked=True), wait_owner_regression(evidence)]
     for policy, developmental in ((policy, developmental) for policy in filters
                                   for developmental in (False, True)):
         label = policy + ('-developmental' if developmental else '-required')
-        with Client(out, evidence / label, launch_prefix=[wrapper, policy],
+        launches = RuntimeLaunchTrace(out, evidence / (label + '-exec'))
+        with Client(out, evidence / label, launch_prefix=launches.command() + [wrapper, policy],
                     launch_environment={k: v for k, v in os.environ.items()
                                         if not k.startswith('SNAP')}) as client:
             client.send('start guest auto memory ' +
@@ -305,8 +342,11 @@ def teardown_refusal(out, evidence, fixtures, filters=('deny', 'deny-kill')):
                 states = [v for v in client.events if v['name'] == 'guest' and v['event'] == 'state']
                 assert all(v['state'] == v['observed_state'] for v in states), states
                 assert 'PIDFD_SIGNAL_FILTER_DENIED=1' in (client.root / 'consumer.log').read_text()
+                observed_launches = launches.launches()
+                assert not observed_launches, observed_launches
                 rows.append(dict(case='pidfd-signal-' + label, report=report,
-                                 runtime_entries=0, navigations=0))
+                                 runtime_entries=len(observed_launches), launches=observed_launches,
+                                 launch_observation='exec-trace-before-start-through-shutdown', navigations=0))
             finally:
                 # The pre-correction red test can reach the old engine. Cleanup
                 # uses identities pinned by the unfiltered harness, never a
@@ -327,6 +367,33 @@ def teardown_refusal(out, evidence, fixtures, filters=('deny', 'deny-kill')):
         close_and_observe(client, out)
         client.finish()
         rows.append(dict(case='pidfd-signal-allowed-loads', page=page))
+    for policy, failed in ((policy, failed) for policy in ('nochildwait', 'ignored', 'reaper')
+                           for failed in (False, True)):
+        label = 'sigchld-' + policy + ('-supervisor-failed' if failed else '-close')
+        with Client(out, evidence / label,
+                    launch_environment=dict(os.environ, ALLOY_FIXTURE_SIGCHLD=policy)) as client:
+            client.start(required='data-writes-denied')
+            client.active()
+            page = client.page(fixtures.base + '/title/APP_SIGNAL_SETUP', 'APP_SIGNAL_SETUP')
+            client.wait('guest', 'load', lambda value: value['document'] == page['document'] and value['status'] == 200)
+            if failed:
+                processes = OwnedProcesses(client.process.pid, out)
+                try:
+                    supervisors = [handle for row, handle in zip(processes.members, processes.handles)
+                                   if row['role'] == 'supervisor']
+                    assert len(supervisors) == 1, processes.members
+                    signal.pidfd_send_signal(supervisors[0], signal.SIGKILL)
+                    client.closed(reason='failed')
+                    processes.exited()
+                finally:
+                    processes.close()
+            else:
+                close_and_observe(client, out)
+            client.finish()
+            preserved = client.wait('driver', 'signal-setup-preserved')
+            assert preserved['policy'] == policy
+            rows.append(dict(case=label, page=page, signal_setup_preserved=True,
+                             final_reason='failed' if failed else 'closed'))
     assert not any(v['path'] == '/title/NOT_ADMITTED' for v in fixtures.requests)
     return rows
 

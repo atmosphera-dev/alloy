@@ -26,6 +26,7 @@ std::optional<std::array<std::string, 5>> PackagingProtectionFields(
   auto* trusted = coverage->FindList("trusted_setup");
   if (!trusted) return std::nullopt;
   trusted->Append("fixed-static-bootstrap-teardown-probe; no-engine-payload");
+  trusted->Append("fixed-static-wait-owner; private-kernel-exit-status; no-engine-payload");
   coverage->Set("snap_external_entries", "unsupported:strict-Snap-policy-denies-pidfd_send_signal");
   limits->Set("namespace_filesystem_and_packages",
       "native-namespace-view-absent; Snap-unsupported-policy-denies-pidfd_send_signal");

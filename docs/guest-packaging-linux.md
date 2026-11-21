@@ -56,6 +56,27 @@ exceptions without engine payload. Ordinary exec/zygote descendants inherit
 Landlock. The report distinguishes those paths and does not advertise the
 deferred namespace/read-only view.
 
+## Static exit-status ownership
+
+The app starts a dedicated fixed static wait owner, not a probe whose status
+depends on the app's SIGCHLD handler. Only this new process resets its own
+SIGCHLD disposition. It owns the probe's actual SIGKILL wait status and the
+runtime supervisor's final kernel wait status. SA_NOCLDWAIT, SIGCHLD=SIG_IGN and
+an app reaping handler do not select a weaker route or change the app's signals.
+
+Readiness observes cancellation and original process exit. The owner can still
+reach a stopped trusted probe through its pidfd when the app closes startup.
+Cancellation half-closes the private channel's write side, leaving no unread
+command that could reset the final-status receipt when the owner exits.
+The runtime supervisor's original pidfd is transferred before a private static
+admission gate opens. The app retains that exit barrier even if the wait owner
+dies. Successful completion needs the runtime exit, owner exit and a valid
+private status receipt. A missing receipt reports failure after the retained
+exit barriers complete; ECHILD never becomes proof of successful teardown.
+Neither trusted setup process loads an engine payload. Runtime registration,
+forced termination, final reaping and scratch cleanup remain with the existing
+runtime supervisor, not a new engine-controlled status owner.
+
 ## Snap guest mode is unsupported
 
 A real strict local package with connected browser-support/allow-sandbox on
@@ -100,9 +121,16 @@ Negative RAM tests use a fresh package identity and assert actual carrier
 absence: revoking a grant on a previously used app can leave usable private RAM.
 Flatpak 1.14.6's default filter permits portal calls, so removing a talk policy does
 not prove IPC loss; that test verifies absence of the session-bus socket.
-Both configurations passed 20 Flatpak and 21 native/package cases, plus shared
-recovery, foundation, smoke and blocking checks. Each also passed six teardown
-checks, 36 Python fixture tests and 26/14/4 session/lock/packaging unit tests.
+Both configurations passed 21 Flatpak and 29 native/package cases, plus shared
+recovery, foundation, smoke and blocking checks. Each also passed 13 teardown
+checks, 42 Python fixture tests and 26/14/4 session/lock/packaging unit tests.
+The teardown checks include 11 standalone status/cancellation modes and actual
+SDK page load plus normal/failed close with SA_NOCLDWAIT, SIG_IGN and an app
+reaping handler. All preserve the app's signal setup. Native and Flatpak tests
+also retain the original runtime exit barrier after wait-owner death.
+Failing-first SDK runs reproduced the old false refusal under SA_NOCLDWAIT and
+SIG_IGN. A deterministic fixture caught cancellation resetting the status lane;
+after the EOF correction, 30 additional SDK page-load/close samples passed.
 The startup-refusal regression inherits a real seccomp filter denying
 `pidfd_send_signal` either entirely or only for SIGKILL, and checks the SDK's
 unavailable report, truthful state notifications, rejected acceptance,
@@ -114,4 +142,8 @@ rejected PREPARED notification before the correction. A minimal real Flatpak
 also confirmed actual pidfd SIGKILL and the original child's signal-9 wait status.
 Package observation pins before inspecting birth/executable identity, and the
 consumer revalidates that identity after pinning before any signaling helper.
+The validator exchange itself has a deadline and pinned-helper cleanup. Process
+names in proc stat are treated as bytes; only numeric birth ticks are decoded.
+Refusal tests trace exec calls from SDK launch through shutdown, so a runtime
+that starts and exits before the final snapshot cannot hide from the check.
 Local test packages are never published to a store.

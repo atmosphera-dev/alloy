@@ -8,6 +8,7 @@
 #include "include/cef_render_handler.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <condition_variable>
 #include <deque>
@@ -17,8 +18,10 @@
 #include <memory>
 #include <mutex>
 #include <poll.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -280,6 +283,25 @@ int main(int argc, char** argv) {
   int child = CefExecuteProcess(args, app, nullptr);
   if (child >= 0)
     return child;
+  const char* signal_policy = getenv("ALLOY_FIXTURE_SIGCHLD");
+  struct sigaction original_signal = {};
+  sigset_t original_mask;
+  if (signal_policy) {
+    std::string policy(signal_policy);
+    if (policy != "nochildwait" && policy != "ignored" && policy != "reaper") return 2;
+    original_signal.sa_handler = policy == "ignored" ? SIG_IGN : SIG_DFL;
+    if (policy == "reaper") original_signal.sa_handler = +[](int) {
+      int saved = errno;
+      while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+      errno = saved;
+    };
+    original_signal.sa_flags = policy == "nochildwait" ? SA_NOCLDWAIT : 0;
+    sigemptyset(&original_signal.sa_mask);
+    if (sigaction(SIGCHLD, &original_signal, nullptr) ||
+        sigaction(SIGCHLD, nullptr, &original_signal) ||
+        sigprocmask(SIG_SETMASK, nullptr, &original_mask)) return 1;
+    Event("driver", "signal-setup", ",\"policy\":" + Quote(policy));
+  }
   std::vector<int> reserved;
   void* inherited_mapping = MAP_FAILED;
   size_t inherited_mapping_size = 0;
@@ -422,6 +444,17 @@ int main(int argc, char** argv) {
     app_context = nullptr;
     app_view = nullptr;
     CefShutdown();
+  }
+  if (signal_policy) {
+    struct sigaction observed;
+    sigset_t mask;
+    if (sigaction(SIGCHLD, nullptr, &observed) || sigprocmask(SIG_SETMASK, nullptr, &mask) ||
+        observed.sa_handler != original_signal.sa_handler ||
+        observed.sa_flags != original_signal.sa_flags) return 1;
+    for (int signal = 1; signal < NSIG; ++signal)
+      if (sigismember(&mask, signal) != sigismember(&original_mask, signal) ||
+          sigismember(&observed.sa_mask, signal) != sigismember(&original_signal.sa_mask, signal)) return 1;
+    Event("driver", "signal-setup-preserved", ",\"policy\":" + Quote(signal_policy));
   }
   Event("driver", "finished");
   app_profile = nullptr;

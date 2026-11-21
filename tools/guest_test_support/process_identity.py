@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import select
+import signal
 import socket
+import sys
 
 
 def identity(pid, handle):
@@ -20,7 +22,7 @@ def identity(pid, handle):
     if int(fields['Pid']) != pid:
         raise ProcessLookupError(pid)
     proc = Path('/proc') / str(pid)
-    start = (proc / 'stat').read_text().rpartition(')')[2].split()[19]
+    start = (proc / 'stat').read_bytes().rpartition(b')')[2].split()[19].decode('ascii')
     executable = (proc / 'exe').stat()
     result = dict(start_ticks=start, exe_device=executable.st_dev, exe_inode=executable.st_ino)
     if poll.poll(0):
@@ -32,6 +34,13 @@ def validate_channel():
     """VM-root read-only validator; one already-pinned descriptor per request."""
     assert os.getuid() == 0
     channel = socket.socket(fileno=0)
+    # Transfer the helper's original identity before serving requests, so the
+    # unprivileged owner can retire this exact helper on an exchange deadline.
+    handle = os.pidfd_open(os.getpid())
+    try:
+        channel.sendmsg([b'I'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [handle]))])
+    finally:
+        os.close(handle)
     while True:
         packet, control, flags, _ = channel.recvmsg(4096, socket.CMSG_SPACE(array.array('i').itemsize))
         if not packet:
@@ -58,4 +67,23 @@ def validate_channel():
 
 
 if __name__ == '__main__':
-    validate_channel()
+    if sys.argv[1:] == ['--terminate']:
+        assert os.getuid() == 0
+        channel = socket.socket(fileno=0)
+        packet, control, flags, _ = channel.recvmsg(1, socket.CMSG_SPACE(array.array('i').itemsize))
+        handles = array.array('i')
+        for level, kind, data in control:
+            assert level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+            handles.frombytes(data)
+        try:
+            assert packet == b'K' and not flags and len(handles) == 1
+            try:
+                signal.pidfd_send_signal(handles[0], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        finally:
+            for handle in handles:
+                os.close(handle)
+    else:
+        assert not sys.argv[1:]
+        validate_channel()

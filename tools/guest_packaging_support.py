@@ -14,6 +14,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import time
 import uuid
 
 from guest_lock_probe import Members
@@ -22,6 +23,46 @@ from guest_test_support.session import Client
 ZYPAK_REVISION = '693a71c5ffa80ec9c9ce2ae03b1ccc493c698e53'
 RUNTIME = 'org.freedesktop.Platform'
 BRANCH = '25.08'
+IDENTITY_EXCHANGE_TIMEOUT = 15
+
+
+def terminate_identity(handle):
+    """Fixture-only root signaling of an already-pinned original identity."""
+    try:
+        signal.pidfd_send_signal(handle, signal.SIGKILL)
+        return
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        pass
+    channel, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    channel.settimeout(IDENTITY_EXCHANGE_TIMEOUT)
+    helper = None
+    monitor = -1
+    try:
+        script = Path(__file__).parent / 'guest_test_support/process_identity.py'
+        helper = subprocess.Popen(['sudo', '-n', 'env', 'TMPDIR=' + os.environ['TMPDIR'],
+                                   'python3', '-B', str(script), '--terminate'], stdin=child)
+        monitor = os.pidfd_open(helper.pid)
+        child.close()
+        channel.sendmsg([b'K'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [handle]))])
+        channel.close()
+        assert helper.wait(timeout=IDENTITY_EXCHANGE_TIMEOUT) == 0, 'Pinned helper termination failed'
+    finally:
+        child.close()
+        channel.close()
+        if helper is not None and helper.poll() is None:
+            if monitor >= 0:
+                # sudo's owned monitor forwards TERM to its command before
+                # waiting/reaping. No bare process identity is signaled.
+                try:
+                    signal.pidfd_send_signal(monitor, signal.SIGTERM)
+                    signal.pidfd_send_signal(monitor, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            helper.wait()
+        if monitor >= 0:
+            os.close(monitor)
 
 
 def digest(path):
@@ -197,7 +238,8 @@ class LocalFlatpak(AbstractContextManager):
 
     def snapshot(self):
         script = self.repo / 'tools/testdata/guest-packaging/observe.py'
-        return json.loads(self.run(['sudo', '-n', 'python3', '-B', script, self.library]))
+        return json.loads(self.run(['sudo', '-n', 'env', 'TMPDIR=' + os.environ['TMPDIR'],
+                                    'python3', '-B', script, self.library]))
 
     def client(self, root, **kwargs):
         return PackageClient(self, root, **kwargs)
@@ -341,21 +383,43 @@ class PackageMembers(Members):
         # birth/executable identity after pinning, before any signal or root
         # signaling helper can receive this capability.
         channel, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        channel.settimeout(IDENTITY_EXCHANGE_TIMEOUT)
         script = Path(__file__).parent / 'guest_test_support/process_identity.py'
         try:
-            helper = subprocess.Popen(['sudo', '-n', 'python3', '-B', str(script)], stdin=child)
+            helper = subprocess.Popen(['sudo', '-n', 'env', 'TMPDIR=' + os.environ['TMPDIR'],
+                                       'python3', '-B', str(script)], stdin=child)
         except BaseException:
             child.close()
             channel.close()
             raise
         child.close()
         live = []
+        validator = -1
+        monitor = -1
+        transport_failed = False
         try:
+            monitor = os.pidfd_open(helper.pid)
+            packet, control, flags, _ = channel.recvmsg(1, socket.CMSG_SPACE(array.array('i').itemsize))
+            handles = array.array('i')
+            for level, kind, data in control:
+                assert level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+                handles.frombytes(data)
+            try:
+                assert packet == b'I' and not flags and len(handles) == 1, 'Invalid validator identity'
+                validator = handles.pop()
+            finally:
+                for handle in handles:
+                    os.close(handle)
+            deadline = time.monotonic() + IDENTITY_EXCHANGE_TIMEOUT
             for row, handle in self.handles:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Process identity exchange deadline expired')
+                channel.settimeout(remaining)
                 payload = json.dumps(dict(pid=row['pid'], identity=row['identity'])).encode()
                 channel.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                              array.array('i', [handle]))])
-                result = channel.recv(1)
+                result = channel.recv(2)
                 assert result in (b'V', b'E', b'R'), 'Process identity validation failed'
                 assert result != b'R', ('Observed package process identity changed', row)
                 if result == b'V':
@@ -365,32 +429,53 @@ class PackageMembers(Members):
                 os.close(handle)
             self.handles = live
             self.rows = [row for row, handle in live]
+        except (TimeoutError, OSError):
+            transport_failed = True
+            raise
         finally:
             channel.close()
-            assert helper.wait(timeout=15) == 0, 'Process identity validator failed'
+            try:
+                if transport_failed and validator >= 0:
+                    terminate_identity(validator)
+                    # sudo mirrors a stopped command's job-control state.
+                    # Resume its original monitor after retiring that command,
+                    # otherwise a successful SIGKILL can still leave wait stuck.
+                    if monitor >= 0:
+                        try:
+                            signal.pidfd_send_signal(monitor, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                elif transport_failed and monitor >= 0:
+                    # Startup failed before the trusted helper transferred its
+                    # pidfd. Its sudo monitor owns command termination/reaping.
+                    try:
+                        signal.pidfd_send_signal(monitor, signal.SIGTERM)
+                        signal.pidfd_send_signal(monitor, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    status = helper.wait(timeout=IDENTITY_EXCHANGE_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    if validator >= 0:
+                        terminate_identity(validator)
+                        if monitor >= 0:
+                            try:
+                                signal.pidfd_send_signal(monitor, signal.SIGCONT)
+                            except ProcessLookupError:
+                                pass
+                    elif monitor >= 0:
+                        signal.pidfd_send_signal(monitor, signal.SIGTERM)
+                        signal.pidfd_send_signal(monitor, signal.SIGCONT)
+                    status = helper.wait()
+                if not transport_failed:
+                    assert status == 0, 'Process identity validator failed'
+            finally:
+                if validator >= 0:
+                    os.close(validator)
+                if monitor >= 0:
+                    os.close(monitor)
 
     def terminate(self):
         for row, handle in self.handles:
-            try:
-                signal.pidfd_send_signal(handle, signal.SIGKILL)
-            except ProcessLookupError:
-                continue
-            except PermissionError:
-                # Same fixture-owned pidfd transfer as the native death probe;
-                # the VM's root helper never receives a numeric process target.
-                channel, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-                code = ('import array,signal,socket; s=socket.socket(fileno=0); '
-                        'm,c,f,a=s.recvmsg(1,socket.CMSG_SPACE(4)); '
-                        'v=array.array("i"); v.frombytes(c[0][2]); '
-                        '\ntry: signal.pidfd_send_signal(v[0],signal.SIGKILL)'
-                        '\nexcept ProcessLookupError: pass')
-                try:
-                    helper = subprocess.Popen(['sudo', '-n', 'python3', '-B', '-c', code], stdin=child)
-                    child.close()
-                    channel.sendmsg([b'K'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                                             array.array('i', [handle]))])
-                    assert helper.wait(timeout=15) == 0
-                finally:
-                    child.close()
-                    channel.close()
+            terminate_identity(handle)
         self.exited()

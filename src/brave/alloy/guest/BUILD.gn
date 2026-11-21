@@ -3,7 +3,7 @@
 import("//testing/test.gni")
 
 _implementation = [
-  "bootstrap/main.c", "bootstrap/supervisor.c", "bootstrap/engine_main.cc",
+  "bootstrap/main.c", "bootstrap/supervisor.c", "bootstrap/wait_owner.c", "bootstrap/engine_main.cc",
   "session/session.cc", "session/session.h", "session/client.cc", "session/client.h",
   "session/supervisor.cc", "session/supervisor.h", "session/host.cc",
   "session/control_queue.h",
@@ -176,7 +176,7 @@ group("session") {
 action("alloy_guest_host") {
   testonly = true
   script = "bootstrap/build_bootstrap.py"
-  inputs = [ "bootstrap/main.c", "bootstrap/supervisor.c", "protocol/wire.h",
+  inputs = [ "bootstrap/main.c", "bootstrap/supervisor.c", "bootstrap/wait_owner.c", "protocol/wire.h",
              "linux_lock/protection.h", "linux_lock/ram_scratch.c",
              "linux_lock/writer_paths.c", "linux_lock/landlock.c",
              "linux_lock/child_launch.c", "linux_lock/child_launch.h",

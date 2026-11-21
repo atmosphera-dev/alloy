@@ -23,8 +23,10 @@ TEST(GuestPackaging, NativeDoesNotClaimExternalFlatpakEntries) {
   ASSERT_TRUE(coverage);
   EXPECT_EQ(*coverage->FindString("flatpak_external_entries"), "unavailable");
   ASSERT_TRUE(coverage->FindList("trusted_setup"));
-  EXPECT_NE((*fields)[1].find("fixed-static-bootstrap-teardown-probe; no-engine-payload"),
-            std::string::npos);
+  EXPECT_TRUE(coverage->FindList("trusted_setup")->contains(
+      "fixed-static-bootstrap-teardown-probe; no-engine-payload"));
+  EXPECT_TRUE(coverage->FindList("trusted_setup")->contains(
+      "fixed-static-wait-owner; private-kernel-exit-status; no-engine-payload"));
   EXPECT_EQ(*coverage->FindString("snap_external_entries"),
             "unsupported:strict-Snap-policy-denies-pidfd_send_signal");
   auto native = base::JSONReader::ReadDict((*fields)[3], base::JSON_PARSE_RFC);

@@ -40,5 +40,18 @@ package-coverage claim. Snap guest mode is unsupported because its strict
 policy denies pidfd_send_signal. `deny_pidfd_signal.c` supplies blanket and
 SIGKILL-only inherited seccomp denials for the SDK refusal test, with an
 unfiltered positive control. `teardown_policy.c` checks real supervisor error
-propagation and retained ownership using trusted EOF-released fixture children;
-there is no Snap adapter or weaker lifetime fallback here.
+propagation and retained ownership. Allowed cases use children that only an
+actual SIGKILL can end; denied cases use trusted EOF-released fixture children.
+There is no Snap adapter or weaker lifetime fallback here.
+
+`wait_owner.cc` and `wait_owner_fixture.c` exercise the actual static wait owner:
+default/ignored/SA_NOCLDWAIT/reaping-handler app signals, nonzero final status,
+stopped-probe cancellation, final receipt after cancellation EOF and outer-owner
+loss with the inner exit barrier retained. The full SDK repeats the signal modes
+through page load and normal close or supervisor failure. No production test hook
+or app signal change is used.
+
+`validator_stall.py` stops the trusted root validator before or after its pidfd
+handshake to check bounded, fail-closed exchange and exact helper/monitor cleanup.
+Refusal fixtures record exec calls before SDK startup through shutdown, not just
+late process snapshots; a transient runtime launch is a failure too.

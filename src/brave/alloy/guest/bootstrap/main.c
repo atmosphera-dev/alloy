@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 int alloy_guest_supervise(const char* bootstrap);
+int alloy_guest_wait_owner(const char* bootstrap);
 
 static int teardown_probe(void) {
   // Trusted static setup only: no registration, writer setup or engine load.
@@ -36,7 +37,8 @@ static int teardown_probe(void) {
   return received == 0 ? 0 : 125;
 }
 
-static int granted(int fd, int supervisor, int child) {
+static int granted(int fd, int supervisor, int child, int wait_owner) {
+  if (wait_owner && fd == ALLOY_GUEST_WAIT_STATUS_FD) return 1;
   if (child && alloy_flatpak_preserves(fd))
     return 1;
   if (alloy_lock_preserves(fd))
@@ -66,7 +68,7 @@ static int granted(int fd, int supervisor, int child) {
   return 0;
 }
 
-static int close_ungranted(int supervisor, int child) {
+static int close_ungranted(int supervisor, int child, int wait_owner) {
   DIR* directory = opendir("/proc/self/fd");
   if (!directory)
     return 0;
@@ -86,7 +88,7 @@ static int close_ungranted(int supervisor, int child) {
     if (errno || entry->d_name == end || *end || number < 3 ||
         number > INT_MAX || number == directory_fd)
       continue;
-    if (!granted((int)number, supervisor, child) && close((int)number)) {
+    if (!granted((int)number, supervisor, child, wait_owner) && close((int)number)) {
       valid = 0;
       break;
     }
@@ -128,8 +130,11 @@ static int sanitize_environment(void) {
 
 int main(int argc, char** argv) {
   unsigned int inherited_nnp = (unsigned int)prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-  int supervisor = argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0;
+  int gated = argc == 3 && strcmp(argv[1], "--alloy-supervisor") == 0 &&
+              strcmp(argv[2], ALLOY_GUEST_WAIT_GATE_ARGUMENT) == 0;
+  int supervisor = gated || (argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0);
   int probe = argc == 2 && strcmp(argv[1], ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT) == 0;
+  int wait_owner = argc == 2 && strcmp(argv[1], ALLOY_GUEST_WAIT_OWNER_ARGUMENT) == 0;
   int child = 0;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--type=", 7) == 0)
@@ -145,11 +150,12 @@ int main(int argc, char** argv) {
   if (length <= 0 || (size_t)length >= sizeof(executable) - 1)
     return 125;
   executable[length] = 0;
-  int flatpak = probe ? 0 : alloy_flatpak_detect(executable);
+  int flatpak = probe || wait_owner ? 0 : alloy_flatpak_detect(executable);
   if (flatpak < 0)
     return 125;
   struct rlimit no_core = {0, 0};
-  if (setrlimit(RLIMIT_CORE, &no_core) || !close_ungranted(supervisor || probe, child) ||
+  if (setrlimit(RLIMIT_CORE, &no_core) ||
+      !close_ungranted(supervisor || probe || wait_owner, child, wait_owner || gated) ||
       !sanitize_environment())
     return 125;
   int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -163,6 +169,16 @@ int main(int argc, char** argv) {
     close(null_fd);
   if (probe)
     return teardown_probe();
+  if (wait_owner)
+    return alloy_guest_wait_owner(executable);
+  if (gated) {
+    char grant;
+    ssize_t received;
+    do { received = recv(ALLOY_GUEST_WAIT_STATUS_FD, &grant, 1, MSG_TRUNC); }
+    while (received < 0 && errno == EINTR);
+    close(ALLOY_GUEST_WAIT_STATUS_FD);
+    if (received != 1 || grant != 'G') return received == 0 ? 0 : 125;
+  }
   if (supervisor)
     return alloy_guest_supervise(executable);
   if (!alloy_guest_is_runtime() || !alloy_guest_register_runtime(1))

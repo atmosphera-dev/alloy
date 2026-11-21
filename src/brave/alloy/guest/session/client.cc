@@ -655,7 +655,7 @@ class SessionImpl final : public AlloyGuestSession {
     std::string reason = "failed";
     StateChanged("STARTING");
     std::string unavailable;
-    bool launched = !core_->IsClosing() && LaunchSupervisor(&child, &unavailable);
+    bool launched = !core_->IsClosing() && LaunchSupervisor(&child, &unavailable, core_->wake);
     if (!unavailable.empty() && !core_->IsClosing()) {
       // A startup prerequisite failed, so no supervised runtime exists. Publish
       // the precise unavailable report through the normal callback owner, but

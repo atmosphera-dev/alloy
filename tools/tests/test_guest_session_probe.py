@@ -177,6 +177,8 @@ class GuestProbeTests(unittest.TestCase):
             self.assertEqual(role, process_role([b'/engine --type=' + role.encode() + b' --flag', b'']))
         self.assertEqual('browser', process_role([b'/engine', b'']))
         self.assertEqual('supervisor', process_role([b'/host', b'--alloy-supervisor', b'']))
+        self.assertEqual('supervisor', process_role([b'/host', b'--alloy-supervisor', b'--alloy-wait-gate']))
+        self.assertEqual('wait-owner', process_role([b'/host', b'--alloy-wait-owner', b'']))
 
     def test_process_walk_includes_worker_thread_children(self):
         ready, release = threading.Event(), threading.Event()

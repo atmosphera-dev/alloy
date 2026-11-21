@@ -43,6 +43,8 @@ def process_role(arguments):
     # Chromium rewrites /proc/cmdline to one space-separated process title.
     # Before that rewrite, the same flags are distinct NUL-separated arguments.
     title = b' '.join(arguments)
+    if re.search(rb'(?:^|\s)--alloy-wait-owner(?:\s|$)', title):
+        return 'wait-owner'
     if re.search(rb'(?:^|\s)--alloy-supervisor(?:\s|$)', title):
         return 'supervisor'
     match = re.search(rb'(?:^|\s)--type=([a-z0-9-]+)(?:\s|$)', title)

@@ -110,6 +110,8 @@ class Members:
 
 
 def role_of(row):
+    if '--alloy-wait-owner' in row['argv']:
+        return 'wait-owner'
     if '--alloy-supervisor' in row['argv']:
         return 'supervisor'
     for field in row['argv'].split():
@@ -345,7 +347,7 @@ def lifecycle(out, evidence, fixtures):
     sentinel = evidence / 'inherited-disk-sentinel'
     sentinel.write_bytes(b'UNCHANGED-DURABLE-SENTINEL')
     env = dict(os.environ, ALLOY_FIXTURE_DISK_CAPABILITY=str(sentinel))
-    for death in ('close', 'browser', 'supervisor', 'app', 'renderer', 'gpu-process', 'scratch'):
+    for death in ('close', 'browser', 'supervisor', 'wait-owner', 'app', 'renderer', 'gpu-process', 'scratch'):
         with Client(out, evidence / ('lifetime-' + death), launch_environment=env) as client:
             client.wait('driver', 'inherited-capability')
             report = client.start(required='data-writes-denied')
@@ -366,7 +368,7 @@ def lifecycle(out, evidence, fixtures):
                     client.closed(reason='failed')
                 else:
                     members.kill(death)
-                    if death in ('browser', 'supervisor'):
+                    if death in ('browser', 'supervisor', 'wait-owner'):
                         client.closed(reason='failed')
                     else:
                         time.sleep(1)

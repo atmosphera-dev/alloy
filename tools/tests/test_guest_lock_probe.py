@@ -5,14 +5,65 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guest_lock_probe import bus_calls, inventory, inventory_equal, protected, role_of, wait_bus_output
+from guest_lock_probe import bus_calls, inventory, inventory_equal, main, protected, role_of, wait_bus_output
 
 
 class LockReceipts(unittest.TestCase):
+    def test_expected_guest_accepts_the_supplied_validated_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / 'evidence'
+            with patch('guest_lock_probe.WORK', root), patch('guest_lock_probe.validate_output') as validate, \
+                 patch('guest_lock_probe.os.getuid', return_value=1000), \
+                 patch('guest_lock_probe.os.uname', return_value=SimpleNamespace(nodename='alloy-gm-lock-next')), \
+                 patch.dict('os.environ', TMPDIR='/home/builder/work/tmp'), \
+                 patch('guest_lock_probe.Fixtures'), patch('guest_lock_probe.package_proof', return_value=[]) as proof, \
+                 patch('builtins.print'):
+                main(['--out', str(root / 'out'), '--check', 'package',
+                      '--evidence', str(evidence), '--expected-hostname', 'alloy-gm-lock-next'])
+                validate.assert_called_once_with(root, root / 'out')
+                proof.assert_called_once()
+                result = json.loads((evidence / 'results.json').read_text())
+                self.assertEqual(result['expected_hostname'], 'alloy-gm-lock-next')
+                self.assertEqual(result['status'], 'passed')
+
+    def test_expected_guest_rejects_mismatch_before_evidence_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / 'evidence'
+            with patch('guest_lock_probe.WORK', root), \
+                 patch('guest_lock_probe.validate_output') as validate, \
+                 patch('guest_lock_probe.os.getuid', return_value=1000), \
+                 patch('guest_lock_probe.os.uname', return_value=SimpleNamespace(nodename='other-guest')), \
+                 patch.dict('os.environ', TMPDIR='/home/builder/work/tmp'):
+                with self.assertRaisesRegex(AssertionError, 'Expected guest alloy-gm-lifetime'):
+                    main(['--out', str(root / 'out'), '--check', 'baseline',
+                          '--evidence', str(evidence), '--expected-hostname', 'alloy-gm-lifetime'])
+                validate.assert_called_once_with(root, root / 'out')
+                self.assertFalse(evidence.exists())
+
+    def test_expected_guest_does_not_bypass_workspace_validation(self):
+        with patch('guest_lock_probe.validate_output', side_effect=RuntimeError('invalid workspace')):
+            with self.assertRaisesRegex(RuntimeError, 'invalid workspace'):
+                main(['--out', '/unowned/out', '--check', 'baseline', '--evidence', '/unowned/evidence',
+                      '--expected-hostname', 'alloy-gm-lifetime'])
+
+    def test_expected_guest_still_rejects_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch('guest_lock_probe.WORK', root), patch('guest_lock_probe.validate_output'), \
+                 patch('guest_lock_probe.os.getuid', return_value=0), \
+                 patch('guest_lock_probe.os.uname', return_value=SimpleNamespace(nodename='alloy-gm-lifetime')), \
+                 patch.dict('os.environ', TMPDIR='/home/builder/work/tmp'):
+                with self.assertRaisesRegex(AssertionError, 'unprivileged'):
+                    main(['--out', str(root / 'out'), '--check', 'baseline',
+                          '--evidence', str(root / 'evidence'), '--expected-hostname', 'alloy-gm-lifetime'])
+
     def test_inventory_errors_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(FileNotFoundError):

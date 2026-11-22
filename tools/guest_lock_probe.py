@@ -626,21 +626,24 @@ def package_proof(out, evidence, fixtures):
             assert not policy.exists()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--check', choices=('baseline', 'all', 'package'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument('--expected-hostname', required=True,
+                        help='Exact assigned test guest; workspace validation remains mandatory')
+    args = parser.parse_args(argv)
     out = args.out.resolve()
     validate_output(WORK, out)
     evidence = args.evidence.resolve()
     assert evidence.is_relative_to(WORK), evidence
     assert os.environ.get('TMPDIR', '').startswith('/home/builder/work/')
-    assert os.getuid() != 0 and os.uname().nodename == 'alloy-gm-m2'
+    assert os.getuid() != 0, 'Run browser fixtures as the unprivileged workspace owner'
+    assert os.uname().nodename == args.expected_hostname, f'Expected guest {args.expected_hostname}'
     evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     started = time.monotonic()
-    result = dict(check=args.check, status='running', cases=[])
+    result = dict(check=args.check, expected_hostname=args.expected_hostname, status='running', cases=[])
     try:
         with Fixtures(REPO, tls_root=evidence / 'tls') as tls:
             if args.check != 'package':

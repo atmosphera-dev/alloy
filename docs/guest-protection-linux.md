@@ -86,7 +86,7 @@ Run only on the assigned Alloy cloud guest, task `gm-m2`, workspace
 `/home/builder/work/alloy`, with `TMPDIR=/home/builder/work/tmp`:
 
 ```sh
-python3 repo/tools/guest_lock_probe.py --out src/out/Verify_Alloy --check all --evidence evidence/guest-mode/m2/lock-01
+python3 repo/tools/guest_lock_probe.py --expected-hostname alloy-gm-m2 --out src/out/Verify_Alloy --check all --evidence evidence/guest-mode/m2/lock-01
 ```
 
 The driver records real-default before/live/close/crash inventories without

@@ -69,6 +69,9 @@ There is no automatic retry: after a crash abort the next app-requested navigati
 loads in a new renderer. A replacement document or closed view still retires
 the original intent explicitly. No process-readiness check can serialize a
 navigation with a kill sent outside the browser before that process exits.
+Native document adoption is independent of that single-use outcome: a pending
+cross-site renderer can still commit after the old primary crashes. Its matching
+document, title and stream become live without a second completion callback.
 
 ## Sequences, ownership and shutdown
 

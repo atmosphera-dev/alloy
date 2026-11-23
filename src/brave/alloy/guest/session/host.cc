@@ -355,11 +355,13 @@ class NativeView final : public CefClient,
     auto found = pending_.find(navigation->GetNavigationId());
     if (closing_ || found == pending_.end())
       return;
-    Owner original = found->second;
+    const Owner original = found->second;
     pending_.erase(found);
-    if (!SameNavigation(original, owner_) || !outcome_.Owns(owner_))
+    if (!SameNavigation(original, owner_))
       return;
-    original.generation = owner_.generation;
+    // Native document custody outlives the single-use app outcome. A different
+    // renderer can commit this navigation after the old primary's crash has
+    // already reported its outcome. Adopt it without completing that token twice.
     if (navigation->HasCommitted()) {
       current_token_ = content::AlloyDocumentNoiseIdentity(navigation->GetRenderFrameHost());
     } else {

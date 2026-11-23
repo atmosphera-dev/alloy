@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import select
+import signal
 import subprocess
 import threading
 import time
@@ -17,6 +18,7 @@ import zlib
 
 from guest_test_support.display import environment
 from guest_test_support.session import OwnedProcesses
+from guest_test_support.session import RENDERER_CRASH_ABORT
 from workspace import validate_output, workspace_path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -50,6 +52,34 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
         if path == '/no-content':
             self.send_response(204)
             self.end_headers()
+            return
+        if path == '/custody-worker.js':
+            body = b'postMessage("ready");setInterval(()=>{},1000);'
+            content_type = 'application/javascript'
+        elif path in ('/custody-a.html', '/custody-b.html'):
+            if path == '/custody-b.html':
+                self.server.cross_site_waiting.set()
+                assert self.server.cross_site_release.wait(120), 'cross-site navigation not released'
+            label = 'A' if path == '/custody-a.html' else 'B'
+            color = '180,35,65' if label == 'A' else '25,90,170'
+            body = ('''<!doctype html><style>html{background:rgb(''' + color + ''')}</style><script>
+const worker=new Worker('/custody-worker.js');
+worker.onmessage=()=>{document.title='CUSTODY_''' + label + '''';
+fetch('/custody-executed-''' + label + '''');};
+</script>''').encode()
+            content_type = 'text/html'
+        elif path in ('/custody-executed-A', '/custody-executed-B'):
+            getattr(self.server, 'cross_site_executed_' + path[-1]).set()
+            body, content_type = b'ok', 'text/plain'
+        else:
+            body = None
+        if body is not None:
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == '/pending-input.html':
             self.server.navigation_waiting.set()
@@ -596,6 +626,98 @@ def edge_checks(out, evidence, base, case):
         (evidence / 'events.json').write_text(json.dumps(client.events, indent=2) + '\n')
 
 
+def worker_renderers(processes):
+    """A live fixture worker identifies its actual renderer, not Chromium's spare."""
+    result = []
+    for row, handle in zip(processes.members, processes.handles):
+        if row['role'] != 'renderer':
+            continue
+        poll = select.poll()
+        poll.register(handle, select.POLLIN)
+        if poll.poll(0):
+            continue
+        try:
+            names = [(task / 'comm').read_text().strip()
+                     for task in (Path('/proc') / str(row['pid']) / 'task').iterdir()]
+        except FileNotFoundError:
+            continue
+        if 'DedicatedWorker' in names:
+            result.append((row, handle))
+    return result
+
+
+def cross_site_crash(out, evidence, base, server):
+    """A late native commit remains usable after its sole outcome reports A's crash."""
+    evidence.mkdir()
+    client = Client(out, evidence)
+    before = pending = None
+    after = None
+    receipt = {}
+    try:
+        assert client.wait('prepared')['stream']
+        client.wait('configured')
+        client.command('navigate ' + base + '/custody-a.html', 'navigate-queued', lambda v: v['ok'])
+        first = client.wait('title', lambda v: v['title'] == 'CUSTODY_A')
+        client.wait('load', lambda v: v['document'] == first['document'] and v['status'] == 200)
+        first_frame = client.wait('frame', lambda v: v['document'] == first['document'])
+        assert server.cross_site_executed_A.wait(30)
+        before = OwnedProcesses(client.process.pid, out)
+        workers = worker_renderers(before)
+        assert len(workers) == 1, ('Cannot identify A renderer', before.members, workers)
+        old, handle = workers[0]
+        receipt.update(first=first, primary_url=base + '/custody-a.html', primary_renderer=old)
+        after = len(client.events)
+        # localhost and the numeric loopback are different Chromium sites.
+        cross_site = base.replace('127.0.0.1', 'localhost') + '/custody-b.html'
+        receipt['pending_url'] = cross_site
+        client.command('navigate ' + cross_site, 'navigate-queued', lambda v: v['ok'])
+        assert server.cross_site_waiting.wait(30), 'B did not reach the held server'
+        pending = OwnedProcesses(client.process.pid, out)
+        others = [row for row in pending.members if row['role'] == 'renderer' and row != old]
+        assert others, ('No separate renderer while B is held', pending.members)
+        receipt['pending_renderers'] = others
+        signal.pidfd_send_signal(handle, signal.SIGKILL)
+        poll = select.poll()
+        poll.register(handle, select.POLLIN)
+        assert poll.poll(30000), 'Original A renderer did not exit'
+        outcome = client.wait('load', lambda v: v['view'] == first['view'], after=after, timeout=30)
+        assert outcome['status'] == RENDERER_CRASH_ABORT and outcome['document'] > first['document'], outcome
+        receipt['outcome'] = outcome
+        server.cross_site_release.set()
+        # An HTTP marker emitted by B's real JS proves native commitment even
+        # on the red build where NativeView suppresses its public title/frames.
+        assert server.cross_site_executed_B.wait(30), 'Held B did not execute after A died'
+        committed = worker_renderers(pending)
+        assert len(committed) == 1 and committed[0][0] in others, committed
+        receipt['committed_renderer'] = committed[0][0]
+        title = client.wait('title', lambda v: v['title'] == 'CUSTODY_B' and
+                            v['document'] == outcome['document'], after=after, timeout=30)
+        frame = client.wait('frame', lambda v: v['document'] == title['document'] and
+                            v['generation'] > first_frame['generation'], after=after, timeout=30)
+        pixel = client.command(f'pixel {title["view"]} 64 48', 'pixel')
+        assert (pixel['r'], pixel['g'], pixel['b'], pixel['a']) == (25, 90, 170, 255), pixel
+        client.send('close')
+        client.wait('closed', lambda v: v['reason'] == 'closed')
+        before.exited()
+        pending.exited()
+        client.finish()
+        # Terminal close and reader drain, not a time-based quiet window.
+        outcomes = [v for v in client.events[after:] if v['event'] == 'load' and v['view'] == first['view']]
+        assert outcomes == [outcome], outcomes
+        receipt.update(title=title, frame=frame, pixel=pixel, outcomes=outcomes, status='passed')
+        return dict(case='old-primary-crash-during-held-cross-site-navigation', **receipt)
+    finally:
+        server.cross_site_release.set()
+        client.dispose()
+        for processes in (before, pending):
+            if processes is not None:
+                processes.close()
+        if after is not None:
+            receipt['observed_outcomes'] = [v for v in client.events[after:] if v['event'] == 'load']
+        (evidence / 'adoption.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        (evidence / 'events.json').write_text(json.dumps(client.events, indent=2) + '\n')
+
+
 def startup_failure(out, evidence):
     evidence.mkdir()
     library = evidence / 'refuse-eventfd.so'
@@ -617,7 +739,7 @@ def startup_failure(out, evidence):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=('frames', 'all'), required=True)
+    parser.add_argument('--check', choices=('frames', 'cross-site-crash', 'all'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     args = parser.parse_args(argv)
     out = args.out.resolve()
@@ -631,6 +753,10 @@ def main(argv=None):
     server.daemon_threads = True
     server.navigation_waiting = threading.Event()
     server.navigation_release = threading.Event()
+    server.cross_site_waiting = threading.Event()
+    server.cross_site_release = threading.Event()
+    server.cross_site_executed_A = threading.Event()
+    server.cross_site_executed_B = threading.Event()
     server.click_lock = threading.Lock()
     server.clicks = 0
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -638,7 +764,10 @@ def main(argv=None):
     result = {'check': args.check, 'status': 'running'}
     start = time.monotonic()
     try:
-        rows = frames(out, evidence, f'http://127.0.0.1:{server.server_port}')
+        base = f'http://127.0.0.1:{server.server_port}'
+        rows = [] if args.check == 'cross-site-crash' else frames(out, evidence, base)
+        if args.check in ('cross-site-crash', 'all'):
+            rows.append(cross_site_crash(out, evidence / 'cross-site-crash', base, server))
         if args.check == 'all':
             rows.extend(input_checks(out, evidence / 'input', f'http://127.0.0.1:{server.server_port}', server))
             for case in ('empty-text', 'touch-capture', 'pointer-capture', 'non-committing-navigation', 'full-budget-resize'):
@@ -651,6 +780,7 @@ def main(argv=None):
         raise
     finally:
         server.navigation_release.set()
+        server.cross_site_release.set()
         server.shutdown()
         server.server_close()
         worker.join()

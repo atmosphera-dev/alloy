@@ -29,6 +29,11 @@ int alloy_lock_scratch_valid(void) { return 1; }
 void alloy_lock_remove_scratch(void) {}
 
 static int fail_poll, fail_recv, fail_wait;
+static int deny_kill;
+int __real_alloy_pinned_signal(int, int);
+int __wrap_alloy_pinned_signal(int fd, int number) {
+  return deny_kill && number == SIGKILL ? EPERM : __real_alloy_pinned_signal(fd, number);
+}
 static int injected_error = EIO;
 static int fault(int* selected) {
   if (!*selected) return 0;
@@ -61,11 +66,14 @@ int main(int argc, char** argv) {
   assert(size > 0);
   executable[size] = 0;
 #ifdef ALLOY_LIFETIME_WAIT_OWNER
-  if (argc == 2 && !strcmp(argv[1], ALLOY_GUEST_WAIT_OWNER_ARGUMENT))
+  if (argc == 2 && !strcmp(argv[1], ALLOY_GUEST_WAIT_OWNER_ARGUMENT)) {
+    deny_kill = strstr(executable, "/kill-refused-") != NULL;
     return alloy_guest_wait_owner(executable);
+  }
   if (argc == 2 && !strcmp(argv[1], ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT)) {
     if (strstr(executable, "/startup-cancel/")) raise(SIGSTOP);
     assert(send(ALLOY_GUEST_CONTROL_FD, "P", 1, MSG_NOSIGNAL) == 1);
+    if (strstr(executable, "/kill-refused-probe/")) raise(SIGSTOP);
     char byte;
     while (read(ALLOY_GUEST_CONTROL_FD, &byte, 1) < 0 && errno == EINTR) {}
     return 0;
@@ -114,11 +122,13 @@ int main(int argc, char** argv) {
   }
   assert(!prctl(PR_SET_NAME, "alloy-lifetime", 0, 0, 0));
   if (strstr(executable, "/registration-reuse/") || strstr(executable, "/registration-allocation/") ||
+      strstr(executable, "/registration-allocation-denied/") ||
       strstr(executable, "/registration-duplicate/")) {
     char* name = strrchr(executable, '/');
     assert(name && (size_t)(name - executable) + sizeof("/alloy_registry_probe") <= sizeof(executable));
     strcpy(name + 1, "alloy_registry_probe");
-    const char* check = strstr(executable, "/registration-allocation/") ? "allocation" :
+    const char* check = strstr(executable, "/registration-allocation-denied/") ? "allocation-denied" :
+                         strstr(executable, "/registration-allocation/") ? "allocation" :
                         strstr(executable, "/registration-duplicate/") ? "duplicate" : "reuse";
     execl("/usr/bin/unshare", "unshare", "-Urpf", "--mount-proc", executable, check, NULL);
     assert(!"Could not execute fixture-only namespace helper");

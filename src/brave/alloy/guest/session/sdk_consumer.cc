@@ -9,18 +9,24 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdlib>
 #include <condition_variable>
 #include <deque>
 #include <fcntl.h>
 #include <iostream>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <poll.h>
+#include <set>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sstream>
 #include <string>
@@ -34,20 +40,36 @@ std::mutex output_mutex;
 bool verify_signal_policy = false;
 struct sigaction expected_sigchld;
 sigset_t expected_mask;
+std::thread::id signal_policy_thread;
 void ReapFixtureChildren(int) {
   int saved = errno;
   while (waitpid(-1, nullptr, WNOHANG) > 0) {}
   errno = saved;
 }
 bool FixtureSignalsUnchanged() {
+  if (std::this_thread::get_id() != signal_policy_thread) return false;
   struct sigaction current;
   sigset_t mask;
   if (sigaction(SIGCHLD, nullptr, &current) || sigprocmask(SIG_SETMASK, nullptr, &mask) ||
       current.sa_handler != expected_sigchld.sa_handler || current.sa_flags != expected_sigchld.sa_flags)
     return false;
   for (int number = 1; number < NSIG; ++number)
-    if (sigismember(&mask, number) != sigismember(&expected_mask, number)) return false;
+    if (sigismember(&mask, number) != sigismember(&expected_mask, number) ||
+        sigismember(&current.sa_mask, number) != sigismember(&expected_sigchld.sa_mask, number)) return false;
   return true;
+}
+bool DenyCallerKill() {
+  // No TSYNC: this fixture changes only the API caller, after custody exists.
+  sock_filter filter[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_pidfd_send_signal, 0, 3),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1])),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGKILL, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+  sock_fprog program = {6, filter};
+  return !prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) &&
+         !prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program);
 }
 std::string Quote(const std::string& text) {
   const char hex[] = "0123456789abcdef";
@@ -125,9 +147,6 @@ class Guest final : public AlloyGuestSessionHandler,
       completed_session_ = std::move(session);
       closed_ = true;
     }
-    if (verify_signal_policy)
-      Event("driver", "signal-policy-preserved", std::string(",\"ok\":") +
-            (FixtureSignalsUnchanged() ? "true" : "false"));
     Event(name_, "closed", ",\"reason\":" + Quote(reason.ToString()));
   }
   void OnReady(CefRefPtr<AlloyGuestView> view) override {
@@ -324,6 +343,7 @@ int main(int argc, char** argv) {
         sigaction(SIGCHLD, nullptr, &expected_sigchld) ||
         sigprocmask(SIG_SETMASK, nullptr, &expected_mask)) return 2;
     verify_signal_policy = true;
+    signal_policy_thread = std::this_thread::get_id();
   }
   std::vector<int> reserved;
   void* inherited_mapping = MAP_FAILED;
@@ -390,9 +410,15 @@ int main(int argc, char** argv) {
     Event("app", "initialized");
   }
   std::map<std::string, CefRefPtr<Guest>> guests;
+  std::set<std::string> signal_checked;
   std::string input;
   bool quitting = false;
   while (true) {
+    for (const auto& [name, guest] : guests) {
+      if (verify_signal_policy && guest->closed() && signal_checked.insert(name).second)
+        Event("driver", "signal-policy-preserved", std::string(",\"ok\":") +
+              (FixtureSignalsUnchanged() ? "true" : "false"));
+    }
     if (flexible)
       CefDoMessageLoopWork();
     if (quitting) {
@@ -419,6 +445,11 @@ int main(int argc, char** argv) {
       input.erase(0, newline + 1);
       std::string operation, name;
       command >> operation >> name;
+      if (operation == "close-denied" || operation == "terminate-denied") {
+        if (!DenyCallerKill()) return 2;
+        Event("driver", "caller-kill-denied");
+        operation.erase(operation.find('-'));
+      }
       if (operation == "quit") {
         quitting = true;
         for (auto& [id, guest] : guests) guest->Close();

@@ -4,19 +4,25 @@
 #define BRAVE_ALLOY_GUEST_SESSION_SUPERVISOR_H_
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
+
+#define ALLOY_LIFETIME_CUSTODY_OWNER 1
 
 namespace alloy::guest {
 enum class LaunchOutcome { kReady, kCancelled, kOwnerLost, kUnavailable, kFailed };
 enum class CustodyInstall { kInstalled, kCancelled, kFailed };
 
-// One move-only custody result, including failures after process creation.
-// Only its worker mutates these handles; other threads retain private mirrors.
+struct CustodyOwner;
+// The custody thread verifies and exercises process authority. Client callbacks
+// and API callers only post force/reap requests, never borrow its pidfds.
 struct Supervisor {
   Supervisor();
   Supervisor(const Supervisor&) = delete;
   Supervisor& operator=(const Supervisor&) = delete;
   ~Supervisor();
+  void RequestClose(const std::function<void()>& notify);
+  void RequestForce(bool startup_cancelled = false, const std::function<void()>& notify = {});
   int process = -1;
   int pidfd = -1;
   int channel = -1;
@@ -25,8 +31,10 @@ struct Supervisor {
   int exec_error = -1;
   int runtime_pidfd = -1;
   int probe_pidfd = -1;
-  int mirror_pidfd = -1;
   int mirror_status = -1;
+  int request_channel = -1;
+  std::atomic<bool> force_pending{false};
+  std::unique_ptr<CustodyOwner> owner;
   Supervisor* fork_next = nullptr;
   bool finished = false;
   std::atomic<bool> forced{false};

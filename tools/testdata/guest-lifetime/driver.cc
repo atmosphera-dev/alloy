@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <vector>
 #include "receive_fork.h"
+#include "custody_owner.h"
 
 static void Reaper(int) {
   int saved = errno;
@@ -84,7 +85,13 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < 3; ++i) assert(!stat(namespaces[i], &namespace_before[i]));
   if (check == "clone-enosys") DenyLifetimeCall(SYS_clone3, ENOSYS);
   if (check == "waitid-denied") DenyLifetimeCall(SYS_waitid, EPERM, 0, 3);
-  if (check == "kill-denied") DenyLifetimeCall(SYS_pidfd_send_signal, EPERM, 1, SIGKILL);
+  if (check == "kill-denied" || check == "kill-refused-probe")
+    DenyLifetimeCall(SYS_pidfd_send_signal, EPERM, 1, SIGKILL);
+  if (check == "socket-denied") DenyLifetimeCall(SYS_socketpair, EACCES);
+  if (check == "mask-restore-denied") {
+    fixture_process = getpid();
+    fail_mask_restore = true;
+  }
   if (check == "fd-pressure") {
     rlimit original;
     assert(!getrlimit(RLIMIT_NOFILE, &original) && original.rlim_max >= 256);
@@ -100,6 +107,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 6; ++i) { close(reserved.back()); reserved.pop_back(); }
     size_t descriptors = DescriptorCount();
     for (int attempt = 0; attempt < 16; ++attempt) {
+      {
       alloy::guest::Supervisor pressure;
 #ifdef ALLOY_LIFETIME_WAIT_OWNER
       std::string unavailable;
@@ -114,6 +122,7 @@ int main(int argc, char** argv) {
       alloy::guest::LaunchSupervisor(&pressure);
       alloy::guest::ReapSupervisor(&pressure);
 #endif
+      }
       assert(DescriptorCount() == descriptors);
       VerifyNoChildren();
     }
@@ -134,6 +143,16 @@ int main(int argc, char** argv) {
     registry_result = barrier[0];
   }
   alloy::guest::Supervisor child;
+  if (check.starts_with("custody-")) {
+#ifdef ALLOY_LIFETIME_WAIT_OWNER
+    CustodyOwnerCase(&child, check);
+    VerifySignals(before);
+    return 0;
+#else
+    puts("CUSTODY_OWNER_UNAVAILABLE");
+    return 4;
+#endif
+  }
   if (check == "receive-fork") {
     ReceiveFork(&child);
     VerifySignals(before);
@@ -188,7 +207,7 @@ int main(int argc, char** argv) {
     return alloy::guest::CustodyInstall::kInstalled;
   });
   bool launched = outcome == alloy::guest::LaunchOutcome::kReady &&
-                  alloy::guest::AdmitSupervisor(child.status_channel);
+                   (check == "kill-refused-retire" || alloy::guest::AdmitSupervisor(child.status_channel));
   if (outcome == alloy::guest::LaunchOutcome::kUnavailable) {
     printf("REFUSED %s\n", unavailable.c_str());
     fflush(stdout);
@@ -197,9 +216,9 @@ int main(int argc, char** argv) {
 #else
   bool launched = alloy::guest::LaunchSupervisor(&child);
 #endif
-  if (launched && check == "fault-app-poll") DenyLifetimeCall(SYS_poll, EIO);
-  if (launched && check == "fault-app-recv") DenyLifetimeCall(SYS_recvmsg, EIO);
-  if (launched && check == "fault-app-wait") DenyLifetimeCall(SYS_waitid, EPERM, 0, 3);
+  if (launched && check == "fault-app-poll") fail_app_poll = true;
+  if (launched && check == "fault-app-recv") fail_app_recv = true;
+  if (launched && check == "fault-app-wait") refused_waits = 1;
   printf("LAUNCHED %d OWNER %d\n", launched, child.process);
   fflush(stdout);
   if (!launched) return 2;
@@ -231,7 +250,7 @@ int main(int argc, char** argv) {
   }
   char command = 0;
   while (read(STDIN_FILENO, &command, 1) < 0 && errno == EINTR) {}
-  if (check.starts_with("fault-")) {
+  if (check.starts_with("fault-") || check == "kill-refused-retire") {
     assert(command == 'C');
 #ifdef ALLOY_LIFETIME_WAIT_OWNER
     int cleanup = alloy::guest::ReapSupervisor(&child);
@@ -240,9 +259,6 @@ int main(int argc, char** argv) {
     alloy::guest::ReapSupervisor(&child);
     int cleanup = 0;
 #endif
-    // An intentionally denied waitid cannot consume its zombie. The fixture,
-    // not product code, collects any remaining child status with waitpid.
-    if (check == "fault-app-wait") while (waitpid(-1, nullptr, WNOHANG) > 0) {}
     VerifySignals(before);
     VerifyNoChildren();
     puts(cleanup == -1 ? "FAILED_CLEANUP APP_SIGNALS_UNCHANGED" : "FALSE_CLEANUP_SUCCESS");
@@ -255,7 +271,10 @@ int main(int argc, char** argv) {
     int inherited[] = {child.pidfd, child.channel, child.resources,
 #ifdef ALLOY_LIFETIME_WAIT_OWNER
                        child.status_channel, child.exec_error, child.runtime_pidfd,
-                       child.probe_pidfd, child.mirror_pidfd, child.mirror_status,
+                       child.probe_pidfd, child.mirror_status,
+#ifdef ALLOY_LIFETIME_CUSTODY_OWNER
+                       child.request_channel,
+#endif
 #endif
     };
     int barrier[2];

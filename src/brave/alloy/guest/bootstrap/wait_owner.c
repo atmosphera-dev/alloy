@@ -88,7 +88,9 @@ static int spawn_owned(const char* bootstrap, const char* role,
 static int retire_child(struct alloy_pinned_child* child, int* status) {
   if (child->pidfd < 0) return 0;
   int error = alloy_pinned_signal(child->pidfd, SIGKILL);
-  int waited = alloy_pinned_wait(child->pidfd, status);
+  // A refused signal cannot make a stopped child progress. Return to init's
+  // exit, whose kernel sweep owns all remaining enclosure members.
+  int waited = error ? 0 : alloy_pinned_wait(child->pidfd, status);
   close(child->pidfd);
   child->pidfd = -1;
   return error ? error : waited;
@@ -136,16 +138,19 @@ static int probe_teardown(const char* bootstrap, int* status, unsigned int* oper
     error = send_status(ALLOY_GUEST_WAIT_PROBE, 0, 0, probe.pidfd, *operation);
     if (!error) error = receive_signal_result();
   }
+  int signal_error = 0;
   if (error && probe.pidfd >= 0) {
     // Error cleanup only; this is never accepted as the app's authority proof.
-    alloy_pinned_signal(probe.pidfd, SIGKILL);
+    signal_error = alloy_pinned_signal(probe.pidfd, SIGKILL);
   }
   // Cooperative EOF is only a fallback for this trusted pre-engine probe when
   // the kernel denies SIGKILL. It is not a runtime retirement mechanism.
   shutdown(pair[0], SHUT_RDWR);
   close(pair[0]);
   if (probe.pidfd >= 0) {
-    int waited = alloy_pinned_wait(probe.pidfd, status);
+    // Never wait for cooperative EOF if even init cannot kill the probe.
+    // Returning the original refusal lets init exit and perform its sweep.
+    int waited = signal_error ? 0 : alloy_pinned_wait(probe.pidfd, status);
     if (waited && !error) { error = waited; *operation = ALLOY_GUEST_WAIT_REAP; }
     close(probe.pidfd);
   }

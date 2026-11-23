@@ -51,23 +51,27 @@ static int write_map(const char* path, const char* text) {
 int alloy_spawn_pinned(const char* path, char* const argv[], char* const envp[],
                        const struct alloy_lock_fd_map* maps, size_t count,
                        int enclosure, struct alloy_pinned_child* child) {
-  *child = (struct alloy_pinned_child){-1, -1, -1};
+  *child = (struct alloy_pinned_child){-1, -1, -1, "spawn descriptor validation"};
   int maximum = ALLOY_GUEST_RESOURCE_FD;
   if (count > SIZE_MAX / sizeof(int)) return EOVERFLOW;
   for (size_t i = 0; i < count; ++i) {
     if (maps[i].target < 0 || maps[i].target == INT_MAX) return EINVAL;
     if (maps[i].target > maximum) maximum = maps[i].target;
   }
+  child->operation = "spawn descriptor allocation";
   int* copies = count ? malloc(count * sizeof(int)) : NULL;
   if (count && !copies) return ENOMEM;
   size_t copied = 0;
   int error = 0, errors[2] = {-1, -1}, parent = -1;
   for (; copied < count; ++copied) {
+    child->operation = "fcntl(spawn descriptor copy)";
     copies[copied] = fcntl(maps[copied].source, F_DUPFD_CLOEXEC, maximum + 1);
     if (copies[copied] < 0) { error = errno; goto done; }
   }
+  child->operation = "pipe2(exec error lane)";
   if (pipe2(errors, O_CLOEXEC)) { error = errno; goto done; }
   // The exec-error writer must not be overwritten by any remap.
+  child->operation = "fcntl(exec error writer)";
   int writer = fcntl(errors[1], F_DUPFD_CLOEXEC, maximum + 1);
   if (writer < 0) { error = errno; goto done; }
   close(errors[1]);
@@ -76,8 +80,10 @@ int alloy_spawn_pinned(const char* path, char* const argv[], char* const envp[],
   if (enclosure) {
     snprintf(uid_map, sizeof(uid_map), "%u %u 1\n", (unsigned)getuid(), (unsigned)getuid());
     snprintf(gid_map, sizeof(gid_map), "%u %u 1\n", (unsigned)getgid(), (unsigned)getgid());
+    child->operation = "pidfd_open(parent liveness)";
     int original = (int)syscall(SYS_pidfd_open, getpid(), 0);
     if (original < 0) { error = errno; goto done; }
+    child->operation = "fcntl(parent liveness copy)";
     parent = fcntl(original, F_DUPFD_CLOEXEC, maximum + 1);
     error = parent < 0 ? errno : 0;
     close(original);
@@ -85,6 +91,7 @@ int alloy_spawn_pinned(const char* path, char* const argv[], char* const envp[],
   }
   sigset_t blocked, original_mask;
   sigfillset(&blocked);
+  child->operation = "sigprocmask(spawn signal block)";
   if (sigprocmask(SIG_SETMASK, &blocked, &original_mask)) { error = errno; goto done; }
   int pidfd = -1;
   struct clone_args arguments = {0};
@@ -92,6 +99,8 @@ int alloy_spawn_pinned(const char* path, char* const argv[], char* const envp[],
   arguments.pidfd = (uint64_t)(uintptr_t)&pidfd;
   arguments.exit_signal = SIGCHLD;
   // VER0 works with Linux 5.3; no glibc clone3 wrapper/new libc requirement.
+  child->operation = enclosure ? "clone3(CLONE_PIDFD|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNS)" :
+                                 "clone3(CLONE_PIDFD)";
   pid_t process = (pid_t)syscall(SYS_clone3, &arguments, CLONE_ARGS_SIZE_VER0);
   if (!process) {
     // No malloc, C++, pthread atfork callbacks or inherited app handlers here.
@@ -142,9 +151,11 @@ int alloy_spawn_pinned(const char* path, char* const argv[], char* const envp[],
   int restored = sigprocmask(SIG_SETMASK, &original_mask, NULL);
   if (process > 0) {
     // Even a restore error must return custody, never abandon a created child.
-    *child = (struct alloy_pinned_child){process, pidfd, errors[0]};
+    child->process = process;
+    child->pidfd = pidfd;
+    child->exec_error = errors[0];
     errors[0] = -1;
-    if (restored) error = errno;
+    if (restored) { error = errno; child->operation = "sigprocmask(parent signal restore)"; }
   }
 done:
   for (size_t i = 0; i < copied; ++i) close(copies[i]);

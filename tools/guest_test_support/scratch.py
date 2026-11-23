@@ -53,7 +53,7 @@ print(json.dumps(dict(pid=int(sys.argv[1]),device=st.st_dev,mount=row,
 
 def scratch_references(receipt):
     # No observer in the ordinary proof keeps an FD open. Verify no process
-    # mount view OR open file retains this exact tmpfs device after teardown.
+    # mount view, open file OR mapping retains the device after teardown.
     code = r'''
 import errno,json,os,pathlib,select,sys
 device=int(sys.argv[1]); refs=[]
@@ -71,6 +71,9 @@ for p in pathlib.Path('/proc').iterdir():
    try:
     if fd.stat().st_dev==device: refs.append(dict(pid=int(p.name),fd=fd.name))
    except (FileNotFoundError,ProcessLookupError,PermissionError): pass
+   for line in (p/'maps').read_text().splitlines():
+    fields=line.split(); major,minor=(int(value,16) for value in fields[3].split(':'))
+    if os.makedev(major,minor)==device: refs.append(dict(pid=int(p.name),mapping=line))
  except (FileNotFoundError,ProcessLookupError,PermissionError): pass
  except OSError as error:
   if error.errno!=errno.EINVAL or handle<0 or not exited.poll(0): raise

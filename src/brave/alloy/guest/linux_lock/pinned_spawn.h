@@ -12,6 +12,7 @@ struct alloy_pinned_child {
   pid_t process;
   int pidfd;
   int exec_error;
+  const char* operation;
 };
 
 // No spawn-then-pin or clone fallback. Parent prepares every input; the copied

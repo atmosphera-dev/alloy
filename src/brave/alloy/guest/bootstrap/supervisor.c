@@ -77,7 +77,7 @@ static int retire(struct members* members) {
   for (size_t i = 0; i < members->count; ++i) {
     struct member* member = &members->items[i];
     if (member->pidfd >= 0) {
-      if (alloy_pinned_exited(member->pidfd, 1) != 1 && !error) error = EIO;
+      if (!error && alloy_pinned_exited(member->pidfd, 1) != 1) error = EIO;
       close(member->pidfd);
     }
   }
@@ -166,8 +166,7 @@ static int admit(int registration, struct members* members) {
     // A previously admitted process may already have exited and been reaped by
     // its native parent. Its numeric PID must not veto a new pinned identity.
     if (!prune_members(members)) {
-      alloy_pinned_signal(pidfd, SIGKILL);
-      alloy_pinned_exited(pidfd, 1);
+      if (!alloy_pinned_signal(pidfd, SIGKILL)) alloy_pinned_exited(pidfd, 1);
       close(pidfd);
       close(endpoint);
       return 0;
@@ -189,8 +188,7 @@ static int admit(int registration, struct members* members) {
   if (!replacement) {
     if (pidfd >= 0) {
       // Custody is not released just because the registry allocation failed.
-      alloy_pinned_signal(pidfd, SIGKILL);
-      alloy_pinned_exited(pidfd, 1);
+      if (!alloy_pinned_signal(pidfd, SIGKILL)) alloy_pinned_exited(pidfd, 1);
       close(pidfd);
     }
     if (endpoint >= 0)
@@ -315,9 +313,8 @@ static int supervise_prepared(const char* bootstrap) {
   close(ALLOY_GUEST_RESOURCE_FD);
   if (launched) {
     if (browser.pidfd >= 0) {
-      alloy_pinned_signal(browser.pidfd, SIGKILL);
       int status;
-      alloy_pinned_wait(browser.pidfd, &status);
+      if (!alloy_pinned_signal(browser.pidfd, SIGKILL)) alloy_pinned_wait(browser.pidfd, &status);
       close(browser.pidfd);
     }
     return 125;
@@ -398,9 +395,10 @@ static int supervise_prepared(const char* bootstrap) {
   if (registration[0] >= 0)
     close(registration[0]);
   close(browser_control[0]);
-  if (alloy_pinned_signal(browser_pidfd, SIGKILL)) result = 125;
+  int browser_signal = alloy_pinned_signal(browser_pidfd, SIGKILL);
+  if (browser_signal) result = 125;
   if (retire(&members)) result = 125;
-  if (alloy_pinned_exited(browser_pidfd, 1) != 1) result = 125;
+  if (!browser_signal && alloy_pinned_exited(browser_pidfd, 1) != 1) result = 125;
   close(browser_pidfd);
   if (reap()) result = 125;
   close(ALLOY_GUEST_CONTROL_FD);

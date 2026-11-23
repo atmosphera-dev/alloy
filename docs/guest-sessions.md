@@ -128,8 +128,14 @@ after the guest ends. The report discloses this observer limit; no dumpable or
 extra isolation mechanism is selected.
 
 The static init owns a real SIGKILL/waitid probe and a gated supervisor. READY
-and the app's Close/Terminate share one locked admission decision. Terminate
-signals the mirrored init pidfd directly, independently of the callback worker.
+and the app's Close/Terminate share one locked admission decision. One dedicated
+app-side custody thread performs capability checks, signals and final waits.
+Close/Terminate post requests; the calling thread's later seccomp or signal
+policy does not supply teardown authority. The custody thread remains responsive
+while the callback worker is blocked, including when init or its supervisor is
+stopped. Failed force attempts remain pending and retry. A refused final wait
+retains the exact pidfd and retries without publishing completion or dropping
+the reaping obligation. Failures remain recorded even after eventual cleanup.
 Final completion waits for the original init's exit barrier, not control EOF or
 the FINISHED receipt alone. App forks close inherited session handles without
 shutting down the parent's endpoints. No product close timeout is selected.
@@ -204,9 +210,10 @@ zygote tracer holds an actual Chromium newborn before registration, detaches it
 in confirmed SIGSTOP, and retains its original pidfd across custodian loss.
 Each invocation needs a new evidence path; repeat the SDK, zygote and existing
 gates against Release as well.
-The scratch matrix verifies ordinary mount invisibility and no remaining mount
-or open-file reference after death, except its explicit same-user observer
-case; that case verifies retention until the observer closes its handle.
+The scratch matrix verifies ordinary mount invisibility and no remaining mount,
+open-file or mapped-file reference after death, except its explicit same-user
+observer cases. Those verify retention until the observer closes its handle or
+unmaps the file, including a mapping whose descriptor was already closed.
 
 The M1 execution plan names DigitalOcean `alloy-gm-m1`, task `gm-m1`, allocated
 in sfo2 under addendum 01. All commands run there, from

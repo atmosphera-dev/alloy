@@ -42,7 +42,14 @@ static void ReceiveFork(alloy::guest::Supervisor* child) {
   assert(!pthread_atfork(ForkEntered, nullptr, nullptr));
   receive_fork_enabled = true;
   bool launched = false;
-  std::thread worker([&] { launched = alloy::guest::LaunchSupervisor(child); });
+  std::promise<void> launch_ready, retired;
+  auto ready = launch_ready.get_future();
+  auto retirement = retired.get_future();
+  std::thread worker([&] {
+    launched = alloy::guest::LaunchSupervisor(child);
+    launch_ready.set_value();
+    retirement.wait();  // PR_SET_PDEATHSIG names this creating thread.
+  });
   assert(ReadByte(receive_entered[0]) == 'R');
   std::thread copier([&] {
     pid_t copy = fork();
@@ -66,7 +73,7 @@ static void ReceiveFork(alloy::guest::Supervisor* child) {
   do { observed = poll(&result, 1, 1000); } while (observed < 0 && errno == EINTR);
   assert(observed >= 0);
   assert(write(receive_release[1], "G", 1) == 1);
-  worker.join();
+  ready.wait();
   copier.join();
   char proof = ReadByte(fork_result[0]);
   assert(launched);
@@ -79,6 +86,8 @@ static void ReceiveFork(alloy::guest::Supervisor* child) {
 #else
   alloy::guest::ReapSupervisor(child);
 #endif
+  retired.set_value();
+  worker.join();
   for (int* pair : {receive_entered, receive_release, fork_entered, fork_result}) {
     close(pair[0]);
     close(pair[1]);

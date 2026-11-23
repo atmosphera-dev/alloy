@@ -23,7 +23,9 @@ CHECKS = ('signals', 'enclosure', 'late', 'fork-control',
           'registration-reuse', 'registration-allocation', 'registration-duplicate', 'pin-reuse',
           'fd-pressure', 'fault-inner-poll', 'fault-inner-recv', 'fault-inner-wait',
            'fault-app-poll', 'fault-app-recv', 'fault-app-wait', 'eintr-registration', 'orphan-reap', 'proc-view',
-           'receive-fork')
+            'receive-fork', 'custody-caller-close', 'custody-caller-force',
+            'custody-late-wait', 'custody-force-retry', 'registration-allocation-denied',
+            'kill-refused-probe', 'kill-refused-retire', 'socket-denied', 'mask-restore-denied')
 
 
 def compile_fixture(destination, root=None):
@@ -40,7 +42,8 @@ def compile_fixture(destination, root=None):
                         '-I', str(root), '-c', str(pinned), '-o', objects[0]], check=True)
     subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-Werror', '-pthread',
                     '-I', str(root), *flags, str(guest / 'session/supervisor.cc'),
-                    str(REPO / 'tools/testdata/guest-lifetime/driver.cc'), *objects, '-ldl',
+                     str(REPO / 'tools/testdata/guest-lifetime/driver.cc'), *objects, '-ldl',
+                     '-Wl,--wrap=waitid,--wrap=alloy_pinned_signal,--wrap=poll,--wrap=recvmsg,--wrap=sigprocmask',
                     '-o', str(destination / 'driver')], check=True)
     sources = [REPO / 'tools/testdata/guest-lifetime/entry.c',
                guest / 'bootstrap/supervisor.c', guest / 'linux_lock/child_launch.c',
@@ -51,14 +54,14 @@ def compile_fixture(destination, root=None):
         sources.append(pinned)
     subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
                     '-I', str(root), *flags, *map(str, sources), '-pthread',
-                    '-Wl,--wrap=poll,--wrap=recvmsg,--wrap=waitid,--wrap=waitpid',
+                     '-Wl,--wrap=poll,--wrap=recvmsg,--wrap=waitid,--wrap=waitpid,--wrap=alloy_pinned_signal',
                     '-o', str(destination / 'alloy_guest_host')], check=True)
     registry_sources = [REPO / 'tools/testdata/guest-lifetime/registration.c',
                         guest / 'linux_lock/child_launch.c', root / 'base/process/alloy_guest_runtime.c']
     if pinned.exists():
         registry_sources.append(pinned)
     subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
-                    '-I', str(root), *map(str, registry_sources), '-Wl,--wrap=realloc', '-pthread',
+                     '-I', str(root), *map(str, registry_sources), '-Wl,--wrap=realloc,--wrap=alloy_pinned_signal', '-pthread',
                     '-o', str(destination / 'alloy_registry_probe')], check=True)
     subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
                     str(REPO / 'tools/testdata/guest-lifetime/pin_reuse.c'),
@@ -112,6 +115,53 @@ def exited(fd, seconds=10):
     return bool(poll.poll(int(seconds * 1000)))
 
 
+def cleanup_driver(process, handles, target):
+    errors = []
+    try:
+        for pid in descendants(process.pid):
+            try:
+                fd = pinned(pid)
+                try:
+                    handles.append(fd)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except ProcessLookupError:
+                pass
+            except Exception as error:
+                errors.append(error)
+    except Exception as error:
+        errors.append(error)
+    for fd in handles:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as error:
+            errors.append(error)
+        finally:
+            try:
+                os.close(fd)
+            except Exception as error:
+                errors.append(error)
+    try:
+        if process.poll() is None:
+            process.kill()
+    except Exception as error:
+        errors.append(error)
+    try:
+        process.wait(timeout=10)
+    except Exception as error:
+        errors.append(error)
+    try:
+        if process.poll() is not None:
+            (target / 'stderr.txt').write_text(process.stderr.read())
+    except Exception as error:
+        errors.append(error)
+    if errors:
+        raise ExceptionGroup('Lifetime fixture cleanup failed', errors)
+
+
 def case(fixture, evidence, policy, check):
     target = evidence / check / policy
     target.mkdir(parents=True)
@@ -129,6 +179,24 @@ def case(fixture, evidence, policy, check):
     handles = []
     try:
         launched = line(process)
+        if check.startswith('custody-'):
+            if launched.startswith('CUSTODY_STOPPED '):
+                owner = int(launched.split()[-1])
+                handles.append(pinned(owner))
+                children = descendants(owner)
+                deadline = time.monotonic() + 10
+                while not any(status(pid)['State'].strip().startswith('T')
+                              for pid in [owner, *children]):
+                    assert time.monotonic() < deadline, 'No confirmed stopped original'
+                    time.sleep(.01)
+                handles.extend(pinned(pid) for pid in children)
+                process.stdin.write('G')
+                process.stdin.flush()
+                launched = line(process, 15)
+            assert launched == 'CUSTODY_OWNER_PASS', launched
+            assert process.wait(timeout=10) == 0
+            assert all(exited(fd) for fd in handles)
+            return dict(policy=policy, check=check, passed=True)
         if check == 'receive-fork':
             assert launched == 'RECEIVE_FORK_CLOSED APP_SIGNALS_UNCHANGED', launched
             assert process.wait(timeout=10) == 0
@@ -167,15 +235,35 @@ def case(fixture, evidence, policy, check):
             assert line(process) == 'CANCELLED_CLOSED APP_SIGNALS_UNCHANGED'
             assert process.wait(timeout=10) == 0
             return dict(policy=policy, check=check, passed=True, confirmed_stopped=stopped)
-        if check in ('clone-enosys', 'waitid-denied', 'kill-denied'):
+        if check in ('clone-enosys', 'waitid-denied', 'kill-denied', 'kill-refused-probe',
+                     'socket-denied', 'mask-restore-denied'):
             expected = {'clone-enosys': 'clone3(', 'waitid-denied': 'waitid(P_PIDFD)',
-                        'kill-denied': 'pidfd_send_signal(SIGKILL)'}[check]
+                        'kill-denied': 'pidfd_send_signal(SIGKILL)',
+                        'kill-refused-probe': 'pidfd_send_signal(SIGKILL)',
+                        'socket-denied': 'socketpair(',
+                        'mask-restore-denied': 'sigprocmask(parent signal restore)'}[check]
             assert launched.startswith('REFUSED ') and expected in launched, launched
             assert process.wait(timeout=10) == 0
             assert not descendants(process.pid)
             return dict(policy=policy, check=check, passed=True, reason=launched)
         assert launched.startswith('LAUNCHED 1 OWNER '), launched
         owner = int(launched.split()[-1])
+        if check == 'kill-refused-retire':
+            handles.append(pinned(owner))
+            children = descendants(owner)
+            assert len(children) == 1, children
+            handles.extend(pinned(pid) for pid in children)
+            signal.pidfd_send_signal(handles[1], signal.SIGSTOP)
+            deadline = time.monotonic() + 10
+            while not status(children[0])['State'].strip().startswith('T'):
+                assert time.monotonic() < deadline
+                time.sleep(.01)
+            process.stdin.write('C')
+            process.stdin.flush()
+            assert line(process) == 'FAILED_CLEANUP APP_SIGNALS_UNCHANGED'
+            assert process.wait(timeout=10) == 0
+            assert all(exited(fd) for fd in handles)
+            return dict(policy=policy, check=check, passed=True)
         if check.startswith('registration-'):
             observed = line(process)
             assert observed == 'REGISTRY_PASS APP_SIGNALS_UNCHANGED', observed
@@ -206,6 +294,9 @@ def case(fixture, evidence, policy, check):
                 break
             time.sleep(.01)
         assert children and ready, 'No admitted fixture entry'
+        if check in ('late', 'inner-lost', 'stopped-creator', 'app-dead'):
+            assert any(status(pid)['State'].strip().startswith('T') for pid in children), \
+                'No confirmed stopped unregistered child'
         handles.extend(pinned(pid) for pid in children)
         if check == 'orphan-reap':
             orphan = next(pid for pid in children if status(pid)['Name'].strip() == 'alloy-orphan')
@@ -260,20 +351,7 @@ def case(fixture, evidence, policy, check):
     finally:
         # Fixture deadlines fail tests, never product timeout abandonment. Kill
         # retained exact originals, including the intentionally copied app fork.
-        for pid in descendants(process.pid):
-            try:
-                handles.append(pinned(pid))
-            except ProcessLookupError:
-                pass
-        for fd in handles:
-            try:
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            os.close(fd)
-        process.kill() if process.poll() is None else None
-        process.wait(timeout=10)
-        (target / 'stderr.txt').write_text(process.stderr.read())
+        cleanup_driver(process, handles, target)
 
 
 def main():

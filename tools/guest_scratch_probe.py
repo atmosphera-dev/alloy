@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Real CEF private scratch lifetime and disclosed observer-limit proofs."""
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ def main():
     os.close(zombie_handle)
     try:
         with Fixtures(REPO) as fixtures:
-            for check in ('close', 'app-loss', 'init-loss', 'inner-loss', 'observer'):
+            for check in ('close', 'app-loss', 'init-loss', 'inner-loss', 'observer', 'observer-mapping'):
                 for policy in POLICIES:
                     root = evidence / check / policy
                     env = environment(root / 'environment', out)
@@ -52,6 +53,7 @@ def main():
                         client.page(fixtures.base + '/title/PRIVATE_SCRATCH', 'PRIVATE_SCRATCH')
                         processes = OwnedProcesses(client.process.pid, out)
                         borrowed = None
+                        mapping = None
                         try:
                             pid = next(row['pid'] for row in processes.members if row['role'] == 'supervisor')
                             mount = scratch_receipt(pid)
@@ -59,9 +61,20 @@ def main():
                             canary = scratch_view(pid) / 'private-scratch-canary'
                             canary.write_bytes(b'PRIVATE_CANARY')
                             assert not (Path('/dev/shm') / canary.name).exists()
-                            if check == 'observer':
+                            if check in ('observer', 'observer-mapping'):
                                 borrowed = os.open(canary, os.O_RDONLY | os.O_CLOEXEC)
-                            if check in ('app-loss', 'observer'):
+                            if check == 'observer-mapping':
+                                libc = ctypes.CDLL(None, use_errno=True)
+                                libc.mmap.restype = ctypes.c_void_p
+                                libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                                      ctypes.c_int, ctypes.c_int, ctypes.c_long]
+                                libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                                created = libc.mmap(None, 14, 1, 1, borrowed, 0)
+                                assert created != ctypes.c_void_p(-1).value, ctypes.get_errno()
+                                mapping = created
+                                os.close(borrowed)
+                                borrowed = None
+                            if check in ('app-loss', 'observer', 'observer-mapping'):
                                 client.abort()
                             elif check == 'close':
                                 client.send('close guest')
@@ -78,14 +91,31 @@ def main():
                                            row.get('fd') == str(borrowed) for row in observer), observer
                                 os.close(borrowed)
                                 borrowed = None
+                            if mapping is not None:
+                                assert ctypes.string_at(mapping, 14) == b'PRIVATE_CANARY'
+                                observer = scratch_references(mount)
+                                assert any(row.get('pid') == os.getpid() and 'mapping' in row
+                                           for row in observer), observer
+                                assert not any(row.get('pid') == os.getpid() and 'fd' in row
+                                               for row in observer), observer
+                                try:
+                                    scratch_reclaimed(mount)
+                                except AssertionError:
+                                    pass
+                                else:
+                                    raise AssertionError('Mapped scratch was reported reclaimed')
+                                assert libc.munmap(mapping, 14) == 0, ctypes.get_errno()
+                                mapping = None
                             scratch_reclaimed(mount)
-                            if check not in ('app-loss', 'observer'):
+                            if check not in ('app-loss', 'observer', 'observer-mapping'):
                                 assert client.wait('driver', 'signal-policy-preserved')['ok']
                                 client.finish()
                             rows.append(dict(check=check, policy=policy, passed=True, mount=mount,
                                              sandbox=sandbox, observer_limit=observer))
                             (evidence / 'results.json').write_text(json.dumps(rows, indent=2) + '\n')
                         finally:
+                            if mapping is not None:
+                                assert libc.munmap(mapping, 14) == 0, ctypes.get_errno()
                             if borrowed is not None:
                                 os.close(borrowed)
                             processes.close()

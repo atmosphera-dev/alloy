@@ -23,7 +23,9 @@ POLICIES = ('default', 'ignored', 'nochildwait', 'reaper')
 CHECKS = ('close', 'terminate', 'stopped-init', 'stopped-inner', 'inner-loss',
           'init-loss', 'app-loss', 'blocked-callback', 'clone-refusal', 'wait-refusal',
           'kill-refusal', 'starting-close', 'starting-terminate',
-          'ready-close', 'ready-terminate', 'probe-close', 'probe-terminate')
+          'ready-close', 'ready-terminate', 'probe-close', 'probe-terminate',
+          'ready-close-denied', 'ready-terminate-denied',
+          'stopped-inner-caller-denied', 'blocked-callback-caller-denied')
 
 
 def process_status(pid):
@@ -36,7 +38,7 @@ def stop_original(processes, role):
     signal.pidfd_send_signal(processes.handles[index], signal.SIGSTOP)
     pid = processes.members[index]['pid']
     deadline = time.monotonic() + 10
-    while not process_status(pid)['State'].strip().startswith('T'):
+    while process_status(pid)['State'].strip()[0] not in ('T', 't'):
         assert time.monotonic() < deadline, ('SIGSTOP not observed', pid)
         time.sleep(.01)
     return pid
@@ -121,7 +123,17 @@ def case(out, evidence, fixtures, policy, check, denied, barrier):
             if check.startswith('probe-'):
                 wait_probe_group_stop(trace, observation)
             command = check.split('-')[1]
-            client.send(command + ' guest')
+            if check.endswith('-denied'):
+                processes = OwnedProcesses(client.process.pid, out)
+                try:
+                    stopped = stop_original(processes, 'wait-owner')
+                    wait_probe_group_stop(trace, dict(pid=stopped,
+                                          state=process_status(stopped)['State'].strip()[0]))
+                finally:
+                    processes.close()
+            client.send(command + ('-denied' if check.endswith('-denied') else '') + ' guest')
+            if check.endswith('-denied'):
+                client.wait('driver', 'caller-kill-denied')
             client.wait('guest', command + '-called')
             # The API call has returned, so cancellation won the admission
             # mutex. Only now permit the worker to process its receipt.
@@ -159,11 +171,12 @@ def case(out, evidence, fixtures, policy, check, denied, barrier):
             client.finish()
             assert not trace.launches(), 'Refused startup admitted a supervisor or engine'
             return dict(policy=policy, check=check, passed=True)
-        client.start(policy='stall-title' if check == 'blocked-callback' else 'auto')
+        blocked = check.startswith('blocked-callback')
+        client.start(policy='stall-title' if blocked else 'auto')
         client.active()
-        title = 'STALL_CONSUMER' if check == 'blocked-callback' else 'LIFETIME_PAGE_LOADED'
+        title = 'STALL_CONSUMER' if blocked else 'LIFETIME_PAGE_LOADED'
         page = client.page(fixtures.base + '/title/' + title, title)
-        if check == 'blocked-callback':
+        if blocked:
             client.wait('guest', 'callback-blocked')
         else:
             client.wait('guest', 'load', lambda value: value['document'] == page['document'] and
@@ -171,7 +184,8 @@ def case(out, evidence, fixtures, policy, check, denied, barrier):
         processes = OwnedProcesses(client.process.pid, out)
         try:
             sandbox = sandbox_receipt(processes)
-            if check in ('stopped-init', 'stopped-inner'):
+            if check in ('stopped-init', 'stopped-inner', 'stopped-inner-caller-denied',
+                         'blocked-callback-caller-denied'):
                 stop_original(processes, 'wait-owner' if check == 'stopped-init' else 'supervisor')
             if check == 'app-loss':
                 client.abort()
@@ -182,8 +196,11 @@ def case(out, evidence, fixtures, policy, check, denied, barrier):
                 processes.kill('supervisor' if check == 'inner-loss' else 'wait-owner')
                 reason = 'failed'
             else:
-                client.send(('close' if check == 'close' else 'terminate') + ' guest')
-            if check == 'blocked-callback':
+                command = 'close' if check == 'close' else 'terminate'
+                client.send(command + ('-denied' if check.endswith('-denied') else '') + ' guest')
+                if check.endswith('-denied'):
+                    client.wait('driver', 'caller-kill-denied')
+            if blocked:
                 client.wait('guest', 'terminate-called')
                 # Observe every original exit BEFORE releasing the callback.
                 processes.exited()
@@ -199,10 +216,20 @@ def case(out, evidence, fixtures, policy, check, denied, barrier):
             client.finish()
             closed = [row for row in client.events if row['name'] == 'guest' and row['event'] == 'closed']
             assert len(closed) == 1, closed
+            if blocked:
+                assert_callback_order(client.events)
             return dict(policy=policy, check=check, passed=True, sandbox=sandbox,
                         originals=processes.members)
         finally:
             processes.close()
+
+
+def assert_callback_order(events, name='guest'):
+    resumed = [index for index, row in enumerate(events)
+               if row['name'] == name and row['event'] == 'callback-resumed']
+    closed = [index for index, row in enumerate(events)
+              if row['name'] == name and row['event'] == 'closed']
+    assert len(resumed) == len(closed) == 1 and resumed[0] < closed[0], events
 
 
 def main():

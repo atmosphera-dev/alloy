@@ -13,7 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from guest_test_support.launch_trace import RuntimeLaunchTrace
 from guest_test_support.session import process_role
 from guest_lock_probe import role_of
-from guest_lifetime_sdk_probe import wait_probe_group_stop
+from guest_lifetime_sdk_probe import wait_probe_group_stop, assert_callback_order
+from guest_lifetime_probe import cleanup_driver
+import guest_lifetime_probe as lifetime
 from guest_test_support.native_consumer import native_consumer_executable
 from guest_test_support.scratch import private_directory
 from guest_test_support.certificate import stage_nss_certificate
@@ -25,6 +27,71 @@ def quoted(value):
 
 
 class LifetimeReceipts(unittest.TestCase):
+    def test_late_child_deadline_cannot_pass_with_only_the_named_creator(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(lifetime.shutil, 'copy2'), \
+             patch.object(lifetime.subprocess, 'Popen') as popen, \
+             patch.object(lifetime, 'line', side_effect=['LAUNCHED 1 OWNER 123',
+                                                       'REAPED APP_SIGNALS_UNCHANGED']), \
+             patch.object(lifetime, 'pinned', return_value=11), \
+             patch.object(lifetime, 'descendants', return_value=[124]), \
+             patch.object(lifetime, 'status', return_value={'Name': 'alloy-lifetime', 'State': 'R'}), \
+             patch.object(lifetime, 'exited', return_value=True), \
+             patch.object(lifetime.time, 'monotonic', side_effect=[0, 0, 11]), \
+             patch.object(lifetime.time, 'sleep'), \
+             patch.object(lifetime, 'cleanup_driver'):
+            popen.return_value.wait.return_value = 0
+            with self.assertRaisesRegex(AssertionError, 'No confirmed stopped unregistered child'):
+                lifetime.case(Path(directory), Path(directory), 'default', 'late')
+
+    def test_blocked_callback_order_uses_the_drained_log(self):
+        resumed = dict(name='guest', event='callback-resumed')
+        closed = dict(name='guest', event='closed')
+        assert_callback_order([resumed, closed])
+        for events in ([closed, resumed], [resumed, closed, closed], [closed]):
+            with self.subTest(events=events), self.assertRaises(AssertionError):
+                assert_callback_order(events)
+
+    def test_cleanup_collects_pin_errors_but_still_closes_handles_and_driver(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('guest_lifetime_probe.descendants', return_value=[123]), \
+             patch('guest_lifetime_probe.pinned', side_effect=OSError(24, 'FD pressure')), \
+             patch('guest_lifetime_probe.signal.pidfd_send_signal') as signal_fd, \
+             patch('guest_lifetime_probe.os.close') as close:
+            process = Mock(pid=100)
+            process.poll.return_value = None
+            with self.assertRaises(ExceptionGroup):
+                cleanup_driver(process, [11, 12], Path(directory))
+            self.assertEqual(signal_fd.call_count, 2)
+            self.assertEqual([call.args[0] for call in close.call_args_list], [11, 12])
+            process.kill.assert_called_once()
+            process.wait.assert_called_once_with(timeout=10)
+
+    def test_cleanup_signal_errors_do_not_skip_later_descriptors(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('guest_lifetime_probe.descendants', return_value=[]), \
+             patch('guest_lifetime_probe.signal.pidfd_send_signal',
+                   side_effect=[PermissionError(1, 'denied'), None]), \
+             patch('guest_lifetime_probe.os.close') as close:
+            process = Mock(pid=100)
+            process.poll.return_value = None
+            with self.assertRaises(ExceptionGroup):
+                cleanup_driver(process, [11, 12], Path(directory))
+            self.assertEqual([call.args[0] for call in close.call_args_list], [11, 12])
+            process.kill.assert_called_once()
+            process.wait.assert_called_once_with(timeout=10)
+
+    def test_certificate_input_uses_supplied_tmpdir_without_ambient_tmpdir(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch('guest_test_support.certificate.subprocess.run',
+                   side_effect=[Mock(returncode=0), Mock(returncode=0), Mock(returncode=0)]) as run:
+            env = {'TMPDIR': '/home/builder/work/client-tmp'}
+            stage_nss_certificate(123, 'home/.pki/nssdb', Path('/fixture/ca.pem'),
+                                  'builder', io.StringIO(), env)
+            for call in run.call_args_list:
+                self.assertIn('TMPDIR=' + env['TMPDIR'], call.args[0])
+                self.assertIs(call.kwargs['env'], env)
+
     def test_certificate_input_uses_one_namespace_for_database_operations(self):
         with patch.dict(os.environ, TMPDIR='/home/builder/work/tmp'), \
              patch('guest_test_support.certificate.subprocess.run',

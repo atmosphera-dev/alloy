@@ -11,6 +11,11 @@ int alloy_lock_scratch_valid(void) { return 1; }
 void alloy_lock_remove_scratch(void) {}
 
 static int fail_registry;
+static int deny_kill;
+int __real_alloy_pinned_signal(int, int);
+int __wrap_alloy_pinned_signal(int fd, int number) {
+  return deny_kill && number == SIGKILL ? EPERM : __real_alloy_pinned_signal(fd, number);
+}
 void* __real_realloc(void* pointer, size_t size);
 void* __wrap_realloc(void* pointer, size_t size) {
   if (fail_registry) { errno = ENOMEM; return NULL; }
@@ -71,7 +76,8 @@ int main(int argc, char** argv) {
   int lane[2], enabled = 1;
   assert(!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, lane));
   assert(!setsockopt(lane[0], SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)));
-  int allocation = !strcmp(argv[1], "allocation");
+  int allocation = !strncmp(argv[1], "allocation", 10);
+  deny_kill = !strcmp(argv[1], "allocation-denied");
   int duplicate = !strcmp(argv[1], "duplicate");
   pid_t registrant = fork();
   assert(registrant >= 0);
@@ -86,7 +92,8 @@ int main(int argc, char** argv) {
     fail_registry = 1;
     int accepted = admit(lane[0], &members);
     fail_registry = 0;
-    good = !accepted && members.count == 0 && readable(original, 3000);
+    good = !accepted && members.count == 0 &&
+           (deny_kill ? !readable(original, 0) : readable(original, 3000));
     clean_child(original, registrant);
   } else {
     int old = (int)syscall(SYS_pidfd_open, registrant, 0);

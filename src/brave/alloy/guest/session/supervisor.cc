@@ -5,21 +5,41 @@
 #include "base/process/alloy_guest_runtime.h"
 
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <mutex>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace alloy::guest {
+struct CustodyOwner {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::thread thread;
+  bool launched = false;
+  bool reap_requested = false;
+  bool done = false;
+  bool reaped = false;
+  int status = -1;
+  int wait_error = 0;
+  LaunchOutcome outcome = LaunchOutcome::kFailed;
+  std::string unavailable;
+  std::function<void()> notify;
+};
 namespace {
 pthread_mutex_t fork_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_once_t fork_once = PTHREAD_ONCE_INIT;
@@ -33,7 +53,7 @@ void InAppFork() {
   for (Supervisor* owner = fork_head; owner; owner = owner->fork_next) {
     for (int* fd : {&owner->pidfd, &owner->channel, &owner->resources,
                    &owner->status_channel, &owner->exec_error, &owner->runtime_pidfd,
-                   &owner->mirror_pidfd, &owner->mirror_status, &owner->probe_pidfd}) {
+                    &owner->mirror_status, &owner->probe_pidfd, &owner->request_channel}) {
       if (*fd >= 0) close(*fd);
       *fd = -1;
     }
@@ -75,6 +95,68 @@ int CloseSocket(int* fd) {
     *fd = -1;
   }
   return error;
+}
+
+void ServiceForce(Supervisor* child) {
+  uint64_t value;
+  while (read(child->request_channel, &value, sizeof(value)) > 0) {}
+  std::function<void()> notify;
+  {
+    std::lock_guard lock(child->owner->mutex);
+    notify = std::move(child->owner->notify);
+  }
+  if (notify) notify();
+  if (!child->force_pending || child->pidfd < 0) return;
+  if (child->channel >= 0) {
+    int result;
+    do { result = shutdown(child->channel, SHUT_RDWR); } while (result < 0 && errno == EINTR);
+    if (result < 0 && errno != ENOTCONN) child->cleanup = -1;
+  }
+  if (alloy_pinned_signal(child->pidfd, SIGKILL)) {
+    child->cleanup = -1;
+    // Keep the request live. Neither socket EOF nor a failed attempt retires it.
+  } else {
+    child->force_pending = false;
+  }
+}
+
+int PollCustody(Supervisor* child, pollfd* events, size_t count) {
+  for (;;) {
+    ServiceForce(child);
+    std::vector<pollfd> watched(events, events + count);
+    watched.push_back({child->request_channel, POLLIN, 0});
+    int result = poll(watched.data(), watched.size(), 100);
+    if (result < 0 && errno == EINTR) continue;
+    if (result < 0) return result;
+    bool observed = false;
+    for (size_t i = 0; i < count; ++i) {
+      events[i].revents = watched[i].revents;
+      observed = observed || events[i].revents;
+    }
+    ServiceForce(child);
+    if (observed) return result;
+  }
+}
+
+void RetryPause(Supervisor* child) {
+  std::unique_lock lock(child->owner->mutex);
+  child->owner->changed.wait_for(lock, std::chrono::milliseconds(100));
+}
+
+void WaitOriginal(Supervisor* child) {
+  auto& owner = *child->owner;
+  if (owner.reaped) return;
+  for (;;) {
+    owner.wait_error = alloy_pinned_wait(child->pidfd, &owner.status);
+    if (!owner.wait_error || owner.wait_error == ECHILD) {
+      owner.reaped = true;
+      return;
+    }
+    child->cleanup = -1;
+    // A retry cadence is not a cleanup timeout. The exact pidfd and obligation
+    // remain owned until a successful reap or app-side ECHILD proves disposal.
+    RetryPause(child);
+  }
 }
 
 // 1 packet, 0 drained, -1 invalid/failed, -2 EOF, -3 connection reset.
@@ -152,10 +234,11 @@ LaunchOutcome Unavailable(std::string* reason, const char* operation, int error)
   return LaunchOutcome::kUnavailable;
 }
 
-int SpawnBootstrap(const std::string& bootstrap, Supervisor* child) {
+int SpawnBootstrap(const std::string& bootstrap, Supervisor* child, const char** operation) {
   SupervisorForkLock guard;
   int pair[2] = {-1, -1}, resources[2] = {-1, -1}, status[2] = {-1, -1};
   int error = 0;
+  *operation = "socketpair(bootstrap custody lanes)";
   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
       socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, resources) ||
       socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, status)) error = errno;
@@ -178,6 +261,7 @@ int SpawnBootstrap(const std::string& bootstrap, Supervisor* child) {
         {resources[1], ALLOY_GUEST_RESOURCE_FD}, {status[1], ALLOY_GUEST_WAIT_STATUS_FD}};
     alloy_pinned_child pinned;
     error = alloy_spawn_pinned(bootstrap.c_str(), argv, env.data(), maps, 3, 1, &pinned);
+    *operation = pinned.operation;
     if (pinned.pidfd >= 0) {
       child->process = pinned.process;
       child->pidfd = pinned.pidfd;
@@ -194,21 +278,46 @@ int SpawnBootstrap(const std::string& bootstrap, Supervisor* child) {
 }  // namespace
 
 Supervisor::~Supervisor() {
-  if (pidfd >= 0) {
-    forced = true;
-    if (alloy_pinned_signal(pidfd, SIGKILL)) cleanup = -1;
+  if (owner) {
+    bool done;
+    {
+      std::lock_guard lock(owner->mutex);
+      done = owner->done;
+    }
+    if (!done) RequestForce();
     ReapSupervisor(this);
   }
   SupervisorForkLock guard;
   for (Supervisor** item = &fork_head; *item; item = &(*item)->fork_next) {
     if (*item == this) { *item = fork_next; break; }
   }
-  for (int fd : {mirror_pidfd, mirror_status}) if (fd >= 0) close(fd);
+  if (mirror_status >= 0) close(mirror_status);
+  if (request_channel >= 0) close(request_channel);
 }
 
-LaunchOutcome StartSupervisor(Supervisor* child, std::string* unavailable,
-                              const std::function<CustodyInstall(Supervisor*)>& install) {
+void Supervisor::RequestClose(const std::function<void()>& notify) {
+  {
+    std::lock_guard lock(owner->mutex);
+    if (notify) owner->notify = notify;
+  }
+  uint64_t one = 1;
+  ssize_t result;
+  do { result = write(request_channel, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
+}
+
+void Supervisor::RequestForce(bool startup_cancelled, const std::function<void()>& notify) {
+  forced = true;
+  if (startup_cancelled) cancelled = true;
+  force_pending = true;
+  RequestClose(notify);
+  // EAGAIN already means a wake is queued. A pending request is never cleared
+  // by the posting thread, and the custody owner also inspects it on each wake.
+}
+
+static LaunchOutcome StartOnOwner(Supervisor* child, std::string* unavailable,
+                                 const std::function<CustodyInstall(Supervisor*)>& install) {
   unavailable->clear();
+  if (child->cancelled) return LaunchOutcome::kCancelled;
   if (fork_error) return LaunchOutcome::kFailed;
   // Probe a real positive pidfd before creating a child. ECHILD for our own
   // identity proves parsing/policy without leaving a zombie on refused waitid.
@@ -228,24 +337,26 @@ LaunchOutcome StartSupervisor(Supervisor* child, std::string* unavailable,
   if (wait_error != ECHILD) return Unavailable(unavailable, "waitid(P_PIDFD)", wait_error);
   std::string bootstrap = BundledBootstrap();
   if (bootstrap.empty() || access(bootstrap.c_str(), X_OK)) return LaunchOutcome::kFailed;
-  int error = SpawnBootstrap(bootstrap, child);
+  const char* spawn_operation = nullptr;
+  int error = SpawnBootstrap(bootstrap, child, &spawn_operation);
   if (child->pidfd >= 0) {
     CustodyInstall installed = install(child);
     if (installed != CustodyInstall::kInstalled) {
       child->forced = true;
       child->cancelled = installed == CustodyInstall::kCancelled;
-      if (alloy_pinned_signal(child->pidfd, SIGKILL)) child->cleanup = -1;
+      child->RequestForce(child->cancelled);
+      ServiceForce(child);
       return child->cancelled ? LaunchOutcome::kCancelled : LaunchOutcome::kFailed;
     }
   }
-  if (error) return Unavailable(unavailable, "clone3(CLONE_PIDFD|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNS)", error);
+  if (error) return Unavailable(unavailable, spawn_operation, error);
   // Wait only after publishing custody. A stopped pre-exec child is therefore
   // still cancellable. Read the error lane before interpreting owner exit, so
   // a fast map/exec refusal cannot lose its precise operation/errno report.
   for (;;) {
     pollfd events[] = {{child->exec_error, POLLIN, 0}, {child->pidfd, POLLIN, 0}};
     int observed;
-    do { observed = poll(events, 2, -1); } while (observed < 0 && errno == EINTR);
+    observed = PollCustody(child, events, 2);
     if (observed < 0) { child->cleanup = -1; return LaunchOutcome::kFailed; }
     if (events[0].revents || events[1].revents) {
       const char* operation = "bootstrap exec receipt";
@@ -274,7 +385,7 @@ LaunchOutcome StartSupervisor(Supervisor* child, std::string* unavailable,
   for (;;) {
     pollfd events[] = {{child->status_channel, POLLIN, 0}, {child->pidfd, POLLIN, 0}};
     int observed;
-    do { observed = poll(events, 2, -1); } while (observed < 0 && errno == EINTR);
+    observed = PollCustody(child, events, 2);
     if (observed < 0) { child->cleanup = -1; return LaunchOutcome::kFailed; }
     if (events[0].revents & POLLIN) {
       int received = ReceiveStatus(child);
@@ -317,7 +428,7 @@ bool LaunchSupervisor(Supervisor* child) {
          AdmitSupervisor(child->status_channel);
 }
 
-int ReapSupervisor(Supervisor* child) {
+static int ReapOnOwner(Supervisor* child) {
   if (child->pidfd < 0) return child->cleanup;
   {
     SupervisorForkLock guard;
@@ -340,7 +451,13 @@ int ReapSupervisor(Supervisor* child) {
       else if (received > 0) continue;
     }
     int exited = alloy_pinned_exited(child->pidfd, 0);
-    if (exited < 0) { child->cleanup = -1; break; }
+    if (exited < 0) {
+      child->cleanup = -1;
+      child->RequestForce();
+      ServiceForce(child);
+      RetryPause(child);
+      continue;
+    }
     if (exited) {
       // Drain queued receipts after the exit barrier; never wait for socket EOF.
       while (!drained) {
@@ -354,13 +471,14 @@ int ReapSupervisor(Supervisor* child) {
     }
     pollfd events[] = {{drained ? -1 : child->status_channel, POLLIN, 0}, {child->pidfd, POLLIN, 0}};
     int observed;
-    do { observed = poll(events, 2, -1); } while (observed < 0 && errno == EINTR);
-    if (observed < 0) { child->cleanup = -1; break; }
+    observed = PollCustody(child, events, 2);
+    if (observed < 0) { child->cleanup = -1; child->RequestForce(); RetryPause(child); }
   }
   if (child->runtime_pidfd >= 0 && alloy_pinned_exited(child->runtime_pidfd, 1) != 1) child->cleanup = -1;
   if (child->probe_pidfd >= 0 && alloy_pinned_exited(child->probe_pidfd, 1) != 1) child->cleanup = -1;
-  int status = -1;
-  int waited = alloy_pinned_wait(child->pidfd, &status);
+  WaitOriginal(child);
+  int status = child->owner->status;
+  int waited = child->owner->wait_error;
   bool evidence = child->finished || child->forced;
   if (waited && !(waited == ECHILD && evidence)) child->cleanup = -1;
   if (!child->forced && (!child->finished || child->receipt_status != 0)) child->cleanup = -1;
@@ -378,6 +496,83 @@ int ReapSupervisor(Supervisor* child) {
       *fd = -1;
     }
   }
+  return child->cleanup;
+}
+
+LaunchOutcome StartSupervisor(Supervisor* child, std::string* unavailable,
+                              const std::function<CustodyInstall(Supervisor*)>& install) {
+  if (child->owner) return LaunchOutcome::kFailed;
+  {
+    SupervisorForkLock guard;
+    child->request_channel = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  }
+  if (child->request_channel < 0) return LaunchOutcome::kFailed;
+  child->owner = std::make_unique<CustodyOwner>();
+  auto& owner = *child->owner;
+  owner.thread = std::thread([child, install] {
+    auto& context = *child->owner;
+    auto outcome = StartOnOwner(child, &context.unavailable, install);
+    {
+      std::lock_guard lock(context.mutex);
+      context.outcome = outcome;
+      context.launched = true;
+    }
+    context.changed.notify_all();
+    for (;;) {
+      {
+        std::lock_guard lock(context.mutex);
+        if (context.reap_requested) break;
+      }
+      ServiceForce(child);
+      // Reap the original even if the client worker is inside an app callback.
+      // Keep client sockets alive until its explicit reap/join request.
+      if (child->pidfd >= 0 && !context.reaped) {
+        int exited = alloy_pinned_exited(child->pidfd, 0);
+        if (exited == 1) WaitOriginal(child);
+        else if (exited < 0) { child->cleanup = -1; child->RequestForce(); RetryPause(child); }
+      }
+      {
+        std::lock_guard lock(context.mutex);
+        if (context.reap_requested) break;
+      }
+      pollfd events[] = {{child->request_channel, POLLIN, 0},
+                         {context.reaped ? -1 : child->pidfd, POLLIN, 0}};
+      int observed;
+      do { observed = poll(events, 2, 100); }
+      while (observed < 0 && errno == EINTR);
+      if (observed < 0) {
+        child->cleanup = -1;
+        child->RequestForce();
+        RetryPause(child);
+      }
+    }
+    ReapOnOwner(child);
+    {
+      std::lock_guard lock(context.mutex);
+      context.done = true;
+    }
+    context.changed.notify_all();
+  });
+  std::unique_lock lock(owner.mutex);
+  owner.changed.wait(lock, [&] { return owner.launched; });
+  *unavailable = owner.unavailable;
+  return owner.outcome;
+}
+
+int ReapSupervisor(Supervisor* child) {
+  if (!child->owner) return child->cleanup;
+  auto& owner = *child->owner;
+  {
+    std::unique_lock lock(owner.mutex);
+    owner.reap_requested = true;
+    uint64_t one = 1;
+    ssize_t sent;
+    do { sent = write(child->request_channel, &one, sizeof(one)); } while (sent < 0 && errno == EINTR);
+    owner.changed.wait(lock, [&] { return owner.done; });
+  }
+  if (owner.thread.joinable()) owner.thread.join();
+  // Keep the mailbox's descriptor identity until the Supervisor is destroyed.
+  // ClientCore may still post a racing force before ReleaseCustody clears it.
   return child->cleanup;
 }
 }  // namespace alloy::guest

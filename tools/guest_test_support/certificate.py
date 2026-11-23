@@ -9,11 +9,12 @@ import subprocess
 def stage_nss_certificate(pid, relative, certificate, account, log, env=None):
     # NSS/SQLite canonicalizes database paths itself. A /proc/PID/root alias is
     # not sufficient: perform the entire input operation in the observed view.
+    environment = os.environ if env is None else env
     relative = Path(relative)
     assert not relative.is_absolute() and '..' not in relative.parts
     directory = '/dev/shm/' + str(relative)
     prefix = ['sudo', '-n', 'nsenter', '--mount=/proc/' + str(pid) + '/ns/mnt',
-              'sudo', '-n', '-u', account, 'env', 'TMPDIR=' + os.environ['TMPDIR'],
+              'sudo', '-n', '-u', account, 'env', 'TMPDIR=' + environment['TMPDIR'],
               'PYTHONDONTWRITEBYTECODE=1']
     code = ('import sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); '
             'from guest_test_support.scratch import private_directory; '

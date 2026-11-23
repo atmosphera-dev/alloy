@@ -21,7 +21,7 @@ _implementation = [
   "linux_lock/protection.h", "linux_lock/ram_scratch.c",
   "linux_lock/writer_paths.c", "linux_lock/landlock.c",
   "linux_lock/child_launch.c", "linux_lock/child_launch.h",
-  "linux_lock/pinned_spawn.c", "linux_lock/pinned_spawn.h",
+  "linux_lock/pinned_spawn.c", "linux_lock/pinned_spawn.h", "linux_lock/scratch_mount.h",
   "linux_lock/linux_uapi.h",
   "linux_lock/protection.cc", "linux_lock/sandbox_preflight.h",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
@@ -180,7 +180,7 @@ action("alloy_guest_host") {
              "linux_lock/protection.h", "linux_lock/ram_scratch.c",
              "linux_lock/writer_paths.c", "linux_lock/landlock.c",
               "linux_lock/child_launch.c", "linux_lock/child_launch.h",
-              "linux_lock/pinned_spawn.c", "linux_lock/pinned_spawn.h",
+               "linux_lock/pinned_spawn.c", "linux_lock/pinned_spawn.h", "linux_lock/scratch_mount.h",
              "linux_lock/linux_uapi.h",
              "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h" ]
   outputs = [ "$root_out_dir/alloy_guest_host" ]

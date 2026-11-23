@@ -12,10 +12,12 @@ void alloy_lock_remove_scratch(void) {}
 
 static int fail_registry;
 static int deny_kill;
+#ifdef ALLOY_LIFETIME_PINNED_SPAWN
 int __real_alloy_pinned_signal(int, int);
 int __wrap_alloy_pinned_signal(int fd, int number) {
   return deny_kill && number == SIGKILL ? EPERM : __real_alloy_pinned_signal(fd, number);
 }
+#endif
 void* __real_realloc(void* pointer, size_t size);
 void* __wrap_realloc(void* pointer, size_t size) {
   if (fail_registry) { errno = ENOMEM; return NULL; }

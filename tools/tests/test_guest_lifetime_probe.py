@@ -27,6 +27,59 @@ def quoted(value):
 
 
 class LifetimeReceipts(unittest.TestCase):
+    def test_signal_wrapper_selection_matches_the_supplied_source_tree(self):
+        for modern in (False, True):
+            with self.subTest(modern=modern), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(lifetime.subprocess, 'run') as run:
+                root = Path(directory) / 'src'
+                guest = root / 'brave/alloy/guest'
+                if modern:
+                    for relative in ('linux_lock/pinned_spawn.c', 'bootstrap/wait_owner.c'):
+                        source = guest / relative
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        source.touch()
+                lifetime.compile_fixture(Path(directory) / 'fixture', root)
+                for call in run.call_args_list:
+                    command = call.args[0]
+                    if any(str(argument).endswith(('/driver.cc', '/entry.c', '/registration.c'))
+                           for argument in command):
+                        self.assertEqual(any('--wrap=alloy_pinned_signal' in str(argument)
+                                             for argument in command), modern)
+                        self.assertEqual('-DALLOY_LIFETIME_PINNED_SPAWN=1' in command, modern)
+
+    def test_probe_refusal_cannot_pass_without_a_retained_original(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(lifetime.shutil, 'copy2'), \
+             patch.object(lifetime.subprocess, 'Popen') as popen, \
+             patch.object(lifetime, 'line', return_value='REFUSED pidfd_send_signal(SIGKILL)'), \
+             patch.object(lifetime, 'descendants', return_value=[]), \
+             patch.object(lifetime, 'cleanup_driver'):
+            popen.return_value.wait.return_value = 0
+            with self.assertRaisesRegex(AssertionError, 'Original enclosure not retained'):
+                lifetime.case(Path(directory), Path(directory), 'default', 'kill-refused-probe')
+
+    def test_probe_refusal_requires_the_retained_original_to_exit(self):
+        for did_exit in (False, True):
+            with self.subTest(did_exit=did_exit), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(lifetime.shutil, 'copy2'), \
+                 patch.object(lifetime.subprocess, 'Popen') as popen, \
+                 patch.object(lifetime, 'line', side_effect=['REFUSAL_ORIGINAL 123',
+                                                           'REFUSED pidfd_send_signal(SIGKILL)']), \
+                 patch.object(lifetime, 'pinned', return_value=11) as pin, \
+                 patch.object(lifetime, 'exited', return_value=did_exit) as exit_check, \
+                 patch.object(lifetime, 'descendants', return_value=[]), \
+                 patch.object(lifetime, 'cleanup_driver'):
+                popen.return_value.wait.return_value = 0
+                if did_exit:
+                    self.assertTrue(lifetime.case(Path(directory), Path(directory), 'default',
+                                                  'kill-refused-probe')['passed'])
+                else:
+                    with self.assertRaisesRegex(AssertionError, 'Original enclosure survived refusal'):
+                        lifetime.case(Path(directory), Path(directory), 'default', 'kill-refused-probe')
+                pin.assert_called_once_with(123)
+                exit_check.assert_called_once_with(11)
+                popen.return_value.stdin.write.assert_called_once_with('G')
+
     def test_late_child_deadline_cannot_pass_with_only_the_named_creator(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(lifetime.shutil, 'copy2'), \

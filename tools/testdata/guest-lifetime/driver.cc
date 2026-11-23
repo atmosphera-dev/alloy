@@ -203,7 +203,13 @@ int main(int argc, char** argv) {
   }
 #ifdef ALLOY_LIFETIME_WAIT_OWNER
   std::string unavailable;
-  auto outcome = alloy::guest::StartSupervisor(&child, &unavailable, [](alloy::guest::Supervisor*) {
+  auto outcome = alloy::guest::StartSupervisor(&child, &unavailable, [&](alloy::guest::Supervisor* original) {
+    if (check == "kill-refused-probe") {
+      printf("REFUSAL_ORIGINAL %d\n", original->process);
+      fflush(stdout);
+      char grant;
+      assert(read(STDIN_FILENO, &grant, 1) == 1 && grant == 'G');
+    }
     return alloy::guest::CustodyInstall::kInstalled;
   });
   bool launched = outcome == alloy::guest::LaunchOutcome::kReady &&

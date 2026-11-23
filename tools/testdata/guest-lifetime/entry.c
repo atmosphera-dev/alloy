@@ -29,11 +29,13 @@ int alloy_lock_scratch_valid(void) { return 1; }
 void alloy_lock_remove_scratch(void) {}
 
 static int fail_poll, fail_recv, fail_wait;
+#ifdef ALLOY_LIFETIME_PINNED_SPAWN
 static int deny_kill;
 int __real_alloy_pinned_signal(int, int);
 int __wrap_alloy_pinned_signal(int fd, int number) {
   return deny_kill && number == SIGKILL ? EPERM : __real_alloy_pinned_signal(fd, number);
 }
+#endif
 static int injected_error = EIO;
 static int fault(int* selected) {
   if (!*selected) return 0;

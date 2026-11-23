@@ -35,15 +35,17 @@ def compile_fixture(destination, root=None):
     pinned = guest / 'linux_lock/pinned_spawn.c'
     owner = guest / 'bootstrap/wait_owner.c'
     flags = ['-DALLOY_LIFETIME_WAIT_OWNER=1'] if owner.exists() else []
+    pinned_flags = ['-DALLOY_LIFETIME_PINNED_SPAWN=1'] if pinned.exists() else []
+    signal_wrap = ['-Wl,--wrap=alloy_pinned_signal'] if pinned.exists() else []
     objects = []
     if pinned.exists():
         objects.append(str(destination / 'pinned_spawn.o'))
         subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
                         '-I', str(root), '-c', str(pinned), '-o', objects[0]], check=True)
     subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-Werror', '-pthread',
-                    '-I', str(root), *flags, str(guest / 'session/supervisor.cc'),
+                    '-I', str(root), *flags, *pinned_flags, str(guest / 'session/supervisor.cc'),
                      str(REPO / 'tools/testdata/guest-lifetime/driver.cc'), *objects, '-ldl',
-                     '-Wl,--wrap=waitid,--wrap=alloy_pinned_signal,--wrap=poll,--wrap=recvmsg,--wrap=sigprocmask',
+                     '-Wl,--wrap=waitid,--wrap=poll,--wrap=recvmsg,--wrap=sigprocmask', *signal_wrap,
                     '-o', str(destination / 'driver')], check=True)
     sources = [REPO / 'tools/testdata/guest-lifetime/entry.c',
                guest / 'bootstrap/supervisor.c', guest / 'linux_lock/child_launch.c',
@@ -53,15 +55,16 @@ def compile_fixture(destination, root=None):
     if pinned.exists():
         sources.append(pinned)
     subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
-                    '-I', str(root), *flags, *map(str, sources), '-pthread',
-                     '-Wl,--wrap=poll,--wrap=recvmsg,--wrap=waitid,--wrap=waitpid,--wrap=alloy_pinned_signal',
+                    '-I', str(root), *flags, *pinned_flags, *map(str, sources), '-pthread',
+                     '-Wl,--wrap=poll,--wrap=recvmsg,--wrap=waitid,--wrap=waitpid', *signal_wrap,
                     '-o', str(destination / 'alloy_guest_host')], check=True)
     registry_sources = [REPO / 'tools/testdata/guest-lifetime/registration.c',
                         guest / 'linux_lock/child_launch.c', root / 'base/process/alloy_guest_runtime.c']
     if pinned.exists():
         registry_sources.append(pinned)
     subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
-                     '-I', str(root), *map(str, registry_sources), '-Wl,--wrap=realloc,--wrap=alloy_pinned_signal', '-pthread',
+                     '-I', str(root), *pinned_flags, *map(str, registry_sources),
+                     '-Wl,--wrap=realloc', *signal_wrap, '-pthread',
                     '-o', str(destination / 'alloy_registry_probe')], check=True)
     subprocess.run(['cc', '-std=c11', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
                     str(REPO / 'tools/testdata/guest-lifetime/pin_reuse.c'),
@@ -179,6 +182,12 @@ def case(fixture, evidence, policy, check):
     handles = []
     try:
         launched = line(process)
+        if check == 'kill-refused-probe':
+            assert launched.startswith('REFUSAL_ORIGINAL '), 'Original enclosure not retained'
+            handles.append(pinned(int(launched.split()[-1])))
+            process.stdin.write('G')
+            process.stdin.flush()
+            launched = line(process)
         if check.startswith('custody-'):
             if launched.startswith('CUSTODY_STOPPED '):
                 owner = int(launched.split()[-1])
@@ -244,6 +253,8 @@ def case(fixture, evidence, policy, check):
                         'mask-restore-denied': 'sigprocmask(parent signal restore)'}[check]
             assert launched.startswith('REFUSED ') and expected in launched, launched
             assert process.wait(timeout=10) == 0
+            if check == 'kill-refused-probe':
+                assert all(exited(fd) for fd in handles), 'Original enclosure survived refusal'
             assert not descendants(process.pid)
             return dict(policy=policy, check=check, passed=True, reason=launched)
         assert launched.startswith('LAUNCHED 1 OWNER '), launched

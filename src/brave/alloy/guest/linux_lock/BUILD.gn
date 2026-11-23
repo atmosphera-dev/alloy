@@ -3,7 +3,7 @@
 import("//testing/test.gni")
 
 source_set("linux_lock") {
-  sources = [ "provider.cc", "protection.cc", "child_launch.c" ]
+  sources = [ "provider.cc", "protection.cc", "child_launch.c", "pinned_spawn.c", "pinned_spawn.h" ]
   deps = [ "..:provider_api", "//base" ]
 }
 

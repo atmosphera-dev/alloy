@@ -16,6 +16,7 @@ import time
 from workspace import validate_output, workspace_path
 from guest_test_support.display import environment
 from guest_test_support.fixtures import Fixtures, tracker_loopback_aliases
+from guest_test_support.native_consumer import native_consumer_executable
 from guest_test_support.session import (Client, OwnedProcesses, descendants, kill_renderers,
                                        navigate_after_crash, assert_navigation_outcomes)
 
@@ -37,19 +38,31 @@ def frame(kind, payload=b'', version=1, session=b'\x01' + b'\0' * 15):
 
 
 def incompatible(out, root, kind):
+    with native_consumer_executable(out) as driver:
+        return _incompatible(out, root, kind, driver)
+
+
+def _incompatible(out, root, kind, driver):
     env = environment(root, out)
-    env.update(ALLOY_GUEST_RUNTIME='1', ALLOY_GUEST_BOOTSTRAP=str(out / 'alloy_guest_host'))
     control, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    resources, resource_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    process = os.posix_spawn(str(out / 'alloy_guest_host'),
-        [str(out / 'alloy_guest_host'), '--alloy-supervisor'], env,
-        file_actions=[(os.POSIX_SPAWN_DUP2, peer.fileno(), 198),
-                      (os.POSIX_SPAWN_DUP2, resource_peer.fileno(), 200)])
-    peer.close()
-    resource_peer.close()
-    handle = os.pidfd_open(process)
+    handle = None
+    process = None
     control.settimeout(120)
     try:
+        pinned = root / 'pinned_spawn.o'
+        source = REPO / 'src/brave/alloy/guest'
+        with (root / 'compile-wire.log').open('x') as log:
+            subprocess.run(['gcc', '-std=c11', '-O2', '-I', str(REPO / 'src'), '-c',
+                            str(source / 'linux_lock/pinned_spawn.c'), '-o', str(pinned)],
+                           stdout=log, stderr=subprocess.STDOUT, check=True)
+            subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-Werror', '-pthread',
+                            '-I', str(REPO / 'src'), str(source / 'session/supervisor.cc'),
+                            str(REPO / 'tools/guest_test_support/wire_driver.cc'), str(pinned),
+                            '-ldl', '-o', str(driver)], stdout=log, stderr=subprocess.STDOUT, check=True)
+        process = subprocess.Popen([str(driver), kind], env=env, stdin=peer,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        peer.close()
+        handle = os.pidfd_open(process.pid)
         build = 'wrong-build'
         if kind == 'api':
             identity = (out / 'gen/brave/alloy/guest/build_identity.h').read_text()
@@ -67,18 +80,27 @@ def incompatible(out, root, kind):
         poll = select.poll()
         poll.register(handle, select.POLLIN)
         assert poll.poll(30000), 'incompatible peer did not exit/reap'
-        got, status = os.waitpid(process, 0)
-        assert got == process
-        return {'case': kind + '-mismatch', 'supervisor': process, 'status': status,
+        status = process.wait(timeout=30)
+        assert status == 0, status
+        return {'case': kind + '-mismatch', 'app': process.pid, 'status': status,
+                'expected_cleanup': 'failed' if kind == 'version' else 'clean',
                 'response': response.hex(), 'admitted': False}
     finally:
         control.close()
-        resources.close()
-        os.close(handle)
+        peer.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        if handle is not None:
+            os.close(handle)
 
 
 def compile_c(out, evidence):
-    executable = evidence / 'guest_c_sdk_consumer'
+    with native_consumer_executable(out) as executable:
+        return _compile_c(out, evidence, executable)
+
+
+def _compile_c(out, evidence, executable):
     command = ['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
                 '-DUSING_CEF_SHARED', '-I', str(WORK / 'src'),
                 '-I', str(WORK / 'src/cef'), '-I', str(out / 'gen/cef'),
@@ -113,7 +135,7 @@ def foundation(out, evidence, fixtures):
                     '-I', str(REPO / 'src'), '-I', str(WORK / 'src'),
                     str(REPO / 'tools/guest_test_support/registration_exit.c'),
                     *[str(REPO / 'src/brave/alloy/guest/linux_lock' / (leaf + '.c'))
-                      for leaf in ('ram_scratch', 'child_launch')],
+                      for leaf in ('ram_scratch', 'child_launch', 'pinned_spawn')],
                     '-o', str(registration)], check=True)
     with (evidence / 'registration-exit.log').open('x') as log:
         subprocess.run([str(registration)], stdout=log, stderr=subprocess.STDOUT,

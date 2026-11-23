@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import signal
 import socket
 import stat
@@ -19,14 +20,22 @@ import time
 
 from workspace import validate_output, workspace_path
 from guest_test_support.fixtures import Fixtures
-from guest_test_support.session import Client
+from guest_test_support.session import Client, process_role
+from guest_test_support.scratch import scratch_view, scratch_receipt, scratch_reclaimed
+from guest_test_support.native_consumer import native_consumer_executable
+from guest_test_support.certificate import stage_nss_certificate
 
 REPO = Path(__file__).resolve().parents[1]
 WORK = workspace_path(REPO)
 
 
 def run(command, **kwargs):
-    return subprocess.run(list(map(str, command)), check=True, text=True, **kwargs)
+    try:
+        return subprocess.run(list(map(str, command)), check=True, text=True, **kwargs)
+    except subprocess.CalledProcessError as error:
+        if error.stderr:
+            error.add_note(error.stderr)
+        raise
 
 
 def snapshot(pid):
@@ -44,13 +53,14 @@ while pending:
             pending.extend(map(int,(task/'children').read_text().split()))
         exe=str((p/'exe').resolve(strict=True))
         if pathlib.Path(exe).name not in ('alloy_guest_host','alloy_guest_engine'): continue
-        argv=(p/'cmdline').read_bytes().replace(b'\0',b' ').decode()
+        arguments=[os.fsdecode(a) for a in (p/'cmdline').read_bytes().split(b'\0') if a]
+        argv=' '.join(arguments)
         status=dict(line.split(':',1) for line in (p/'status').read_text().splitlines())
         fds={}
         for fd in (p/'fd').iterdir():
             try: fds[fd.name]=str(fd.readlink())
             except FileNotFoundError: pass
-        rows.append(dict(pid=pid,exe=exe,argv=argv,status={k:v.strip() for k,v in status.items()},
+        rows.append(dict(pid=pid,exe=exe,argv=argv,arguments=arguments,status={k:v.strip() for k,v in status.items()},
             fds=fds,maps=(p/'maps').read_text(),oom_score_adj=int((p/'oom_score_adj').read_text()),
             namespaces={n:str((p/'ns'/n).readlink()) for n in ('user','pid','net')},
             apparmor=(p/'attr/current').read_text().strip()))
@@ -110,19 +120,18 @@ class Members:
 
 
 def role_of(row):
-    if '--alloy-supervisor' in row['argv']:
-        return 'supervisor'
-    for field in row['argv'].split():
-        if field.startswith('--type='):
-            return field.removeprefix('--type=')
-    return 'browser'
+    arguments = row.get('arguments')
+    if arguments is None:
+        arguments = shlex.split(row['argv'])  # Legacy synthetic receipts only.
+    return process_role([os.fsencode(field) for field in arguments], row.get('exe'))
 
 
 def scratch_of(rows):
     roots = {(r['pid'], int(fd), target) for r in rows if role_of(r) == 'supervisor'
-             for fd, target in r['fds'].items() if target.startswith('/dev/shm/alloy-guest-')}
+             for fd, target in r['fds'].items() if target == '/dev/shm'}
     assert len(roots) == 1, roots
-    return roots.pop()
+    pid, fd, _ = roots.pop()
+    return pid, fd, str(scratch_view(pid))
 
 
 def assert_no_runtime_entries(out):
@@ -263,9 +272,7 @@ def native_roles(rows, sentinel=None):
             assert caps & ~(1 << 21) == 0, row
         else:
             assert caps == 0, row
-        assert all(not (target.startswith('/dev/shm/alloy-guest-') and
-                        '/' not in target.removeprefix('/dev/shm/'))
-                   for target in row['fds'].values()), row
+        assert '/dev/shm' not in row['fds'].values(), row
         for fd in ('0', '1', '2'):
             assert row['fds'].get(fd) == '/dev/null', row
         if sentinel:
@@ -306,15 +313,11 @@ def defaults(out, evidence, fixtures):
                 report = client.start(policy='manual', required='data-writes-denied')
                 protected(report)
                 rows = snapshot(client.process.pid)
-                _, _, scratch = scratch_of(rows)
-                for nss in ('home/.pki/nssdb', 'data/pki/nssdb'):
-                    db = Path(scratch) / nss
-                    exists = subprocess.run(['sudo', '-n', 'test', '-f', str(db / 'cert9.db')]).returncode
-                    assert exists in (0, 1), exists
-                    if exists:
-                        run(['sudo', '-n', '-u', name, 'certutil', '-N', '--empty-password', '-d', 'sql:' + str(db)])
-                    run(['sudo', '-n', '-u', name, 'certutil', '-A', '-d', 'sql:' + str(db),
-                         '-n', 'Alloy M2 synthetic CA', '-t', 'C,,', '-i', certificate])
+                scratch_pid, _, scratch = scratch_of(rows)
+                private_mount = scratch_receipt(scratch_pid)
+                with (evidence / ('defaults-' + death + '-certificate.log')).open('x') as certificate_log:
+                    for relative in ('home/.pki/nssdb', 'data/pki/nssdb'):
+                        stage_nss_certificate(scratch_pid, relative, certificate, name, certificate_log)
                 client.send('accept guest')
                 client.active()
                 page = client.page(fixtures.base + '/smoke', 'Internet - Alloy smoke fixture')
@@ -334,6 +337,7 @@ def defaults(out, evidence, fixtures):
                 assert_no_runtime_entries(out)
                 inventory_equal(baseline, root_inventory(roots))
                 assert not Path(scratch).exists(), scratch
+                scratch_reclaimed(private_mount)
                 results.append(dict(case='real-default-' + death, page=page, report=report,
                                     processes=roles, unchanged_paths=len(baseline)))
         (evidence / 'real-default-inventory.json').write_text(json.dumps(baseline, indent=2) + '\n')
@@ -354,7 +358,8 @@ def lifecycle(out, evidence, fixtures):
             page = client.page(fixtures.base + '/title/LOCK_BEFORE', 'LOCK_BEFORE')
             with Members(client.process.pid) as members:
                 roles = native_roles(members.rows, sentinel)
-                _, _, scratch = scratch_of(members.rows)
+                scratch_pid, _, scratch = scratch_of(members.rows)
+                private_mount = scratch_receipt(scratch_pid)
                 if death == 'app':
                     client.abort()
                 elif death == 'close':
@@ -380,13 +385,8 @@ def lifecycle(out, evidence, fixtures):
                 client.finish()
             assert_no_runtime_entries(out)
             assert sentinel.read_bytes() == b'UNCHANGED-DURABLE-SENTINEL'
-            if death == 'supervisor':
-                # Documented volatile remnant, never a product disk fallback.
-                if Path(scratch).exists():
-                    import shutil
-                    shutil.rmtree(scratch)
-            else:
-                assert not Path(scratch).exists(), scratch
+            assert not Path(scratch).exists(), scratch
+            scratch_reclaimed(private_mount)
             rows.append(dict(case='lifetime-' + death, report=report, processes=roles))
     return rows
 
@@ -427,22 +427,20 @@ def mode_and_app(out, evidence, fixtures):
 
 
 def pressure(out, evidence, fixtures, *, inodes=False):
-    # A private mount namespace bounds the pressure fixture to a new 128 MiB
-    # tmpfs. Never fill the task VM's shared /dev/shm or its disk workspace.
-    options = 'size=128m,mode=1777' + (',nr_inodes=4096' if inodes else '')
-    script = ('mount --make-rprivate /\n'
-              'mount -t tmpfs -o ' + options + ' tmpfs /dev/shm\n'
-              'exec sudo -n -u builder env -i PATH=/usr/bin:/bin HOME=/home/builder '
-              'TMPDIR=/home/builder/work/tmp LD_LIBRARY_PATH="' + str(out) + '" "$@"')
-    prefix = ['sudo', '-n', 'unshare', '--mount', '--fork', 'bash', '-euc', script, '--']
+    # Remount only the observed enclosure scratch to bound test pressure. The
+    # product's normal 1 GiB capacity remains unchanged outside this fixture.
+    options = 'size=128m,mode=0700,nosuid,nodev,noexec' + (',nr_inodes=4096' if inodes else '')
     kind = 'inodes' if inodes else 'blocks'
-    with Client(out, evidence / ('pressure-' + kind), launch_prefix=prefix) as client:
+    with Client(out, evidence / ('pressure-' + kind)) as client:
         report = client.start(required='data-writes-denied')
         protected(report)
         client.active()
         client.page(fixtures.base + '/title/BEFORE_PRESSURE', 'BEFORE_PRESSURE')
         with Members(client.process.pid) as members:
             pid, fd, scratch = scratch_of(members.rows)
+            run(['sudo', '-n', 'nsenter', '--mount=/proc/' + str(pid) + '/ns/mnt',
+                 'mount', '-o', 'remount,' + options, '/dev/shm'])
+            scratch_receipt(pid)  # Pressure must preserve every protection flag.
             code = r'''
 import errno,json,os,sys
 p='/proc/'+sys.argv[1]+'/fd/'+sys.argv[2]
@@ -467,7 +465,9 @@ except OSError as e:
 finally: os.close(root)
 print(json.dumps(dict(amount=total,resource=sys.argv[3],error='ENOSPC')))
 '''
-            filled = json.loads(run(['sudo', '-n', 'python3', '-c', code, pid, fd, kind], capture_output=True).stdout)
+            # The tmpfs owner namespace maps builder, not outside root. Fill as
+            # that unprivileged owner rather than inventing another UID grant.
+            filled = json.loads(run(['python3', '-c', code, pid, fd, kind], capture_output=True).stdout)
             client.closed(reason='failed')
             members.exited()
         client.finish()
@@ -504,7 +504,11 @@ def bus_barrier(address, path, monitor):
 
 
 def native_writers(out, evidence, fixtures):
-    executable = evidence / 'native-writers'
+    with native_consumer_executable(out) as executable:
+        return _native_writers(out, evidence, fixtures, executable)
+
+
+def _native_writers(out, evidence, fixtures, executable):
     run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', REPO / 'src',
          REPO / 'tools/testdata/guest-lock/native-writers.c',
          *[REPO / 'src/brave/alloy/guest/linux_lock' / (leaf + '.c')
@@ -584,16 +588,19 @@ def package_proof(out, evidence, fixtures):
             report = client.start(policy='manual', required='data-writes-denied')
             unprofiled_report = report
             assert report['filesystem'] == 'unavailable', report
-            assert 'userns-unavailable:unshare-errno-' in report['limits'], report
+            assert report['limits'].startswith('guest lifetime unavailable:'), report
+            assert any(operation in report['limits'] for operation in
+                       ('clone3(', 'PID enclosure /proc/self/')), report
             assert not any(role_of(r) == 'renderer' for r in snapshot(client.process.pid))
             client.send('create guest ' + fixtures.base + '/title/NEVER_ADMITTED')
             assert client.wait('guest', 'create-queued')['ok'] is False
             client.send('close guest')
-            client.closed()
+            client.closed(reason='failed')
             client.finish()
         template = (REPO / 'packaging/linux/alloy-guest.apparmor.in').read_text()
         template = template.replace('@@PROFILE@@', name).replace('@@BOOTSTRAP@@', str(install / 'alloy_guest_host'))
         template = template.replace('@@ENGINE@@', str(install / 'alloy_guest_engine'))
+        template = template.replace('@@APP@@', str(install / 'alloy_guest_sdk_consumer'))
         packaged_policy = stage / policy.relative_to('/')
         packaged_policy.parent.mkdir(parents=True)
         packaged_policy.write_text(template)

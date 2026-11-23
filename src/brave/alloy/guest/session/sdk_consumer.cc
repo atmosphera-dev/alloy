@@ -8,6 +8,7 @@
 #include "include/cef_render_handler.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <condition_variable>
 #include <deque>
@@ -17,8 +18,10 @@
 #include <memory>
 #include <mutex>
 #include <poll.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -28,6 +31,24 @@
 
 namespace {
 std::mutex output_mutex;
+bool verify_signal_policy = false;
+struct sigaction expected_sigchld;
+sigset_t expected_mask;
+void ReapFixtureChildren(int) {
+  int saved = errno;
+  while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+  errno = saved;
+}
+bool FixtureSignalsUnchanged() {
+  struct sigaction current;
+  sigset_t mask;
+  if (sigaction(SIGCHLD, nullptr, &current) || sigprocmask(SIG_SETMASK, nullptr, &mask) ||
+      current.sa_handler != expected_sigchld.sa_handler || current.sa_flags != expected_sigchld.sa_flags)
+    return false;
+  for (int number = 1; number < NSIG; ++number)
+    if (sigismember(&mask, number) != sigismember(&expected_mask, number)) return false;
+  return true;
+}
 std::string Quote(const std::string& text) {
   const char hex[] = "0123456789abcdef";
   std::string result = "\"";
@@ -90,6 +111,8 @@ class Guest final : public AlloyGuestSessionHandler,
     Event(name_, "state", ",\"state\":" + Quote(state.ToString()));
     if (state == "STARTING" && policy_ == "terminate-start")
       session->Terminate();
+    if (state == "STARTING" && policy_ == "close-start")
+      session->Close();
     if (state == "ACTIVE" && policy_ == "queue-close") {
       session->CreateView(640, 480, this);
       session->Close();
@@ -102,6 +125,9 @@ class Guest final : public AlloyGuestSessionHandler,
       completed_session_ = std::move(session);
       closed_ = true;
     }
+    if (verify_signal_policy)
+      Event("driver", "signal-policy-preserved", std::string(",\"ok\":") +
+            (FixtureSignalsUnchanged() ? "true" : "false"));
     Event(name_, "closed", ",\"reason\":" + Quote(reason.ToString()));
   }
   void OnReady(CefRefPtr<AlloyGuestView> view) override {
@@ -125,7 +151,9 @@ class Guest final : public AlloyGuestSessionHandler,
           ",\"title\":" + Quote(title.ToString()));
     if (policy_ == "stall-title" && title == "STALL_CONSUMER") {
       std::unique_lock lock(stall_mutex_);
+      Event(name_, "callback-blocked");
       stall_cv_.wait(lock, [this] { return resumed_; });
+      Event(name_, "callback-resumed");
     }
   }
   void OnNavigationComplete(CefRefPtr<AlloyGuestView> view,
@@ -178,6 +206,7 @@ class Guest final : public AlloyGuestSessionHandler,
     CefRefPtr<AlloyGuestSession> session;
     { std::lock_guard guard(mutex_); session = session_; }
     if (session) session->Close();
+    Event(name_, "close-called");
   }
   void Terminate() {
     CefRefPtr<AlloyGuestSession> session;
@@ -279,6 +308,23 @@ int main(int argc, char** argv) {
   int child = CefExecuteProcess(args, app, nullptr);
   if (child >= 0)
     return child;
+  if (const char* policy = getenv("ALLOY_FIXTURE_SIGCHLD")) {
+    std::string selected(policy);
+    if (selected != "default" && selected != "ignored" && selected != "nochildwait" && selected != "reaper")
+      return 2;
+    struct sigaction action = {};
+    action.sa_handler = selected == "ignored" ? SIG_IGN : selected == "reaper" ? ReapFixtureChildren : SIG_DFL;
+    action.sa_flags = selected == "nochildwait" ? SA_NOCLDWAIT : 0;
+    sigemptyset(&action.sa_mask);
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGTERM);
+    if (sigaction(SIGCHLD, &action, nullptr) ||
+        sigprocmask(SIG_BLOCK, &blocked, nullptr) ||
+        sigaction(SIGCHLD, nullptr, &expected_sigchld) ||
+        sigprocmask(SIG_SETMASK, nullptr, &expected_mask)) return 2;
+    verify_signal_policy = true;
+  }
   std::vector<int> reserved;
   void* inherited_mapping = MAP_FAILED;
   size_t inherited_mapping_size = 0;

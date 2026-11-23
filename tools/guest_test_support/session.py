@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import pwd
 import re
 import select
 import signal
@@ -13,6 +14,7 @@ import threading
 import time
 
 from .display import environment
+from .certificate import stage_nss_certificate
 
 
 def descendants(pid):
@@ -39,14 +41,24 @@ def descendants(pid):
     return found
 
 
-def process_role(arguments):
+def process_role(arguments, executable=None):
     # Chromium rewrites /proc/cmdline to one space-separated process title.
     # Before that rewrite, the same flags are distinct NUL-separated arguments.
-    title = b' '.join(arguments)
-    if re.search(rb'(?:^|\s)--alloy-supervisor(?:\s|$)', title):
-        return 'supervisor'
-    match = re.search(rb'(?:^|\s)--type=([a-z0-9-]+)(?:\s|$)', title)
-    return match[1].decode() if match else 'browser'
+    fields = [field for field in arguments if field]
+    if len(fields) == 1:
+        title = fields[0]
+        prefix = os.fsencode(executable) if executable is not None else title.split(b' ', 1)[0]
+        fields = title[len(prefix):].split() if title.startswith(prefix) else []
+    else:
+        fields = fields[1:]  # argv[0] is a path, never a role token.
+    for role in (b'--alloy-wait-owner', b'--alloy-supervisor'):
+        if role in fields:
+            return 'wait-owner' if role == b'--alloy-wait-owner' else 'supervisor'
+    for field in fields:
+        match = re.fullmatch(rb'--type=([a-z0-9-]+)', field)
+        if match:
+            return match[1].decode()
+    return 'browser'
 
 
 class OwnedProcesses:
@@ -66,7 +78,7 @@ class OwnedProcesses:
             if exe not in {out / 'alloy_guest_host', out / 'alloy_guest_engine'}:
                 os.close(handle)
                 continue
-            role = process_role(argv)
+            role = process_role(argv, str(exe))
             self.members.append({'pid': pid, 'exe': str(exe), 'role': role})
             self.handles.append(handle)
 
@@ -241,7 +253,8 @@ class Client:
             try:
                 if (proc / 'exe').resolve(strict=True) != self.out.resolve() / 'alloy_guest_host':
                     continue
-                if process_role((proc / 'cmdline').read_bytes().split(b'\0')) != 'supervisor':
+                if process_role((proc / 'cmdline').read_bytes().split(b'\0'),
+                                str(self.out.resolve() / 'alloy_guest_host')) != 'supervisor':
                     continue
                 # The supervisor owns the authoritative RAM pin. Chromium
                 # relocates/overwrites its initial environment for process
@@ -251,28 +264,25 @@ class Client:
                         target = descriptor.readlink()
                     except FileNotFoundError:
                         continue
-                    if target.name.startswith(f'alloy-guest-{os.getuid()}-') and target.is_dir():
-                        roots.add(target)
+                    if str(target) == '/dev/shm':
+                        roots.add(Path('/proc') / str(pid) / 'root/dev/shm')
             except (FileNotFoundError, ProcessLookupError):
                 continue
         assert len(roots) == 1, 'Expected the one newly prepared supervisor RAM pin'
         scratch = roots.pop()
-        assert scratch.is_absolute() and scratch.resolve(strict=True) == scratch
+        # Preserve the proc magic-link traversal into this exact mount view;
+        # realpath would collapse it back into the observer's /dev/shm.
+        assert scratch.is_absolute()
         info = scratch.stat()
+        assert info.st_dev != os.stat('/dev/shm').st_dev
         assert info.st_uid == os.getuid() and info.st_mode & 0o777 == 0o700
         backing = subprocess.run(['stat', '-f', '--format=%T', str(scratch)],
                                  text=True, capture_output=True, check=True).stdout.strip()
         assert backing == 'tmpfs', (scratch, backing)
-        home, data = scratch / 'home', scratch / 'data'
         with (self.root / ('guest-certificate-input-' + name + '.log')).open('x') as log:
-            for nss in (home / '.pki/nssdb', data / 'pki/nssdb'):
-                assert nss.resolve(strict=True) == nss and nss.is_dir(), nss
-                if not (nss / 'cert9.db').exists():
-                    subprocess.run(['certutil', '-N', '--empty-password', '-d', 'sql:' + str(nss)],
-                        env=self.env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=20)
-                subprocess.run(['certutil', '-A', '-d', 'sql:' + str(nss), '-n', 'Alloy guest fixture',
-                    '-t', 'C,,', '-i', str(self.trusted_certificate)], env=self.env,
-                    stdout=log, stderr=subprocess.STDOUT, check=True, timeout=20)
+            for relative in ('home/.pki/nssdb', 'data/pki/nssdb'):
+                stage_nss_certificate(int(scratch.parts[2]), relative, self.trusted_certificate,
+                                      pwd.getpwuid(os.getuid()).pw_name, log, self.env)
 
     def active(self, name='guest'):
         return self.wait(name, 'state', lambda value: value['state'] == 'ACTIVE')

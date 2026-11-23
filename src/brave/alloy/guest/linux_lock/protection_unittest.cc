@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "brave/alloy/guest/linux_lock/protection.h"
 #include "brave/alloy/guest/linux_lock/child_launch.h"
+#include "brave/alloy/guest/linux_lock/test_private_scratch.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -65,10 +66,14 @@ TEST(LinuxProtectionReportTest, SeparatesBoundaryLimitsAndUsernsRequirement) {
   EXPECT_EQ((*fields)[2], "verified-tmpfs");
   EXPECT_NE((*fields)[3].find("never-used-in-guest-mode"), std::string::npos);
   EXPECT_NE((*fields)[4].find("not-isolated-from-other-same-user-processes"), std::string::npos);
-  EXPECT_NE((*fields)[4].find("private-process-view-planned-after-first-release"), std::string::npos);
+  EXPECT_NE((*fields)[1].find("private-PID-namespace-procfs; separate-POSIX-session"), std::string::npos);
+  EXPECT_NE((*fields)[4].find("non-process-procfs-controls-not-virtualized"), std::string::npos);
+  EXPECT_EQ((*fields)[4].find("private-process-view-planned-after-first-release"), std::string::npos);
   EXPECT_NE((*fields)[4].find("metadata_and_atime"), std::string::npos);
   EXPECT_NE((*fields)[4].find("RAM-may-swap"), std::string::npos);
   EXPECT_NE((*fields)[4].find("not-OS-enforced"), std::string::npos);
+  EXPECT_NE((*fields)[4].find("observer-handle-retains-memory-after-exit"), std::string::npos);
+  EXPECT_EQ((*fields)[4].find("named-RAM-may-remain"), std::string::npos);
 }
 
 TEST(LinuxLockLaunchTest, RemappingCannotClobberALaterSource) {
@@ -106,9 +111,8 @@ class LinuxLockTest : public testing::Test {
     ASSERT_TRUE(base::WriteFile(base::FilePath(sentinel_), "durable-sentinel"));
   }
 
-  // Restrictions belong only to a fixture subprocess. The unconfined parent
-  // owns cleanup, including the volatile root that Landlock cannot unlink from
-  // its otherwise ungranted parent hierarchy.
+  // Restrictions and the scratch mount belong only to a fixture subprocess.
+  // No outside directory or mount handle is retained; kernel exit releases it.
   int Run(const std::function<bool()>& body,
           const std::function<bool()>& prepare = [] { return true; }) {
     int pipe_fds[2];
@@ -117,7 +121,7 @@ class LinuxLockTest : public testing::Test {
     EXPECT_GE(pid, 0);
     if (!pid) {
       close(pipe_fds[0]);
-      if (!alloy_lock_prepare_scratch() || !alloy_lock_writer_paths()) _exit(10);
+      if (!alloy_test_private_scratch() || !alloy_lock_prepare_scratch() || !alloy_lock_writer_paths()) _exit(10);
       char alias[64], scratch[PATH_MAX];
       snprintf(alias, sizeof(alias), "/proc/self/fd/%d", alloy_lock_scratch_fd());
       ssize_t count = readlink(alias, scratch, sizeof(scratch));
@@ -133,9 +137,7 @@ class LinuxLockTest : public testing::Test {
     int status = 0;
     EXPECT_EQ(waitpid(pid, &status, 0), pid);
     if (count > 0) {
-      base::FilePath path(std::string(scratch, count));
-      EXPECT_TRUE(path.value().starts_with("/dev/shm/alloy-guest-"));
-      EXPECT_TRUE(base::DeletePathRecursively(path));
+      EXPECT_EQ(std::string(scratch, count), ALLOY_GUEST_SCRATCH_PATH);
     }
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
   }
@@ -156,7 +158,7 @@ TEST_F(LinuxLockTest, VerifiedRamWritesAndNativePaths) {
     for (const char* name : {"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
          "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR", "ALLOY_GUEST_CEF_ROOT"}) {
       const char* value = getenv(name);
-      if (!value || !std::string(value).starts_with("/dev/shm/alloy-guest-")) return false;
+      if (!value || !std::string(value).starts_with("/dev/shm/")) return false;
       int dir = open(value, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
       if (dir < 0) return false;
       int fd = openat(dir, "native-writer", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -170,13 +172,13 @@ TEST_F(LinuxLockTest, VerifiedRamWritesAndNativePaths) {
   }), 0);
 }
 
-TEST_F(LinuxLockTest, RemovesUnreadableChildrenWithoutFollowingSymlinks) {
+TEST_F(LinuxLockTest, KernelOwnsUnreadableScratchWithoutFollowingSymlinks) {
   struct stat before;
   ASSERT_EQ(stat(disk_.GetPath().value().c_str(), &before), 0);
   pid_t pid = fork();
   ASSERT_GE(pid, 0);
   if (!pid) {
-    if (!alloy_lock_prepare_scratch()) _exit(10);
+    if (!alloy_test_private_scratch() || !alloy_lock_prepare_scratch()) _exit(10);
     int root = alloy_lock_scratch_fd();
     char alias[64], path[PATH_MAX];
     snprintf(alias, sizeof(alias), "/proc/self/fd/%d", root);
@@ -195,15 +197,14 @@ TEST_F(LinuxLockTest, RemovesUnreadableChildrenWithoutFollowingSymlinks) {
         symlinkat(disk_.GetPath().value().c_str(), root, "outside") ||
         fchmod(nested, 0000) || fchmod(child, 0000)) _exit(12);
     alloy_lock_remove_scratch();
-    bool removed = access(path, F_OK) && errno == ENOENT;
-    // Bound fixture leftovers even on the failing implementation.
-    if (!removed) {
-      if (fchmod(child, 0700) || fchmod(nested, 0700)) _exit(14);
-      if (!base::DeletePathRecursively(base::FilePath(path))) _exit(14);
-    }
+    // Closing a setup pin does not walk or chmod files. Mount reclamation is
+    // the kernel's responsibility when this last namespace member exits.
+    struct stat blocked;
+    bool private_tree = !fstat(child, &blocked) && (blocked.st_mode & 0777) == 0 &&
+                        alloy_lock_scratch_fd() < 0;
     close(nested);
     close(child);
-    _exit(removed ? 0 : 13);
+    _exit(private_tree ? 0 : 13);
   }
   int status;
   ASSERT_EQ(waitpid(pid, &status, 0), pid);

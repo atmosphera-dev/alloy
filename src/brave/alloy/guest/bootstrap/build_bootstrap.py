@@ -12,7 +12,9 @@ args = parser.parse_args()
 args.out.parent.mkdir(parents=True, exist_ok=True)
 sources = ['base/process/alloy_guest_runtime.c',
            'brave/alloy/guest/bootstrap/main.c',
-           'brave/alloy/guest/bootstrap/supervisor.c',
+            'brave/alloy/guest/bootstrap/supervisor.c',
+            'brave/alloy/guest/bootstrap/wait_owner.c',
+            'brave/alloy/guest/linux_lock/pinned_spawn.c',
            'brave/alloy/guest/linux_lock/ram_scratch.c',
            'brave/alloy/guest/linux_lock/writer_paths.c',
            'brave/alloy/guest/linux_lock/landlock.c',

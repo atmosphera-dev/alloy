@@ -7,6 +7,7 @@
 #include "brave/alloy/guest/protocol/wire.h"
 #include "brave/alloy/guest/linux_lock/protection.h"
 #include "brave/alloy/guest/linux_lock/child_launch.h"
+#include "brave/alloy/guest/linux_lock/pinned_spawn.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,48 +36,59 @@ struct members {
   size_t count;
 };
 
-static void reap(void) {
+static int prune_members(struct members* members) {
+  for (size_t i = 0; i < members->count;) {
+    int exited = alloy_pinned_exited(members->items[i].pidfd, 0);
+    if (exited < 0) return 0;
+    if (!exited) { ++i; continue; }
+    close(members->items[i].pidfd);
+    if (members->items[i].liveness >= 0) close(members->items[i].liveness);
+    members->items[i] = members->items[--members->count];
+  }
+  return 1;
+}
+
+static int reap(void) {
   for (;;) {
-    int status = 0;
-    pid_t process = waitpid(-1, &status, WNOHANG);
-    if (process > 0 || (process < 0 && errno == EINTR))
-      continue;
-    break;
+    siginfo_t info = {0};
+    if (waitid(P_ALL, 0, &info, WEXITED | WNOHANG)) {
+      if (errno == EINTR) continue;
+      return errno == ECHILD ? 0 : errno;
+    }
+    if (!info.si_pid) return 0;
   }
 }
 
-static void retire(struct members* members) {
+static int retire(struct members* members) {
+  int error = 0;
   for (size_t i = 0; i < members->count; ++i) {
     struct member* member = &members->items[i];
     if (member->liveness >= 0) {
       close(member->liveness);
       member->liveness = -1;
     }
-    if (member->pidfd >= 0)
-      syscall(SYS_pidfd_send_signal, member->pidfd, SIGKILL, NULL, 0);
+    if (member->pidfd >= 0) {
+      int signaled = alloy_pinned_signal(member->pidfd, SIGKILL);
+      if (signaled && !error) error = signaled;
+    }
   }
   // Owned children and orphans reparent to this subreaper. Never report final
   // completion while an admitted pidfd is live, even if its parent is reaping.
   for (size_t i = 0; i < members->count; ++i) {
     struct member* member = &members->items[i];
     if (member->pidfd >= 0) {
-      struct pollfd event = {member->pidfd, POLLIN, 0};
-      int result;
-      do {
-        result = poll(&event, 1, -1);
-      } while (result < 0 && errno == EINTR);
+      if (alloy_pinned_exited(member->pidfd, 1) != 1 && !error) error = EIO;
       close(member->pidfd);
     }
   }
-  for (;;) {
-    pid_t process = waitpid(-1, NULL, 0);
-    if (process > 0 || (process < 0 && errno == EINTR))
-      continue;
-    break;
-  }
+  int reaped = reap();
+  if (!error) error = reaped;
+  // Live, unregistered orphans belong to enclosure init. Its kernel exit
+  // sweeps them even when stopped; never block here on waitpid(-1).
   free(members->items);
   members->items = NULL;
   members->count = 0;
+  return error;
 }
 
 static int admit(int registration, struct members* members) {
@@ -93,7 +105,9 @@ static int admit(int registration, struct members* members) {
   message.msg_iovlen = 1;
   message.msg_control = control.bytes;
   message.msg_controllen = sizeof(control.bytes);
-  ssize_t received = recvmsg(registration, &message, MSG_CMSG_CLOEXEC);
+  ssize_t received;
+  do { received = recvmsg(registration, &message, MSG_CMSG_CLOEXEC); }
+  while (received < 0 && errno == EINTR);
   struct ucred credential = {0, 0, 0};
   size_t credential_count = 0;
   size_t handle_count = 0;
@@ -136,6 +150,28 @@ static int admit(int registration, struct members* members) {
     return 1;
   }
   if (pidfd >= 0) {
+    // Pin first, then prove this is still the sole live peer. The registering
+    // entry cannot fork or exec before A. A cached credential PID alone is not
+    // authority after its original peer closed and the PID was recycled.
+    struct pollfd alive = {endpoint, POLLIN, 0};
+    int observed;
+    do { observed = poll(&alive, 1, 0); } while (observed < 0 && errno == EINTR);
+    if (observed < 0 || alive.revents) {
+      close(pidfd);
+      close(endpoint);
+      return observed < 0 ? 0 : 1;
+    }
+  }
+  if (pidfd >= 0) {
+    // A previously admitted process may already have exited and been reaped by
+    // its native parent. Its numeric PID must not veto a new pinned identity.
+    if (!prune_members(members)) {
+      alloy_pinned_signal(pidfd, SIGKILL);
+      alloy_pinned_exited(pidfd, 1);
+      close(pidfd);
+      close(endpoint);
+      return 0;
+    }
     for (size_t i = 0; i < members->count; ++i) {
       if (members->items[i].process == credential.pid) {
         // A duplicate live registration is invalid. Reused numeric PIDs never
@@ -151,8 +187,12 @@ static int admit(int registration, struct members* members) {
     replacement = realloc(members->items,
                           (members->count + 1) * sizeof(struct member));
   if (!replacement) {
-    if (pidfd >= 0)
+    if (pidfd >= 0) {
+      // Custody is not released just because the registry allocation failed.
+      alloy_pinned_signal(pidfd, SIGKILL);
+      alloy_pinned_exited(pidfd, 1);
       close(pidfd);
+    }
     if (endpoint >= 0)
       close(endpoint);
     return 0;
@@ -166,9 +206,8 @@ static int admit(int registration, struct members* members) {
   } while (acknowledged < 0 && errno == EINTR);
   if (acknowledged == 1)
     return 1;
-  struct pollfd exited = {pidfd, POLLIN, 0};
   if ((errno == EPIPE || errno == ECONNRESET) ||
-      (poll(&exited, 1, 0) == 1 && exited.revents)) {
+      alloy_pinned_exited(pidfd, 0) == 1) {
     // Keep the exact pidfd until exit even if its endpoint closed early. No
     // admission ack reached this entry, but it must not become untracked.
     close(endpoint);
@@ -200,7 +239,9 @@ static int receive_forward(int from, struct forwarding* forward, int* closing) {
   message.msg_iovlen = 1;
   message.msg_control = control.bytes;
   message.msg_controllen = sizeof(control.bytes);
-  ssize_t count = recvmsg(from, &message, MSG_CMSG_CLOEXEC);
+  ssize_t count;
+  do { count = recvmsg(from, &message, MSG_CMSG_CLOEXEC); }
+  while (count < 0 && errno == EINTR);
   int valid = count > 0 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC));
   for (struct cmsghdr* header = CMSG_FIRSTHDR(&message); header;
        header = CMSG_NXTHDR(&message, header)) {
@@ -260,41 +301,37 @@ static int supervise_prepared(const char* bootstrap) {
   if (setsockopt(registration[0], SOL_SOCKET, SO_PASSCRED,
                  &enabled, sizeof(enabled)))
     return 125;
-  posix_spawn_file_actions_t actions;
   const struct alloy_lock_fd_map maps[] = {
       {registration[1], ALLOY_GUEST_REGISTRATION_FD},
       {browser_control[1], ALLOY_GUEST_CONTROL_FD},
       {ALLOY_GUEST_RESOURCE_FD, ALLOY_GUEST_RESOURCE_FD}};
-  int copies[3];
-  if (!alloy_lock_spawn_actions(&actions, maps, 3, copies))
-    return 125;
   char* arguments[] = {(char*)bootstrap, NULL};
-  pid_t browser = -1;
-  int launched = posix_spawn(&browser, bootstrap, &actions,
-                             NULL, arguments, environ);
-  alloy_lock_spawn_actions_destroy(&actions, 3, copies);
+  struct alloy_pinned_child browser;
+  int launched = alloy_spawn_pinned(bootstrap, arguments, environ, maps, 3, 0, &browser);
+  if (!launched) launched = alloy_pinned_exec_result(browser.exec_error, NULL);
+  if (browser.exec_error >= 0) close(browser.exec_error);
   close(registration[1]);
   close(browser_control[1]);
   close(ALLOY_GUEST_RESOURCE_FD);
-  if (launched)
-    return 125;
-  int browser_pidfd = (int)syscall(SYS_pidfd_open, browser, 0);
-  if (browser_pidfd < 0) {
-    // This is the unreaped direct child from our own spawn, so it cannot have
-    // been recycled. No numeric PID from the guest is trusted here.
-    kill(browser, SIGKILL);
-    waitpid(browser, NULL, 0);
+  if (launched) {
+    if (browser.pidfd >= 0) {
+      alloy_pinned_signal(browser.pidfd, SIGKILL);
+      int status;
+      alloy_pinned_wait(browser.pidfd, &status);
+      close(browser.pidfd);
+    }
     return 125;
   }
+  int browser_pidfd = browser.pidfd;
   struct members members = {NULL, 0};
   struct forwarding to_browser = {{0}, 0, 0};
   struct forwarding to_app = {{0}, 0, 0};
   int closing = 0;
   int browser_dead = 0;
   int browser_eof = 0;
-  int result = 0;
+  int result = 125;
   for (;;) {
-    reap();
+    if (reap()) break;
     if (!alloy_lock_scratch_valid())
       break;
     struct pollfd events[] = {
@@ -312,8 +349,11 @@ static int supervise_prepared(const char* bootstrap) {
       break;
     // App close/death is processed before registration in this same sequence.
     // A later entry cannot receive its admission ack once closing begins.
-    if (events[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+    if (events[0].revents & POLLHUP) {
+      result = 0;
       break;
+    }
+    if (events[0].revents & (POLLERR | POLLNVAL)) break;
     if ((events[0].revents & POLLIN) &&
         !receive_forward(ALLOY_GUEST_CONTROL_FD, &to_browser, &closing))
       break;
@@ -346,32 +386,23 @@ static int supervise_prepared(const char* bootstrap) {
     }
     if (registration[0] >= 0 && events[2].revents && !admit(registration[0], &members))
       break;
-    if (browser_dead && browser_eof && !to_app.count)
+    if (browser_dead && browser_eof && !to_app.count) {
+      result = 0;
       break;
-    for (size_t i = 0; i < members.count;) {
-      struct pollfd event = {members.items[i].pidfd, POLLIN, 0};
-      if (poll(&event, 1, 0) == 1 && event.revents) {
-        close(members.items[i].pidfd);
-        if (members.items[i].liveness >= 0)
-          close(members.items[i].liveness);
-        members.items[i] = members.items[--members.count];
-      } else {
-        ++i;
-      }
     }
-    reap();
+    if (!prune_members(&members)) break;
+    if (reap()) break;
   }
   // Closing the registration receiver first refuses even entries already
   // queued in the kernel. They are still in the pre-engine admission handshake.
   if (registration[0] >= 0)
     close(registration[0]);
   close(browser_control[0]);
-  syscall(SYS_pidfd_send_signal, browser_pidfd, SIGKILL, NULL, 0);
-  retire(&members);
-  struct pollfd event = {browser_pidfd, POLLIN, 0};
-  while (poll(&event, 1, -1) < 0 && errno == EINTR) {}
+  if (alloy_pinned_signal(browser_pidfd, SIGKILL)) result = 125;
+  if (retire(&members)) result = 125;
+  if (alloy_pinned_exited(browser_pidfd, 1) != 1) result = 125;
   close(browser_pidfd);
-  reap();
+  if (reap()) result = 125;
   close(ALLOY_GUEST_CONTROL_FD);
   return result;
 }

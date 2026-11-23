@@ -7,11 +7,13 @@
 #include <charconv>
 #include <cstdlib>
 #include <deque>
+#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <poll.h>
+#include <signal.h>
 #include <sys/eventfd.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -22,6 +24,7 @@
 #include "brave/alloy/guest/build_identity.h"
 #include "brave/alloy/guest/providers.h"
 #include "brave/alloy/guest/session/supervisor.h"
+#include "brave/alloy/guest/linux_lock/pinned_spawn.h"
 #include "brave/alloy/guest/session/extensions.h"
 #include "brave/alloy/guest/session/interactions.h"
 #include "brave/alloy/guest/stream/stream_client.h"
@@ -131,6 +134,7 @@ struct Command {
 };
 
 struct ClientCore : public std::enable_shared_from_this<ClientCore> {
+  enum class Admission { kStarting, kReady, kAdmitted, kCancelled };
   explicit ClientCore(int wake) : wake(wake) {}
   ~ClientCore() { close(wake); }
   bool Enqueue(Command command, const std::string& required_state) {
@@ -150,6 +154,9 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
       return;
     closing = true;
     state = "CLOSING";
+    // No browser was admitted yet: cancellation must also reach a stopped init
+    // or probe, rather than depending on either process servicing socket EOF.
+    if (admission != Admission::kAdmitted) ForceCustodyLocked();
     uint64_t one = 1;
     ssize_t result;
     do { result = write(wake, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
@@ -163,8 +170,8 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     state = "CLOSING";
     // Shutdown, not close: the worker retains FD ownership. This also works
     // while its application callback is running or graceful close is pending.
-    if (channel >= 0)
-      shutdown(channel, SHUT_RDWR);
+    if (channel >= 0 && !Shutdown(channel, SHUT_RDWR)) custody_error = true;
+    ForceCustodyLocked();
     uint64_t one = 1;
     ssize_t result;
     do { result = write(wake, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
@@ -172,8 +179,60 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
   void SetChannel(int value) {
     std::lock_guard guard(mutex);
     channel = value;
-    if (channel >= 0 && terminated)
-      shutdown(channel, SHUT_RDWR);
+    if (channel >= 0 && terminated && !Shutdown(channel, SHUT_RDWR)) custody_error = true;
+  }
+  static bool Shutdown(int fd, int how) {
+    int result;
+    do { result = shutdown(fd, how); } while (result < 0 && errno == EINTR);
+    return result == 0 || errno == ENOTCONN;
+  }
+  void ForceCustodyLocked() {
+    bool pending = admission != Admission::kAdmitted;
+    admission = Admission::kCancelled;
+    if (custody) {
+      custody->forced = true;
+      custody->cancelled = pending;
+    }
+    if (custody && custody->mirror_pidfd >= 0 && alloy_pinned_signal(custody->mirror_pidfd, SIGKILL))
+      custody_error = true;
+    if (custody && custody->mirror_status >= 0 && !Shutdown(custody->mirror_status, SHUT_WR))
+      custody_error = true;
+  }
+  CustodyInstall InstallCustody(Supervisor* value) {
+    std::lock_guard guard(mutex);
+    if (closing) return CustodyInstall::kCancelled;
+    SupervisorForkLock fork_guard;
+    value->mirror_pidfd = fcntl(value->pidfd, F_DUPFD_CLOEXEC, 3);
+    value->mirror_status = fcntl(value->status_channel, F_DUPFD_CLOEXEC, 3);
+    if (value->mirror_pidfd < 0 || value->mirror_status < 0) {
+      if (value->mirror_pidfd >= 0) close(value->mirror_pidfd);
+      if (value->mirror_status >= 0) close(value->mirror_status);
+      value->mirror_pidfd = value->mirror_status = -1;
+      custody_error = true;
+      return CustodyInstall::kFailed;
+    }
+    custody = value;
+    return CustodyInstall::kInstalled;
+  }
+  bool Admit() {
+    std::lock_guard guard(mutex);
+    // READY, grant, Close and Terminate have exactly one admission commit.
+    if (closing || !custody || admission != Admission::kStarting) return false;
+    admission = Admission::kReady;
+    if (!AdmitSupervisor(custody->mirror_status)) return false;
+    admission = Admission::kAdmitted;
+    return true;
+  }
+  bool ReleaseCustody() {
+    std::lock_guard guard(mutex);
+    SupervisorForkLock fork_guard;
+    if (custody) {
+      if (custody->mirror_pidfd >= 0 && close(custody->mirror_pidfd)) custody_error = true;
+      if (custody->mirror_status >= 0 && close(custody->mirror_status)) custody_error = true;
+      custody->mirror_pidfd = custody->mirror_status = -1;
+    }
+    custody = nullptr;
+    return !custody_error;
   }
   bool IsTerminated() {
     std::lock_guard guard(mutex);
@@ -187,10 +246,13 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     std::lock_guard guard(mutex);
     return closing;
   }
-  void SetState(const std::string& value) {
+  bool SetState(const std::string& value) {
     std::lock_guard guard(mutex);
-    if (!closing || value == "CLOSED" || value == "FAILED")
+    if (!closing || value == "CLOSING" || value == "CLOSED" || value == "FAILED") {
       state = value;
+      return true;
+    }
+    return false;
   }
   std::deque<Command> TakeCommands() {
     std::lock_guard guard(mutex);
@@ -358,6 +420,9 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
   bool closing = false;
   bool terminated = false;
   int channel = -1;
+  Supervisor* custody = nullptr;
+  Admission admission = Admission::kStarting;
+  bool custody_error = false;
   std::deque<Command> commands;
   std::map<uint64_t, Owner> extension_owners;
   std::map<std::pair<uint64_t, Feature>, std::shared_ptr<ExtensionSink>> sinks;
@@ -495,8 +560,7 @@ class SessionImpl final : public AlloyGuestSession {
 
  private:
   void StateChanged(const std::string& state) {
-    core_->SetState(state);
-    handler_->OnStateChanged(this, state);
+    if (core_->SetState(state)) handler_->OnStateChanged(this, state);
   }
   void CancelView(uint64_t id, const std::string& reason) {
     auto found = views_.find(id);
@@ -651,7 +715,19 @@ class SessionImpl final : public AlloyGuestSession {
     std::unique_ptr<stream::ResourceLane> resources;
     std::string reason = "failed";
     StateChanged("STARTING");
-    bool launched = !core_->IsClosing() && LaunchSupervisor(&child);
+    std::string unavailable;
+    LaunchOutcome outcome = LaunchOutcome::kCancelled;
+    if (!core_->IsClosing()) {
+      outcome = StartSupervisor(&child, &unavailable,
+          [&](Supervisor* value) { return core_->InstallCustody(value); });
+    }
+    bool launched = outcome == LaunchOutcome::kReady && core_->Admit();
+    if (outcome == LaunchOutcome::kUnavailable && !core_->IsClosing()) {
+      core_->Close();
+      handler_->OnPrepared(this, new ProtectionImpl({"unavailable",
+          "{\"before_engine\":true,\"runtime_supervision\":false,\"process_teardown\":\"unavailable\"}",
+          "unavailable", "{\"route\":\"unavailable\"}", unavailable}), new CapabilitiesImpl(0));
+    }
     if (launched)
       core_->SetChannel(child.channel);
     if (launched)
@@ -832,7 +908,7 @@ class SessionImpl final : public AlloyGuestSession {
     }
     if (!close_reason.empty())
       reason = close_reason;
-    else if (core_->IsClosing())
+    else if (core_->IsClosing() && unavailable.empty())
       reason = "closed";
     core_->Close();
     session.BeginClose();
@@ -847,7 +923,11 @@ class SessionImpl final : public AlloyGuestSession {
     // EOF is a close request to the supervisor, which serializes it against
     // registration, terminates/reaps members, and only then exits.
     core_->SetChannel(-1);
-    ReapSupervisor(&child);
+    int cleanup = ReapSupervisor(&child);
+    if (!core_->ReleaseCustody() || cleanup != 0) {
+      reason = "failed";
+      StateChanged("FAILED");
+    }
     core_->WaitExtensions();
     session.Closed();
     core_->SetState("CLOSED");

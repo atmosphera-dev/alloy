@@ -93,11 +93,15 @@ std::optional<std::array<std::string, 5>> LinuxProtectionFields(
   coverage.Set("ordinary_fork_exec", "inherited-landlock");
   coverage.Set("zygote_forks", "inherited-landlock");
   coverage.Set("runtime_supervision", "registered-native-entries-and-pidfds");
+  coverage.Set("process_enclosure", "clone3-CLONE_PIDFD-CLONE_NEWUSER-CLONE_NEWPID; init-death-kernel-kill-and-reap");
+  coverage.Set("process_view", "private-PID-namespace-procfs; separate-POSIX-session");
   coverage.Set("setuid_entry", "disabled-in-guest-mode");
   coverage.Set("flatpak_external_entries", "unavailable");
   coverage.Set("snap_external_entries", "unavailable");
   base::ListValue trusted;
   trusted.Append("static-unprivileged-supervisor-without-engine-payload");
+  trusted.Append("fixed-static-enclosure-init; private-kernel-exit-status; no-engine-payload");
+  trusted.Append("fixed-static-bootstrap-teardown-probe; no-engine-payload");
   coverage.Set("trusted_setup", std::move(trusted));
 
   base::DictValue native;
@@ -121,8 +125,8 @@ std::optional<std::array<std::string, 5>> LinuxProtectionFields(
   limits.Set("backend", "landlock");
   limits.Set("abi", abi);
   limits.Set("handled", "write,truncate,create,remove,rename,link; device-node-creation-denied-even-in-RAM");
-  limits.Set("procfs_exception", "WRITE_FILE across procfs, not per-PID; no truncate/create/remove grant");
-  limits.Set("process_isolation", "not-isolated-from-other-same-user-processes; non-truncating-procfs-writes-can-change-their-oom-score,coredump-filter,clear_refs,sched,autogroup; private-process-view-planned-after-first-release");
+  limits.Set("procfs_exception", "WRITE_FILE across private procfs, not per-PID; no truncate/create/remove grant");
+  limits.Set("process_isolation", "not-isolated-from-other-same-user-processes-for-ambient-IPC; PID/procfs-view-and-POSIX-session-are-private; not-a-distinct-host-UID; non-process-procfs-controls-not-virtualized");
   limits.Set("device_exceptions", "/dev/null,/dev/random,/dev/urandom WRITE_FILE");
   limits.Set("metadata_and_atime", "not-refused-by-Landlock");
   limits.Set("preopened_capabilities", "Landlock-does-not-revoke; bootstrap-closes-ungranted-FDs-and-replaces-stdio; exec-discards-old-mappings");
@@ -131,8 +135,8 @@ std::optional<std::array<std::string, 5>> LinuxProtectionFields(
   limits.Set("namespace_filesystem_and_packages", "unavailable-until-real-backend-proofs");
   limits.Set("physical_storage", "RAM-may-swap-or-hibernate; OS-audit/core/external-service-effects-outside-boundary");
   limits.Set("scratch_failure", "no-durable-fallback; loss-or-exhaustion-ends-session");
-  limits.Set("joint_app_supervisor_death", "named-RAM-may-remain; never-reused; no-immediate-erasure-claim");
-  limits.Set("abrupt_supervisor_death", "named-RAM-may-remain-even-if-app-survives; never-reused; cleanup-is-not-write-prevention");
+  limits.Set("scratch_lifetime", "private-enclosure-tmpfs; 1-GiB-limit; noexec,nosuid,nodev; no-named-shared-root; kernel-reclaims-after-last-reference");
+  limits.Set("same_user_observer", "same-user-process-inspection-can-read-private-scratch; observer-handle-retains-memory-after-exit; not-a-tenant-boundary");
 
   auto encoded_coverage = base::WriteJson(coverage);
   auto encoded_native = base::WriteJson(native);

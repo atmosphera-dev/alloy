@@ -4,7 +4,7 @@
 
 Linux guest sessions apply pre-engine Landlock write refusal and verified RAM
 scratch, with Chromium's user-namespace sandbox. See `guest-protection-linux.md`
-for the actual limits, including same-user procfs control writes and metadata.
+for the actual limits, including deliberate same-user inspection and metadata.
 M3 adds the experimental CPU stream capability described in `guest-streaming.md`;
 native integration and accessibility have separate capability reports. Required
 protection that is unavailable refuses admission; it never selects an in-process
@@ -100,18 +100,60 @@ observations under their explicit evidence directories.
 
 ## Process and extension boundary
 
-The app uses `posix_spawn`. Its fixed static entry closes ungranted inherited
+The app uses a C-only
+`clone3(CLONE_PIDFD|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNS)` adapter,
+not a shell, a spawn-then-pin sequence or post-fork C++. The top static entry is
+PID 1 in the guest enclosure. Its original pidfd exists atomically with the
+process; its death makes Linux kill and reap every enclosure member, including
+stopped processes and native forks that have not registered yet. The app's
+signal mask, dispositions, child reaper and namespace membership stay unchanged.
+
+Before its fixed exec, the enclosure child makes mount propagation private,
+mounts procfs for its PID namespace and starts its own POSIX session. Real CEF
+needs matching `/proc/<pid>` lookups for native renderer status; the inherited
+outer procfs resolves those local numbers to unrelated processes. This does not
+add a read-only filesystem view or IPC isolation, or expand proc write grants.
+
+The enclosure also mounts its own 1 GiB tmpfs at its private `/dev/shm`, with
+noexec, nosuid and nodev. HOME, XDG, CEF and temporary writer paths use that
+mount; no `alloy-guest-*` directory is created in shared RAM or on disk. The
+kernel reclaims the mount after the last reference ends, including app/init or
+supervisor SIGKILL. Cleanup does not depend on a supervisor walking directories.
+This is not a same-user tenant boundary: a program deliberately inspecting
+`/proc/<pid>/root` can read scratch and hold a reference that retains its memory
+after the guest ends. The report discloses this observer limit; no dumpable or
+extra isolation mechanism is selected.
+
+The static init owns a real SIGKILL/waitid probe and a gated supervisor. READY
+and the app's Close/Terminate share one locked admission decision. Terminate
+signals the mirrored init pidfd directly, independently of the callback worker.
+Final completion waits for the original init's exit barrier, not control EOF or
+the FINISHED receipt alone. App forks close inherited session handles without
+shutting down the parent's endpoints. No product close timeout is selected.
+
+Alloy's static children use the same clone3 pinned creation primitive. Native
+Chromium namespace/zygote forks remain inside the kernel enclosure. The fixed
+static entry closes ungranted inherited
 handles and stdio, sanitizes loader/plugin/desktop environment, registers the
 runtime with the supervisor, and seals actual pre-engine facts before the fixed
 engine exec. The Linux lock adds actual write refusal and managed RAM paths;
 bootstrap startup facts alone are not the enforcement proof.
 
-The supervisor obtains kernel sender credentials and pidfds before acknowledging
+The supervisor obtains kernel sender credentials, pins the process, then proves
+the private registration peer is still live before acknowledging
 each entry. Native exec and zygote-fork routes preserve registration capability
 and obtain fresh liveness endpoints. Peer endpoints do not leak into descendants.
 Threadless Linux liveness notification preserves Chromium's single-threaded
 sandbox setup; parent-death signals are supplementary, not the cleanup authority.
 Close and runtime admission share one supervisor sequence.
+
+Before admission, refused clone3 flags, user-namespace ID mapping,
+`pidfd_send_signal(SIGKILL)` or `waitid(P_PIDFD)` produce an unavailable report
+naming the operation and errno. Resource exhaustion or a corrupt/failed launch
+is a failure, not a successful cleanup or a weaker retry. No clone fallback or
+newer `SO_PEERPIDFD` baseline is used. Flatpak, strict Snap and default Docker
+seccomp do not currently support this route when their policies deny those
+operations. Flatpak's parked adapter is not enabled by an environment marker.
 
 The control envelope negotiates protocol, build, experimental API hash and
 feature availability. It uses explicit byte order, exact lengths and ordered
@@ -138,6 +180,30 @@ CPU startup is not GPU transport or 1080p60 evidence. Scratch, swap, external
 services, metadata and persistence limits remain in the copied protection report.
 
 ## Verification
+
+Lifetime custody verification uses cloudbuild task `gm-lifetime`, guest
+`alloy-gm-lifetime`, workspace `/home/builder/work/alloy`, with
+`TMPDIR=/home/builder/work/tmp`. On that guest, after the matching build:
+
+```sh
+python3 repo/tools/guest_lifetime_probe.py --evidence evidence/lifetime-fixtures-new
+python3 repo/tools/guest_lifetime_sdk_probe.py --out src/out/Verify_Alloy --evidence evidence/lifetime-sdk-new
+python3 repo/tools/testdata/guest-lifetime/zygote_probe.py --out src/out/Verify_Alloy --evidence evidence/lifetime-zygote-new
+python3 repo/tools/guest_scratch_probe.py --out src/out/Verify_Alloy --evidence evidence/lifetime-scratch-new
+python3 repo/tools/guest_lock_probe.py --expected-hostname alloy-gm-lifetime --out src/out/Verify_Alloy --check all --evidence evidence/lifetime-lock-new
+```
+
+The lifetime matrices exercise default SIGCHLD, SIG_IGN, SA_NOCLDWAIT and an
+app-owned reaper. Fixture-only PID reuse, seccomp filters and interposition do
+not change the product launch path. The receive/fork test holds a newly received
+pidfd before publication and verifies the app's fork closes it. The root-only
+zygote tracer holds an actual Chromium newborn before registration, detaches it
+in confirmed SIGSTOP, and retains its original pidfd across custodian loss.
+Each invocation needs a new evidence path; repeat the SDK, zygote and existing
+gates against Release as well.
+The scratch matrix verifies ordinary mount invisibility and no remaining mount
+or open-file reference after death, except its explicit same-user observer
+case; that case verifies retention until the observer closes its handle.
 
 The M1 execution plan names DigitalOcean `alloy-gm-m1`, task `gm-m1`, allocated
 in sfo2 under addendum 01. All commands run there, from

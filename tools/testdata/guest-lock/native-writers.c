@@ -4,13 +4,14 @@
 // stdout is intentionally retained; product stdio closure is tested separately.
 #define _GNU_SOURCE
 #include "brave/alloy/guest/linux_lock/protection.h"
+#include "brave/alloy/guest/linux_lock/test_private_scratch.h"
 #include <errno.h>
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 int main(int argc, char** argv) {
-  if (argc < 2 || !alloy_lock_prepare_scratch()) return 1;
+  if (argc < 2 || !alloy_test_private_scratch() || !alloy_lock_prepare_scratch()) return 1;
   pid_t child = fork();
   if (!child) {
     if (!alloy_lock_writer_paths() || !alloy_lock_enforce() ||

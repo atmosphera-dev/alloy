@@ -23,8 +23,23 @@
 #include <unistd.h>
 
 int alloy_guest_supervise(const char* bootstrap);
+int alloy_guest_wait_owner(const char* bootstrap);
+
+static int teardown_probe(void) {
+  ssize_t sent;
+  do { sent = send(ALLOY_GUEST_CONTROL_FD, "P", 1, MSG_NOSIGNAL); }
+  while (sent < 0 && errno == EINTR);
+  if (sent != 1) return 125;
+  char byte;
+  ssize_t count;
+  do { count = recv(ALLOY_GUEST_CONTROL_FD, &byte, 1, MSG_TRUNC); }
+  while (count < 0 && errno == EINTR);
+  return count == 0 ? 0 : 125;
+}
 
 static int granted(int fd, int supervisor, int child) {
+  if (supervisor && (fd == ALLOY_GUEST_PARENT_FD || fd == ALLOY_GUEST_WAIT_STATUS_FD))
+    return 1;
   if (alloy_lock_preserves(fd))
     return 1;
   if (fd == ALLOY_GUEST_REGISTRATION_FD)
@@ -113,7 +128,13 @@ static int sanitize_environment(void) {
 
 int main(int argc, char** argv) {
   unsigned int inherited_nnp = (unsigned int)prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-  int supervisor = argc == 2 && strcmp(argv[1], "--alloy-supervisor") == 0;
+  int gated = argc == 3 && strcmp(argv[1], "--alloy-supervisor") == 0 &&
+              strcmp(argv[2], ALLOY_GUEST_WAIT_GATE_ARGUMENT) == 0;
+  int wait_owner = argc == 2 && strcmp(argv[1], ALLOY_GUEST_WAIT_OWNER_ARGUMENT) == 0;
+  int probe = argc == 2 && strcmp(argv[1], ALLOY_GUEST_TEARDOWN_PROBE_ARGUMENT) == 0;
+  if (argc >= 2 && strcmp(argv[1], "--alloy-supervisor") == 0 && !gated)
+    return 125;  // No ungated path around enclosure custody, including fixtures.
+  int supervisor = gated || wait_owner || probe;
   int child = 0;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--type=", 7) == 0)
@@ -142,6 +163,24 @@ int main(int argc, char** argv) {
   }
   if (null_fd > 2)
     close(null_fd);
+  if (wait_owner)
+    return alloy_guest_wait_owner(executable);
+  if (probe)
+    return teardown_probe();
+  if (gated) {
+    struct ucred parent = {0, 0, 0};
+    socklen_t size = sizeof(parent);
+    if (getppid() != 1 ||
+        getsockopt(ALLOY_GUEST_WAIT_STATUS_FD, SOL_SOCKET, SO_PEERCRED, &parent, &size) ||
+        size != sizeof(parent) || parent.pid != 1 || parent.uid != getuid())
+      return 125;
+    char grant;
+    ssize_t count;
+    do { count = recv(ALLOY_GUEST_WAIT_STATUS_FD, &grant, 1, MSG_TRUNC); }
+    while (count < 0 && errno == EINTR);
+    close(ALLOY_GUEST_WAIT_STATUS_FD);
+    if (count != 1 || grant != 'G') return count == 0 ? 0 : 125;
+  }
   if (supervisor)
     return alloy_guest_supervise(executable);
   if (!alloy_guest_is_runtime() || !alloy_guest_register_runtime(1))

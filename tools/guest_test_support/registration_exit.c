@@ -55,10 +55,10 @@ static void registration_case(int exit_before_admit) {
   if (exit_before_admit) {
     assert(members.count == 0);
   } else {
-    // A disconnected but still-live original must remain supervised.
-    assert(members.count == 1 && members.items[0].process == child);
-    struct pollfd live = {members.items[0].pidfd, POLLIN, 0};
-    assert(poll(&live, 1, 0) == 0);
+    // A disconnected pre-ACK peer cannot prove that a numeric lookup is still
+    // its original identity. It receives no admission; enclosure init owns the
+    // lifetime of any such unregistered entry, including one that is stopped.
+    assert(members.count == 0);
     assert(write(release[1], "X", 1) == 1);
     assert(waitpid(child, NULL, 0) == child);
     retire(&members);

@@ -4,6 +4,7 @@ import("//testing/test.gni")
 
 _implementation = [
   "bootstrap/main.c", "bootstrap/supervisor.c", "bootstrap/engine_main.cc",
+  "bootstrap/wait_owner.c",
   "session/session.cc", "session/session.h", "session/client.cc", "session/client.h",
   "session/supervisor.cc", "session/supervisor.h", "session/host.cc",
   "session/control_queue.h",
@@ -20,6 +21,7 @@ _implementation = [
   "linux_lock/protection.h", "linux_lock/ram_scratch.c",
   "linux_lock/writer_paths.c", "linux_lock/landlock.c",
   "linux_lock/child_launch.c", "linux_lock/child_launch.h",
+  "linux_lock/pinned_spawn.c", "linux_lock/pinned_spawn.h",
   "linux_lock/linux_uapi.h",
   "linux_lock/protection.cc", "linux_lock/sandbox_preflight.h",
   "media/provider.cc", "integration/provider.cc", "accessibility/provider.cc",
@@ -174,10 +176,11 @@ group("session") {
 action("alloy_guest_host") {
   testonly = true
   script = "bootstrap/build_bootstrap.py"
-  inputs = [ "bootstrap/main.c", "bootstrap/supervisor.c", "protocol/wire.h",
+  inputs = [ "bootstrap/main.c", "bootstrap/supervisor.c", "bootstrap/wait_owner.c", "protocol/wire.h",
              "linux_lock/protection.h", "linux_lock/ram_scratch.c",
              "linux_lock/writer_paths.c", "linux_lock/landlock.c",
-             "linux_lock/child_launch.c", "linux_lock/child_launch.h",
+              "linux_lock/child_launch.c", "linux_lock/child_launch.h",
+              "linux_lock/pinned_spawn.c", "linux_lock/pinned_spawn.h",
              "linux_lock/linux_uapi.h",
              "//base/process/alloy_guest_runtime.c", "//base/process/alloy_guest_runtime.h" ]
   outputs = [ "$root_out_dir/alloy_guest_host" ]

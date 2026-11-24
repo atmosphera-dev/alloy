@@ -41,6 +41,10 @@ class Fixture(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split('?', 1)[0]
+        if path == '/no-content':
+            self.send_response(204)
+            self.end_headers()
+            return
         if path == '/file-download.bin':
             # Chromium intentionally rejects HTTP/1.0 strong validators.
             self.protocol_version = 'HTTP/1.1'
@@ -1097,10 +1101,26 @@ def file_outcomes(out, evidence, base, server, results):
                         lambda client: file_download_selection_retry(client, base, server)))
 
 
+def document_after_abort(client, base):
+    client.page(base)
+    old_frame = client.wait('frame-consumed', lambda v: int(v['document']) > 0)
+    after = len(client.events)
+    queued = client.command(op='navigate', url=base + '/no-content')
+    assert queued['ok'] and int(queued['id']), queued
+    load = client.wait('load', lambda v: v['request'] == queued['id'], after)
+    assert load['status'] == -3 and int(load['document']) > int(old_frame['document']), load
+    client.wait('frame-consumed', lambda v: v['document'] == load['document'], after)
+    # Deliberately omit document: use the reference consumer's admitted owner.
+    action = client.action(op='focus', focused=True)
+    assert action['document'] == load['document'], (load, action)
+    return dict(load=load, action=action)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=('native-grants-unit', 'ui', 'file-handles', 'files', 'all'), required=True)
+    parser.add_argument('--check', choices=('native-grants-unit', 'ui', 'file-handles', 'files',
+                                           'document-after-abort', 'all'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     args = parser.parse_args(argv)
     out = args.out.resolve()
@@ -1123,6 +1143,13 @@ def main(argv=None):
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()
             base = f'http://127.0.0.1:{server.server_port}'
+            if args.check in ('document-after-abort', 'all'):
+                result['cases'].append(case(out, evidence, 'document-after-abort',
+                                            lambda client: document_after_abort(client, base)))
+                if args.check == 'document-after-abort':
+                    result.update(status='passed', seconds=time.monotonic() - started)
+                    print('GUEST_DOCUMENT_AFTER_ABORT_PASS', flush=True)
+                    return
             if args.check == 'file-handles':
                 result['cases'].append(case(out, evidence, 'file-handles', lambda client: file_handles(client, base)))
                 result['cases'].append(case(out, evidence, 'file-sink-failure', lambda client: file_sink_failure(client, base)))

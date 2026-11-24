@@ -79,6 +79,7 @@ class Reader final : public AlloyGuestDataHandler {
 class Stream final : public AlloyGuestStreamHandler {
  public:
   std::function<void(uint64_t)> configured;
+  std::function<void(uint64_t)> document_ready;
   void OnConfigured(uint64_t generation, int width, int height, double scale) override {
     configured(generation);
     auto event = CefDictionaryValue::Create(); event->SetString("generation", std::to_string(generation));
@@ -88,6 +89,7 @@ class Stream final : public AlloyGuestStreamHandler {
   void OnFrame(CefRefPtr<AlloyGuestFrame> frame) override {
     if (frame->GetSurface() || frame->GetGeneration() == seen_) return;
     seen_ = frame->GetGeneration();
+    document_ready(frame->GetDocumentId());
     uint8_t pixels[4] = {};
     const auto read = frame->ReadPixels(pixels, sizeof(pixels), 0);
     auto event = CefDictionaryValue::Create();
@@ -190,6 +192,9 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     observer->configured = [self](uint64_t generation) {
       std::lock_guard lock(self->mutex_); self->generation_ = generation;
     };
+    observer->document_ready = [self](uint64_t document) {
+      self->ObserveDocument(document);
+    };
     const bool started = stream && stream->Start(observer, 3, 16 * 1024 * 1024);
     const bool attached = attach_ && integration && integration->Start(this);
     if (started) stream->Configure(640, 480, 1, 30);
@@ -197,17 +202,14 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     Event("view-ready", event);
   }
   void OnTitleChanged(CefRefPtr<AlloyGuestView>, uint64_t document, const CefString& title) override {
-    { std::lock_guard lock(mutex_); document_ = document; }
+    ObserveDocument(document);
     auto event = CefDictionaryValue::Create(); event->SetString("document", std::to_string(document));
     event->SetString("title", title); Event("title", event);
   }
   void OnNavigationComplete(CefRefPtr<AlloyGuestView>, uint64_t request,
                             uint64_t document, int status) override {
-    // A cancellation can describe an older document or no document at all.
-    if (document && status != -3) {
-      std::lock_guard lock(mutex_);
-      if (document > document_) document_ = document;
-    }
+    // Outcomes describe requests. Only admitted titles and frames describe
+    // the document available for interaction, including after an aborted load.
     auto event = CefDictionaryValue::Create(); event->SetString("document", std::to_string(document));
     event->SetString("request", std::to_string(request));
     event->SetInt("status", status); Event("load", event);
@@ -514,6 +516,10 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     return cv_.wait_for(lock, std::chrono::seconds(20), [this] { return closed_; });
   }
  private:
+  void ObserveDocument(uint64_t document) {
+    std::lock_guard lock(mutex_);
+    if (document > document_) document_ = document;
+  }
   const bool attach_;
   std::mutex mutex_;
   std::condition_variable cv_;

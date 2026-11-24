@@ -50,12 +50,12 @@ class GuestProbeTests(unittest.TestCase):
     def test_crash_abort_drives_one_new_app_request_after_its_outcome(self):
         client = Mock()
         client.events = []
-        aborted = dict(name='guest', event='load', view=1, document=2,
+        aborted = dict(name='guest', event='load', view=1, request=7, document=2,
                        status=RENDERER_CRASH_ABORT, reason='renderer-crash')
-        loaded = dict(name='guest', event='load', view=1, document=3, status=200)
+        loaded = dict(name='guest', event='load', view=1, request=8, document=3, status=200)
         def wait(name, event, *args, **kwargs):
             if event == 'navigate-queued':
-                return dict(ok=True)
+                return dict(request=8 if client.events else 7)
             if event == 'load':
                 value = aborted if not client.events else loaded
                 client.events.append(value)
@@ -72,22 +72,22 @@ class GuestProbeTests(unittest.TestCase):
 
     def test_loaded_crash_race_does_not_request_another_navigation(self):
         client = Mock(events=[])
-        loaded = dict(name='guest', event='load', view=1, document=2, status=200)
-        client.wait.side_effect = [dict(ok=True), loaded, dict(title='RECOVERED')]
+        loaded = dict(name='guest', event='load', view=1, request=7, document=2, status=200)
+        client.wait.side_effect = [dict(request=7), loaded, dict(title='RECOVERED')]
         observation = navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')
         self.assertEqual([loaded], observation['outcomes'])
         client.send.assert_called_once()
 
     def test_generic_cancellation_is_not_misreported_as_a_renderer_crash(self):
         client = Mock(events=[])
-        client.wait.side_effect = [dict(ok=True), dict(view=1, document=2, status=-3)]
+        client.wait.side_effect = [dict(request=7), dict(view=1, request=7, document=2, status=-3)]
         with self.assertRaises(AssertionError):
             navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')
         client.send.assert_called_once()
 
     def test_immediate_crash_regression_does_not_accept_silence_after_queue_ack(self):
         client = Mock(events=[])
-        client.wait.side_effect = [dict(ok=True),
+        client.wait.side_effect = [dict(request=7),
                                    AssertionError('No navigation outcome')]
         with self.assertRaisesRegex(AssertionError, 'No navigation outcome'):
             navigate_after_crash(client, 1, 'http://127.0.0.1/title/RECOVERED', 'RECOVERED')

@@ -183,8 +183,16 @@ class Consumer final : public AlloyGuestSessionHandler,
   void OnTitleChanged(CefRefPtr<AlloyGuestView> view, uint64_t document, const CefString& title) override {
     Event("title", ",\"view\":" + std::to_string(view->GetId()) + ",\"document\":" + std::to_string(document) + ",\"title\":" + Quote(title.ToString()));
   }
-  void OnNavigationComplete(CefRefPtr<AlloyGuestView> view, uint64_t document, int status) override {
-    Event("load", ",\"view\":" + std::to_string(view->GetId()) + ",\"document\":" + std::to_string(document) + ",\"status\":" + std::to_string(status));
+  void OnNavigationComplete(CefRefPtr<AlloyGuestView> view, uint64_t request,
+                            uint64_t document, int status) override {
+    Event("load", ",\"view\":" + std::to_string(view->GetId()) +
+          ",\"request\":" + std::to_string(request) +
+          ",\"document\":" + std::to_string(document) + ",\"status\":" + std::to_string(status));
+  }
+  void QueueNavigation(CefRefPtr<AlloyGuestView> view, const std::string& url) {
+    const auto request = view ? view->Navigate(url) : 0;
+    Event("navigate-queued", ",\"ok\":" + std::string(request ? "true" : "false") +
+          ",\"request\":" + std::to_string(request));
   }
   void OnClosed(CefRefPtr<AlloyGuestView> view, const CefString& reason) override {
     Event("view-closed", ",\"view\":" + std::to_string(view->GetId()) + ",\"reason\":" + Quote(reason.ToString()));
@@ -347,10 +355,10 @@ class Consumer final : public AlloyGuestSessionHandler,
     } else if (operation == "navigate-view") {
       uint64_t target = 0; std::string url; input >> target >> url;
       { std::lock_guard guard(mutex_); if (auto found = views_.find(target); found != views_.end()) view = found->second; else view = nullptr; }
-      Event("navigate-queued", ",\"ok\":" + std::string(view && view->Navigate(url) ? "true" : "false"));
+      QueueNavigation(view, url);
     } else if (operation == "navigate") {
       std::string url; input >> url;
-      Event("navigate-queued", ",\"ok\":" + std::string(view && view->Navigate(url) ? "true" : "false"));
+      QueueNavigation(view, url);
     } else if (operation == "configure") {
       int width = 0, height = 0; double scale = 0; input >> width >> height >> scale;
       Event("configure-queued", ",\"ok\":" + std::string(stream && stream->Configure(width, height, scale, 30) ? "true" : "false"));

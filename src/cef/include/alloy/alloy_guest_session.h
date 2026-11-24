@@ -90,15 +90,18 @@ class AlloyGuestViewHandler : public virtual CefBaseRefCounted {
   virtual void OnTitleChanged(CefRefPtr<AlloyGuestView> view,
                               uint64_t document, const CefString& title) = 0;
   ///
-  /// Main-document load completed once with |status|: HTTP/native negative error,
-  /// or ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED for a renderer-crash abort,
-  /// distinct from app/user cancellation (ERR_ABORTED). There is no automatic
-  /// retry; the next app-requested navigation can recover in a new renderer.
+  /// Each accepted Navigate request completes exactly once with its |request|
+  /// ID and |status|: HTTP status, zero when unavailable, a negative native
+  /// error, or ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED. Cancellation (including
+  /// supersession) reports ERR_ABORTED. |document| is zero if no native
+  /// document was assigned. For a native-initiated load |request| is zero.
+  /// There is no automatic retry; a new request can recover in a new renderer.
   /// This event observes page loading, not display/media transport availability.
   ///
   /*--cef()--*/
   virtual void OnNavigationComplete(CefRefPtr<AlloyGuestView> view,
-                                    uint64_t document, int status) = 0;
+                                    uint64_t request, uint64_t document,
+                                    int status) = 0;
   ///
   /// View requests/owners retired. No further callback is delivered for it.
   /// |reason| distinguishes "closed", "cancelled" and "failed".
@@ -110,8 +113,8 @@ class AlloyGuestViewHandler : public virtual CefBaseRefCounted {
 
 ///
 /// EXPERIMENTAL: View identity and lifecycle, not a remote CefBrowser facade.
-/// Methods enqueue work without waiting for the other process. False means
-/// unqueued. Release does not close a retained session; call Close explicitly.
+/// Methods enqueue work without waiting for the other process. Release does
+/// not close a retained session; call Close explicitly.
 ///
 /*--cef(source=library,added=experimental)--*/
 class AlloyGuestView : public virtual CefBaseRefCounted {
@@ -142,12 +145,13 @@ class AlloyGuestView : public virtual CefBaseRefCounted {
   virtual CefRefPtr<AlloyGuestAccessibility> GetAccessibility() = 0;
   ///
   /// Queue a URL while ACTIVE, using CEF's normal scheme validation and native
-  /// admission. Invalid URLs return false before queuing and do not change the
-  /// current document or produce a load completion. Navigation retires the old
-  /// document's pending owners before admitting its replacement.
+  /// admission. Return a nonzero, monotonically increasing ID local to this
+  /// view, or zero if rejected (e.g. invalid URL or no longer ACTIVE). Rejected
+  /// calls do not change the document or produce a completion. Navigation retires
+  /// the old document's pending owners before admitting its replacement.
   ///
   /*--cef()--*/
-  virtual bool Navigate(const CefString& url) = 0;
+  virtual uint64_t Navigate(const CefString& url) = 0;
   ///
   /// Stop admission immediately and retire the view asynchronously. Idempotent.
   ///

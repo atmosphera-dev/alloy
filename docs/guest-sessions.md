@@ -53,13 +53,18 @@ whose `Navigate` method uses CEF's URL/scheme admission. This is not a remote `C
 facade. Multiple views use one context; different sessions use different
 contexts and browser crash groups.
 
-Invalid URLs return false from Navigate before admission; they do not change
-the live document or emit a load-completion callback for it. Native URL
-normalization is shared with CEF, including bare-hostname scheme insertion.
+`Navigate` returns a nonzero, increasing request ID local to that view, or zero
+if rejected. Invalid URLs are rejected before admission; they do not change the
+live document or emit a completion. Native URL normalization is shared with CEF,
+including bare-hostname scheme insertion.
 
-A queued navigation belongs to its view and original document, not the stream
-generation. Renderer/GPU recovery cannot silently discard it. One single-use
-completion owner arbitrates native load/error, renderer crash and replacement.
+A queued navigation belongs to its view, not a URL or stream generation. Each
+accepted request gets exactly one `OnNavigationComplete(view, request, document,
+status)`, including failure, cancellation by a newer request, or retirement on
+close. A request cancelled before native start reports `ERR_ABORTED` (-3) and
+document 0; it is not attributed to the current document. Native-initiated
+loads retain their document reports with request 0. Title and frame events
+remain keyed by document.
 A navigation racing an external kill either loads or completes with
 `ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED` (-10000), distinguishable from native
 app/user cancellation (`ERR_ABORTED`, -3). The constant is declared in
@@ -79,7 +84,7 @@ document, title and stream become live without a second completion callback.
 |---|---|---|
 | 1 | Lifecycle | STARTING, PREPARED, ACTIVE, CLOSING, CLOSED; failures are explicit |
 | 2 | Callbacks | One dedicated serialized client sequence per session, independent of app-side CEF UI |
-| 3 | Queued methods | True means queued, not completed; callbacks observe actual creation, page title/load or terminal retirement |
+| 3 | Queued methods | True (or a nonzero navigation request ID) means queued, not completed; callbacks observe actual results |
 | 4 | Reentrancy | Callbacks may close/release owners; closing synchronously stops new client admission |
 | 5 | Identity | Session, view, native document, request and stream generation remain distinct; IDs are not authority |
 | 6 | Close | Graceful: cancel view owners, run native browser close (page handlers may delay), then wait for supervisor teardown/reaping |

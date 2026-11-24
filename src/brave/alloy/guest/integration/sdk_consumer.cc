@@ -201,9 +201,15 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     auto event = CefDictionaryValue::Create(); event->SetString("document", std::to_string(document));
     event->SetString("title", title); Event("title", event);
   }
-  void OnNavigationComplete(CefRefPtr<AlloyGuestView>, uint64_t document, int status) override {
-    { std::lock_guard lock(mutex_); document_ = document; }
+  void OnNavigationComplete(CefRefPtr<AlloyGuestView>, uint64_t request,
+                            uint64_t document, int status) override {
+    // A cancellation can describe an older document or no document at all.
+    if (document && status != -3) {
+      std::lock_guard lock(mutex_);
+      if (document > document_) document_ = document;
+    }
     auto event = CefDictionaryValue::Create(); event->SetString("document", std::to_string(document));
+    event->SetString("request", std::to_string(request));
     event->SetInt("status", status); Event("load", event);
   }
   void OnClosed(CefRefPtr<AlloyGuestView>, const CefString& reason) override {
@@ -372,7 +378,7 @@ class Consumer final : public AlloyGuestSessionHandler, public AlloyGuestViewHan
     const auto source = Text(data, "source").empty() ? "app" : Text(data, "source");
     const auto capture = U(data, "capture_us", 12345);
     uint64_t id = 0; bool queued = false;
-    if (op == "navigate") queued = view && view->Navigate(Text(data, "url"));
+    if (op == "navigate") id = view ? view->Navigate(Text(data, "url")) : 0;
     else if (op == "close") { if (session) session->Close(); queued = true; }
     else if (op == "terminate") { if (session) session->Terminate(); queued = true; }
     else if (op == "stop-provider") { if (integration) integration->Stop(); queued = true; }

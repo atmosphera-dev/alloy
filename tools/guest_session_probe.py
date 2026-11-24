@@ -226,7 +226,7 @@ def foundation(out, evidence, fixtures):
         after = len(client.events)
         client.send(f'navigate guest {page["view"]} http://[')
         rejected = client.wait('guest', 'navigate-queued', after=after)
-        assert rejected['ok'] is False, rejected
+        assert rejected['request'] == 0 and rejected['ok'] is False, rejected
         client.send(f'navigate guest {page["view"]} {fixtures.base}/title/VALID_AFTER_INVALID')
         resumed = client.wait('guest', 'title', lambda v: v['title'] == 'VALID_AFTER_INVALID', after=after)
         assert resumed['view'] == page['view'] and resumed['document'] > page['document']
@@ -237,7 +237,7 @@ def foundation(out, evidence, fixtures):
         blank = client.wait('guest', 'view-ready', after=after)
         after = len(client.events)
         client.send(f'navigate guest {blank["view"]} http://[')
-        assert client.wait('guest', 'navigate-queued', after=after)['ok'] is False
+        assert client.wait('guest', 'navigate-queued', after=after)['request'] == 0
         client.send(f'navigate guest {blank["view"]} {fixtures.base}/title/VALID_BLANK_OWNER')
         client.wait('guest', 'title', lambda v: v['view'] == blank['view'] and v['title'] == 'VALID_BLANK_OWNER',
                     after=after)
@@ -505,10 +505,36 @@ def blocking(out, evidence, fixtures, data):
     return rows
 
 
+def navigation_pair(out, evidence, fixtures, identical):
+    first_title = 'REQUEST_B' if identical else 'REQUEST_A'
+    second = f'{fixtures.base}/title/REQUEST_B'
+    with Client(out, evidence / 'client') as client:
+        client.start()
+        client.active()
+        client.send(f'create guest {fixtures.base}/title/{first_title} {second}')
+        view = client.wait('guest', 'view-ready')['view']
+        client.wait('guest', 'load', lambda v: v['status'] == 200)
+        close_and_observe(client, out)
+        client.finish()
+        queued = [v for v in client.events if v['event'] == 'navigate-queued']
+        outcomes = [v for v in client.events if v['event'] == 'load' and v['view'] == view]
+        assert len(queued) == 2 and all(v['ok'] for v in queued), queued
+        requests = [v.get('request', 0) for v in queued]
+        assert 0 < requests[0] < requests[1], ('distinct returned navigation IDs', queued, outcomes)
+        assert [(v.get('request'), v['status']) for v in outcomes] == [
+            (requests[0], -3), (requests[1], 200)], ('one outcome per ID', queued, outcomes)
+        assert outcomes[0]['document'] == 0 and outcomes[1]['document'] > 0, outcomes
+        assert any(v['event'] == 'title' and v['view'] == view and
+                   v['document'] == outcomes[1]['document'] and v['title'] == 'REQUEST_B'
+                   for v in client.events), client.events
+        return [dict(queued=queued, outcomes=outcomes)]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--check', choices=('foundation', 'smoke', 'blocking', 'recovery'), required=True)
+    parser.add_argument('--check', choices=('foundation', 'smoke', 'blocking', 'recovery',
+                                           'navigation-pair', 'navigation-identical'), required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     parser.add_argument('--alloy-data-dir', type=Path)
     args = parser.parse_args(argv)
@@ -532,13 +558,17 @@ def main(argv=None):
                 rows = smoke(out, evidence, fixtures)
             elif args.check == 'recovery':
                 rows = recovery(out, evidence, fixtures)
+            elif args.check in ('navigation-pair', 'navigation-identical'):
+                rows = navigation_pair(out, evidence, fixtures, args.check == 'navigation-identical')
             else:
                 rows = blocking(out, evidence, fixtures, args.alloy_data_dir.resolve())
             (evidence / 'fixture-requests.json').write_text(json.dumps(fixtures.requests, indent=2) + '\n')
         result.update(status='passed', cases=rows, seconds=time.monotonic() - started)
         (evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         marker = {'foundation': 'GUEST_FOUNDATION_PASS', 'smoke': 'GUEST_SMOKE_PASS',
-                  'blocking': 'GUEST_BLOCKING_PASS', 'recovery': 'GUEST_RECOVERY_PASS'}[args.check]
+                  'blocking': 'GUEST_BLOCKING_PASS', 'recovery': 'GUEST_RECOVERY_PASS',
+                  'navigation-pair': 'GUEST_NAVIGATION_PAIR_PASS',
+                  'navigation-identical': 'GUEST_NAVIGATION_IDENTICAL_PASS'}[args.check]
         print(marker, flush=True)
         return 0
     except BaseException as error:

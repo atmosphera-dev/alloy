@@ -136,8 +136,10 @@ def navigate_after_crash(client, view, url, title):
     """The app reacts to one crash outcome with one new navigation, never a timer."""
     after = len(client.events)
     client.send(f'navigate guest {view} {url}')
-    assert client.wait('guest', 'navigate-queued', after=after)['ok']
+    request = client.wait('guest', 'navigate-queued', after=after)['request']
+    assert request > 0
     first = client.wait('guest', 'load', lambda value: value['view'] == view, after=after)
+    assert first['request'] == request, first
     assert first['status'] in (200, RENDERER_CRASH_ABORT), first
     outcomes = [first]
     loaded = first
@@ -146,10 +148,12 @@ def navigate_after_crash(client, view, url, title):
         # This is a new explicit app request made only in response to the abort.
         following = len(client.events)
         client.send(f'navigate guest {view} {url}')
-        assert client.wait('guest', 'navigate-queued', after=following)['ok']
+        retry = client.wait('guest', 'navigate-queued', after=following)['request']
+        assert retry > request
         loaded = client.wait('guest', 'load', lambda value: value['view'] == view,
                              after=following)
-        assert loaded['status'] == 200 and loaded['document'] > first['document'], loaded
+        assert loaded['request'] == retry and loaded['status'] == 200 and \
+            loaded['document'] > first['document'], loaded
         outcomes.append(loaded)
     client.wait('guest', 'title', lambda value: value['view'] == view and
                 value['document'] == loaded['document'] and value['title'] == title, after=after)

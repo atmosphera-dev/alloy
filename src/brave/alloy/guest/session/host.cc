@@ -42,6 +42,8 @@
 #include "cef/libcef/common/net/url_util.h"
 #include "content/public/browser/alloy_document_identity.h"
 #include "content/public/browser/navigation_handle.h"
+#include "content/public/browser/navigation_handle_user_data.h"
+#include "content/public/browser/page_navigator.h"
 #include "content/public/browser/gpu_data_manager.h"
 #include "content/public/browser/gpu_data_manager_observer.h"
 #include "content/public/browser/render_frame_host.h"
@@ -270,16 +272,34 @@ class NativeView final : public CefClient,
     }
     return true;
   }
-  void Navigate(uint64_t request, const std::string& url) {
-    if (closing_ || !browser_)
-      return;
-    if (pending_request_) {
-      Owner original = owner_;
-      original.request = pending_request_;
+  void Navigate(uint64_t request, const GURL& url) {
+    const Owner original{owner_.view, 0, request, owner_.generation};
+    if (closing_ || !browser_) {
       emit_({Message::kCancel, {}, 0, original, {}});
+      return;
     }
-    pending_request_ = request;
-    browser_->GetMainFrame()->LoadURL(url);
+    if (auto earlier = unstarted_.lock()) earlier->Finish(net::ERR_ABORTED);
+    auto attempt = std::make_shared<NavigationAttempt>(request, base::BindOnce(
+        &NativeView::EmitUnstarted, weak_.GetWeakPtr(), original));
+    unstarted_ = attempt;
+
+    // Use the existing CEF main-frame handoff. The token follows this native
+    // request, even if CEF or beforeunload defers it; it never follows a URL.
+    content::OpenURLParams params(
+        url, content::Referrer(), ::WindowOpenDisposition::CURRENT_TAB,
+        static_cast<ui::PageTransition>(ui::PAGE_TRANSITION_TYPED |
+                                        ui::PAGE_TRANSITION_FROM_ADDRESS_BAR),
+        /*is_renderer_initiated=*/false);
+    params.user_gesture = false;
+    CefBrowserHostBase::FromBrowser(browser_)->LoadMainFrameURL(
+        params,
+        base::BindRepeating([](const std::shared_ptr<NavigationAttempt>& attempt,
+                               content::NavigationHandle& handle) {
+          NavigationTag::CreateForNavigationHandle(handle, attempt);
+        }, attempt),
+        base::BindRepeating([](const std::shared_ptr<NavigationAttempt>& attempt, int status) {
+          attempt->Finish(status);
+        }, attempt));
   }
   void Close(bool force = false) {
     if (closing_)
@@ -326,13 +346,18 @@ class NativeView final : public CefClient,
     CompleteNavigation(ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED);
   }
   void DidStartNavigation(content::NavigationHandle* navigation) override {
-    if (closing_ || !navigation->IsInPrimaryMainFrame() || navigation->IsSameDocument())
+    if (closing_ || !navigation->IsInPrimaryMainFrame())
       return;
+    auto* tag = NavigationTag::GetForNavigationHandle(*navigation);
+    if (navigation->IsSameDocument()) {
+      if (tag) tag->document = owner_.document;
+      return;
+    }
     // The initial blank page has no app navigation owner and cannot supply
     // success for a later requested page.
-    if (navigation->GetURL().IsAboutBlank() && !pending_request_ && !owner_.document)
+    if (navigation->GetURL().IsAboutBlank() && !tag && !owner_.document)
       return;
-    auto owner = begin_document_(std::exchange(pending_request_, 0));
+    auto owner = begin_document_(tag ? tag->attempt->request : 0);
     if (!owner) {
       Close();
       return;
@@ -343,6 +368,9 @@ class NativeView final : public CefClient,
     // replacement's document event. Do not silently drop old callback owners.
     if (auto original = outcome_.Begin(owner_))
       emit_({Message::kCancel, {}, 0, *original, {}});
+    // If supersession already reported a cancellation, native adoption still
+    // follows its own document rules, but has no second outcome to publish.
+    if (tag && !tag->attempt->ClaimStarted()) outcome_.Retire();
     pending_.clear();
      pending_.emplace(navigation->GetNavigationId(), owner_);
      integration_.SetOwner(owner_);
@@ -352,6 +380,16 @@ class NativeView final : public CefClient,
     if (accessibility_) accessibility_->SetOwner(owner_);
   }
   void DidFinishNavigation(content::NavigationHandle* navigation) override {
+    if (!closing_ && navigation->IsInPrimaryMainFrame() && navigation->IsSameDocument()) {
+      if (auto* tag = NavigationTag::GetForNavigationHandle(*navigation);
+          tag && tag->attempt->ClaimStarted()) {
+        const Owner original{owner_.view, tag->document, tag->attempt->request,
+                             owner_.generation};
+        emit_({Message::kNavigationComplete, {}, 0, original,
+               std::to_string(navigation->GetNetErrorCode())});
+      }
+      return;
+    }
     auto found = pending_.find(navigation->GetNavigationId());
     if (closing_ || found == pending_.end())
       return;
@@ -394,6 +432,38 @@ class NativeView final : public CefClient,
     }
   }
  private:
+  // Dropping a deferred CEF closure or a handle before DidStartNavigation is
+  // an outcome too. A started handle transfers that duty to NavigationOutcome.
+  struct NavigationAttempt {
+    NavigationAttempt(uint64_t request, base::OnceCallback<void(int)> completion)
+        : request(request), completion(std::move(completion)) {}
+    ~NavigationAttempt() { Finish(net::ERR_ABORTED); }
+    void Finish(int status) {
+      if (completion) std::move(completion).Run(status);
+    }
+    bool ClaimStarted() {
+      if (!completion) return false;
+      completion.Reset();
+      return true;
+    }
+    const uint64_t request;
+    base::OnceCallback<void(int)> completion;
+  };
+  class NavigationTag : public content::NavigationHandleUserData<NavigationTag> {
+   public:
+    std::shared_ptr<NavigationAttempt> attempt;
+    uint64_t document = 0;
+   private:
+    friend NavigationHandleUserData;
+    NavigationTag(content::NavigationHandle&, std::shared_ptr<NavigationAttempt> attempt)
+        : attempt(std::move(attempt)) {}
+    NAVIGATION_HANDLE_USER_DATA_KEY_DECL();
+  };
+  void EmitUnstarted(Owner original, int status) {
+    if (!closing_) {
+      emit_({Message::kNavigationComplete, {}, 0, original, std::to_string(status)});
+    }
+  }
   void CompleteNavigation(int status) {
     if (closing_) return;
     if (auto original = outcome_.Finish(owner_)) {
@@ -424,7 +494,7 @@ class NativeView final : public CefClient,
   base::Token current_token_;
   std::map<int64_t, Owner> pending_;
   NavigationOutcome outcome_;
-  uint64_t pending_request_ = 0;
+  std::weak_ptr<NavigationAttempt> unstarted_;
   int status_ = 0;
   bool closing_ = false;
   bool closed_ = false;
@@ -443,6 +513,7 @@ class NativeView final : public CefClient,
    base::WeakPtrFactory<NativeView> weak_{this};
   IMPLEMENT_REFCOUNTING(NativeView);
 };
+NAVIGATION_HANDLE_USER_DATA_KEY_IMPL(NativeView::NavigationTag);
 
 class ContextReady final : public CefRequestContextHandler {
  public:
@@ -823,13 +894,14 @@ int RunBrowser(const CefMainArgs& args) {
     } else if (request.message == Message::kNavigate) {
       auto found = views.find(request.owner.view);
       std::vector<std::string> url;
-      if (found == views.end() || !session.CanNavigate(request.owner)) {
-        emit({Message::kCancel, {}, 0, request.owner, {}});
-        continue;
-      }
-      if (!request.owner.request || !UnpackFields(request.payload, 1, &url)) {
+      if (!IsAppNavigation(request.owner.request) || !UnpackFields(request.payload, 1, &url)) {
         failed = true;
         close();
+        continue;
+      }
+      if (found == views.end() || !session.CanNavigate(request.owner)) {
+        request.owner.document = 0;
+        emit({Message::kCancel, {}, 0, request.owner, {}});
         continue;
       }
       GURL normalized = url_util::MakeGURL(url[0], /*fixup=*/false);
@@ -840,7 +912,7 @@ int RunBrowser(const CefMainArgs& args) {
         close();
         continue;
       }
-      found->second->Navigate(request.owner.request, normalized.spec());
+      found->second->Navigate(request.owner.request, normalized);
     } else if (request.message == Message::kExtensionCall) {
       ExtensionRequest extension;
       if (!UnpackExtension(request.payload, &extension) ||

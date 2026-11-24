@@ -150,18 +150,19 @@ class Guest final : public AlloyGuestSessionHandler,
     Event(name_, "closed", ",\"reason\":" + Quote(reason.ToString()));
   }
   void OnReady(CefRefPtr<AlloyGuestView> view) override {
-    std::string url;
+    std::pair<std::string, std::string> urls;
     {
       std::lock_guard guard(mutex_);
       views_[view->GetId()] = view;
       if (!pending_.empty()) {
-        url = std::move(pending_.front());
+        urls = std::move(pending_.front());
         pending_.pop_front();
       }
     }
     Event(name_, "view-ready", ",\"view\":" + std::to_string(view->GetId()));
-    if (!url.empty())
-      Event(name_, "navigate-queued", ",\"ok\":" + std::string(view->Navigate(url) ? "true" : "false"));
+    if (!urls.first.empty()) QueueNavigation(view, urls.first);
+    // On the client callback sequence neither request is sent until we return.
+    if (!urls.second.empty()) QueueNavigation(view, urls.second);
   }
   void OnTitleChanged(CefRefPtr<AlloyGuestView> view, uint64_t document,
                         const CefString& title) override {
@@ -176,8 +177,9 @@ class Guest final : public AlloyGuestSessionHandler,
     }
   }
   void OnNavigationComplete(CefRefPtr<AlloyGuestView> view,
-                              uint64_t document, int status) override {
+                              uint64_t request, uint64_t document, int status) override {
     Event(name_, "load", ",\"view\":" + std::to_string(view->GetId()) +
+          ",\"request\":" + std::to_string(request) +
           ",\"document\":" + std::to_string(document) +
           ",\"status\":" + std::to_string(status) +
           ",\"reason\":" + Quote(status == ALLOY_GUEST_NAVIGATION_RENDERER_CRASHED
@@ -198,12 +200,12 @@ class Guest final : public AlloyGuestSessionHandler,
     { std::lock_guard guard(mutex_); session = session_; }
     Event(name_, "accept-queued", ",\"ok\":" + std::string(session && session->Accept() ? "true" : "false"));
   }
-  void Create(const std::string& url) {
+  void Create(const std::string& url, const std::string& next_url) {
     CefRefPtr<AlloyGuestSession> session;
     {
       std::lock_guard guard(mutex_);
       session = session_;
-      pending_.push_back(url);
+      pending_.emplace_back(url, next_url);
     }
     bool queued = session && session->CreateView(640, 480, this);
     if (!queued) {
@@ -219,7 +221,7 @@ class Guest final : public AlloyGuestSessionHandler,
       auto found = views_.find(id);
       if (found != views_.end()) view = found->second;
     }
-    Event(name_, "navigate-queued", ",\"ok\":" + std::string(view && view->Navigate(url) ? "true" : "false"));
+    QueueNavigation(view, url);
   }
   void Close() {
     CefRefPtr<AlloyGuestSession> session;
@@ -244,6 +246,12 @@ class Guest final : public AlloyGuestSessionHandler,
   }
   bool closed() const { return closed_; }
  private:
+  void QueueNavigation(CefRefPtr<AlloyGuestView> view, const std::string& url) {
+    const auto request = view ? view->Navigate(url) : 0;
+    Event(name_, "navigate-queued", ",\"ok\":" + std::string(request ? "true" : "false") +
+          ",\"request\":" + std::to_string(request) +
+          ",\"view\":" + std::to_string(view ? view->GetId() : 0));
+  }
   const std::string name_;
   const std::string policy_;
   std::mutex mutex_;
@@ -252,7 +260,7 @@ class Guest final : public AlloyGuestSessionHandler,
   bool resumed_ = false;
   CefRefPtr<AlloyGuestSession> session_;
   CefRefPtr<AlloyGuestSession> completed_session_;
-  std::deque<std::string> pending_;
+  std::deque<std::pair<std::string, std::string>> pending_;
   std::map<uint64_t, CefRefPtr<AlloyGuestView>> views_;
   std::atomic<bool> closed_{false};
   IMPLEMENT_REFCOUNTING(Guest);
@@ -480,9 +488,9 @@ int main(int argc, char** argv) {
         else if (operation == "terminate") found->second->Terminate();
         else if (operation == "resume") found->second->Resume();
         else if (operation == "create") {
-          std::string url;
-          command >> url;
-          found->second->Create(url == "-" ? "" : url);
+          std::string url, next_url;
+          command >> url >> next_url;
+          found->second->Create(url == "-" ? "" : url, next_url);
         } else if (operation == "navigate") {
           uint64_t view;
           std::string url;

@@ -32,6 +32,7 @@
 #include "cef/include/cef_version.h"
 #include "cef/libcef/common/api_version_util.h"
 #include "cef/libcef/common/net/url_util.h"
+#include "net/base/net_errors.h"
 #include "url/gurl.h"
 
 namespace alloy::guest {
@@ -121,6 +122,7 @@ class ViewImpl;
 struct Command {
   Message kind = Message::kClose;
   uint64_t view = 0;
+  uint64_t request = 0;
   int width = 0;
   int height = 0;
   std::string payload;
@@ -140,11 +142,44 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     if (closing || state != required_state)
       return false;
     commands.push_back(std::move(command));
-    uint64_t one = 1;
-    // Nonblocking eventfd; EAGAIN means a wake is already pending.
-    ssize_t result;
-    do { result = write(wake, &one, sizeof(one)); } while (result < 0 && errno == EINTR);
+    WakeCallback()();
     return true;
+  }
+  uint64_t EnqueueNavigation(Command command, const std::atomic<bool>& retired) {
+    std::lock_guard guard(mutex);
+    if (closing || retired || state != "ACTIVE") return 0;
+    auto& requests = navigations[command.view];
+    if (!IsAppNavigation(requests.next)) return 0;
+    const auto request = requests.next++;
+    requests.pending.emplace(request, 0);
+    command.request = request;
+    commands.push_back(std::move(command));
+    WakeCallback()();
+    return request;
+  }
+  void ObserveNavigation(const Owner& owner) {
+    std::lock_guard guard(mutex);
+    auto view = navigations.find(owner.view);
+    if (view == navigations.end()) return;
+    auto request = view->second.pending.find(owner.request);
+    if (request != view->second.pending.end()) request->second = owner.document;
+  }
+  bool TakeNavigation(const Owner& owner, bool same_document) {
+    std::lock_guard guard(mutex);
+    auto view = navigations.find(owner.view);
+    if (view == navigations.end()) return false;
+    auto request = view->second.pending.find(owner.request);
+    if (request == view->second.pending.end() ||
+        (request->second != owner.document && !(same_document && !request->second)))
+      return false;
+    view->second.pending.erase(request);
+    return true;
+  }
+  std::map<uint64_t, uint64_t> RetireNavigations(uint64_t view) {
+    std::lock_guard guard(mutex);
+    auto found = navigations.extract(view);
+    if (found.empty()) return {};
+    return std::move(found.mapped().pending);
   }
   void Close() {
     std::lock_guard guard(mutex);
@@ -241,6 +276,10 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
     result.swap(commands);
     return result;
   }
+  struct NavigationRequests {
+    uint64_t next = 1;
+    std::map<uint64_t, uint64_t> pending;  // request -> document (0 before start)
+  };
   ExtensionEndpoint Endpoint(uint64_t view) {
     std::weak_ptr<ClientCore> weak = shared_from_this();
     return {
@@ -404,6 +443,7 @@ struct ClientCore : public std::enable_shared_from_this<ClientCore> {
   Admission admission = Admission::kStarting;
   bool custody_error = false;
   std::deque<Command> commands;
+  std::map<uint64_t, NavigationRequests> navigations;
   std::map<uint64_t, Owner> extension_owners;
   std::map<std::pair<uint64_t, Feature>, std::shared_ptr<ExtensionSink>> sinks;
   std::vector<std::shared_ptr<ExtensionSink>> retired_sinks;
@@ -442,20 +482,20 @@ class ViewImpl final : public AlloyGuestView {
     }
     return integration_;
   }
-  bool Navigate(const CefString& url) override {
+  uint64_t Navigate(const CefString& url) override {
     auto client = client_.lock();
     std::string value = url.ToString();
     if (!client || closed_ || value.empty() || value.find('\0') != std::string::npos)
-      return false;
+      return 0;
     GURL normalized = url_util::MakeGURL(url, /*fixup=*/false);
     std::string packed;
     if (!normalized.is_valid() || !PackFields({normalized.spec()}, &packed))
-      return false;
+      return 0;
     Command command;
     command.kind = Message::kNavigate;
     command.view = id_;
     command.payload = std::move(packed);
-    return client->Enqueue(std::move(command), "ACTIVE");
+    return client->EnqueueNavigation(std::move(command), closed_);
   }
   CefRefPtr<AlloyGuestAccessibility> GetAccessibility() override {
     std::lock_guard guard(stream_mutex_);
@@ -548,11 +588,21 @@ class SessionImpl final : public AlloyGuestSession {
       return;
     ViewEntry entry = std::move(found->second);
     entry.view->Retire();
+    auto pending = core_->RetireNavigations(id);
     core_->RetireExtensions(id);
     views_.erase(found);
     if (entry.offer_parent)
       if (auto sink = core_->Sink(entry.offer_parent->first, entry.offer_parent->second)) sink->ViewRetired(id);
-    if (entry.handler) entry.handler->OnClosed(entry.view, reason);
+    if (entry.handler) {
+      for (const auto& [request, document] : pending)
+        entry.handler->OnNavigationComplete(entry.view, request, document, net::ERR_ABORTED);
+      entry.handler->OnClosed(entry.view, reason);
+    }
+  }
+  void CompleteNavigation(const ViewEntry& entry, const Owner& owner, int status,
+                          bool same_document = false) {
+    if (core_->TakeNavigation(owner, same_document) && entry.handler)
+      entry.handler->OnNavigationComplete(entry.view, owner.request, owner.document, status);
   }
   bool Dispatch(Envelope envelope, Session* session, std::string* reason) {
     if (envelope.message == Message::kExtensionViewOffer) {
@@ -638,20 +688,40 @@ class SessionImpl final : public AlloyGuestSession {
       CancelView(view->GetId(), envelope.payload == "failed" ? "failed" : "closed");
       return true;
     }
-    if (view->closed())
-      return true;
     if (envelope.message == Message::kDocumentStarted ||
         envelope.message == Message::kGenerationChanged) {
+      if (view->closed()) return true;
       bool observed = envelope.message == Message::kDocumentStarted
           ? session->Observe(envelope.owner) : session->ObserveGeneration(envelope.owner);
-      if (observed) core_->ExtensionOwner(envelope.owner);
+      if (observed) {
+        if (envelope.message == Message::kDocumentStarted)
+          core_->ObserveNavigation(envelope.owner);
+        core_->ExtensionOwner(envelope.owner);
+      }
       return observed;
     }
-    if (envelope.message == Message::kCancel) {
-      if (handler) handler->OnNavigationComplete(view, envelope.owner.document, -3);
+    if (envelope.message == Message::kCancel || envelope.message == Message::kNavigationComplete) {
+      int status = net::ERR_ABORTED;
+      if (envelope.message == Message::kNavigationComplete) {
+        const auto& payload = envelope.payload;
+        auto parsed = std::from_chars(payload.data(), payload.data() + payload.size(), status);
+        if (parsed.ec != std::errc() || parsed.ptr != payload.data() + payload.size())
+          return false;
+      }
+      if (IsAppNavigation(envelope.owner.request)) {
+        if (view->closed()) return true;
+        const auto current = session->Find(envelope.owner.view);
+        const bool live_document = current && current->document == envelope.owner.document &&
+                                   current->generation == envelope.owner.generation;
+        if (!envelope.owner.document || status == net::ERR_ABORTED || live_document)
+          CompleteNavigation(found->second, envelope.owner, status, live_document);
+      } else if (!view->closed() && handler &&
+                 (envelope.message == Message::kCancel || session->Owns(envelope.owner))) {
+        handler->OnNavigationComplete(view, 0, envelope.owner.document, status);
+      }
       return true;
     }
-    if (!session->Owns(envelope.owner))
+    if (view->closed() || !session->Owns(envelope.owner))
       return true;
     if (envelope.message == Message::kExtensionEvent) {
       ExtensionRequest event;
@@ -673,19 +743,7 @@ class SessionImpl final : public AlloyGuestSession {
       if (handler) handler->OnTitleChanged(view, envelope.owner.document, envelope.payload);
       return true;
     }
-    if (envelope.message == Message::kNavigationComplete) {
-      char* end = nullptr;
-      errno = 0;
-      long status = strtol(envelope.payload.c_str(), &end, 10);
-      if (errno || end == envelope.payload.c_str() || *end ||
-          status < std::numeric_limits<int>::min() ||
-          status > std::numeric_limits<int>::max())
-        return false;
-      if (handler) handler->OnNavigationComplete(view, envelope.owner.document,
-                                                 static_cast<int>(status));
-      return true;
-    }
-    return envelope.message == Message::kUnavailable || envelope.message == Message::kCancel;
+    return envelope.message == Message::kUnavailable;
   }
 
   void Run() {
@@ -807,7 +865,15 @@ class SessionImpl final : public AlloyGuestSession {
             auto found = views_.find(command.view);
             if (found == views_.end() || found->second.view->closed())
               continue;
-            envelope.owner.request = next_request++;
+            // Consecutive intents from a single client batch have not reached
+            // native code. Only the last can start; retire each original ID.
+            if (!commands.empty() && commands.front().kind == Message::kNavigate &&
+                commands.front().view == command.view) {
+              CompleteNavigation(found->second, Owner{command.view, 0, command.request, 0},
+                                 net::ERR_ABORTED);
+              continue;
+            }
+            envelope.owner.request = command.request;
             envelope.payload = std::move(command.payload);
           } else if (command.kind == Message::kCloseView) {
             session.RetireView(command.view);

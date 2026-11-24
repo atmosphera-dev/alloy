@@ -1,0 +1,130 @@
+--- a/libcef/browser/browser_host_base.h
++++ b/libcef/browser/browser_host_base.h
+@@ -329,7 +329,12 @@
+   bool HasObserver(Observer* observer) const;
+ 
+   // Methods called from CefFrameHostImpl.
+-  void LoadMainFrameURL(const content::OpenURLParams& params);
++  // The guest-only callbacks attach native request state and report a load
++  // with no surviving navigation handle. They are not a public CEF API.
++  void LoadMainFrameURL(
++      const content::OpenURLParams& params,
++      base::RepeatingCallback<void(content::NavigationHandle&)> guest_created = {},
++      base::RepeatingCallback<void(int)> guest_no_navigation = {});
+   virtual void OnSetFocus(cef_focus_source_t source) = 0;
+   void ViewText(const std::string& text);
+ 
+@@ -463,6 +468,7 @@
+ 
+   // Called from LoadMainFrameURL to perform the actual navigation.
+   virtual bool Navigate(const content::OpenURLParams& params);
++  std::optional<GURL> GetMainFrameNavigationURL(const content::OpenURLParams& params);
+ 
+   // Called from ShowDevTools to perform the actual show.
+   void ShowDevToolsOnUIThread(std::unique_ptr<CefShowDevToolsParams> params);
+--- a/libcef/browser/browser_host_base.cc
++++ b/libcef/browser/browser_host_base.cc
+@@ -35,6 +35,7 @@
+ #include "content/public/browser/download_request_utils.h"
+ #include "content/public/browser/file_select_listener.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "net/base/net_errors.h"
+ #include "content/public/browser/render_view_host.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "ui/base/resource/resource_scale_factor.h"
+@@ -1374,9 +1375,11 @@
+ }
+ 
+ void CefBrowserHostBase::LoadMainFrameURL(
+-    const content::OpenURLParams& params) {
+-  auto callback =
+-      base::BindOnce(&CefBrowserHostBase::LoadMainFrameURL, this, params);
++    const content::OpenURLParams& params,
++    base::RepeatingCallback<void(content::NavigationHandle&)> guest_created,
++    base::RepeatingCallback<void(int)> guest_no_navigation) {
++  auto callback = base::BindOnce(&CefBrowserHostBase::LoadMainFrameURL, this,
++                                 params, guest_created, guest_no_navigation);
+   if (!CEF_CURRENTLY_ON_UIT()) {
+     CEF_POST_TASK(CEF_UIT, std::move(callback));
+     return;
+@@ -1386,26 +1389,67 @@
+     return;
+   }
+ 
+-  if (Navigate(params)) {
++  if (guest_created) {
++    auto url = GetMainFrameNavigationURL(params);
++    if (!url) {
++      guest_no_navigation.Run(net::ERR_ABORTED);
++      return;
++    }
++    content::NavigationController::LoadURLParams load(*url);
++    load.referrer = params.referrer;
++    load.transition_type = params.transition;
++    load.extra_headers = params.extra_headers;
++    load.alloy_on_request_created = std::move(guest_created);
++    auto result = GetWebContents()->GetController().LoadURLWithParamsForResult(load);
++    if (!result.has_value()) {
++      using Reason = content::NavigationNotStartedReason;
++      int status = net::ERR_ABORTED;
++      switch (result.error()) {
++        case Reason::kInvalidUrl:
++        case Reason::kOversizedUrl:
++          status = net::ERR_INVALID_URL;
++          break;
++        case Reason::kBlockedRendererDebugUrl:
++        case Reason::kDisallowedScheme:
++          status = net::ERR_BLOCKED_BY_CLIENT;
++          break;
++        case Reason::kRendererDebugUrlHandled:
++          status = net::OK;
++          break;
++        default:
++          break;
++      }
++      guest_no_navigation.Run(status);
++    }
++    OnSetFocus(FOCUS_SOURCE_NAVIGATION);
++  } else if (Navigate(params)) {
+     OnSetFocus(FOCUS_SOURCE_NAVIGATION);
+   }
+ }
+ 
++std::optional<GURL> CefBrowserHostBase::GetMainFrameNavigationURL(
++    const content::OpenURLParams& params) {
++  auto* web_contents = GetWebContents();
++  if (!web_contents ||
++      !alloy::ProfileNavigationAllowed(*web_contents->GetBrowserContext())) {
++    return std::nullopt;
++  }
++  GURL url = params.url;
++  if (!url_util::FixupGURL(url)) {
++    return std::nullopt;
++  }
++  return url;
++}
++
+ bool CefBrowserHostBase::Navigate(const content::OpenURLParams& params) {
+   CEF_REQUIRE_UIT();
+-  auto web_contents = GetWebContents();
+-  if (web_contents && !alloy::ProfileNavigationAllowed(*web_contents->GetBrowserContext())) return false;
+-  if (web_contents) {
+-    GURL gurl = params.url;
+-    if (!url_util::FixupGURL(gurl)) {
+-      return false;
+-    }
+-
+-    web_contents->GetController().LoadURL(
+-        gurl, params.referrer, params.transition, params.extra_headers);
+-    return true;
++  auto url = GetMainFrameNavigationURL(params);
++  if (!url) {
++    return false;
+   }
+-  return false;
++  GetWebContents()->GetController().LoadURL(
++      *url, params.referrer, params.transition, params.extra_headers);
++  return true;
+ }
+ 
+ void CefBrowserHostBase::ShowDevToolsOnUIThread(

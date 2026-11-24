@@ -12,6 +12,14 @@
 #include <string.h>
 #include <time.h>
 
+typedef uint64_t(CEF_CALLBACK *navigate_fn)(alloy_guest_view_t*, const cef_string_t*);
+typedef void(CEF_CALLBACK *navigation_complete_fn)(alloy_guest_view_handler_t*,
+    alloy_guest_view_t*, uint64_t, uint64_t, int);
+_Static_assert(_Generic(((alloy_guest_view_t*)0)->navigate, navigate_fn: 1, default: 0),
+    "Navigate must return a request ID");
+_Static_assert(_Generic(((alloy_guest_view_handler_t*)0)->on_navigation_complete,
+    navigation_complete_fn: 1, default: 0), "Completion must name the request and document");
+
 typedef struct {
   alloy_guest_session_handler_t api;
   atomic_int references;

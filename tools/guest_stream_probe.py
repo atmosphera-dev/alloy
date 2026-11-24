@@ -656,9 +656,9 @@ def cross_site_crash(out, evidence, base, server):
     try:
         assert client.wait('prepared')['stream']
         client.wait('configured')
-        client.command('navigate ' + base + '/custody-a.html', 'navigate-queued', lambda v: v['ok'])
+        queued_a = client.command('navigate ' + base + '/custody-a.html', 'navigate-queued', lambda v: v['ok'])
         first = client.wait('title', lambda v: v['title'] == 'CUSTODY_A')
-        client.wait('load', lambda v: v['document'] == first['document'] and v['status'] == 200)
+        loaded = client.wait('load', lambda v: v['document'] == first['document'] and v['status'] == 200)
         first_frame = client.wait('frame', lambda v: v['document'] == first['document'])
         assert server.cross_site_executed_A.wait(30)
         before = OwnedProcesses(client.process.pid, out)
@@ -670,7 +670,7 @@ def cross_site_crash(out, evidence, base, server):
         # localhost and the numeric loopback are different Chromium sites.
         cross_site = base.replace('127.0.0.1', 'localhost') + '/custody-b.html'
         receipt['pending_url'] = cross_site
-        client.command('navigate ' + cross_site, 'navigate-queued', lambda v: v['ok'])
+        queued_b = client.command('navigate ' + cross_site, 'navigate-queued', lambda v: v['ok'])
         assert server.cross_site_waiting.wait(30), 'B did not reach the held server'
         pending = OwnedProcesses(client.process.pid, out)
         others = [row for row in pending.members if row['role'] == 'renderer' and row != old]
@@ -704,6 +704,9 @@ def cross_site_crash(out, evidence, base, server):
         # Terminal close and reader drain, not a time-based quiet window.
         outcomes = [v for v in client.events[after:] if v['event'] == 'load' and v['view'] == first['view']]
         assert outcomes == [outcome], outcomes
+        request_a, request_b = queued_a.get('request', 0), queued_b.get('request', 0)
+        assert 0 < request_a < request_b and loaded.get('request') == request_a and \
+            outcome.get('request') == request_b, ('one outcome per ID', queued_a, queued_b, loaded, outcomes)
         receipt.update(title=title, frame=frame, pixel=pixel, outcomes=outcomes, status='passed')
         return dict(case='old-primary-crash-during-held-cross-site-navigation', **receipt)
     finally:

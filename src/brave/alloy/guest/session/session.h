@@ -13,6 +13,12 @@
 
 namespace alloy::guest {
 
+// A wire owner carries either an SDK Navigate ID or an internal native ID.
+inline constexpr uint64_t kNativeRequestBit = uint64_t{1} << 63;
+inline bool IsAppNavigation(uint64_t request) {
+  return request && request < kNativeRequestBit;
+}
+
 // Navigation belongs to its original view/document/request. A GPU stream epoch
 // is independent: recovery must not silently retire a still-live navigation.
 inline bool SameNavigation(const Owner& original, const Owner& current) {
@@ -94,7 +100,7 @@ class Session {
   uint64_t next_view_ = 1;
   uint64_t next_native_view_ = uint64_t{1} << 63;
   uint64_t next_document_ = 1;
-  uint64_t next_request_ = uint64_t{1} << 63;
+  uint64_t next_request_ = kNativeRequestBit;
   std::map<uint64_t, Owner> owners_;
 };
 }  // namespace alloy::guest

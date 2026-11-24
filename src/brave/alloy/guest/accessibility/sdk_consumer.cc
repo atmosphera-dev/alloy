@@ -54,8 +54,10 @@ class App final : public AlloyGuestSessionHandler, public AlloyGuestViewHandler,
     auto data = CefDictionaryValue::Create(); data->SetString("document", std::to_string(document));
     data->SetString("title", title); Event("title", data);
   }
-  void OnNavigationComplete(CefRefPtr<AlloyGuestView>, uint64_t document, int status) override {
+  void OnNavigationComplete(CefRefPtr<AlloyGuestView>, uint64_t request,
+                            uint64_t document, int status) override {
     auto data = CefDictionaryValue::Create(); data->SetString("document", std::to_string(document));
+    data->SetString("request", std::to_string(request));
     data->SetInt("status", status); Event("load", data);
   }
   void OnClosed(CefRefPtr<AlloyGuestView>, const CefString&) override { Event("view-closed"); }
@@ -101,7 +103,10 @@ class App final : public AlloyGuestSessionHandler, public AlloyGuestViewHandler,
       std::unique_lock lock(mutex_); cv_.wait(lock, [this] { return closed_; });
       return false;
     }
-    if (operation == "navigate" && view) ok = view->Navigate(data->GetString("url"));
+    if (operation == "navigate" && view) {
+      id = view->Navigate(data->GetString("url"));
+      ok = id != 0;
+    }
     else if (operation == "resync" && ax) ok = ax->Resync();
     else if (operation == "configure" && stream)
       ok = stream->Configure(data->GetInt("width"), data->GetInt("height"), data->GetDouble("scale"), 30);
